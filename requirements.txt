@@ -1,0 +1,6 @@
+# 🔬 科研助手 Agent 依赖
+# 安装：pip install -r requirements-research.txt
+
+requests>=2.28.0          # HTTP 请求（调用 DeepSeek API + 学术搜索API）
+PyMuPDF>=1.23.0           # PDF 解析（提取文本）
+python-dotenv>=1.0.0      # 加载 .env 环境变量

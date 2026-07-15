@@ -1,0 +1,5 @@
+# 环境变量（含 API Key）
+.env
+
+# 下载的论文 PDF
+data/papers/
