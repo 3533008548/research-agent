@@ -1,5 +1,9 @@
 # 环境变量（含 API Key）
 .env
 
+# 运行时生成
+__pycache__/
+chroma_data/
+
 # 下载的论文 PDF
 data/papers/
