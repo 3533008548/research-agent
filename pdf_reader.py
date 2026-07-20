@@ -71,7 +71,7 @@ _SECTION_PATTERN = re.compile(
 class PaperReader:
     """增强型 PDF 阅读器 — 表格感知 + 双栏排序 + 章节标注"""
 
-    def __init__(self, max_pages: int = 15, max_chars: int = 8000):
+    def __init__(self, max_pages: int = 15, max_chars: int = 50000):
         if pdfplumber is None:
             raise ImportError(
                 "需要安装 pdfplumber 才能解析 PDF：\n"
@@ -371,7 +371,7 @@ class PaperReader:
 #  便捷函数（兼容现有 read_pdf 接口）
 # ═══════════════════════════════════════════════════════════════
 
-def read_pdf_enhanced(pdf_path: str, max_pages: int = 15, max_chars: int = 8000) -> str:
+def read_pdf_enhanced(pdf_path: str, max_pages: int = 15, max_chars: int = 50000) -> str:
     """
     便捷函数：用 PaperReader 读取 PDF。
 

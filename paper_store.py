@@ -15,6 +15,7 @@
 """
 
 import os
+import sys
 import uuid
 import json
 from pathlib import Path
@@ -36,8 +37,8 @@ from chromadb.utils import embedding_functions
 
 def chunk_text(
     text: str,
-    chunk_size: int = 600,
-    overlap: int = 100,
+    chunk_size: int = 1000,
+    overlap: int = 150,
 ) -> list[dict]:
     """
     将论文文本切分为有重叠的语义块。
@@ -119,7 +120,7 @@ class PaperStore:
     def __init__(self, persist_dir: str = "./chroma_data"):
         if chromadb is None:
             raise ImportError(
-                "需要安装 chromadb：\n   pip install chromadb"
+                "需要安装 chromadb:\n   pip install chromadb"
             )
 
         persist_dir = Path(persist_dir)
@@ -129,11 +130,11 @@ class PaperStore:
         # 使用 ChromaDB 内置 ONNX 嵌入（all-MiniLM-L6-v2, ~80MB, 纯 CPU）
         # 首次运行自动下载模型，之后本地缓存，无需安装 sentence-transformers
         print(
-            f"      🤖 加载 ChromaDB 内置 Embedding (ONNX, 首次需下载 ~80MB)...",
-            end="", flush=True,
+            f"      [Embedding] 加载 ChromaDB ONNX 模型...",
+            end="", flush=True, file=sys.stderr,
         )
         self._embed_fn = embedding_functions.DefaultEmbeddingFunction()
-        print(" 完成")
+        print(" 完成", file=sys.stderr)
 
         # 初始化 ChromaDB（持久化模式）
         self._chroma = chromadb.PersistentClient(

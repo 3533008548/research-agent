@@ -12,6 +12,13 @@
 
 import os
 import sys
+
+# ── Windows GBK 终端兼容：强制 stderr 使用 UTF-8 ──
+if sys.platform == "win32":
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 import json
 import argparse
 import uuid
@@ -95,16 +102,23 @@ class ResearchAgent:
                     file=sys.stderr,
                 )
 
-        # 构建 LangGraph
+        # 构建 LangGraph（SQLite 持久化对话历史）
         self._app = build_graph(
             api_key=self.api_key,
             model=self.model,
             paper_store=self._paper_store,
             token_usage=self.token_usage,
+            checkpoint_db="checkpoint.db",
         )
 
-        # 会话配置
-        self._config = self._new_config()
+        # 会话配置：固定 thread_id 实现跨重启恢复
+        self._thread_id = "research-main"
+        self._config = {"configurable": {"thread_id": self._thread_id}}
+
+        # 检查是否有历史对话
+        if Path("checkpoint.db").exists():
+            size = Path("checkpoint.db").stat().st_size
+            print(f"      💾 对话历史: checkpoint.db ({size / 1024:.0f} KB)", file=sys.stderr)
 
     # ── 公开 API ──
 
@@ -144,9 +158,10 @@ class ResearchAgent:
             )
 
     def reset(self):
-        """重置会话（新 thread_id）"""
-        self._config = self._new_config()
-        print("\n🔄 已开始新对话。", file=sys.stderr)
+        """重置会话（新 thread_id，旧对话永久保留在 checkpoint.db 中）"""
+        self._thread_id = f"session-{uuid.uuid4().hex[:8]}"
+        self._config = {"configurable": {"thread_id": self._thread_id}}
+        print(f"\n🔄 已开始新对话 (thread: {self._thread_id})。", file=sys.stderr)
 
     @property
     def paper_store(self):
@@ -155,12 +170,9 @@ class ResearchAgent:
 
     # ── 内部 ──
 
-    def _new_config(self) -> dict:
-        return {
-            "configurable": {
-                "thread_id": f"session-{uuid.uuid4().hex[:8]}",
-            }
-        }
+    @property
+    def thread_id(self) -> str:
+        return self._thread_id
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -186,7 +198,7 @@ def print_help():
 📖 **命令列表**
 
   /help            显示此帮助
-  /new             开始新对话（重置 thread）
+  /new             开始新对话（旧对话保留在 checkpoint.db）
   /papers          列出已下载论文
   /indexed         列出已索引论文（RAG库）
   /model           显示当前模型和 RAG 状态
@@ -204,6 +216,7 @@ def print_help():
 📦 **数据存储**
   data/papers/     PDF 缓存
   chroma_data/     RAG 向量库（持久化）
+  checkpoint.db    对话历史（SQLite，重启不丢）
 """
     print(msg)
 

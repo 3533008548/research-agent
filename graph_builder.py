@@ -20,6 +20,8 @@ import requests
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -43,23 +45,28 @@ class AgentState(TypedDict):
 
 _SYSTEM_PROMPT = (
     "你是一位顶级的科研助手（Research Assistant AI），专精于帮助研究人员进行文献调研和方向分析。\n\n"
+    "## ⚠️ 信息获取优先级（必须严格遵守）\n"
+    "你拥有一座**本地论文库**（通过 query_papers 访问），存储所有已读论文的全文索引。\n"
+    "1. **本地优先** — 收到问题后，先想一想本地论文库里有没有相关内容。如有，用 query_papers 检索\n"
+    "2. **外部补充** — 仅当本地内容不足以回答时，才用 search_papers 搜索新论文\n"
+    "3. **精读后检索** — read_pdf 后论文已自动索引到本地库，追问细节时用 query_papers 精准定位，不要重新阅读\n"
+    "4. **明确告知来源** — 回答时主动说明信息来自「你已读的论文」还是「新搜索的结果」\n\n"
     "## 核心能力\n"
-    "1. **论文搜索** — 用 search_papers 工具搜索相关论文\n"
-    "2. **PDF阅读** — 用 read_pdf 工具下载并阅读论文全文\n"
-    "3. **论文检索** — 用 query_papers 工具在已索引论文中精准检索方法细节、实验数据\n"
-    "4. **研究方向分析** — 综合多篇论文，总结技术趋势、对比方法优劣、提出见解\n"
+    "1. **本地检索** — query_papers 在你已索引的论文库中精准定位方法细节、实验数据、公式\n"
+    "2. **论文搜索** — search_papers 从 Semantic Scholar / arXiv 搜索新论文\n"
+    "3. **PDF阅读** — read_pdf 下载并阅读论文全文（自动索引到本地库）\n"
+    "4. **方向分析** — 综合多篇论文，总结技术趋势、对比方法优劣、提出见解\n"
     "5. **科研建议** — 基于文献调研给出研究选题、实验设计等建议\n\n"
     "## 工作方法\n"
-    "- **搜索阶段**：用 search_papers 搜索，返回结果后询问用户想深入看哪篇\n"
-    "- **精读阶段**：用 read_pdf 下载并提取论文内容（自动索引到本地库）\n"
-    "- **检索阶段**：用 query_papers 精准定位方法细节、损失函数、实验设置等\n"
-    "- **分析阶段**：综合多篇论文，做技术对比、趋势分析\n\n"
+    "- **先查后搜**：任何问题都先 query_papers → 不够再 search_papers\n"
+    "- **搜索阶段**：search_papers 搜索新论文，返回结果后询问用户想精读哪篇\n"
+    "- **精读阶段**：read_pdf 下载并提取论文内容，自动索引后追问直接用 query_papers\n"
+    "- **分析阶段**：综合多篇论文做技术对比、趋势分析\n\n"
     "## 行为准则\n"
     "- 用**中文**回答，论文标题和专有术语保留英文\n"
     "- 解读论文时覆盖：解决了什么问题 → 方法核心思想 → 实验设置与结果 → 局限性\n"
     "- 分析研究方向时给出清晰的对比表和渐进式研究路线\n"
-    "- 每次回复末尾主动建议下一步动作\n"
-    "- 对已精读的论文，后续细节问题优先用 query_papers 检索而非重新阅读\n\n"
+    "- 每次回复末尾主动建议下一步动作\n\n"
     "开始吧！请用户告诉你想研究什么方向。"
 )
 
@@ -164,6 +171,26 @@ def _build_tool_schemas() -> list[dict]:
                 "parameters": {"type": "object", "properties": {}},
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_paper",
+                "description": (
+                    "从 RAG 论文库中删除一篇已索引的论文。"
+                    "当你发现论文被重复索引或用户明确要求删除时使用。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paper_id_or_title": {
+                            "type": "string",
+                            "description": "论文的标题或 paper_id（可用 list_indexed_papers 查看）",
+                        },
+                    },
+                    "required": ["paper_id_or_title"],
+                },
+            },
+        },
     ]
 
 
@@ -177,6 +204,7 @@ def build_graph(
     model: str = "deepseek-chat",
     paper_store = None,  # Optional[PaperStore]
     token_usage: dict = None,  # 外部传入的可变 dict，用于累计 token 消耗
+    checkpoint_db: str = "checkpoint.db",  # SQLite 持久化路径
 ) -> callable:
     """
     构建并编译 LangGraph ReAct Agent。
@@ -321,7 +349,8 @@ def build_graph(
     graph.add_conditional_edges("llm", router, {"tools": "tools", END: END})
     graph.add_edge("tools", "llm")
 
-    return graph.compile(checkpointer=MemorySaver())
+    conn = sqlite3.connect(checkpoint_db, check_same_thread=False)
+    return graph.compile(checkpointer=SqliteSaver(conn))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -394,11 +423,16 @@ def _execute_tool(name: str, args: dict, paper_store=None) -> str:
         else:
             pdf_path = Path(url_or_path)
             if not pdf_path.exists():
-                return f"❌ 本地文件不存在: {url_or_path}"
+                # fallback: 尝试 data/papers/ 目录（匹配 list_papers 输出）
+                alt = pdf_dir / pdf_path.name
+                if alt.exists():
+                    pdf_path = alt
+                else:
+                    return f"❌ 本地文件不存在: {url_or_path}\n   已尝试: data/papers/{pdf_path.name}"
 
         # ── 增强型文本提取 ──
         try:
-            result = read_pdf_enhanced(str(pdf_path), max_pages=max_pages, max_chars=8000)
+            result = read_pdf_enhanced(str(pdf_path), max_pages=max_pages, max_chars=50000)
         except ImportError as e:
             return f"❌ {e}"
         except Exception as e:
@@ -408,6 +442,12 @@ def _execute_tool(name: str, args: dict, paper_store=None) -> str:
         if paper_store and result and not result.startswith("❌"):
             try:
                 title = pdf_path.stem.replace("_", " ")
+                # 去重：先删除同名论文的旧索引
+                for p in paper_store.list_papers():
+                    if p["title"] == title:
+                        paper_store.delete_paper(p["paper_id"])
+                        print(f"      🗑️ 已删除旧索引: {title}", file=sys.stderr)
+                        break
                 paper_store.index_paper(result, title=title)
                 print(f"      📚 已索引到论文库", file=sys.stderr)
                 result += (
@@ -432,7 +472,7 @@ def _execute_tool(name: str, args: dict, paper_store=None) -> str:
         for i, r in enumerate(results, 1):
             lines.append(
                 f"  {i}. [{r['title']}]  相似度距离: {r['distance']}\n"
-                f"     {r['text'][:300]}..."
+                f"     {r['text']}"
             )
         return "\n".join(lines)
 
@@ -451,6 +491,24 @@ def _execute_tool(name: str, args: dict, paper_store=None) -> str:
         for i, p in enumerate(papers, 1):
             lines.append(f"  {i}. {p['title']} ({p['chunks']} chunks)")
         return "\n".join(lines)
+
+    # ── delete_paper ──
+    if name == "delete_paper":
+        if not paper_store:
+            return "❌ RAG 功能未启用。"
+        pid_or_title = args.get("paper_id_or_title", "")
+        if not pid_or_title:
+            return "❌ 请指定要删除的论文标题或 paper_id。"
+        papers = paper_store.list_papers()
+        found = None
+        for p in papers:
+            if pid_or_title in p["paper_id"] or pid_or_title.lower() in p["title"].lower():
+                found = p
+                break
+        if not found:
+            return f"❌ 未找到论文: {pid_or_title}\n   可用 /indexed 或 list_indexed_papers 查看已索引论文。"
+        count = paper_store.delete_paper(found["paper_id"])
+        return f"🗑️ 已删除: {found['title']} ({count} 个块)"
 
     # ── 未知工具 ──
     return f"❌ 未知工具: {name}"

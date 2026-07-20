@@ -4,6 +4,8 @@
 # 运行时生成
 __pycache__/
 chroma_data/
+checkpoint.db
+checkpoint.db-*
 
 # 下载的论文 PDF
 data/papers/
