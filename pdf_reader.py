@@ -71,7 +71,7 @@ _SECTION_PATTERN = re.compile(
 class PaperReader:
     """增强型 PDF 阅读器 — 表格感知 + 双栏排序 + 章节标注"""
 
-    def __init__(self, max_pages: int = 15, max_chars: int = 50000):
+    def __init__(self, max_pages: int = 15, max_chars: int | None = None):
         if pdfplumber is None:
             raise ImportError(
                 "需要安装 pdfplumber 才能解析 PDF：\n"
@@ -131,9 +131,9 @@ class PaperReader:
         if total_pages > self.max_pages:
             full_text += f"\n\n...（共 {total_pages} 页，已读取前 {self.max_pages} 页）"
 
-        # Token 截断
+        # Token 截断（max_chars=None 时不截断）
         char_count = len(full_text)
-        if char_count > self.max_chars:
+        if self.max_chars is not None and char_count > self.max_chars:
             full_text = full_text[:self.max_chars] + (
                 f"\n\n...（内容过长，已截断至前 {self.max_chars} 字符）"
             )
@@ -368,20 +368,60 @@ class PaperReader:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  便捷函数（兼容现有 read_pdf 接口）
+# ═══════════════════════════════════════════════════════════════
+#  图片提取 — PyMuPDF 从 PDF 提取嵌入图片
 # ═══════════════════════════════════════════════════════════════
 
-def read_pdf_enhanced(pdf_path: str, max_pages: int = 15, max_chars: int = 50000) -> str:
+def extract_images(pdf_path: str, max_pages: int = 15) -> list[str]:
     """
-    便捷函数：用 PaperReader 读取 PDF。
+    从 PDF 中提取嵌入图片，保存到 data/papers/images/ 目录。
+    返回提取的图片文件路径列表。
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        print("      ⚠ PyMuPDF 未安装，跳过图片提取。pip install PyMuPDF", file=sys.stderr)
+        return []
+
+    from pathlib import Path
+    img_dir = Path("data/papers/images")
+    img_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(pdf_path).stem[:30]
+
+    saved = []
+    doc = fitz.open(pdf_path)
+    for page_num in range(min(len(doc), max_pages)):
+        for img_idx, img in enumerate(doc[page_num].get_images(full=True)):
+            xref = img[0]
+            try:
+                base = doc.extract_image(xref)
+                ext = base["ext"]
+                fname = img_dir / f"{stem}_p{page_num+1}_i{img_idx+1}.{ext}"
+                fname.write_bytes(base["image"])
+                saved.append(str(fname))
+            except Exception:
+                pass
+    doc.close()
+    if saved:
+        print(f"      🖼 提取 {len(saved)} 张图片到 data/papers/images/", file=sys.stderr)
+    return saved
+
+
+# ═══════════════════════════════════════════════════════════════
+#  便捷函数
+# ═══════════════════════════════════════════════════════════════
+
+def read_pdf_enhanced(pdf_path: str, max_pages: int = 15, max_chars: int | None = None) -> str:
+    """
+    读取 PDF，提取文本 + 表格 + 图片。
 
     参数:
       pdf_path : str — PDF 文件路径
-      max_pages : int — 最多读取的页数
-      max_chars : int — 最多返回的字符数
+      max_pages : int — 最多读取页数
+      max_chars : int — 最多返回字符数
 
     返回:
-      str — 结构化文本，含表格 Markdown / 双栏排序 / ## 章节标注
+      str — 结构化文本
     """
     reader = PaperReader(max_pages=max_pages, max_chars=max_chars)
     return reader.read(pdf_path)

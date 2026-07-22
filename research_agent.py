@@ -109,23 +109,27 @@ class ResearchAgent:
             paper_store=self._paper_store,
             token_usage=self.token_usage,
             checkpoint_db="checkpoint.db",
+            glm_api_key=os.getenv("GLM_API_KEY", ""),
         )
 
         # 会话配置：固定 thread_id 实现跨重启恢复
         self._thread_id = "research-main"
         self._config = {"configurable": {"thread_id": self._thread_id}}
 
-        # 检查是否有历史对话
+        # 检查是否有历史对话 + 估算上下文占比
         if Path("checkpoint.db").exists():
             size = Path("checkpoint.db").stat().st_size
             print(f"      💾 对话历史: checkpoint.db ({size / 1024:.0f} KB)", file=sys.stderr)
+            self._load_context_from_checkpoint()
 
     # ── 公开 API ──
 
-    def step(self, user_input: str) -> str:
-        """单轮推理：输入用户消息，返回 Agent 回复文本"""
-        before = self.token_usage["total"]
-        state = {"messages": [{"role": "user", "content": user_input}]}
+    def step(self, user_input: str, context: str | None = None) -> str:
+        """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文"""
+        state = {"messages": []}
+        if context:
+            state["messages"].append({"role": "system", "content": context})
+        state["messages"].append({"role": "user", "content": user_input})
 
         try:
             result = self._app.invoke(state, config=self._config)
@@ -157,10 +161,29 @@ class ResearchAgent:
                 f"({self.token_usage['calls']} 次调用)"
             )
 
+    def _load_context_from_checkpoint(self):
+        """从 checkpoint.db 读取当前 thread 的已有消息，估算上下文占比"""
+        try:
+            state = self._app.get_state(self._config)
+            messages = state.values.get("messages", []) if state.values else []
+        except Exception:
+            messages = []
+        if not messages:
+            return
+        # 估算 tokens：总字符数 / 2（中英混合近似）
+        total_chars = sum(len(m.get("content", "") or "") for m in messages)
+        est_tokens = total_chars // 2
+        self.token_usage["prompt"] = est_tokens
+        self.token_usage["total"] = est_tokens
+        self.token_usage["last_prompt"] = est_tokens
+        pct = min(int(est_tokens / 65536 * 100), 99)
+        print(f"      📊 已有上下文: ~{est_tokens:,} tokens ({pct}%)", file=sys.stderr)
+
     def reset(self):
         """重置会话（新 thread_id，旧对话永久保留在 checkpoint.db 中）"""
         self._thread_id = f"session-{uuid.uuid4().hex[:8]}"
         self._config = {"configurable": {"thread_id": self._thread_id}}
+        self.token_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "last_prompt": 0}
         print(f"\n🔄 已开始新对话 (thread: {self._thread_id})。", file=sys.stderr)
 
     @property

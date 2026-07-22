@@ -45,29 +45,53 @@ class AgentState(TypedDict):
 
 _SYSTEM_PROMPT = (
     "你是一位顶级的科研助手（Research Assistant AI），专精于帮助研究人员进行文献调研和方向分析。\n\n"
-    "## ⚠️ 信息获取优先级（必须严格遵守）\n"
-    "你拥有一座**本地论文库**（通过 query_papers 访问），存储所有已读论文的全文索引。\n"
-    "1. **本地优先** — 收到问题后，先想一想本地论文库里有没有相关内容。如有，用 query_papers 检索\n"
-    "2. **外部补充** — 仅当本地内容不足以回答时，才用 search_papers 搜索新论文\n"
-    "3. **精读后检索** — read_pdf 后论文已自动索引到本地库，追问细节时用 query_papers 精准定位，不要重新阅读\n"
-    "4. **明确告知来源** — 回答时主动说明信息来自「你已读的论文」还是「新搜索的结果」\n\n"
+    "## 🧠 思考框架（四阶段）\n\n"
+    "### 阶段1 — 评估\n"
+    "收到问题后，先判断：用户问什么？本地论文库有没有相关内容？\n"
+    "→ 有 → 用 query_papers 检索\n"
+    "→ 无 → 用 search_papers 搜索\n"
+    "→ 不确定 → 先 query_papers 确认无，再 search_papers\n\n"
+    "### 阶段2 — 执行\n"
+    "调用工具获取信息。追踪每条信息的来源：\n"
+    "[已读] = 来自本地论文库  [搜索] = 来自网络搜索  [推测] = 基于领域知识\n\n"
+    "### 阶段3 — 合成\n"
+    "综合信息给出回答。严格要求：\n"
+    "- 公式必须标注来源：[已读·论文标题] 或 [推测]\n"
+    "- 实验数据标注论文和图表编号\n"
+    "- 不确定的结论前加「推测」标记\n\n"
+    "### 阶段4 — 自检\n"
+    "回答前自查：公式引用是否具体？来源是否区分清楚？不确定的内容是否标注？\n\n"
+    "## ⚠️ 信息获取优先级\n"
+    "1. **本地优先** — 先用 query_papers 检索已索引论文\n"
+    "2. **外部补充** — 本地不足时才 search_papers\n"
+    "3. **精读后检索** — read_pdf 后追问细节用 query_papers\n"
+    "4. **明确来源** — 回答中用 [已读][搜索][推测] 标记每条信息\n\n"
     "## 核心能力\n"
-    "1. **本地检索** — query_papers 在你已索引的论文库中精准定位方法细节、实验数据、公式\n"
-    "2. **论文搜索** — search_papers 从 Semantic Scholar / arXiv 搜索新论文\n"
-    "3. **PDF阅读** — read_pdf 下载并阅读论文全文（自动索引到本地库）\n"
-    "4. **方向分析** — 综合多篇论文，总结技术趋势、对比方法优劣、提出见解\n"
-    "5. **科研建议** — 基于文献调研给出研究选题、实验设计等建议\n\n"
+    "1. query_papers — 本地论文库精准检索（方法细节、公式、实验数据）\n"
+    "2. search_papers — Semantic Scholar / arXiv 搜索新论文\n"
+    "3. read_pdf — 下载并阅读论文（自动索引，读完后生成摘要卡片）\n"
+    "4. describe_image — 用视觉模型理解论文中的架构图、流程图、实验图\n"
+    "4. 方向分析 — 综合多篇论文，对比技术趋势\n"
+    "5. 科研建议 — 基于文献调研给出选题建议\n\n"
     "## 工作方法\n"
-    "- **先查后搜**：任何问题都先 query_papers → 不够再 search_papers\n"
-    "- **搜索阶段**：search_papers 搜索新论文，返回结果后询问用户想精读哪篇\n"
-    "- **精读阶段**：read_pdf 下载并提取论文内容，自动索引后追问直接用 query_papers\n"
-    "- **分析阶段**：综合多篇论文做技术对比、趋势分析\n\n"
-    "## 行为准则\n"
-    "- 用**中文**回答，论文标题和专有术语保留英文\n"
-    "- 解读论文时覆盖：解决了什么问题 → 方法核心思想 → 实验设置与结果 → 局限性\n"
-    "- 分析研究方向时给出清晰的对比表和渐进式研究路线\n"
-    "- 每次回复末尾主动建议下一步动作\n\n"
-    "开始吧！请用户告诉你想研究什么方向。"
+    "- 先查后搜：任何问题先 query_papers → 不够再 search_papers\n"
+    "- read_pdf 后必须生成**摘要卡片**（问题、方法、公式、实验、局限）\n"
+    "- 公式用 $$...$$（块）或 [已读]标记来源\n"
+    "- 每次回复末尾建议下一步\n\n"
+    "## 输出范例\n\n"
+    "### 范例1：精读论文后\n"
+    "> 📋 **摘要卡片 — Intelligent Traffic Scheduling...**\n"
+    "> 1. 核心问题: 提出基于DRL的TSN调度算法 [已读]\n"
+    "> 2. 方法思路: DQN + 优先级队列 [已读]\n"
+    "> 3. 关键公式: R = w₁·delay + w₂·throughput [已读·公式3]\n"
+    "> 4. 实验结论: 延迟降低23% [已读·Table 2]\n"
+    "> 5. 局限性: 仅仿真验证 [已读]\n\n"
+    "### 范例2：回答论文细节\n"
+    "> Q: 损失函数是什么？\n"
+    "> A: 根据本地方案，该论文使用MSE作为调度损失 [已读·query_papers结果]\n"
+    "> 公式(10) L = Σ(t_actual - t_target)² [已读·formula 10]\n"
+    "> 对比文献[搜索]也常用Huber Loss，但该论文选择MSE因为...\n\n"
+    "开始吧！"
 )
 
 
@@ -113,7 +137,7 @@ def _build_tool_schemas() -> list[dict]:
                 "name": "read_pdf",
                 "description": (
                     "下载论文PDF并提取文本内容。支持 arXiv 链接、PDF直链和本地路径。"
-                    "读取完成后会自动索引到本地论文库，后续可用 query_papers 精准检索。"
+                    "读取完成后会自动索引到本地论文库，同时提取图片供 describe_image 工具分析。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -128,6 +152,27 @@ def _build_tool_schemas() -> list[dict]:
                         },
                     },
                     "required": ["url_or_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "describe_image",
+                "description": (
+                    "用视觉模型描述论文中的图片（架构图、流程图、实验结果图等）。"
+                    "当用户问到'图X是什么'或需要理解图表内容时使用。"
+                    "传入图片文件路径（Marker 提取的图片在 data/papers/images/ 下）。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image_path": {
+                            "type": "string",
+                            "description": "图片文件的本地路径",
+                        },
+                    },
+                    "required": ["image_path"],
                 },
             },
         },
@@ -205,6 +250,7 @@ def build_graph(
     paper_store = None,  # Optional[PaperStore]
     token_usage: dict = None,  # 外部传入的可变 dict，用于累计 token 消耗
     checkpoint_db: str = "checkpoint.db",  # SQLite 持久化路径
+    glm_api_key: str = "",  # GLM-4V 视觉模型 API Key
 ) -> callable:
     """
     构建并编译 LangGraph ReAct Agent。
@@ -266,6 +312,7 @@ def build_graph(
             token_usage["completion"] += compl_tk
             token_usage["total"] += total_tk
             token_usage["calls"] += 1
+            token_usage["last_prompt"] = prompt_tk  # 当前上下文用量
             print(
                 f"      📊 tokens: +{total_tk} "
                 f"(P:{prompt_tk} C:{compl_tk}) "
@@ -296,14 +343,14 @@ def build_graph(
     # ═══ 路由 ═══
 
     def router(state: AgentState) -> str:
-        """条件路由：最后一条消息有 tool_calls → tools，否则 → END"""
+        """条件路由：tool_calls → tools，最终回答 → verify"""
         messages = state.get("messages", [])
         if not messages:
             return END
         last = messages[-1]
         if last.get("tool_calls"):
             return "tools"
-        return END
+        return "verify"
 
     # ═══ 工具执行节点 ═══
 
@@ -327,7 +374,6 @@ def build_graph(
 
             result = _execute_tool(name, args, paper_store)
 
-            # Token 截断
             if isinstance(result, str) and len(result) > 12000:
                 result = result[:12000] + "\n\n...（截断至 12000 字符）"
 
@@ -339,15 +385,118 @@ def build_graph(
 
         return {"messages": tool_msgs}
 
+    # ═══ 验证节点 ═══
+
+    def verify_node(state: AgentState) -> dict:
+        """自动修正回复 + 智能压缩 + 跨论文库自检"""
+        messages = state.get("messages", [])
+        if not messages:
+            return {}
+        last_msg = messages[-1]
+        content = last_msg.get("content", "")
+        if not content:
+            return {}
+
+        # 本轮是否用了工具？
+        recent = list(messages[-8:])
+        has_tools = any(m.get("role") == "tool" for m in recent)
+
+        # ── 智能上下文压缩：read_pdf 后 LLM 生成摘要卡片了 → 替换原文 ──
+        if has_tools:
+            for i, m in enumerate(recent):
+                if m.get("role") != "tool":
+                    continue
+                txt = m.get("content", "")
+                if txt.startswith("📄") and len(txt) > 3000 and "摘要" in content.lower():
+                    recent[i] = dict(m, content="📄 PDF原文已压缩（全文已索引至本地库，可用 query_papers 检索）")
+                    print("      📦 压缩 read_pdf 原文 → 释放上下文空间", file=sys.stderr)
+
+        tool_texts = []
+        has_read_pdf = False
+        for m in recent:
+            if m.get("role") == "tool":
+                t = m.get("content", "")[:600]
+                tool_texts.append(t)
+                if "📄" in t:
+                    has_read_pdf = True
+
+        if not has_tools:
+            return {}
+
+        # ── 跨论文库自检 ──
+        library_context = ""
+        if paper_store and has_read_pdf:
+            try:
+                lib = paper_store.query(content[:200], top_k=2)
+                if lib:
+                    lib_chunks = [f"[{r['title']}] {r['text'][:300]}" for r in lib]
+                    library_context = (
+                        "\n--- Relevant local papers (for cross-checking) ---\n"
+                        + "\n".join(lib_chunks)
+                    )
+            except Exception:
+                pass
+
+        # Token 预算
+        pct = 0
+        if token_usage and token_usage.get("last_prompt"):
+            pct = min(token_usage["last_prompt"] / 65536, 1.0)
+
+        # ── 验证 prompt ──
+        verify_prompt = (
+            "Review this AI response critically. Fix any factual errors:\n\n"
+            "Rules:\n"
+            "1. Formula claims NOT in tool results → remove or mark [推测]\n"
+            "2. Unclear source → add [已读]/[搜索]/[推测]\n"
+            "3. Contradicts tool results → fix it\n"
+            "4. Everything correct → reply 'OK'\n\n"
+            f"--- Tool results ---\n{chr(10).join(f'[T{i+1}] {t}' for i, t in enumerate(tool_texts))}"
+            f"{library_context}\n\n"
+            f"--- Response ---\n{content[:1500]}\n\n"
+            "Corrected response (or OK):"
+        )
+
+        try:
+            resp = requests.post(
+                api_url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": verify_prompt}],
+                      "stream": False, "temperature": 0.1},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            verified = resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            return {}
+
+        if "usage" in resp.json() and token_usage:
+            vu = resp.json()["usage"]
+            for k in ("prompt", "completion", "total"):
+                token_usage[k] += vu.get(f"{k}_tokens", 0)
+            token_usage["calls"] += 1
+
+        if not verified or verified.upper() == "OK":
+            return {}
+
+        if pct > 0.9:
+            verified += "\n\n⚠️ 上下文已用 90%+，建议 `/new` 开始新对话。"
+        elif pct > 0.8:
+            verified += f"\n\n📊 上下文 {int(pct*100)}%，较早对话可能被遗忘。"
+
+        print(f"      🔍 验证修正: {len(content)} → {len(verified)} chars", file=sys.stderr)
+        return {"messages": [{"role": "assistant", "content": verified}]}
+
     # ═══ 构图 ═══
 
     graph = StateGraph(AgentState)
     graph.add_node("llm", llm_node)
     graph.add_node("tools", tool_node)
+    graph.add_node("verify", verify_node)
 
     graph.set_entry_point("llm")
-    graph.add_conditional_edges("llm", router, {"tools": "tools", END: END})
+    graph.add_conditional_edges("llm", router, {"tools": "tools", "verify": "verify"})
     graph.add_edge("tools", "llm")
+    graph.add_edge("verify", END)
 
     conn = sqlite3.connect(checkpoint_db, check_same_thread=False)
     return graph.compile(checkpointer=SqliteSaver(conn))
@@ -432,11 +581,21 @@ def _execute_tool(name: str, args: dict, paper_store=None) -> str:
 
         # ── 增强型文本提取 ──
         try:
-            result = read_pdf_enhanced(str(pdf_path), max_pages=max_pages, max_chars=50000)
+            result = read_pdf_enhanced(str(pdf_path), max_pages=max_pages, max_chars=None)
         except ImportError as e:
             return f"❌ {e}"
         except Exception as e:
             return f"❌ PDF 解析失败: {type(e).__name__}: {e}"
+
+        # ── 提取图片 ──
+        if result and not result.startswith("❌"):
+            try:
+                from pdf_reader import extract_images
+                imgs = extract_images(str(pdf_path), max_pages=max_pages)
+                if imgs:
+                    result += "\n\n🖼 **提取的图片**:\n" + "\n".join(f"  - {i}" for i in imgs)
+            except Exception as e:
+                print(f"      ⚠ 图片提取失败: {e}", file=sys.stderr)
 
         # ── 自动索引到 RAG ──
         if paper_store and result and not result.startswith("❌"):
@@ -451,7 +610,15 @@ def _execute_tool(name: str, args: dict, paper_store=None) -> str:
                 paper_store.index_paper(result, title=title)
                 print(f"      📚 已索引到论文库", file=sys.stderr)
                 result += (
-                    "\n\n（📚 已自动索引。后续可用 query_papers 精准检索论文细节。）"
+                    "\n\n---\n"
+                    "📋 **请对这篇论文生成一个结构化摘要卡片**，覆盖以下维度（控制在 10 行以内）：\n"
+                    "1. **核心问题** — 这篇论文要解决什么\n"
+                    "2. **方法一句话** — 核心思路是什么\n"
+                    "3. **关键公式** — 最重要的 1-2 个公式（可用 query_papers 检索确认）\n"
+                    "4. **实验结论** — 主要实验结果\n"
+                    "5. **局限性/未解决的问题**\n"
+                    "6. **与本方向的其他论文关系**（如有已读论文）\n\n"
+                    "论文全文已自动索引到本地库，后续追问细节时请用 query_papers 精准检索。"
                 )
             except Exception as e:
                 print(f"      ⚠️ RAG 索引失败: {e}", file=sys.stderr)
@@ -509,6 +676,59 @@ def _execute_tool(name: str, args: dict, paper_store=None) -> str:
             return f"❌ 未找到论文: {pid_or_title}\n   可用 /indexed 或 list_indexed_papers 查看已索引论文。"
         count = paper_store.delete_paper(found["paper_id"])
         return f"🗑️ 已删除: {found['title']} ({count} 个块)"
+
+    # ── describe_image ──
+    if name == "describe_image":
+        image_path = args.get("image_path", "")
+        if not image_path:
+            return "❌ 请提供图片路径。"
+        import base64
+        p = Path(image_path)
+        # 尝试常见目录 fallback
+        for d in [Path("."), Path("data/papers"), Path("data/papers/images")]:
+            candidate = d / p.name
+            if candidate.exists():
+                p = candidate
+                break
+        if not p.exists():
+            return f"❌ 图片不存在: {image_path}"
+        if not glm_api_key:
+            return "❌ GLM-4V API Key 未配置。请在 .env 中设置 GLM_API_KEY。"
+        try:
+            img_data = p.read_bytes()
+            b64 = base64.b64encode(img_data).decode()
+            ext = p.suffix.lstrip(".").lower()
+            mime = f"image/{'jpeg' if ext in ('jpg','jpeg') else ext}"
+        except Exception as e:
+            return f"❌ 读取图片失败: {e}"
+
+        glm_payload = {
+            "model": "glm-4v",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请详细描述这张图的内容。如果是网络架构图，描述每层的结构和数据流；如果是流程图，描述每个步骤；如果是实验数据图，描述数据和结论。用中文回答。"},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ]
+            }],
+            "temperature": 0.3,
+            "stream": False,
+        }
+        try:
+            resp = requests.post(
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {glm_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=glm_payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            desc = resp.json()["choices"][0]["message"]["content"]
+            return f"🖼️ 图片描述 ({p.name}):\n{desc}"
+        except Exception as e:
+            return f"❌ GLM-4V 调用失败: {e}"
 
     # ── 未知工具 ──
     return f"❌ 未知工具: {name}"
