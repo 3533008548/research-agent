@@ -1,0 +1,15 @@
+# 🔬 科研助手 — 统一配置文件
+# 非敏感设置放这里，API Key 仍在 .env
+
+model: deepseek-v4-flash
+
+pdf:
+  max_pages: 15          # read_pdf 默认页数
+
+rag:
+  enabled: true
+  persist_dir: chroma_data
+
+ui:
+  port: 7860
+  theme: soft

@@ -9,3 +9,4 @@ langgraph-checkpoint-sqlite    # SQLite 对话持久化（SqliteSaver）
 gradio>=5.0                    # Web UI（ChatInterface + MathJax 公式渲染）
 python-dotenv>=1.0.0          # .env 环境变量加载
 PyMuPDF                       # PDF 图片提取（describe_image 配合 GLM-4V 看图）
+PyYAML                         # 配置文件解析 (config.yaml)

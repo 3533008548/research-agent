@@ -45,6 +45,7 @@ except ImportError:
 
 # ── 项目模块 ──
 from graph_builder import build_graph
+from profile import ProfileManager
 from tools import list_downloaded_papers
 
 
@@ -81,8 +82,14 @@ class ResearchAgent:
         self.enable_rag = enable_rag
         self._paper_store = None
 
+        # 用户画像
+        self.profile = ProfileManager()
+        print(f"      👤 用户画像: {self.profile.summary() or '待完善'}", file=sys.stderr)
+
         # Token 统计（可变 dict，由 graph 闭包更新）
         self.token_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
+        # 流式回调容器（运行时设置，闭包读取）
+        self._stream_cb = [None]
 
         # 初始化 RAG 论文库
         if enable_rag:
@@ -110,6 +117,8 @@ class ResearchAgent:
             token_usage=self.token_usage,
             checkpoint_db="checkpoint.db",
             glm_api_key=os.getenv("GLM_API_KEY", ""),
+            stream_callback=lambda t: self._stream_cb[0](t) if self._stream_cb[0] else None,
+            profile_manager=self.profile,
         )
 
         # 会话配置：固定 thread_id 实现跨重启恢复
@@ -121,15 +130,20 @@ class ResearchAgent:
             size = Path("checkpoint.db").stat().st_size
             print(f"      💾 对话历史: checkpoint.db ({size / 1024:.0f} KB)", file=sys.stderr)
             self._load_context_from_checkpoint()
+            self._prune_checkpoint(max_snapshots=50)
 
     # ── 公开 API ──
 
-    def step(self, user_input: str, context: str | None = None) -> str:
-        """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文"""
+    def step(self, user_input: str, context: str | None = None, on_token = None) -> str:
+        """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文。
+           on_token(token) 可选，用于流式输出回调。"""
         state = {"messages": []}
         if context:
             state["messages"].append({"role": "system", "content": context})
         state["messages"].append({"role": "user", "content": user_input})
+
+        # 设置流式回调
+        self._stream_cb[0] = on_token
 
         try:
             result = self._app.invoke(state, config=self._config)
@@ -170,20 +184,75 @@ class ResearchAgent:
             messages = []
         if not messages:
             return
+        # 清理不完整的 tool_calls（assistant 有 tool_calls 但无对应 tool 结果）
+        valid_ids = {m["tool_call_id"] for m in messages if m.get("role") == "tool"}
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                m["tool_calls"] = [tc for tc in m["tool_calls"] if tc["id"] in valid_ids]
+                if not m["tool_calls"]:
+                    del m["tool_calls"]
         # 估算 tokens：总字符数 / 2（中英混合近似）
         total_chars = sum(len(m.get("content", "") or "") for m in messages)
-        est_tokens = total_chars // 2
+        est_tokens = total_chars // 3  # 中英混排约 3 字符/token
+        context_limit = 131072
+        if "reasoner" in self.model:
+            context_limit = 65536
+        elif "flash" in self.model:
+            context_limit = 1000000  # deepseek-v4-flash 官方 1M
         self.token_usage["prompt"] = est_tokens
         self.token_usage["total"] = est_tokens
         self.token_usage["last_prompt"] = est_tokens
-        pct = min(int(est_tokens / 65536 * 100), 99)
+        self.token_usage["context_limit"] = context_limit
+        pct = min(int(est_tokens / context_limit * 100), 99)
         print(f"      📊 已有上下文: ~{est_tokens:,} tokens ({pct}%)", file=sys.stderr)
+        # 上下文快满 → 自动开新对话，避免首次提问就 400
+        if pct > 80:
+            self.reset()
+            print("      ⚠ 上下文过高，已自动开新对话", file=sys.stderr)
+
+    def _prune_checkpoint(self, max_snapshots: int = 50):
+        """剪裁 checkpoint——只保留最近 N 个快照（每个 thread）"""
+        import sqlite3
+        try:
+            conn = sqlite3.connect("checkpoint.db")
+            # 获取所有 thread_id
+            threads = conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints"
+            ).fetchall()
+            pruned = 0
+            for (tid,) in threads:
+                rows = conn.execute(
+                    "SELECT checkpoint_id FROM checkpoints WHERE thread_id=? ORDER BY checkpoint_id DESC",
+                    (tid,),
+                ).fetchall()
+                if len(rows) > max_snapshots:
+                    oldest = rows[max_snapshots:][0][0]
+                    conn.execute(
+                        "DELETE FROM checkpoints WHERE thread_id=? AND checkpoint_id <= ?",
+                        (tid, oldest),
+                    )
+                    pruned += len(rows) - max_snapshots
+            conn.commit()
+            conn.close()
+            if pruned:
+                print(f"      🧹 checkpoint 剪裁: 清理 {pruned} 个旧快照", file=sys.stderr)
+        except Exception:
+            pass  # 剪裁失败不影响正常使用
 
     def reset(self):
         """重置会话（新 thread_id，旧对话永久保留在 checkpoint.db 中）"""
         self._thread_id = f"session-{uuid.uuid4().hex[:8]}"
         self._config = {"configurable": {"thread_id": self._thread_id}}
-        self.token_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "last_prompt": 0}
+        # 清零现有 dict（不能新建，否则 graph 闭包仍写旧引用）
+        for k in self.token_usage:
+            self.token_usage[k] = 0
+        limit = 131072
+        if "reasoner" in self.model:
+            limit = 65536
+        elif "flash" in self.model:
+            limit = 1000000
+        self.token_usage["context_limit"] = limit
+        self.token_usage["calls"] = 0
         print(f"\n🔄 已开始新对话 (thread: {self._thread_id})。", file=sys.stderr)
 
     @property
