@@ -94,4 +94,22 @@ def handle_read_pdf(args: dict, paper_store=None, **kw) -> str:
         except Exception as e:
             print(f"      ⚠️ RAG 索引失败: {e}", file=sys.stderr)
 
+    # ── 轻量三元组提取 ──
+    if paper_store:
+        try:
+            title = pdf_path.stem.replace("_", " ")
+            # 从文本中提取方法关键词和实验结果
+            from memory import MemoryStore
+            ms = MemoryStore()
+            # 简单关键词匹配（不需要模型）
+            import re
+            methods = re.findall(r'(?:使用|采用|基于|提出|方法[是为]|model[ is]|method[ is]|approach[ is])\s*[：:]*\s*(.{10,60})', result[:5000])
+            for m in methods[:3]:
+                ms.add_triple(title, "uses_method", m.strip().rstrip("，。.,"))
+            nums = re.findall(r'(\d+\.?\d*\s*%)', result[:5000])
+            for n in nums[:2]:
+                ms.add_triple(title, "achieves", n.strip())
+        except Exception:
+            pass
+
     return result

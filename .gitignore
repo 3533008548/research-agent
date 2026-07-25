@@ -8,6 +8,10 @@ checkpoint.db
 checkpoint.db-*
 notes.db
 notes.db-*
+memory.db
+memory.db-*
+daily.db
+daily.db-*
 
 # 下载的论文 PDF
 data/papers/

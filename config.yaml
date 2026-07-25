@@ -1,3 +1,9 @@
+daily_search:
+  enabled: true
+  keywords: []
+  max_results_per_keyword: 3
+  sources:
+  - semantic_scholar
 model: deepseek-v4-flash
 pdf:
   max_pages: 20

@@ -88,6 +88,10 @@ class ResearchAgent:
         self.token_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
         self._stream_cb = [None]
 
+        # 记忆模块
+        from memory import MemoryStore
+        self.memory = MemoryStore()
+
         # RAG 论文库
         if cfg.rag_enabled:
             try:
@@ -114,6 +118,7 @@ class ResearchAgent:
             glm_api_key=cfg.glm_key,
             stream_callback=lambda t: self._stream_cb[0](t) if self._stream_cb[0] else None,
             profile_manager=self.profile,
+            memory_store=self.memory,
         )
 
         # 会话配置：固定 thread_id 实现跨重启恢复

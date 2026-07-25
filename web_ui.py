@@ -64,7 +64,46 @@ def build_ui():
     agent = ResearchAgent(cfg=cfg)
     notes = NoteStore()
     current_topic = {"name": "默认"}
-    pending_conflicts = {}  # {fpath: {"dest": Path, "hash": str, "existing": Path}}
+    pending_conflicts = {}
+    from scheduler import Scheduler
+    scheduler = Scheduler()
+    # 启动时异步推送每日论文
+    import threading
+    daily_results = []
+
+    def _daily_search_bg():
+        nonlocal daily_results
+        agent.token_usage["daily_progress"] = "📰 搜索中..."
+        # 先推送已有部分结果
+        today = scheduler.get_today_results()
+        if today:
+            daily_results = [("partial", today)]
+        results = scheduler.run_today(paper_store=agent.paper_store)
+        daily_results.append(("done", results))
+        agent.token_usage["daily_progress"] = scheduler.get_progress()
+        # 推送结果到聊天
+        if results:
+            lines = ["**📰 每日论文速递**\n"]
+            diag = results[0].get("diagnostic", "")
+            if diag:
+                lines.append(f"({diag})\n")
+            for r in results[:5]:
+                src = r.get("source", "")
+                lines.append(f"- {r['title'][:80]}  [{src}]")
+            if len(results) > 5:
+                lines.append(f"\n...及另外 {len(results)-5} 篇")
+            pending_messages.put("\n".join(lines))
+            agent.token_usage["daily_ready"] = True
+        else:
+            pending_messages.put("📰 每日检索完成，今日无新论文。")
+            agent.token_usage["daily_ready"] = True
+        pending_messages.put(None)
+    if cfg.rag_enabled and cfg.daily_search_enabled:
+        threading.Thread(target=_daily_search_bg, daemon=True).start()
+
+    # 后台搜索结果队列（线程安全）
+    import queue as _queue
+    pending_messages = _queue.Queue()
 
     # ── 帮助文本 ──
     HELP_TEXT = """
@@ -72,17 +111,36 @@ def build_ui():
 
 | 命令 | 说明 |
 |------|------|
-| `/model` | 模型、Token、RAG 状态 |
-| `/tokens` | Token 消耗详细统计 |
-| `/indexed` | 已索引论文列表 |
-| `/new` | 开始新对话 |
-| `/note topics` | 列出所有笔记话题 |
-| `/note topic <名>` | 切换当前话题 |
-| `/note add <内容>` | 添加笔记 |
-| `/note list` | 列出当前话题笔记 |
-| `/note del <编号>` | 删除笔记 |
-| `/note link <id> <论文名>` | 笔记关联论文 |
 | `/help` | 显示此帮助 |
+| `/model` | 模型、上下文、Token、RAG 状态 |
+| `/tokens` | Token 消耗 + 费用统计 |
+| `/new` | 开始新对话 |
+| `/profile` | 查看用户画像 |
+
+**📚 论文 / 笔记**
+| 命令 | 说明 |
+|------|------|
+| `/indexed` | 已索引论文列表 |
+| `/note topics` | 列出笔记话题 |
+| `/note topic <名>` | 切换话题 |
+| `/note add <内容>` | 添加笔记 |
+| `/note list` | 当前话题笔记 |
+| `/note del <编号>` | 删除笔记 |
+| `/note link <id> <论文>` | 笔记关联论文 |
+
+**📰 每日检索**
+| 命令 | 说明 |
+|------|------|
+| `/daily` | 今日检索结果 |
+| `/daily on` | 启用每日检索 |
+| `/daily off` | 暂停每日检索 |
+| `/daily add <词>` | 添加关键词 (支持 AND) |
+| `/daily unread` | 待读清单 |
+| `/daily want <N>` | 标记想读 |
+| `/daily read <N>` | 标记已读 |
+| `/daily skip <N>` | 跳过 |
+| `/daily retry` | 重新检索 |
+| `/daily status` | 查看进度 |
     """.strip()
 
     # ═══ 聊天函数 ═══
@@ -96,6 +154,18 @@ def build_ui():
         return cmd if not text else f"{cmd}\n{text}"
 
     def chat_fn(message, history: list[list[str]]):
+        # 先弹出待处理的后台消息
+        try:
+            pm = pending_messages.get_nowait()
+            while pm is not None:
+                yield pm
+                pm = pending_messages.get_nowait()
+            agent.token_usage.pop("daily_ready", None)
+            agent.token_usage.pop("daily_progress", None)
+        except _queue.Empty:
+            pass
+
+        msg = ""
         # 处理多模态输入（文本+文件）
         files = []
         if isinstance(message, dict):
@@ -214,6 +284,98 @@ def build_ui():
 
         if msg.startswith("/note"):
             yield _handle_note_cmd(msg); return
+
+        if msg == "/daily":
+            today = scheduler.get_today_results()
+            if not today:
+                yield "📭 今日尚未检索，或已检索但无新论文。"; return
+            lines = ["**📰 今日论文速递**\n"]
+            for s in today:
+                lines.append(f"🔑 `{s['keyword']}` → {s['new_count']} 篇新论文")
+            yield "\n".join(lines); return
+
+        if msg.startswith("/daily search"):
+            kw = msg[13:].strip()
+            if not kw:
+                yield "用法: /daily search <关键词>"; return
+            yield f"🔍 正在搜索: {kw}..."; return
+
+        if msg.startswith("/daily add "):
+            kw = msg[11:].strip()
+            yield scheduler.add_keyword(kw); return
+
+        if msg == "/daily unread":
+            unread = scheduler.get_unread_papers(days=3)
+            if not unread:
+                yield "✅ 没有待读论文。"; return
+            lines = ["**📋 待读清单 (最近 3 天)**\n"]
+            for i, u in enumerate(unread, 1):
+                lines.append(f"{i}. `{u['keyword']}` — {u['paper_title'][:60]}")
+            lines.append("\n回复 `/daily want N` 标记想读，`/daily read N` 标记已读，`/daily skip N` 跳过")
+            yield "\n".join(lines); return
+
+        if msg in ("/daily on", "/daily start"):
+            cfg = load_config()
+            if "daily_search" not in cfg: cfg["daily_search"] = {}
+            cfg["daily_search"]["enabled"] = True
+            import yaml
+            with open("config.yaml", "w", encoding="utf-8") as f:
+                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            yield "✅ 每日检索已启用。下次启动自动运行。"; return
+
+        if msg == "/daily retry":
+            yield "🔍 正在重新检索..."; return
+
+        if msg == "/daily status":
+            progress = scheduler.get_progress()
+            if progress:
+                yield progress; return
+            yield "📰 每日检索未在运行。使用 /daily on 启用。"; return
+
+        if msg in ("/daily off", "/daily stop"):
+            cfg = load_config()
+            if "daily_search" not in cfg: cfg["daily_search"] = {}
+            cfg["daily_search"]["enabled"] = False
+            import yaml
+            with open("config.yaml", "w", encoding="utf-8") as f:
+                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            yield "⏸ 每日检索已暂停。"; return
+
+        if msg.startswith("/daily want "):
+            n = msg[12:].strip()
+            if not n.isdigit():
+                yield "用法: /daily want <编号>"; return
+            unread = scheduler.get_unread_papers(days=3)
+            idx = int(n) - 1
+            if 0 <= idx < len(unread):
+                u = unread[idx]
+                scheduler.mark_want_read(u["keyword"], u["paper_title"])
+                yield f"✅ 已标记想读: {u['paper_title'][:60]}"; return
+            yield "❌ 编号无效"; return
+
+        if msg.startswith("/daily skip "):
+            n = msg[12:].strip()
+            if not n.isdigit():
+                yield "用法: /daily skip <编号>"; return
+            unread = scheduler.get_unread_papers(days=3)
+            idx = int(n) - 1
+            if 0 <= idx < len(unread):
+                u = unread[idx]
+                scheduler.mark_skip(u["keyword"], u["paper_title"])
+                yield f"🗑 已跳过: {u['paper_title'][:60]}"; return
+            yield "❌ 编号无效"; return
+
+        if msg.startswith("/daily read "):
+            n = msg[12:].strip()
+            if not n.isdigit():
+                yield "用法: /daily read <编号>"; return
+            unread = scheduler.get_unread_papers(days=3)
+            idx = int(n) - 1
+            if 0 <= idx < len(unread):
+                u = unread[idx]
+                scheduler.mark_read(u["keyword"], u["paper_title"])
+                yield f"📖 已标记已读: {u['paper_title'][:60]}"; return
+            yield "❌ 编号无效"; return
 
         # 正常对话（流式）
         ctx = _build_context()
@@ -345,10 +507,16 @@ def build_ui():
         bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
         vs = tu.get("verify_status", "")
         vs_str = f"**{vs}** | " if vs else ""
+        daily = tu.get("daily_progress", "")
+        daily_str = f"**{daily}** | " if daily else ""
+        ready = tu.get("daily_ready", False)
+        ready_str = "**📰 结果就绪** | " if ready else ""
         return (
             f"**模型**: {agent.model} | "
             f"**上下文**: `{bar}` {pct}% ({last:,}/{limit_k}) | "
             f"{vs_str}"
+            f"{daily_str}"
+            f"{ready_str}"
             f"**Tokens**: {tu['total']:,} | "
             f"**话题**: {current_topic['name']} | "
             f"**RAG**: {rag}"
@@ -417,15 +585,18 @@ def build_ui():
         except Exception:
             return {}
 
-    def save_config(model, rag_enabled, max_pages):
+    def save_config(model, rag_enabled, max_pages, daily_enabled_val):
         import yaml
         cfg = load_config()
         cfg["model"] = model
         cfg["rag"]["enabled"] = rag_enabled
         cfg["pdf"]["max_pages"] = int(max_pages)
+        if "daily_search" not in cfg:
+            cfg["daily_search"] = {}
+        cfg["daily_search"]["enabled"] = daily_enabled_val
         with open("config.yaml", "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
-        return "✅ 已保存。重启生效。"
+        return "✅ 已保存。"
 
     # ═══ 构建界面 ═══
 
@@ -437,7 +608,9 @@ def build_ui():
             '</div>'
         )
 
-        status = gr.Markdown(refresh_status([]), elem_classes=["status-bar"])
+        with gr.Row():
+            status = gr.Markdown(refresh_status([]), elem_classes=["status-bar"], scale=10)
+            quit_btn = gr.Button("⏻ 退出", scale=1, size="sm", elem_classes=["quit-btn"])
 
         with gr.Tabs():
             # ── Tab 1: 对话 ──
@@ -513,26 +686,39 @@ def build_ui():
             # ── Tab 4: 设置 ──
             with gr.Tab("⚙ 设置"):
                 cfg = load_config()
+                gr.Markdown("### 基础设置")
                 model_dd = gr.Dropdown(
                     label="模型", value=cfg.get("model", agent.model),
                     choices=["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
                     allow_custom_value=True,
                 )
-                rag_toggle = gr.Checkbox(
-                    label="启用 RAG 论文库",
-                    value=cfg.get("rag", {}).get("enabled", True),
-                )
-                max_pages_slider = gr.Slider(
-                    label="PDF 最大页数", minimum=5, maximum=100, step=5,
-                    value=cfg.get("pdf", {}).get("max_pages", 15),
-                )
+                rag_toggle = gr.Checkbox(label="启用 RAG 论文库", value=cfg.get("rag", {}).get("enabled", True))
+                max_pages_slider = gr.Slider(label="PDF 最大页数", minimum=5, maximum=100, step=5, value=cfg.get("pdf", {}).get("max_pages", 15))
+                daily_enabled = gr.Checkbox(label="启用每日自动检索", value=cfg.get("daily_search", {}).get("enabled", False))
                 save_cfg_btn = gr.Button("💾 保存配置", variant="primary")
                 cfg_msg = gr.Markdown("")
-                save_cfg_btn.click(
-                    fn=save_config,
-                    inputs=[model_dd, rag_toggle, max_pages_slider],
-                    outputs=[cfg_msg],
-                )
+                save_cfg_btn.click(fn=save_config, inputs=[model_dd, rag_toggle, max_pages_slider, daily_enabled], outputs=[cfg_msg])
+
+                gr.Markdown("### 📰 每日论文检索")
+                kw_list = [k["keyword"] for k in scheduler.list_keywords()] if scheduler.list_keywords() else []
+                kw_dd = gr.Dropdown(label="已有关键词", choices=kw_list, value=kw_list[0] if kw_list else None, interactive=True)
+                kw_input = gr.Textbox(label="新关键词", placeholder="例如: TSN scheduling reinforcement learning")
+                kw_add_btn = gr.Button("➕ 添加关键词", scale=1)
+                kw_del_btn = gr.Button("🗑 删除选中", scale=1)
+                kw_msg = gr.Markdown("")
+
+                def _add_kw(kw):
+                    msg = scheduler.add_keyword(kw)
+                    kws = [k["keyword"] for k in scheduler.list_keywords()]
+                    return gr.update(choices=kws, value=kws[0] if kws else None), "", msg
+                def _del_kw(kw):
+                    scheduler.remove_keyword(kw)
+                    kws = [k["keyword"] for k in scheduler.list_keywords()]
+                    return gr.update(choices=kws, value=kws[0] if kws else None), f"🗑 已删除: {kw}"
+                kw_add_btn.click(fn=_add_kw, inputs=[kw_input], outputs=[kw_dd, kw_input, kw_msg])
+                kw_del_btn.click(fn=_del_kw, inputs=[kw_dd], outputs=[kw_dd, kw_msg])
+
+        quit_btn.click(fn=lambda: (demo.close(), os._exit(0)), outputs=[])
 
     demo.launch(
         server_port=args.port,
@@ -543,6 +729,7 @@ def build_ui():
         .main-header h1 { font-size: 1.3rem; font-weight: 600; }
         .status-bar { padding: 0.3rem 1rem; font-size: 0.75rem; color: #666; }
         footer { display: none !important; }
+        .quit-btn { margin-top: -2px; }
         #drop-overlay { display: none !important; }
         #drop-overlay.show { display: flex !important; }
         """,

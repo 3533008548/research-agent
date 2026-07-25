@@ -39,6 +39,7 @@ class Config:
 
     ui_port: int = 7860
     ui_debug: bool = False
+    daily_search_enabled: bool = False
 
     checkpoint_db: str = "checkpoint.db"
     chroma_dir: str = "chroma_data"
@@ -75,6 +76,8 @@ class Config:
                     cfg["rag_enabled"] = yaml_cfg["rag"].get("enabled", cfg["rag_enabled"])
                 if "ui" in yaml_cfg:
                     cfg["ui_port"] = yaml_cfg["ui"].get("port", cfg["ui_port"])
+                if "daily_search" in yaml_cfg:
+                    cfg["daily_search_enabled"] = yaml_cfg["daily_search"].get("enabled", False)
         except Exception:
             pass
 
@@ -103,6 +106,7 @@ class Config:
             rag_enabled=cfg["rag_enabled"],
             ui_port=cfg["ui_port"],
             ui_debug=cfg.get("ui_debug", False),
+            daily_search_enabled=cfg.get("daily_search_enabled", False),
             checkpoint_db=cfg.get("checkpoint_db", "checkpoint.db"),
             chroma_dir=cfg.get("chroma_dir", "chroma_data"),
             papers_dir=cfg.get("papers_dir", "data/papers"),

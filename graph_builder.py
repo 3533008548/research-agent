@@ -51,6 +51,7 @@ def build_graph(
     glm_api_key: str = "",
     stream_callback = None,
     profile_manager = None,
+    memory_store = None,  # MemoryStore 实例
 ):
     tool_schemas = get_tool_schemas()
 
@@ -81,6 +82,12 @@ def build_graph(
         verify_fb = state.get("metadata", {}).get("verify_feedback", "")
         if verify_fb:
             messages.append({"role": "system", "content": verify_fb})
+
+        if memory_store:
+            topic = state.get("metadata", {}).get("topic", "")
+            recent = memory_store.get_recent_summary("research-main", topic)
+            if recent:
+                messages.append({"role": "system", "content": f"[对话摘要] {recent}"})
 
         payload = {
             "model": model, "messages": messages, "tools": tool_schemas,
@@ -198,7 +205,7 @@ def build_graph(
             except json.JSONDecodeError:
                 args = {}
             print(f"      🔧 {name}({json.dumps(args, ensure_ascii=False)})", file=sys.stderr)
-            result = execute_tool(name, args, paper_store=paper_store, glm_api_key=glm_api_key, profile_manager=profile_manager)
+            result = execute_tool(name, args, paper_store=paper_store, glm_api_key=glm_api_key, profile_manager=profile_manager, memory_store=memory_store)
             if isinstance(result, str) and len(result) > 12000:
                 result = result[:12000] + "\n\n...（截断至 12000 字符）"
             tool_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
@@ -285,6 +292,29 @@ def build_graph(
         if not result or result.upper().startswith("OK"):
             if token_usage:
                 token_usage.pop("verify_status", None)
+            # ── 对话摘要：上下文 > 50% 或 > 10 轮对话时生成 ──
+            if memory_store:
+                user_msg_count = sum(1 for m in messages if m.get("role") == "user")
+                pct_ctx = (token_usage.get("last_prompt", 0) / token_usage.get("context_limit", 131072)) if token_usage else 0
+                if user_msg_count > 10 or pct_ctx > 0.5:
+                    try:
+                        # 提取最近 20 条消息生成摘要
+                        recent_msgs = []
+                        for m in messages[-20:]:
+                            c = m.get("content", "") or ""
+                            recent_msgs.append(f"[{m.get('role','')}] {c[:300]}")
+                        raw = "\n".join(recent_msgs)
+                        sum_prompt = f"Summarize this research conversation in 150 chars Chinese:\n{raw[:3000]}"
+                        sr = requests.post(api_url, headers={
+                            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+                        }, json={"model": model, "messages": [{"role": "user", "content": sum_prompt}],
+                                  "stream": False, "temperature": 0.2}, timeout=20)
+                        if sr.status_code == 200:
+                            summary = sr.json()["choices"][0]["message"]["content"].strip()[:300]
+                            topic = state.get("metadata", {}).get("topic", "")
+                            memory_store.add_summary("research-main", topic, summary)
+                    except Exception:
+                        pass
             return {}
 
         user_q = ""
