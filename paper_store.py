@@ -16,6 +16,7 @@
 
 import os
 import sys
+import re
 import uuid
 import json
 from pathlib import Path
@@ -45,12 +46,23 @@ def chunk_text(
 
     策略：
       1. 先按段落（双换行）切分
-      2. 块大小控制在 chunk_size 左右
-      3. 相邻块保持 overlap 字符重叠
-      4. 最后一块不下舍不入
+      2. 块大小控制在 chunk_size 左右，相邻块保持 overlap 字符重叠
+      3. 公式区域（$$...$$ 和 $...$）标记为不可切割，切点自动避开
 
     返回: [{"text": "...", "index": 0, "char_start": 0, "char_end": 580}, ...]
     """
+    # 预扫描：找到所有公式的不可切割区间
+    _formula_pat = re.compile(r'\$\$[^$]+\$\$|\$[^$]+\$')
+    def _find_formula_ranges(para: str) -> list[tuple[int, int]]:
+        return [(m.start(), m.end()) for m in _formula_pat.finditer(para)]
+
+    def _safe_cut(para: str, ideal: int, forbidden: list[tuple[int, int]], para_len: int) -> int:
+        """调整切点，避免落在公式区间内"""
+        for s, e in forbidden:
+            if s <= ideal <= e:
+                return s if (ideal - s) < (e - ideal) else e
+        return ideal
+
     paragraphs = text.split("\n\n")
     chunks = []
     char_pos = 0
@@ -58,13 +70,13 @@ def chunk_text(
     for para in paragraphs:
         para = para.strip()
         if not para:
-            char_pos += 2  # 空段落占位
+            char_pos += 2
             continue
 
         para_start = char_pos
         para_len = len(para)
+        formula_ranges = _find_formula_ranges(para)
 
-        # 段落不超过 chunk_size 则直接作为一个块
         if para_len <= chunk_size:
             chunks.append({
                 "text": para,
@@ -74,25 +86,26 @@ def chunk_text(
             char_pos += para_len + 2
             continue
 
-        # 长段落：滑动窗口切分
+        # 长段落：滑动窗口切分，切点避开公式
         start = 0
         while start < para_len:
-            end = min(start + chunk_size, para_len)
-            chunk_text_slice = para[start:end]
+            ideal_end = min(start + chunk_size, para_len)
+            end = _safe_cut(para, ideal_end, formula_ranges, para_len)
+            end = min(max(end, start + 1), para_len)
 
             chunks.append({
-                "text": chunk_text_slice,
+                "text": para[start:end],
                 "char_start": para_start + start,
                 "char_end": para_start + end,
             })
 
             if end >= para_len:
                 break
-            start = end - overlap  # 窗口滑回 overlap 字符
+            start = _safe_cut(para, ideal_end - overlap, formula_ranges, para_len)
+            start = min(start, para_len - 1)
 
         char_pos += para_len + 2
 
-    # 编号
     for i, chunk in enumerate(chunks):
         chunk["index"] = i
 
@@ -314,6 +327,20 @@ class PaperStore:
     def chunk_count(self) -> int:
         """总块数"""
         return self._collection.count()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  NoOpStore — ChromaDB 不可用时的降级后备
+# ═══════════════════════════════════════════════════════════════
+
+class NoOpStore:
+    """空操作存储 — ChromaDB 离线时保持 Agent 可用"""
+    def query(self, *a, **kw): return []
+    def index_paper(self, *a, **kw): return ""
+    def list_papers(self): return []
+    def delete_paper(self, *a, **kw): return 0
+    paper_count = 0
+    chunk_count = 0
 
 
 # ═══════════════════════════════════════════════════════════════

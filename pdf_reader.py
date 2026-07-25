@@ -105,26 +105,64 @@ class PaperReader:
             pages_to_read = min(total_pages, self.max_pages)
 
             page_texts = []
-            page_tables = []
+            raw_tables = []  # (page_num, table_index, header: list, rows: list, y0: float, y1: float)
 
             for i in range(pages_to_read):
                 page = pdf.pages[i]
-                # 1) 按布局提取文本（感知双栏）
                 text = self._extract_text(page)
                 if text:
                     page_texts.append(f"━━━ 第 {i+1} 页 ━━━\n{text}")
 
-                # 2) 提取表格
-                tables_md = self._extract_tables(page)
-                if tables_md:
-                    page_tables.append(f"━━━ 第 {i+1} 页（表格）━━━\n{tables_md}")
+                # 提取表格（带位置，用于跨页检测）
+                found = page.find_tables()
+                for ti, tbl in enumerate(found):
+                    try:
+                        data = tbl.extract()
+                        if not data or len(data) < 2:
+                            continue
+                        header = [str(c or "").strip() for c in data[0]]
+                        rows = [[str(c or "").strip() for c in row] for row in data[1:] if any(str(c or "").strip() for c in row)]
+                        if not rows:
+                            continue
+                        raw_tables.append((i, ti, header, rows, float(tbl.bbox[1]), float(tbl.bbox[3])))
+                    except Exception:
+                        pass
 
-        # 合并：文本 + 表格
-        full_text = "\n\n".join(page_texts)
-        if page_tables:
-            full_text += "\n\n" + "\n\n".join(page_tables)
+            # ── 跨页表格合并 ──
+            merged_tables = []
+            skip_next = set()
+            for idx in range(len(raw_tables)):
+                if idx in skip_next:
+                    continue
+                pn, ti, hdr, rows, y0, y1 = raw_tables[idx]
+                # 检查下一页是否有延续：同页号 + 2，且下一页表格列数匹配
+                for j in range(idx + 1, min(idx + 4, len(raw_tables))):
+                    pn2, ti2, hdr2, rows2, y0_2, y1_2 = raw_tables[j]
+                    if pn2 == pn + 1 and ti2 == 0 and y0_2 < 60:  # 下一页顶部
+                        if len(hdr) == len(hdr2):
+                            rows.extend(rows2)
+                            skip_next.add(j)
+                merged_tables.append((pn, hdr, rows))
+
+            # ── 格式化为 Markdown ──
+            table_mds = []
+            for pn, hdr, rows in merged_tables:
+                col_count = len(hdr)
+                md = []
+                hdr_padded = hdr + [""] * (col_count - len(hdr))
+                md.append("| " + " | ".join(hdr_padded) + " |")
+                md.append("| " + " | ".join(["---"] * col_count) + " |")
+                for row in rows:
+                    cells = (row + [""] * col_count)[:col_count]
+                    md.append("| " + " | ".join(cells) + " |")
+                table_mds.append("\n".join(md))
+
+            if table_mds:
+                # 表格直接插入对应页位置
+                page_texts.append("\n\n📊 **表格**:\n" + "\n\n".join(table_mds))
 
         # 3) 章节标注（对整个文本做一次）
+        full_text = "\n\n".join(page_texts)
         full_text = self._mark_sections(full_text)
 
         # 页码截断提示

@@ -46,7 +46,7 @@ except ImportError:
 # ── 项目模块 ──
 from graph_builder import build_graph
 from profile import ProfileManager
-from tools import list_downloaded_papers
+from search_api import list_downloaded_papers
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -64,59 +64,54 @@ class ResearchAgent:
       agent.reset()  # 新会话
     """
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: str = "deepseek-chat",
-        enable_rag: bool = True,
-    ):
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+    def __init__(self, cfg=None):
+        if cfg is None:
+            from config import Config
+            cfg = Config.load()
+        self.cfg = cfg
+        self.model = cfg.model
+        self.api_key = cfg.deepseek_key
+        self.enable_rag = cfg.rag_enabled
+        self._paper_store = None
+
         if not self.api_key:
             raise ValueError(
                 "❌ 未找到 DEEPSEEK_API_KEY！\n"
-                "   请在 .env 文件中设置 DEEPSEEK_API_KEY=sk-****\n"
-                "   或通过环境变量 DEEPSEEK_API_KEY 传入"
+                "   请在 .env 中设置 DEEPSEEK_API_KEY=sk-****"
             )
-
-        self.model = model
-        self.enable_rag = enable_rag
-        self._paper_store = None
 
         # 用户画像
         self.profile = ProfileManager()
         print(f"      👤 用户画像: {self.profile.summary() or '待完善'}", file=sys.stderr)
 
-        # Token 统计（可变 dict，由 graph 闭包更新）
+        # Token 统计
         self.token_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
-        # 流式回调容器（运行时设置，闭包读取）
         self._stream_cb = [None]
 
-        # 初始化 RAG 论文库
-        if enable_rag:
+        # RAG 论文库
+        if cfg.rag_enabled:
             try:
                 from paper_store import PaperStore
-
                 print("      📚 初始化论文向量库...", file=sys.stderr, flush=True)
-                self._paper_store = PaperStore(persist_dir="./chroma_data")
+                self._paper_store = PaperStore(persist_dir=cfg.chroma_dir)
                 print(
                     f"      ✅ 已加载 {self._paper_store.paper_count} 篇论文, "
                     f"{self._paper_store.chunk_count} 个块",
                     file=sys.stderr,
                 )
-            except ImportError as e:
-                print(
-                    f"      ⚠️ RAG 未启用（依赖缺失: {e}）",
-                    file=sys.stderr,
-                )
+            except Exception as e:
+                from paper_store import NoOpStore
+                self._paper_store = NoOpStore()
+                print(f"      ⚠️ RAG 降级运行（{e}）", file=sys.stderr)
 
-        # 构建 LangGraph（SQLite 持久化对话历史）
+        # LangGraph
         self._app = build_graph(
             api_key=self.api_key,
             model=self.model,
             paper_store=self._paper_store,
             token_usage=self.token_usage,
-            checkpoint_db="checkpoint.db",
-            glm_api_key=os.getenv("GLM_API_KEY", ""),
+            checkpoint_db=cfg.checkpoint_db,
+            glm_api_key=cfg.glm_key,
             stream_callback=lambda t: self._stream_cb[0](t) if self._stream_cb[0] else None,
             profile_manager=self.profile,
         )
@@ -314,26 +309,20 @@ def print_help():
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=" 科研助手 Agent — LangGraph + DeepSeek + RAG"
-    )
-    parser.add_argument(
-        "-m", "--model",
-        default=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-        help="模型名称 (默认: deepseek-chat, 也支持 deepseek-v4-pro、flash 等)",
-    )
-    parser.add_argument(
-        "--no-rag",
-        action="store_true",
-        help="禁用 RAG 论文向量库",
-    )
+    parser = argparse.ArgumentParser(description="科研助手 Agent")
+    parser.add_argument("-m", "--model", default=None, help="模型名称")
+    parser.add_argument("--no-rag", action="store_true", help="禁用 RAG")
+    parser.add_argument("--debug", action="store_true", help="DEBUG 日志")
     args = parser.parse_args()
 
-    model = args.model
-    enable_rag = not args.no_rag
+    from config import Config
+    from logger import setup_logging
+    setup_logging(debug=args.debug)
 
-    # 确保数据目录
-    Path("data/papers").mkdir(parents=True, exist_ok=True)
+    cli = {"model": args.model, "rag_enabled": not args.no_rag, "ui_debug": args.debug}
+    cfg = Config.load({k: v for k, v in cli.items() if v is not None and v is not False})
+
+    Path(cfg.papers_dir).mkdir(parents=True, exist_ok=True)
 
     if not os.getenv("DEEPSEEK_API_KEY"):
         print("❌ 未设置 DEEPSEEK_API_KEY")
@@ -344,7 +333,7 @@ def main():
     print(f"🤖 使用模型: {model}", file=sys.stderr)
 
     try:
-        agent = ResearchAgent(model=model, enable_rag=enable_rag)
+        agent = ResearchAgent(cfg=cfg)
     except ValueError as e:
         print(f"❌ {e}")
         sys.exit(1)

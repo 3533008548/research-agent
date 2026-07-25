@@ -167,7 +167,7 @@ class TestVerifyNode(unittest.TestCase):
 
     def test_tools_module_imports(self):
         """所有工具模块可正常导入"""
-        from tools import search_arxiv, search_semantic_scholar, list_downloaded_papers
+        from search_api import search_arxiv, search_semantic_scholar, list_downloaded_papers
         from pdf_reader import read_pdf_enhanced, extract_images
         from paper_store import PaperStore, chunk_text
         from notes import NoteStore

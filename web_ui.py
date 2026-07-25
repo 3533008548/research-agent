@@ -17,6 +17,8 @@ import argparse
 import os
 import re
 import sys
+import shutil
+import hashlib
 from pathlib import Path
 
 # ── Windows GBK 兼容 ──
@@ -48,16 +50,21 @@ def build_ui():
     )
     parser.add_argument("--port", type=int, default=7860, help="端口号")
     parser.add_argument("--no-rag", action="store_true", help="禁用 RAG")
+    parser.add_argument("--debug", action="store_true", help="DEBUG 日志")
     args = parser.parse_args()
 
-    if not os.getenv("DEEPSEEK_API_KEY"):
-        print("❌ 未设置 DEEPSEEK_API_KEY")
-        sys.exit(1)
+    from logger import setup_logging
+    setup_logging(debug=args.debug)
+    from config import Config
 
-    print(f"🤖 模型: {args.model}")
-    agent = ResearchAgent(model=args.model, enable_rag=not args.no_rag)
+    cli = {"model": args.model, "rag_enabled": not args.no_rag, "ui_debug": args.debug}
+    cfg = Config.load({k: v for k, v in cli.items() if v is not None and v is not False})
+
+    print(f"🤖 模型: {cfg.model}")
+    agent = ResearchAgent(cfg=cfg)
     notes = NoteStore()
-    current_topic = {"name": "默认"}  # 当前选中话题
+    current_topic = {"name": "默认"}
+    pending_conflicts = {}  # {fpath: {"dest": Path, "hash": str, "existing": Path}}
 
     # ── 帮助文本 ──
     HELP_TEXT = """
@@ -80,8 +87,85 @@ def build_ui():
 
     # ═══ 聊天函数 ═══
 
-    def chat_fn(message: str, history: list[list[str]]):
-        msg = message.strip()
+    def _build_file_cmd(text: str, dest: Path, ext: str) -> str:
+        """根据文件类型构建 Agent 命令"""
+        if ext == ".pdf":
+            cmd = f"read_pdf {dest}"
+        else:
+            cmd = f"describe_image {dest}"
+        return cmd if not text else f"{cmd}\n{text}"
+
+    def chat_fn(message, history: list[list[str]]):
+        # 处理多模态输入（文本+文件）
+        files = []
+        if isinstance(message, dict):
+            text = message.get("text", "")
+            files = message.get("files", [])
+        else:
+            text = message.strip() if isinstance(message, str) else ""
+
+        # 保存上传文件 + 构建命令（含校验）
+        for fpath in files:
+            fname = Path(fpath).name
+            fsize = Path(fpath).stat().st_size
+            ext = Path(fpath).suffix.lower()
+            if ext not in (".pdf", ".png", ".jpg", ".jpeg"):
+                yield f"⚠️ 不支持的文件类型: {ext}"; return
+
+            # 大小校验（100MB）
+            if fsize > 100 * 1024 * 1024:
+                yield f"⚠️ 文件过大（{fsize/1024/1024:.0f}MB，上限 100MB）"; return
+
+            # 内容 hash
+            file_hash = hashlib.md5(Path(fpath).read_bytes()).hexdigest()
+            base_dir = Path("data/papers") if ext == ".pdf" else Path("data/papers/images")
+            base_dir.mkdir(parents=True, exist_ok=True)
+            dest = base_dir / fname
+
+            # 检查内容重复
+            dup_path = None
+            for existing in base_dir.glob("*"):
+                if existing.is_file() and existing.suffix.lower() == ext:
+                    try:
+                        if hashlib.md5(existing.read_bytes()).hexdigest() == file_hash:
+                            dup_path = existing; break
+                    except Exception:
+                        pass
+
+            # 处理冲突
+            if dup_path and dup_path.name != fname:
+                yield f"⚠️ 文件内容与 `{dup_path.name}` 完全相同。回复「**保存**」继续上传或「**跳过**」取消。"
+                pending_conflicts[fpath] = {"dest": dest, "hash": file_hash, "existing": dup_path}
+                return
+            elif dest.exists():
+                yield f"⚠️ `{fname}` 已存在。回复「**覆盖**」替换或「**重命名**」自动改名。"
+                pending_conflicts[fpath] = {"dest": dest, "hash": file_hash, "existing": dest}
+                return
+
+            # 无冲突 → 直接保存
+            shutil.copy(fpath, dest)
+            text = _build_file_cmd(text, dest, ext)
+
+        # 检查是否有待处理的冲突回复
+        if msg in ("覆盖", "重命名", "保存", "跳过") and pending_conflicts:
+            for fpath, info in list(pending_conflicts.items()):
+                if msg == "覆盖":
+                    shutil.copy(fpath, info["dest"])
+                    text = _build_file_cmd(text, info["dest"], info["dest"].suffix.lower())
+                elif msg == "重命名":
+                    new_name = f"{info['dest'].stem}_1{info['dest'].suffix}"
+                    new_dest = info["dest"].parent / new_name
+                    shutil.copy(fpath, new_dest)
+                    text = _build_file_cmd(text, new_dest, new_dest.suffix.lower())
+                elif msg == "保存":
+                    shutil.copy(fpath, info["dest"])
+                    text = _build_file_cmd(text, info["dest"], info["dest"].suffix.lower())
+                elif msg == "跳过":
+                    yield "✅ 已跳过。"; return
+                pending_conflicts.pop(fpath)
+                break
+
+        msg = text.strip()
 
         # ── 基础命令 ──
         if msg == "/help":
@@ -259,9 +343,12 @@ def build_ui():
         limit_k = f"{limit//1000000}M" if limit >= 1000000 else f"{limit//1000}K"
         pct = min(round(last / limit * 100), 99) if last else 0
         bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        vs = tu.get("verify_status", "")
+        vs_str = f"**{vs}** | " if vs else ""
         return (
             f"**模型**: {agent.model} | "
             f"**上下文**: `{bar}` {pct}% ({last:,}/{limit_k}) | "
+            f"{vs_str}"
             f"**Tokens**: {tu['total']:,} | "
             f"**话题**: {current_topic['name']} | "
             f"**RAG**: {rag}"
@@ -355,14 +442,29 @@ def build_ui():
         with gr.Tabs():
             # ── Tab 1: 对话 ──
             with gr.Tab("💬 对话"):
+                # 拖拽覆盖层（拖文件时显示）
+                gr.HTML("""
+                <div id="drop-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;
+                background:rgba(0,0,0,0.5);z-index:9999;align-items:center;justify-content:center;">
+                <div style="background:#fff;padding:40px 80px;border-radius:16px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.2);">
+                <p style="font-size:1.8rem;margin:0;">📥 释放文件以上传</p><p style="color:#999;margin-top:8px;">PDF、PNG、JPG</p></div></div>
+                """)
+                # 隐藏的文件上传组件（拖拽释放后接收文件）
+                file_upload = gr.File(
+                    label="", file_types=[".pdf", ".png", ".jpg", ".jpeg"],
+                    visible=False, elem_id="drop-file-input",
+                )
+                # 多模态输入框（📎 附件按钮）
                 chat = gr.ChatInterface(
                     fn=chat_fn,
                     chatbot=gr.Chatbot(height=420, render_markdown=True),
-                    textbox=gr.Textbox(
-                        placeholder="输入问题或命令... /help 查看帮助",
+                    textbox=gr.MultimodalTextbox(
+                        placeholder="输入问题或命令... 可拖拽/粘贴文件",
                         container=False, scale=7,
+                        file_types=[".pdf", ".png", ".jpg", ".jpeg"],
                         submit_btn="发送", stop_btn="停止",
                     ),
+                    multimodal=True,
                     title=None, description=None,
                     examples=[
                         "搜索 diffusion model 在网络调度中的最新论文",
@@ -441,6 +543,18 @@ def build_ui():
         .main-header h1 { font-size: 1.3rem; font-weight: 600; }
         .status-bar { padding: 0.3rem 1rem; font-size: 0.75rem; color: #666; }
         footer { display: none !important; }
+        #drop-overlay { display: none !important; }
+        #drop-overlay.show { display: flex !important; }
+        """,
+        js="""
+        function() {
+            var overlay = document.getElementById('drop-overlay');
+            var dragCount = 0;
+            document.addEventListener('dragenter', function(e) { e.preventDefault(); dragCount++; overlay.classList.add('show'); });
+            document.addEventListener('dragleave', function(e) { e.preventDefault(); dragCount--; if (dragCount <= 0) { dragCount = 0; overlay.classList.remove('show'); } });
+            document.addEventListener('dragover', function(e) { e.preventDefault(); });
+            document.addEventListener('drop', function(e) { e.preventDefault(); dragCount = 0; overlay.classList.remove('show'); });
+        }
         """,
     )
 
