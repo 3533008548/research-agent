@@ -412,8 +412,12 @@ class PaperReader:
 
 def extract_images(pdf_path: str, max_pages: int = 15) -> list[str]:
     """
-    从 PDF 中提取嵌入图片，保存到 data/papers/images/ 目录。
-    返回提取的图片文件路径列表。
+    图注感知图片提取：
+      1. 找图注文字（Figure N: / Fig. N:）作为锚点
+      2. 同图注下方的图片合并为一个 figure 分组
+      3. 渲染合并区域的外接矩形为一张 PNG（保留子图关系）
+      4. 无图注时按位置相邻（gap < 20px）分组回退
+      5. 过滤面积 < 5000 px² 的小图（图标/logo）
     """
     try:
         import fitz  # PyMuPDF
@@ -422,26 +426,128 @@ def extract_images(pdf_path: str, max_pages: int = 15) -> list[str]:
         return []
 
     from pathlib import Path
+    import re as _re
+
     img_dir = Path("data/papers/images")
     img_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(pdf_path).stem[:30]
 
+    caption_pat = _re.compile(r'(?:Figure|Fig\.?|图)\s*(\d+)')
+
+    # ── 缓存：已有该论文图片则跳过 ──
+    existing = list(img_dir.glob(f"{stem}_*.png")) if img_dir.exists() else []
+    if existing:
+        print(f"      🖼 缓存命中: {len(existing)} 张图片", file=sys.stderr)
+        return [str(f) for f in existing]
+
     saved = []
+    captions_map = {}  # label → caption text（用于描述时附带）
     doc = fitz.open(pdf_path)
-    for page_num in range(min(len(doc), max_pages)):
-        for img_idx, img in enumerate(doc[page_num].get_images(full=True)):
-            xref = img[0]
+    total_pages = min(len(doc), max_pages)
+
+    for page_num in range(total_pages):
+        page = doc[page_num]
+
+        # ── 1. 找图注（文字块 + y 坐标 + 完整文本）──
+        captions = []  # [(num, y_mid, text)]
+        try:
+            for block in page.get_text("dict")["blocks"]:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    text = "".join(span.get("text", "") for span in line.get("spans", []))
+                    m = caption_pat.search(text)
+                    if m and len(text) < 120:  # 图注通常较短
+                        captions.append((int(m.group(1)), line.get("bbox", (0, 0, 0, 0))[3], text.strip()))
+        except Exception:
+            pass
+        captions.sort(key=lambda c: c[1])
+
+        # ── 2. 找图片 bbox ──
+        imgs = []
+        try:
+            for info in page.get_image_info():
+                bbox = info.get("bbox")
+                if not bbox:
+                    continue
+                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                if w * h < 5000:  # 过滤小图
+                    continue
+                imgs.append((bbox[0], bbox[1], bbox[2], bbox[3]))
+        except Exception:
+            pass
+
+        if not imgs:
+            continue
+
+        # ── 3. 分组：有图注 → 归入下方最近的图注 ──
+        groups = []  # [(label, [bboxes])]
+        if captions:
+            for (x0, y0, x1, y1) in imgs:
+                nearest = None
+                for num, cap_y, cap_text in captions:
+                    if cap_y >= y1:  # 图注在图片下方
+                        nearest = (num, cap_y, cap_text)
+                        break
+                if nearest:
+                    label = f"Figure{nearest[0]}"
+                    captions_map.setdefault(label, nearest[2])
+                else:
+                    label = f"p{page_num+1}_fig"
+                found = None
+                for g in groups:
+                    if g[0] == label:
+                        found = g; break
+                if found:
+                    found[1].append((x0, y0, x1, y1))
+                else:
+                    groups.append((label, [(x0, y0, x1, y1)]))
+        else:
+            # ── 无图注 → 位置相邻分组回退 ──
+            sorted_imgs = sorted(imgs, key=lambda b: (b[1], b[0]))
+            cur_group = [sorted_imgs[0]] if sorted_imgs else []
+            for i in range(1, len(sorted_imgs)):
+                prev = cur_group[-1]
+                cur = sorted_imgs[i]
+                gap_y = cur[1] - prev[3]
+                gap_x = cur[0] - prev[2]
+                if gap_y < 20 and gap_x < 20:
+                    cur_group.append(cur)
+                else:
+                    groups.append((f"p{page_num+1}_fig{len(groups)+1}", cur_group))
+                    cur_group = [cur]
+            if cur_group:
+                groups.append((f"p{page_num+1}_fig{len(groups)+1}", cur_group))
+
+        # ── 4. 渲染每个分组的外接矩形 ──
+        for label, bboxes in groups:
             try:
-                base = doc.extract_image(xref)
-                ext = base["ext"]
-                fname = img_dir / f"{stem}_p{page_num+1}_i{img_idx+1}.{ext}"
-                fname.write_bytes(base["image"])
+                min_x = min(b[0] for b in bboxes)
+                min_y = min(b[1] for b in bboxes)
+                max_x = max(b[2] for b in bboxes)
+                max_y = max(b[3] for b in bboxes)
+                # 稍微扩展一点，避免边缘裁剪
+                clip = fitz.Rect(min_x - 5, min_y - 5, max_x + 5, max_y + 5)
+                pix = page.get_pixmap(clip=clip, dpi=150)
+                fname = img_dir / f"{stem}_{label}.png"
+                pix.save(str(fname))
                 saved.append(str(fname))
             except Exception:
                 pass
+
     doc.close()
+
+    # ── 保存图注 sidecar（供 describe_image 附带）──
+    if captions_map:
+        try:
+            cap_file = img_dir / f"{stem}_captions.json"
+            import json as _json
+            cap_file.write_text(_json.dumps(captions_map, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+
     if saved:
-        print(f"      🖼 提取 {len(saved)} 张图片到 data/papers/images/", file=sys.stderr)
+        print(f"      🖼 提取 {len(saved)} 张图到 data/papers/images/", file=sys.stderr)
     return saved
 
 

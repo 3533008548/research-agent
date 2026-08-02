@@ -511,12 +511,15 @@ def build_ui():
         daily_str = f"**{daily}** | " if daily else ""
         ready = tu.get("daily_ready", False)
         ready_str = "**📰 结果就绪** | " if ready else ""
+        bw = tu.get("budget_warning", "")
+        bw_str = f"**{bw}** | " if bw else ""
         return (
             f"**模型**: {agent.model} | "
             f"**上下文**: `{bar}` {pct}% ({last:,}/{limit_k}) | "
             f"{vs_str}"
             f"{daily_str}"
             f"{ready_str}"
+            f"{bw_str}"
             f"**Tokens**: {tu['total']:,} | "
             f"**话题**: {current_topic['name']} | "
             f"**RAG**: {rag}"
@@ -609,8 +612,8 @@ def build_ui():
         )
 
         with gr.Row():
-            status = gr.Markdown(refresh_status([]), elem_classes=["status-bar"], scale=10)
-            quit_btn = gr.Button("⏻ 退出", scale=1, size="sm", elem_classes=["quit-btn"])
+            status = gr.Markdown(refresh_status([]), elem_classes=["status-bar"], scale=20)
+            quit_btn = gr.Button("⏻ 退出", scale=1, size="sm", min_width=60, elem_classes=["quit-btn"])
 
         with gr.Tabs():
             # ── Tab 1: 对话 ──
@@ -729,7 +732,7 @@ def build_ui():
         .main-header h1 { font-size: 1.3rem; font-weight: 600; }
         .status-bar { padding: 0.3rem 1rem; font-size: 0.75rem; color: #666; }
         footer { display: none !important; }
-        .quit-btn { margin-top: -2px; }
+        .quit-btn { margin-top: -2px; min-width: 60px !important; max-width: 70px !important; }
         #drop-overlay { display: none !important; }
         #drop-overlay.show { display: flex !important; }
         """,

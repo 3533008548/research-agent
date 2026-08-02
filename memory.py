@@ -38,6 +38,12 @@ class MemoryStore:
                 summary TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS image_descriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_path TEXT UNIQUE NOT NULL,
+                description TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
         """)
         self._conn.commit()
 
@@ -80,7 +86,6 @@ class MemoryStore:
             "INSERT INTO summaries (thread_id, topic, summary, created_at) VALUES (?, ?, ?, ?)",
             (thread_id, topic, summary, now),
         )
-        # 保留最近 3 条同 thread 的
         rows = self._conn.execute(
             "SELECT id FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 3",
             (thread_id,),
@@ -88,6 +93,14 @@ class MemoryStore:
         for r in rows:
             self._conn.execute("DELETE FROM summaries WHERE id=?", (r["id"],))
         self._conn.commit()
+
+    def get_last_summary_time(self, thread_id: str) -> Optional[str]:
+        """获取最近一次摘要的时间戳（用于频率控制）"""
+        row = self._conn.execute(
+            "SELECT created_at FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+        return row["created_at"] if row else None
 
     def get_recent_summary(self, thread_id: str, topic: str = "") -> Optional[str]:
         """获取最近一条摘要，可选按话题过滤"""
@@ -115,3 +128,20 @@ class MemoryStore:
                 (thread_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── 图片描述缓存 ──
+
+    def get_image_description(self, image_path: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT description FROM image_descriptions WHERE image_path=?",
+            (image_path,),
+        ).fetchone()
+        return row["description"] if row else None
+
+    def save_image_description(self, image_path: str, description: str):
+        now = datetime.now().isoformat()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO image_descriptions (image_path, description, created_at) VALUES (?, ?, ?)",
+            (image_path, description, now),
+        )
+        self._conn.commit()

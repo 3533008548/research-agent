@@ -206,12 +206,44 @@ def build_graph(
                 args = {}
             print(f"      🔧 {name}({json.dumps(args, ensure_ascii=False)})", file=sys.stderr)
             result = execute_tool(name, args, paper_store=paper_store, glm_api_key=glm_api_key, profile_manager=profile_manager, memory_store=memory_store)
-            if isinstance(result, str) and len(result) > 12000:
-                result = result[:12000] + "\n\n...（截断至 12000 字符）"
+            if isinstance(result, str):
+                # ── 按工具类型差异化截断 ──
+                limits = {
+                    "query_papers": 5000,
+                    "search_papers": 3000,
+                    "read_pdf": 12000,
+                    "describe_image": 2000,
+                    "memory_search": 1500,
+                }
+                limit = limits.get(name, 3000)
+                if len(result) > limit:
+                    result = result[:limit] + f"\n\n...（截断至 {limit} 字符）"
             tool_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         return {"messages": tool_msgs}
 
     # ═══ 验证节点 ═══
+
+    def _is_subjective_question(q: str) -> bool:
+        """判断是否为主观问题（无需事实验证）"""
+        subjective_markers = ["你觉得", "怎么看待", "你的观点", "你的看法", "推荐一下", "有什么建议",
+                              "喜不喜欢", "好不好用", "值不值得", "opinion", "think about", "your view",
+                              "recommend", "suggest"]
+        ql = q.lower()
+        # 含查证意图的（"论文里怎么说的"）不算主观
+        if any(m in ql for m in ["论文里", "原文", "文中", "paper says", "in the paper", "what does"]):
+            return False
+        return any(m in ql for m in subjective_markers)
+
+    def _parse_issues(raw: str) -> tuple[list[str], list[str]]:
+        """解析 verify 结果 → (严重问题列表, 轻微问题列表)"""
+        severe, minor = [], []
+        for line in raw.split("\n"):
+            ls = line.strip()
+            if ls.startswith("[严重]") or ls.startswith("[SEVERE]"):
+                severe.append(ls)
+            elif ls.startswith("[轻微]") or ls.startswith("[MINOR]"):
+                minor.append(ls)
+        return severe, minor
 
     def verify_node(state: AgentState) -> dict:
         messages = state.get("messages", [])
@@ -224,7 +256,18 @@ def build_graph(
         recent = list(messages[-8:])
         has_tools = any(m.get("role") == "tool" for m in recent)
 
+        # ── 第1层：跳过门控 ──
         if not has_tools:
+            return {}
+        # 短回复跳过（无事实可查）
+        if len(content) < 100:
+            return {}
+        # 主观问题跳过
+        user_q = ""
+        for m in reversed(messages):
+            if m.get("role") == "user" and "[系统验证" not in m.get("content", ""):
+                user_q = m.get("content", ""); break
+        if _is_subjective_question(user_q):
             return {}
 
         # ── 状态提示 ──
@@ -233,14 +276,13 @@ def build_graph(
             token_usage["verify_status"] = f"🔄 第{retry_n+1}次修改..." if retry_n else "🔍 验证中..."
 
         # 智能压缩
-        if has_tools:
-            for i, m in enumerate(recent):
-                if m.get("role") != "tool":
-                    continue
-                txt = m.get("content", "")
-                if txt.startswith("📄") and len(txt) > 3000 and "摘要" in content.lower():
-                    recent[i] = dict(m, content="📄 PDF原文已压缩（全文已索引至本地库，可用 query_papers 检索）")
-                    print("      📦 压缩 read_pdf 原文", file=sys.stderr)
+        for i, m in enumerate(recent):
+            if m.get("role") != "tool":
+                continue
+            txt = m.get("content", "")
+            if txt.startswith("📄") and len(txt) > 3000 and "摘要" in content.lower():
+                recent[i] = dict(m, content="📄 PDF原文已压缩（全文已索引至本地库，可用 query_papers 检索）")
+                print("      📦 压缩 read_pdf 原文", file=sys.stderr)
 
         tool_texts = []
         has_read_pdf = False
@@ -251,8 +293,13 @@ def build_graph(
                 if "📄" in t:
                     has_read_pdf = True
 
-        if not has_tools:
-            return {}
+        # ── verify 输入精简：低价值工具结果不送验证 ──
+        # 只保留 query_papers / read_pdf / search_papers 的结果（含事实内容）
+        def _is_fact_tool(text: str) -> bool:
+            return any(marker in text[:80] for marker in ["📚", "📄", "检索结果", "搜索结果", "PDF"])
+        fact_texts = [t for t in tool_texts if _is_fact_tool(t)]
+        if not fact_texts:
+            fact_texts = tool_texts[:1]  # 兜底：至少送一条
 
         library_context = ""
         if paper_store and has_read_pdf:
@@ -264,14 +311,23 @@ def build_graph(
             except Exception:
                 pass
 
+        # ── 增量验证：上次的问题只重查修复情况 ──
+        prev_issues = state.get("metadata", {}).get("verify_issues", "")
+        incr_note = ""
+        if prev_issues:
+            incr_note = f"\nPreviously flagged issues (verify they are FIXED in the new response, don't re-flag unrelated):\n{prev_issues[:800]}\n"
+
         verify_prompt = (
-            "Review this AI response for factual errors. Reply with 'OK' if correct.\n"
-            "Rules:\n"
-            "1. Formula claims NOT in tool results → flag (BUT: query_papers results may have LaTeX — be lenient)\n"
-            "2. Unclear source → flag\n"
-            "3. Contradicts tool results → flag\n\n"
-            f"--- Tool results ---\n{chr(10).join(f'[T{i+1}] {t}' for i, t in enumerate(tool_texts))}"
-            f"{library_context}\n\n--- Response ---\n{content[:1500]}\n\nIssues (or OK):"
+            "Review this AI response for factual errors. Reply 'OK' if correct.\n"
+            "For each issue, format as: [严重|轻微] description\n"
+            "[严重] = contradicts tool results / wrong formula or data\n"
+            "[轻微] = unclear source / vague wording, content is fine\n\n"
+            "After issues, judge relevance: is the issue about the user's CORE question? Reply [需修正] or [可忽略] per issue.\n\n"
+            f"User question: {user_q[:300]}\n"
+            f"--- Tool results ---\n{chr(10).join(f'[T{i+1}] {t}' for i, t in enumerate(fact_texts))}"
+            f"{library_context}"
+            f"{incr_note}"
+            f"\n--- Response ---\n{content[:1500]}\n\nIssues (or OK):"
         )
 
         try:
@@ -281,7 +337,11 @@ def build_graph(
                       "stream": False, "temperature": 0.1}, timeout=30)
             resp.raise_for_status()
             result = resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
+        except Exception as e:
+            # ── 降级静默：API 失败不阻塞，但状态栏提示 ──
+            if token_usage:
+                token_usage["verify_status"] = "⚠️ 验证跳过（API 失败）"
+            print(f"      ⚠ verify API 失败: {e}", file=sys.stderr)
             return {}
         if "usage" in resp.json() and token_usage:
             vu = resp.json()["usage"]
@@ -296,9 +356,17 @@ def build_graph(
             if memory_store:
                 user_msg_count = sum(1 for m in messages if m.get("role") == "user")
                 pct_ctx = (token_usage.get("last_prompt", 0) / token_usage.get("context_limit", 131072)) if token_usage else 0
-                if user_msg_count > 10 or pct_ctx > 0.5:
+                # ── 摘要频率控制：10 分钟内不重复摘要 ──
+                from datetime import datetime as _dt, timedelta as _td
+                last_sum = memory_store.get_last_summary_time("research-main")
+                recent_sum = False
+                if last_sum:
                     try:
-                        # 提取最近 20 条消息生成摘要
+                        recent_sum = (_dt.fromisoformat(last_sum) + _td(minutes=10)) > _dt.now()
+                    except Exception:
+                        recent_sum = False
+                if (user_msg_count > 10 or pct_ctx > 0.5) and not recent_sum:
+                    try:
                         recent_msgs = []
                         for m in messages[-20:]:
                             c = m.get("content", "") or ""
@@ -315,19 +383,47 @@ def build_graph(
                             memory_store.add_summary("research-main", topic, summary)
                     except Exception:
                         pass
+                # ── 预算预警前置：> 60% 提示（> 90% 强警告）──
+                if pct_ctx > 0.9 and token_usage:
+                    token_usage["budget_warning"] = "⚠️ 上下文 90%+，建议 /new"
+                elif pct_ctx > 0.6 and token_usage:
+                    token_usage["budget_warning"] = f"📊 上下文 {int(pct_ctx*100)}%"
             return {}
 
-        user_q = ""
-        for m in reversed(messages):
-            if m.get("role") == "user" and "[系统验证" not in m.get("content", ""):
-                user_q = m.get("content", ""); break
-        feedback = f"[系统验证] 上一轮回答存在以下问题:\n{result}\n\n请修正后重新回答。用户的问题是:\n{user_q[:500]}"
+        # ── 分级处理 ──
+        severe, minor = _parse_issues(result)
         count = 1 + state.get("metadata", {}).get("verify_count", 0)
-        print(f"      🔍 验证不合格 (第{count}次) → 反馈 LLM", file=sys.stderr)
+        # 重试历史：连续 [轻微] 触发 2 次 → 降级为仅追加提示
+        hist = state.get("metadata", {}).get("verify_history", {})
+        minor_key = "minor_repeat"
+        hist[minor_key] = hist.get(minor_key, 0) + 1 if minor and not severe else 0
+
+        need_regenerate = bool(severe)
+        if not need_regenerate and minor:
+            # 轻微问题：判断是否与用户问题强相关
+            need_regenerate = "[需修正]" in result
+            if hist.get(minor_key, 0) >= 2 and not severe:
+                need_regenerate = False  # 连续轻微 → 不重生成，追加提示
+
+        if not need_regenerate and minor:
+            # 仅追加提示，不重生成
+            note = "\n\n⚠️ 注: " + "; ".join(minor[:2])
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "assistant" and messages[i].get("content"):
+                    messages[i] = dict(messages[i], content=messages[i]["content"] + note)
+                    break
+            if token_usage:
+                token_usage.pop("verify_status", None)
+            return {}
+
+        # ── 需要重生成 ──
+        feedback = f"[系统验证] 上一轮回答存在以下问题:\n{result}\n\n请修正后重新回答。用户的问题是:\n{user_q[:500]}"
+        print(f"      🔍 验证不合格 (第{count}次, {'严重' if severe else '轻微'}) → 反馈 LLM", file=sys.stderr)
         return {"metadata": {
             "verify_feedback": feedback,
             "verify_count": count,
-            "verify_issues": result,  # 保存问题文本，最终失败时用于横幅
+            "verify_issues": result,
+            "verify_history": hist,
         }}
 
     # ═══ 验证路由 ═══
@@ -336,7 +432,6 @@ def build_graph(
         md = state.get("metadata", {})
         count = md.get("verify_count", 0)
         if count >= 3:
-            # 最终失败 — 不覆盖，在原回答前加警告横幅
             issues = md.get("verify_issues", "")
             msgs = state.get("messages", [])
             for i in range(len(msgs) - 1, -1, -1):

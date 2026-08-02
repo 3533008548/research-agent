@@ -21,12 +21,14 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
         return "❌ RAG 功能未启用。"
     query = args.get("query", "")
     top_k = min(args.get("top_k", 3), 5)
-    results = paper_store.query(query, top_k=top_k)
+    section = args.get("section", None)
+    results = paper_store.query(query, top_k=top_k, section=section)
     if not results:
         return "📭 未找到相关内容。请先阅读并索引论文（read_pdf 会自动索引）。"
     lines = [f"📚 检索结果 — 「{query}」（共 {len(results)} 条）\n"]
     for i, r in enumerate(results, 1):
-        lines.append(f"  {i}. [{r['title']}]  相似度距离: {r['distance']}\n     {r['text']}")
+        sec = r.get("section", "未标注")
+        lines.append(f"  {i}. [{r['title']} · {sec}章节]  距离: {r['distance']}\n     {r['text']}")
     return "\n".join(lines)
 
 
@@ -60,4 +62,16 @@ def handle_delete_paper(args: dict, paper_store=None, **kw) -> str:
     if not found:
         return f"❌ 未找到论文: {pid_or_title}"
     count = paper_store.delete_paper(found["paper_id"])
-    return f"🗑️ 已删除: {found['title']} ({count} 个块)"
+    # 删除对应的图片文件（标题 → stem 反推）
+    deleted_imgs = 0
+    try:
+        stem = found["title"].replace(" ", "_")[:30]
+        img_dir = Path("data/papers/images")
+        if img_dir.exists():
+            for img in img_dir.glob(f"{stem}_*"):
+                img.unlink(missing_ok=True)
+                deleted_imgs += 1
+    except Exception:
+        pass
+    extra = f", 图片 {deleted_imgs} 张" if deleted_imgs else ""
+    return f"🗑️ 已删除: {found['title']} ({count} 个块{extra})"

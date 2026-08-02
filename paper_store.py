@@ -49,62 +49,135 @@ def chunk_text(
       2. 块大小控制在 chunk_size 左右，相邻块保持 overlap 字符重叠
       3. 公式区域（$$...$$ 和 $...$）标记为不可切割，切点自动避开
 
-    返回: [{"text": "...", "index": 0, "char_start": 0, "char_end": 580}, ...]
+    返回: [{"text": "...", "section": "Method", "index": 0, "char_start": 0, "char_end": 580}, ...]
     """
     # 预扫描：找到所有公式的不可切割区间
-    _formula_pat = re.compile(r'\$\$[^$]+\$\$|\$[^$]+\$')
+    # [^$]* 允许 $$..$$ 空公式，避免正则漏掉边界情况
+    _formula_pat = re.compile(r'\$\$[^$]*\$\$|\$[^$]+\$')
+    _sent_end = re.compile(r'[。．.!?！？;；]')
+
     def _find_formula_ranges(para: str) -> list[tuple[int, int]]:
         return [(m.start(), m.end()) for m in _formula_pat.finditer(para)]
 
     def _safe_cut(para: str, ideal: int, forbidden: list[tuple[int, int]], para_len: int) -> int:
-        """调整切点，避免落在公式区间内"""
-        for s, e in forbidden:
+        """调整切点，避免落在公式区间内（公式区间已排序，二分查找）"""
+        import bisect
+        starts = [s for s, e in forbidden]
+        idx = bisect.bisect_right(starts, ideal) - 1
+        if idx >= 0:
+            s, e = forbidden[idx]
             if s <= ideal <= e:
                 return s if (ideal - s) < (e - ideal) else e
         return ideal
 
-    paragraphs = text.split("\n\n")
+    def _sentence_cut(para: str, end: int, para_len: int) -> int:
+        """把切点挪到最近的句子结束符后（在 ±30 字符窗口内）"""
+        if end >= para_len:
+            return end
+        window_start = max(0, end - 30)
+        window = para[window_start:end]
+        # 找窗口内最后一个句子结束符
+        last = None
+        for m in _sent_end.finditer(window):
+            last = m
+        if last:
+            return window_start + last.end()
+        return end
+
+    # ── 第1层：章节切分（## 和 ### 两级）──
+    section_blocks = []  # [(section_label, text)]
+    current_section = "未标注"
+    current_sub = ""
+    lines = text.split("\n")
+    buf = []
+
+    def flush_buf():
+        nonlocal buf
+        if buf:
+            body = "\n".join(buf).strip()
+            if body:
+                label = current_section if not current_sub else f"{current_section} > {current_sub}"
+                section_blocks.append((label, body))
+        buf = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            flush_buf()
+            if not stripped.startswith("### "):
+                current_section = stripped[3:].strip()
+                current_sub = ""
+            else:
+                current_sub = stripped[4:].strip()
+        elif stripped.startswith("### "):
+            flush_buf()
+            current_sub = stripped[4:].strip()
+        else:
+            buf.append(line)
+    flush_buf()
+
+    # ── 第2/3层：段落切分 + 尺寸切分 ──
     chunks = []
     char_pos = 0
 
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            char_pos += 2
-            continue
+    for section_label, section_text in section_blocks:
+        paragraphs = section_text.split("\n\n")
+        # 前缀只取一级章节（## Method），子章节存 metadata 不注入文本
+        prefix_label = section_label.split(" > ")[0]
+        prefix = f"## {prefix_label}\n" if section_label != "未标注" else ""
 
-        para_start = char_pos
-        para_len = len(para)
-        formula_ranges = _find_formula_ranges(para)
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                char_pos += 2
+                continue
 
-        if para_len <= chunk_size:
-            chunks.append({
-                "text": para,
-                "char_start": para_start,
-                "char_end": para_start + para_len,
-            })
+            para_start = char_pos
+            para_len = len(para)
+            adaptive_size = 1500 if section_label != "未标注" else chunk_size
+            formula_ranges = sorted(_find_formula_ranges(para))
+
+            if para_len + len(prefix) <= adaptive_size:
+                chunks.append({
+                    "text": prefix + para,
+                    "section": section_label,
+                    "char_start": para_start,
+                    "char_end": para_start + para_len,
+                })
+                char_pos += para_len + 2
+                continue
+
+            # 长段落：滑动窗口，切点避开公式 + 句子边界
+            start = 0
+            while start < para_len:
+                ideal_end = min(start + adaptive_size - len(prefix), para_len)
+                end = _safe_cut(para, ideal_end, formula_ranges, para_len)
+                # end 必须 > start，防止巨大公式边界把 end 拨回 start 之前 → 1字符chunk
+                if end <= start:
+                    end = ideal_end
+                end = min(max(end, start + 1), para_len)
+                # 句子切割同样不能后退
+                sent_end = _sentence_cut(para, end, para_len)
+                if sent_end > start:
+                    end = sent_end
+                end = min(max(end, start + 1), para_len)
+
+                chunks.append({
+                    "text": prefix + para[start:end],
+                    "section": section_label,
+                    "char_start": para_start + start,
+                    "char_end": para_start + end,
+                })
+
+                if end >= para_len:
+                    break
+                # 下一块起点：必须前进，防止公式边界把 start 拨回 → 死循环
+                next_start = _safe_cut(para, ideal_end - overlap, formula_ranges, para_len)
+                if next_start <= start:
+                    next_start = end
+                start = min(next_start, para_len - 1)
+
             char_pos += para_len + 2
-            continue
-
-        # 长段落：滑动窗口切分，切点避开公式
-        start = 0
-        while start < para_len:
-            ideal_end = min(start + chunk_size, para_len)
-            end = _safe_cut(para, ideal_end, formula_ranges, para_len)
-            end = min(max(end, start + 1), para_len)
-
-            chunks.append({
-                "text": para[start:end],
-                "char_start": para_start + start,
-                "char_end": para_start + end,
-            })
-
-            if end >= para_len:
-                break
-            start = _safe_cut(para, ideal_end - overlap, formula_ranges, para_len)
-            start = min(start, para_len - 1)
-
-        char_pos += para_len + 2
 
     for i, chunk in enumerate(chunks):
         chunk["index"] = i
@@ -192,6 +265,7 @@ class PaperStore:
             metadatas.append({
                 "paper_id": paper_id,
                 "title": title,
+                "section": chunk.get("section", "未标注"),
                 "chunk_index": chunk["index"],
                 "char_start": chunk["char_start"],
                 "char_end": chunk["char_end"],
@@ -213,6 +287,7 @@ class PaperStore:
         query_text: str,
         top_k: int = 3,
         paper_ids: Optional[list[str]] = None,
+        section: Optional[str] = None,
     ) -> list[dict]:
         """
         在已索引论文中检索最相关的段落。
@@ -221,9 +296,9 @@ class PaperStore:
           query_text: 查询文本（自然语言）
           top_k: 返回结果数
           paper_ids: 限定检索范围（None 表示全部论文）
+          section: 限定章节（如 "Method"），None 表示全部
 
-        返回: [{"text": "...", "title": "...", "paper_id": "...",
-                 "chunk_index": 0, "char_start": 0, "char_end": 580,
+        返回: [{"text": "...", "section": "...", "title": "...",
                  "distance": 0.23}, ...]
         """
         if self._collection.count() == 0:
@@ -231,34 +306,46 @@ class PaperStore:
 
         # 构建过滤条件
         where = None
+        conds = []
         if paper_ids:
             if len(paper_ids) == 1:
-                where = {"paper_id": paper_ids[0]}
+                conds.append({"paper_id": paper_ids[0]})
             else:
-                where = {"paper_id": {"$in": paper_ids}}
+                conds.append({"paper_id": {"$in": paper_ids}})
+        if section:
+            conds.append({"section": section})
+        if len(conds) == 1:
+            where = conds[0]
+        elif len(conds) > 1:
+            where = {"$and": conds}
 
-        # 检索（嵌入由 DefaultEmbeddingFunction 自动处理）
+        # 检索
         raw = self._collection.query(
             query_texts=[query_text],
-            n_results=top_k,
+            n_results=top_k * 3,  # 多取一些用于章节加权
             where=where,
             include=["documents", "metadatas", "distances"],
         )
 
-        # 整理结果
+        # 整理结果 + 章节加权（Method/Experiments 优先）
+        WEIGHT_SECTIONS = {"method", "experiment", "evaluation", "result", "proposed"}
         results = []
         if raw["ids"] and raw["ids"][0]:
             for i, doc_id in enumerate(raw["ids"][0]):
                 meta = raw["metadatas"][0][i] if raw["metadatas"] and raw["metadatas"][0] else {}
                 dist = raw["distances"][0][i] if raw["distances"] and raw["distances"][0] else 0
+                sec = meta.get("section", "未标注")
+                # 章节加权：Method 类章节距离减 0.05
+                weight_penalty = 0.05 if any(w in sec.lower() for w in WEIGHT_SECTIONS) else 0
                 results.append({
                     "text": raw["documents"][0][i] if raw["documents"] and raw["documents"][0] else "",
+                    "section": sec,
                     "title": meta.get("title", "Unknown"),
                     "paper_id": meta.get("paper_id", ""),
                     "chunk_index": meta.get("chunk_index", 0),
                     "char_start": meta.get("char_start", 0),
                     "char_end": meta.get("char_end", 0),
-                    "distance": round(dist, 4),
+                    "distance": round(max(dist - weight_penalty, 0), 4),
                 })
 
         return results

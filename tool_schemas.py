@@ -55,12 +55,13 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "query_papers",
-                "description": "在已索引论文中语义检索方法细节/公式/实验数据。",
+                "description": "在已索引论文中语义检索方法细节/公式/实验数据。支持按章节过滤。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "查询内容"},
                         "top_k": {"type": "integer", "description": "返回段落数"},
+                        "section": {"type": "string", "description": "限定章节（如 Method/Experiments），可选"},
                     },
                     "required": ["query"],
                 },
