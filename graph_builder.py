@@ -23,6 +23,7 @@ import requests
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from llm_client import LLMRequestTimeoutError
 from prompts import SYSTEM_PROMPT
 from tool_schemas import get_tool_schemas
 from tools import execute_tool
@@ -52,6 +53,9 @@ def build_graph(
     stream_callback = None,
     profile_manager = None,
     memory_store = None,  # MemoryStore 实例
+    verify_timeout_seconds: int = 8,
+    verify_guard = None,
+    llm_client = None,
 ):
     tool_schemas = get_tool_schemas()
 
@@ -72,20 +76,22 @@ def build_graph(
                     messages[i] = dict(m)
                     del messages[i]["tool_calls"]
 
-        if messages and messages[0].get("role") != "system":
-            profile_text = profile_manager.summary() if profile_manager else ""
-            prompt = SYSTEM_PROMPT
-            if profile_text:
-                prompt = f"[用户画像] {profile_text}\n\n{prompt}"
-            messages.insert(0, {"role": "system", "content": prompt})
+        # 话题/笔记上下文也会以 system message 传入，不能因此跳过核心约束提示词。
+        profile_text = profile_manager.summary() if profile_manager else ""
+        prompt = SYSTEM_PROMPT
+        if profile_text:
+            prompt = f"[用户画像] {profile_text}\n\n{prompt}"
+        messages.insert(0, {"role": "system", "content": prompt})
 
         verify_fb = state.get("metadata", {}).get("verify_feedback", "")
         if verify_fb:
             messages.append({"role": "system", "content": verify_fb})
 
         if memory_store:
-            topic = state.get("metadata", {}).get("topic", "")
-            recent = memory_store.get_recent_summary("research-main", topic)
+            metadata = state.get("metadata", {})
+            topic = metadata.get("topic", "")
+            thread_id = metadata.get("session_id", "research-main")
+            recent = memory_store.get_recent_summary(thread_id, topic)
             if recent:
                 messages.append({"role": "system", "content": f"[对话摘要] {recent}"})
 
@@ -95,9 +101,22 @@ def build_graph(
             "stream": stream_callback is not None,
         }
 
-        resp = requests.post(api_url, headers={
-            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-        }, json=payload, timeout=120)
+        def _api_status(message: str) -> None:
+            if token_usage is not None:
+                token_usage["api_status"] = message
+
+        request_budget = llm_client.new_request_budget() if llm_client else None
+        if llm_client:
+            resp = llm_client.post(
+                payload,
+                stream=stream_callback is not None,
+                on_status=_api_status,
+                budget=request_budget,
+            )
+        else:
+            resp = requests.post(api_url, headers={
+                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+            }, json=payload, timeout=120)
 
         if resp.status_code == 429:
             return {"messages": [{"role": "assistant", "content": "⚠️ API 限流，请稍后再试"}]}
@@ -111,44 +130,106 @@ def build_graph(
             import json as _json
             full_text = ""
             tool_calls_acc = {}
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
+
+            def _consume_stream(response) -> bool:
+                nonlocal full_text
+                lines = iter(response.iter_lines(decode_unicode=True))
+                while True:
+                    if llm_client and not llm_client.prepare_stream_read(
+                        response, request_budget
+                    ):
+                        raise requests.exceptions.ReadTimeout("stream deadline exceeded")
+                    try:
+                        line = next(lines)
+                    except StopIteration:
+                        # 正常 EOF 但未收到协议结束标记，也属于不完整流，不能当作成功。
+                        return False
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        return True
+                    try:
+                        chunk = _json.loads(data_str)
+                    except Exception:
+                        continue
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    token = delta.get("content", "")
+                    if token:
+                        full_text += token
+                        stream_callback(token)
+                    for tc in delta.get("tool_calls", []):
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {"id": tc.get("id", ""), "function": {"name": "", "arguments": ""}}
+                        if tc.get("id"):
+                            tool_calls_acc[idx]["id"] = tc["id"]
+                        if tc.get("function", {}).get("name"):
+                            tool_calls_acc[idx]["function"]["name"] += tc["function"]["name"]
+                        if tc.get("function", {}).get("arguments"):
+                            tool_calls_acc[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                    if token_usage and "usage" in chunk:
+                        u = chunk["usage"]
+                        for k in ("prompt", "completion", "total"):
+                            token_usage[k] += u.get(f"{k}_tokens", 0)
+                        token_usage["calls"] += 1
+                        token_usage["last_prompt"] = u.get("prompt_tokens", 0)
+                        cached = (u.get("prompt_tokens_details", {}).get("cached_tokens")
+                                  or u.get("prompt_cache_hit_tokens", 0))
+                        token_usage["cached"] = token_usage.get("cached", 0) + cached
+                        missed = u.get("prompt_tokens", 0) - cached
+                        cost = missed / 1e6 * 1 + cached / 1e6 * 0.02 + u.get("completion_tokens", 0) / 1e6 * 2
+                        token_usage["cost"] = token_usage.get("cost", 0) + cost
+                        token_usage["last_round_cost"] = cost
+
+            while True:
                 try:
-                    chunk = _json.loads(data_str)
-                except Exception:
-                    continue
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                token = delta.get("content", "")
-                if token:
-                    full_text += token
-                    stream_callback(token)
-                for tc in delta.get("tool_calls", []):
-                    idx = tc.get("index", 0)
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {"id": tc.get("id", ""), "function": {"name": "", "arguments": ""}}
-                    if tc.get("id"):
-                        tool_calls_acc[idx]["id"] = tc["id"]
-                    if tc.get("function", {}).get("name"):
-                        tool_calls_acc[idx]["function"]["name"] += tc["function"]["name"]
-                    if tc.get("function", {}).get("arguments"):
-                        tool_calls_acc[idx]["function"]["arguments"] += tc["function"]["arguments"]
-                if token_usage and "usage" in chunk:
-                    u = chunk["usage"]
-                    for k in ("prompt", "completion", "total"):
-                        token_usage[k] += u.get(f"{k}_tokens", 0)
-                    token_usage["calls"] += 1
-                    token_usage["last_prompt"] = u.get("prompt_tokens", 0)
-                    cached = (u.get("prompt_tokens_details", {}).get("cached_tokens")
-                              or u.get("prompt_cache_hit_tokens", 0))
-                    token_usage["cached"] = token_usage.get("cached", 0) + cached
-                    missed = u.get("prompt_tokens", 0) - cached
-                    cost = missed / 1e6 * 1 + cached / 1e6 * 0.02 + u.get("completion_tokens", 0) / 1e6 * 2
-                    token_usage["cost"] = token_usage.get("cost", 0) + cost
-                    token_usage["last_round_cost"] = cost
+                    completed = _consume_stream(resp)
+                    if not completed:
+                        raise requests.exceptions.ChunkedEncodingError(
+                            "stream ended before [DONE]"
+                        )
+                    if llm_client:
+                        llm_client.finish_stream(resp, success=True)
+                    break
+                except requests.RequestException as exc:
+                    if llm_client:
+                        llm_client.finish_stream(resp, success=False)
+                    else:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    # 未输出任何 token 时可以安全重放同一模型请求；有内容后不重放，避免重复。
+                    if (
+                        not full_text and llm_client
+                        and request_budget.reserve_retry()
+                    ):
+                        resp = llm_client.post(
+                            payload, stream=True, on_status=_api_status,
+                            budget=request_budget,
+                        )
+                        continue
+                    if not full_text:
+                        raise LLMRequestTimeoutError(
+                            "模型流式响应中断；未切换模型，请稍后点击重试"
+                        ) from exc
+                    interruption = "\n\n⚠️ 输出中断，已保留以上内容。发送 `/retry` 可重新请求。"
+                    full_text += interruption
+                    stream_callback(interruption)
+                    if token_usage is not None:
+                        token_usage["api_status"] = "⚠️ 流式输出中断，可发送 /retry"
+                    break
+                except BaseException:
+                    # 客户端断开、回调取消等非 requests 异常也不能遗留 SSE 连接或并发槽。
+                    if llm_client:
+                        llm_client.finish_stream(resp, success=False)
+                    else:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    raise
             assistant_msg = {"role": "assistant", "content": full_text or None}
             if tool_calls_acc:
                 assistant_msg["tool_calls"] = [
@@ -281,6 +362,15 @@ def build_graph(
         if _is_subjective_question(user_q):
             return _complete_verification()
 
+        # verify 是辅助质量保障，不能在服务异常时拖住主对话。
+        if verify_guard and not verify_guard.allow_request():
+            if token_usage:
+                wait_seconds = verify_guard.remaining_seconds()
+                token_usage["verify_status"] = (
+                    f"⚠️ 验证暂时跳过（服务繁忙，约 {wait_seconds}s 后恢复）"
+                )
+            return _complete_verification()
+
         # ── 状态提示 ──
         retry_n = state.get("metadata", {}).get("verify_count", 0)
         if token_usage:
@@ -345,15 +435,20 @@ def build_graph(
             resp = requests.post(api_url, headers={
                 "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
             }, json={"model": model, "messages": [{"role": "user", "content": verify_prompt}],
-                      "stream": False, "temperature": 0.1}, timeout=30)
+                      "stream": False, "temperature": 0.1},
+                timeout=(3.05, verify_timeout_seconds))
             resp.raise_for_status()
             result = resp.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            # ── 降级静默：API 失败不阻塞，但状态栏提示 ──
+            # ── 快速降级：失败两次后熔断，后续请求直接返回主回答 ──
+            if verify_guard:
+                verify_guard.record_failure()
             if token_usage:
-                token_usage["verify_status"] = "⚠️ 验证跳过（API 失败）"
-            print(f"      ⚠ verify API 失败: {e}", file=sys.stderr)
+                token_usage["verify_status"] = "⚠️ 验证跳过（服务超时或不可用）"
+            print(f"      ⚠ verify 跳过: {type(e).__name__}: {e}", file=sys.stderr)
             return _complete_verification()
+        if verify_guard:
+            verify_guard.record_success()
         if "usage" in resp.json() and token_usage:
             vu = resp.json()["usage"]
             for k in ("prompt", "completion", "total"):
@@ -367,9 +462,10 @@ def build_graph(
             if memory_store:
                 user_msg_count = sum(1 for m in messages if m.get("role") == "user")
                 pct_ctx = (token_usage.get("last_prompt", 0) / token_usage.get("context_limit", 131072)) if token_usage else 0
+                thread_id = metadata.get("session_id", "research-main")
                 # ── 摘要频率控制：10 分钟内不重复摘要 ──
                 from datetime import datetime as _dt, timedelta as _td
-                last_sum = memory_store.get_last_summary_time("research-main")
+                last_sum = memory_store.get_last_summary_time(thread_id)
                 recent_sum = False
                 if last_sum:
                     try:
@@ -387,11 +483,12 @@ def build_graph(
                         sr = requests.post(api_url, headers={
                             "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
                         }, json={"model": model, "messages": [{"role": "user", "content": sum_prompt}],
-                                  "stream": False, "temperature": 0.2}, timeout=20)
+                                  "stream": False, "temperature": 0.2},
+                            timeout=(3.05, verify_timeout_seconds))
                         if sr.status_code == 200:
                             summary = sr.json()["choices"][0]["message"]["content"].strip()[:300]
                             topic = state.get("metadata", {}).get("topic", "")
-                            memory_store.add_summary("research-main", topic, summary)
+                            memory_store.add_summary(thread_id, topic, summary)
                     except Exception:
                         pass
                 # ── 预算预警前置：> 60% 提示（> 90% 强警告）──

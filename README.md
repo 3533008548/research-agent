@@ -20,13 +20,15 @@
 |------|------|
 | 🔍 **论文搜索** | Semantic Scholar + arXiv + OpenAlex 三源全量搜索，合并去重 |
 | 📄 **PDF 阅读** | pdfplumber 表格/双栏/章节 + 图注感知图片提取（保留子图关系） |
+| 💬 **多会话管理** | 新建、切换、加载和永久删除会话；历史、摘要、Token 统计互相隔离 |
 | 🧠 **RAG 检索** | 章节感知分层切块 + 章节加权 + 章节过滤 + 公式保护 |
 | 🖼 **多模态看图** | GLM-4V 描述 + 图注附带 + 描述缓存（省 token） |
-| 📰 **每日速递** | 自定义关键词，三源每日自动/临时检索，支持重试和待读清单管理 |
+| 📰 **每日速递** | 自定义关键词，三源并行限时的后台自动/临时检索，支持重试和待读清单管理 |
 | 📝 **科研笔记** | SQLite 按话题分组，关联论文 |
 | 👤 **用户画像** | Markdown 自动维护，Agent 从对话中学习偏好 |
-| ✅ **自动验证** | verify 分级（严重重生成/轻微提示）+ 跳过门控 + 增量验证 |
+| ✅ **自动验证** | verify 分级（严重重生成/轻微提示）+ 跳过门控 + 8 秒限时熔断降级 |
 | 📊 **Token 管理** | 按工具差异化截断 + 缓存命中统计 + 预算预警 + 费用估算 |
+| 🛡️ **请求韧性** | 同模型重试、429 排队、端到端截止时间、半开熔断与流式中断恢复；不自动降级模型 |
 
 ---
 
@@ -70,11 +72,14 @@ python web_ui.py -m deepseek-chat --port 8080
 >>> 对比已读论文的技术路线          ← 跨论文分析
 ```
 
+Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾选确认；旧版固定的 `research-main` 历史会自动迁移为“历史会话”。CLI 中仍可用 `/new` 新建会话。
+
 常用 Web UI 命令：
 
 | 命令 | 说明 |
 |------|------|
-| `/new` `/model` `/tokens` `/profile` | 会话、模型和用量管理 |
+| `/model` `/tokens` `/profile` | 查看模型、当前会话用量和用户画像 |
+| `/retry` | 重发当前进程中最后一个模型请求；流式中断后可用 |
 | `/indexed` | 查看已索引论文 |
 | `/note ...` | 管理按话题归档的科研笔记 |
 | `/daily add <关键词>` | 添加每日检索关键词 |
@@ -90,7 +95,7 @@ python web_ui.py -m deepseek-chat --port 8080
 python tests/test_core.py
 ```
 
-当前有 13 个核心回归测试，覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日检索重试与临时检索。CI 在 GitHub Actions 中自动运行该命令。
+当前有 23 个核心回归测试，覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日检索重试与临时检索、多会话隔离和硬删除，以及三源限时并行、verify 熔断、同模型重试、端到端截止时间、半开熔断和流式中断恢复。CI 在 GitHub Actions 中自动运行该命令。
 
 ---
 
@@ -103,7 +108,7 @@ LangGraph ReAct 循环 (graph_builder.py)
 Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过或达到重试上限后自动清理，避免影响后续对话。
 
 存储层:
-  checkpoint.db  → 对话历史 (SQLite, 自动剪裁)
+  checkpoint.db  → LangGraph 对话历史 + 会话目录 + 每会话 Token 统计 (SQLite, 自动剪裁)
   chroma_data/   → 论文向量库 (ChromaDB ONNX, 章节感知 chunk)
   notes.db       → 科研笔记 (SQLite)
   memory.db      → 三元组 + 对话摘要 + 图片描述缓存
@@ -127,6 +132,8 @@ research_agent/
 ├── notes.py              # 科研笔记 (SQLite)
 ├── profile.py            # 用户画像 (Markdown)
 ├── memory.py             # 记忆模块 (三元组+摘要+图片缓存)
+├── llm_client.py         # 主模型并发/重试/端到端预算（不做模型降级）
+├── resilience.py         # 通用三态熔断器（closed/open/half_open）
 ├── config.py / config.yaml  # 统一配置
 ├── logger.py             # 结构化日志
 │
@@ -137,8 +144,9 @@ research_agent/
 │   └── profile_tool.py   # 画像更新
 │
 ├── research_agent.py     # 终端 CLI 入口
+├── session_store.py       # 会话目录、Token 统计与 checkpoint 联动删除
 ├── web_ui.py             # Web UI (Gradio 4 Tab)
-├── tests/test_core.py    # 13 个核心回归测试
+├── tests/test_core.py    # 23 个核心回归测试
 ├── .github/workflows/    # CI 自动测试
 │
 ├── 需求决策日志.md         # 功能需求与决策记录 (条目 001-025)

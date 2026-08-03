@@ -78,7 +78,9 @@ def search_arxiv(query: str, max_results: int = 5) -> str:
     return "\n".join(lines)
 
 
-def search_semantic_scholar(query: str, limit: int = 5) -> str:
+def search_semantic_scholar(
+    query: str, limit: int = 5, timeout: int | float | tuple[float, float] = 30,
+) -> str:
     """通过 Semantic Scholar API 搜索论文（免费，含引用数、PDF链接）"""
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     params = {
@@ -88,7 +90,7 @@ def search_semantic_scholar(query: str, limit: int = 5) -> str:
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=30)
+        resp = requests.get(url, params=params, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:

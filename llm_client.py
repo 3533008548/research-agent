@@ -1,0 +1,319 @@
+"""主模型调用的同模型韧性层：有界并发、重试、总截止时间与熔断。
+
+这个模块刻意不实现模型降级。发生故障时只会重试当前配置的模型，失败后把
+可操作错误交给上层 UI，而不会在用户不知情的情况下改变回答质量或成本。
+"""
+
+from __future__ import annotations
+
+import random
+import threading
+import time
+from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
+from typing import Callable
+
+import requests
+
+from resilience import CircuitBreaker
+
+
+class LLMClientError(RuntimeError):
+    """主模型请求未能在既定策略内完成。"""
+
+
+class LLMQueueFullError(LLMClientError):
+    pass
+
+
+class LLMCircuitOpenError(LLMClientError):
+    pass
+
+
+class LLMRequestTimeoutError(LLMClientError):
+    pass
+
+
+class LLMRequestFailedError(LLMClientError):
+    pass
+
+
+class _RetryableHTTPError(Exception):
+    def __init__(self, response: requests.Response):
+        self.response = response
+        self.status_code = response.status_code
+        try:
+            self.body = response.text[:200].replace("\n", " ")
+        except Exception:
+            self.body = ""
+        super().__init__(f"HTTP {self.status_code}")
+
+
+@dataclass
+class RequestBudget:
+    """一次模型调用的共享预算，覆盖排队、重试与流式正文。"""
+
+    deadline_at: float
+    max_retries: int
+    retries_used: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def remaining_seconds(self) -> float:
+        return self.deadline_at - time.monotonic()
+
+    def reserve_retry(self) -> bool:
+        """预留一次重试。HTTP 首包失败和 SSE 正文失败共用同一额度。"""
+        with self._lock:
+            if self.retries_used >= self.max_retries:
+                return False
+            self.retries_used += 1
+            return True
+
+
+class LLMClient:
+    """共享的主模型 HTTP 客户端，不改变模型，只管理失败和拥塞。"""
+
+    def __init__(
+        self,
+        api_key: str,
+        api_url: str,
+        *,
+        max_concurrency: int = 4,
+        queue_size: int = 20,
+        connect_timeout_seconds: float = 3.05,
+        read_timeout_seconds: float = 30,
+        request_deadline_seconds: float = 45,
+        max_retries: int = 2,
+        circuit_failure_threshold: int = 3,
+        circuit_recovery_seconds: int = 120,
+    ):
+        self.api_key = api_key
+        self.api_url = api_url
+        self.connect_timeout_seconds = connect_timeout_seconds
+        self.read_timeout_seconds = read_timeout_seconds
+        self.request_deadline_seconds = request_deadline_seconds
+        self.max_retries = max_retries
+        self._slots = threading.BoundedSemaphore(max_concurrency)
+        self._queue_size = queue_size
+        self._waiting = 0
+        self._lock = threading.RLock()
+        self._circuit = CircuitBreaker(
+            failure_threshold=circuit_failure_threshold,
+            recovery_seconds=circuit_recovery_seconds,
+        )
+
+    def post(
+        self,
+        payload: dict,
+        *,
+        stream: bool = False,
+        on_status: Callable[[str], None] | None = None,
+        budget: RequestBudget | None = None,
+    ) -> requests.Response:
+        """提交同模型请求。
+
+        ``budget`` 由同一轮模型调用的首包、流式正文和后续重放共享，因而不会因
+        排队或流式断开而重置总截止时间或重试计数。
+        """
+        budget = budget or self.new_request_budget()
+        if budget.remaining_seconds() <= 0:
+            raise LLMRequestTimeoutError("模型请求在总截止时间内未完成")
+        if not self._circuit.allow_request():
+            raise LLMCircuitOpenError(
+                "模型服务暂不可用，请稍后重试"
+                f"（约 {self._circuit.remaining_seconds()} 秒后恢复）"
+            )
+
+        try:
+            acquired = self._acquire_slot(on_status, budget)
+        except LLMQueueFullError:
+            self._circuit.release_probe()
+            raise
+        if not acquired:
+            self._circuit.release_probe()
+            raise LLMRequestTimeoutError("请求在排队期间超时，请稍后重试")
+
+        last_error: Exception | None = None
+        response: requests.Response | None = None
+        release_slot = True
+        try:
+            while True:
+                remaining = budget.remaining_seconds()
+                if remaining <= 0:
+                    break
+                if on_status:
+                    on_status(
+                        "🤖 正在请求模型..." if budget.retries_used == 0
+                        else f"🔄 模型请求重试 {budget.retries_used}/{budget.max_retries}..."
+                    )
+                try:
+                    response = requests.post(
+                        self.api_url,
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                        timeout=(
+                            min(self.connect_timeout_seconds, remaining),
+                            min(self.read_timeout_seconds, remaining),
+                        ),
+                        stream=stream,
+                    )
+                    if response.status_code == 429 or response.status_code >= 500:
+                        raise _RetryableHTTPError(response)
+                    response.raise_for_status()
+                    # 流式响应的 HTTP 200 只代表首包到达；必须读到 [DONE] 才能
+                    # 清除熔断失败计数，且并发槽要一直持有到正文消费结束。
+                    if stream:
+                        setattr(response, "_llm_stream_slot_owned", True)
+                        release_slot = False
+                    else:
+                        self._circuit.record_success()
+                    if on_status:
+                        on_status("🤖 模型响应中...")
+                    return response
+                except (_RetryableHTTPError, requests.Timeout, requests.ConnectionError) as exc:
+                    last_error = exc
+                    if isinstance(exc, _RetryableHTTPError):
+                        self._close_response(exc.response)
+                    if not budget.reserve_retry():
+                        break
+                    delay = self._retry_delay(exc, budget)
+                    if delay is None:
+                        break
+                    if on_status:
+                        on_status(f"⏳ 请求失败，{delay:.1f}s 后重试...")
+                    time.sleep(delay)
+                except requests.RequestException as exc:
+                    # 4xx（除 429）通常是鉴权、参数或请求格式问题，重试没有意义。
+                    self._circuit.record_failure()
+                    raise LLMRequestFailedError(self._format_request_error(exc)) from exc
+                except BaseException:
+                    # 状态回调取消等异常发生在已拿到 SSE 首包之后时，也必须归还槽位。
+                    if stream and not release_slot and response is not None:
+                        self.finish_stream(response, success=False)
+                    else:
+                        self._circuit.record_failure()
+                    raise
+
+            if last_error is None:
+                self._circuit.release_probe()
+                raise LLMRequestTimeoutError("模型请求在总截止时间内未完成")
+
+            self._circuit.record_failure()
+            if isinstance(last_error, (requests.Timeout, requests.ConnectionError)):
+                raise LLMRequestTimeoutError(
+                    "模型服务连接或响应超时；未切换模型，请稍后点击重试"
+                ) from last_error
+            raise LLMRequestFailedError(self._format_request_error(last_error)) from last_error
+        finally:
+            if release_slot:
+                self._slots.release()
+
+    def new_request_budget(self) -> RequestBudget:
+        """创建一次模型调用的端到端预算。"""
+        return RequestBudget(
+            deadline_at=time.monotonic() + self.request_deadline_seconds,
+            max_retries=self.max_retries,
+        )
+
+    def prepare_stream_read(
+        self, response: requests.Response, budget: RequestBudget
+    ) -> bool:
+        """在读取下一条 SSE 事件前收紧 socket 超时，避免正文越过总截止时间。"""
+        remaining = budget.remaining_seconds()
+        if remaining <= 0:
+            return False
+        timeout = max(0.001, min(self.read_timeout_seconds, remaining))
+        raw = getattr(response, "raw", None)
+        # requests / urllib3 在不同版本中的 socket 层级略有差异；找不到时仍保留
+        # requests.post 设置的初始读超时，下一次收到事件后会再次检查 deadline。
+        candidates = (
+            getattr(getattr(raw, "_connection", None), "sock", None),
+            getattr(
+                getattr(getattr(raw, "_fp", None), "fp", None), "raw", None
+            ),
+        )
+        for candidate in candidates:
+            sock = getattr(candidate, "_sock", candidate)
+            if hasattr(sock, "settimeout"):
+                try:
+                    sock.settimeout(timeout)
+                    break
+                except OSError:
+                    continue
+        return True
+
+    def finish_stream(self, response: requests.Response, *, success: bool) -> None:
+        """关闭 SSE 响应、释放并发槽，并在完整结束时才记录成功。"""
+        with self._lock:
+            if not getattr(response, "_llm_stream_slot_owned", False):
+                return
+            setattr(response, "_llm_stream_slot_owned", False)
+        try:
+            self._close_response(response)
+        finally:
+            self._slots.release()
+        if success:
+            self._circuit.record_success()
+        else:
+            self._circuit.record_failure()
+
+    def _acquire_slot(
+        self,
+        on_status: Callable[[str], None] | None,
+        budget: RequestBudget,
+    ) -> bool:
+        if self._slots.acquire(blocking=False):
+            return True
+        with self._lock:
+            if self._waiting >= self._queue_size:
+                raise LLMQueueFullError("模型请求过多，队列已满，请稍后再试")
+            self._waiting += 1
+            position = self._waiting
+        try:
+            if on_status:
+                on_status(f"⏳ 模型繁忙，正在排队（前方约 {position} 个请求）...")
+            return self._slots.acquire(timeout=max(0.0, budget.remaining_seconds()))
+        finally:
+            with self._lock:
+                self._waiting -= 1
+
+    def _retry_delay(self, error: Exception, budget: RequestBudget) -> float | None:
+        remaining = budget.remaining_seconds()
+        retry_after = self._retry_after_seconds(error)
+        # full jitter 防止同一时间失败的请求再次同时打到 API。
+        base_delay = retry_after if retry_after is not None else min(
+            4.0, 0.5 * (2 ** max(0, budget.retries_used - 1))
+        )
+        delay = max(0.0, base_delay + random.uniform(0, min(0.5, base_delay / 2)))
+        return delay if delay < remaining else None
+
+    @staticmethod
+    def _close_response(response: requests.Response) -> None:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _retry_after_seconds(error: Exception) -> float | None:
+        if not isinstance(error, _RetryableHTTPError) or error.response.status_code != 429:
+            return None
+        value = error.response.headers.get("Retry-After", "")
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                return max(0.0, (parsedate_to_datetime(value).timestamp() - time.time()))
+            except (TypeError, ValueError, IndexError):
+                return None
+
+    @staticmethod
+    def _format_request_error(error: Exception | None) -> str:
+        if isinstance(error, _RetryableHTTPError):
+            return f"模型 API 返回 {error.status_code}: {error.body or '服务暂不可用'}"
+        if error:
+            return f"模型请求失败: {type(error).__name__}: {error}"
+        return "模型请求在总截止时间内未完成"

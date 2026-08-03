@@ -23,10 +23,11 @@ from pathlib import Path
 
 # ── Windows GBK 兼容 ──
 if sys.platform == "win32":
-    try:
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -57,8 +58,12 @@ def build_ui():
     setup_logging(debug=args.debug)
     from config import Config
 
-    cli = {"model": args.model, "rag_enabled": not args.no_rag, "ui_debug": args.debug}
-    cfg = Config.load({k: v for k, v in cli.items() if v is not None and v is not False})
+    cli = {
+        "model": args.model,
+        "rag_enabled": False if args.no_rag else None,
+        "ui_debug": True if args.debug else None,
+    }
+    cfg = Config.load({k: v for k, v in cli.items() if v is not None})
 
     print(f"🤖 模型: {cfg.model}")
     agent = ResearchAgent(cfg=cfg)
@@ -68,12 +73,9 @@ def build_ui():
     from scheduler import Scheduler
     scheduler = Scheduler()
     import threading
-    import queue as _queue
 
-    # 后台搜索结果队列必须在线程启动前创建。
-    pending_messages = _queue.Queue()
     daily_lock = threading.Lock()
-    daily_results = []
+    daily_task = {"thread": None}
 
     def _format_daily_results(results: list[dict], heading: str) -> str:
         if not results:
@@ -88,31 +90,57 @@ def build_ui():
             lines.append(f"\n...及另外 {len(results)-5} 篇")
         return "\n".join(lines)
 
-    def _daily_search_bg():
-        nonlocal daily_results
-        if not daily_lock.acquire(blocking=False):
-            return
+    def _daily_search_bg(task_type: str, keyword: str | None = None):
+        """长时检索只在后台线程运行，完成后写入独立任务面板而非聊天记录。"""
+        worker = None
         try:
-            agent.token_usage["daily_progress"] = "📰 搜索中..."
-            # 先推送已有部分结果
-            today = scheduler.get_today_results()
-            if today:
-                daily_results = [("partial", today)]
-            results = scheduler.run_today(paper_store=agent.paper_store)
-            daily_results.append(("done", results))
-            agent.token_usage["daily_progress"] = scheduler.get_progress()
-            pending_messages.put(_format_daily_results(results, "**📰 每日论文速递**"))
-            agent.token_usage["daily_ready"] = True
+            worker = Scheduler(
+                scheduler.db_path,
+                request_timeout_seconds=cfg.daily_request_timeout_seconds,
+            )
+            agent.runtime_status["daily_progress"] = "📰 搜索中..."
+            if task_type == "retry":
+                results = worker.retry_today(paper_store=agent.paper_store)
+                heading = "**📰 每日检索结果（已重试）**"
+            elif task_type == "search":
+                results = worker.search(keyword or "")
+                heading = f"**🔍 临时检索结果 — {keyword}**"
+            else:
+                results = worker.run_today(paper_store=agent.paper_store)
+                heading = "**📰 每日论文速递**"
+            agent.runtime_status["daily_progress"] = worker.get_progress()
+            agent.runtime_status["daily_message"] = _format_daily_results(results, heading)
+            agent.runtime_status["daily_ready"] = True
         except Exception as e:
-            agent.token_usage["daily_progress"] = "⚠️ 每日检索失败"
-            pending_messages.put(f"⚠️ 每日检索失败: {type(e).__name__}: {e}")
-            agent.token_usage["daily_ready"] = True
+            agent.runtime_status["daily_progress"] = "⚠️ 每日检索失败"
+            agent.runtime_status["daily_message"] = (
+                f"⚠️ 每日检索失败: {type(e).__name__}: {e}"
+            )
+            agent.runtime_status["daily_ready"] = True
         finally:
-            pending_messages.put(None)
+            if worker:
+                worker.close()
             daily_lock.release()
 
-    if cfg.rag_enabled and cfg.daily_search_enabled:
-        threading.Thread(target=_daily_search_bg, daemon=True).start()
+    def _start_daily_task(task_type: str, keyword: str | None = None) -> bool:
+        if not daily_lock.acquire(blocking=False):
+            return False
+        agent.runtime_status["daily_ready"] = False
+        agent.runtime_status["daily_message"] = "📰 任务已开始，可继续使用其他功能。"
+        try:
+            worker = threading.Thread(
+                target=_daily_search_bg, args=(task_type, keyword), daemon=True,
+                name=f"daily-{task_type}",
+            )
+            daily_task["thread"] = worker
+            worker.start()
+            return True
+        except Exception:
+            daily_lock.release()
+            raise
+
+    if cfg.daily_search_enabled:
+        _start_daily_task("daily")
 
     # ── 帮助文本 ──
     HELP_TEXT = """
@@ -124,6 +152,7 @@ def build_ui():
 | `/model` | 模型、上下文、Token、RAG 状态 |
 | `/tokens` | Token 消耗 + 费用统计 |
 | `/new` | 开始新对话 |
+| `/retry` | 重新发送本次运行中最后一个模型请求 |
 | `/profile` | 查看用户画像 |
 
 **📚 论文 / 笔记**
@@ -163,18 +192,8 @@ def build_ui():
             cmd = f"describe_image {dest}"
         return cmd if not text else f"{cmd}\n{text}"
 
-    def chat_fn(message, history: list[list[str]]):
-        # 先弹出待处理的后台消息
-        try:
-            pm = pending_messages.get_nowait()
-            while pm is not None:
-                yield pm
-                pm = pending_messages.get_nowait()
-            agent.token_usage.pop("daily_ready", None)
-            agent.token_usage.pop("daily_progress", None)
-        except _queue.Empty:
-            pass
-
+    def chat_fn(message, history: list[list[str]], session_id: str):
+        session_id = session_id or agent.thread_id
         msg = ""
         # 处理多模态输入（文本+文件）
         files = []
@@ -215,13 +234,13 @@ def build_ui():
             # 处理冲突
             if dup_path and dup_path.name != fname:
                 yield f"⚠️ 文件内容与 `{dup_path.name}` 完全相同。回复「**保存**」继续上传或「**跳过**」取消。"
-                pending_conflicts[fpath] = {
+                pending_conflicts[(session_id, fpath)] = {
                     "dest": dest, "hash": file_hash, "existing": dup_path, "text": text,
                 }
                 return
             elif dest.exists():
                 yield f"⚠️ `{fname}` 已存在。回复「**覆盖**」替换或「**重命名**」自动改名。"
-                pending_conflicts[fpath] = {
+                pending_conflicts[(session_id, fpath)] = {
                     "dest": dest, "hash": file_hash, "existing": dest, "text": text,
                 }
                 return
@@ -233,7 +252,10 @@ def build_ui():
         # 检查是否有待处理的冲突回复
         msg = text.strip()
         if msg in ("覆盖", "重命名", "保存", "跳过") and pending_conflicts:
-            for fpath, info in list(pending_conflicts.items()):
+            for conflict_key, info in list(pending_conflicts.items()):
+                conflict_session_id, fpath = conflict_key
+                if conflict_session_id != session_id:
+                    continue
                 if msg == "覆盖":
                     shutil.copy(fpath, info["dest"])
                     text = _build_file_cmd(info["text"], info["dest"], info["dest"].suffix.lower())
@@ -247,23 +269,30 @@ def build_ui():
                     text = _build_file_cmd(info["text"], info["dest"], info["dest"].suffix.lower())
                 elif msg == "跳过":
                     yield "✅ 已跳过。"; return
-                pending_conflicts.pop(fpath)
+                pending_conflicts.pop(conflict_key)
                 break
 
         msg = text.strip()
 
         # ── 基础命令 ──
+        retry_request = None
+        if msg == "/retry":
+            retry_request = agent.get_retry_input(session_id)
+            if not retry_request:
+                yield "⚠️ 本次启动后没有可重试的模型请求，请重新发送问题。"; return
+            msg = retry_request["user_input"]
+
         if msg == "/help":
             yield HELP_TEXT; return
 
         if msg == "/model":
-            tu = agent.token_usage
+            tu = agent.get_usage(session_id)
             rag = f"{agent.paper_store.paper_count} 篇论文" if agent.paper_store else "未启用"
             yield f"**模型**: {agent.model}\n\n**Tokens**: {tu['total']:,} ({tu['calls']} 次调用)\n\n**RAG**: {rag}"
             return
 
         if msg == "/tokens":
-            tu = agent.token_usage
+            tu = agent.get_usage(session_id)
             accum = tu.get("cost", 0)
             last = tu.get("last_round_cost", 0)
             cached = tu.get("cached", 0)
@@ -291,8 +320,7 @@ def build_ui():
             yield "\n".join(lines); return
 
         if msg in ("/new", "/reset"):
-            agent.reset()
-            yield "✅ 已开始新对话。"; return
+            yield "请使用会话栏的「＋ 新建会话」按钮，新对话会显示在会话列表中。"; return
 
         if msg == "/profile":
             yield agent.profile.read(); return
@@ -313,14 +341,12 @@ def build_ui():
             kw = msg[13:].strip()
             if not kw:
                 yield "用法: /daily search <关键词>"; return
-            yield f"🔍 正在搜索: {kw}..."
-            try:
-                results = scheduler.search(kw)
-            except ValueError as e:
-                yield f"❌ {e}"; return
-            except Exception as e:
-                yield f"❌ 检索失败: {type(e).__name__}: {e}"; return
-            yield _format_daily_results(results, f"**🔍 临时检索结果 — {kw}**"); return
+            error = scheduler.validate_keyword(kw)
+            if error:
+                yield f"❌ {error}"; return
+            if not _start_daily_task("search", kw):
+                yield "📰 已有每日检索任务在运行，请等待它完成。"; return
+            yield "📰 临时检索已转入后台，可继续聊天；结果会显示在页面顶部的任务面板。"; return
 
         if msg.startswith("/daily add "):
             kw = msg[11:].strip()
@@ -346,19 +372,12 @@ def build_ui():
             yield "✅ 每日检索已启用。下次启动自动运行。"; return
 
         if msg == "/daily retry":
-            if not daily_lock.acquire(blocking=False):
-                yield "📰 每日检索正在进行，请稍后再试。"; return
-            yield "🔍 正在重新检索..."
-            try:
-                results = scheduler.retry_today(paper_store=agent.paper_store)
-            except Exception as e:
-                yield f"❌ 重新检索失败: {type(e).__name__}: {e}"; return
-            finally:
-                daily_lock.release()
-            yield _format_daily_results(results, "**📰 每日检索结果**"); return
+            if not _start_daily_task("retry"):
+                yield "📰 已有每日检索任务在运行，请等待它完成。"; return
+            yield "📰 重试任务已转入后台，可继续聊天；结果会显示在页面顶部的任务面板。"; return
 
         if msg == "/daily status":
-            progress = scheduler.get_progress()
+            progress = agent.runtime_status.get("daily_progress") or scheduler.get_progress()
             if progress:
                 yield progress; return
             yield "📰 每日检索未在运行。使用 /daily on 启用。"; return
@@ -409,15 +428,18 @@ def build_ui():
             yield "❌ 编号无效"; return
 
         # 正常对话（流式）
-        ctx = _build_context()
+        ctx = retry_request["context"] if retry_request else _build_context()
+        request_topic = retry_request["topic"] if retry_request else current_topic["name"]
         import queue, threading
         q = queue.Queue()
         final = []
         cancelled = [False]
 
         def _run():
-            r = agent.step(msg, context=ctx if ctx else None,
-                           on_token=lambda t: q.put(t))
+            r = agent.step(
+                msg, context=ctx if ctx else None, on_token=lambda t: q.put(t),
+                session_id=session_id, topic=request_topic,
+            )
             final.append(r)
             q.put(None)
 
@@ -528,8 +550,9 @@ def build_ui():
 
         return "\n".join(parts)
 
-    def refresh_status(history):
-        tu = agent.token_usage
+    def refresh_status(history, session_id: str | None = None):
+        session_id = session_id or agent.thread_id
+        tu = agent.get_usage(session_id)
         rag = f"{agent.paper_store.paper_count} 篇" if agent.paper_store else "关"
         last = tu.get("last_prompt", 0)
         limit = tu.get("context_limit", 131072)
@@ -538,15 +561,18 @@ def build_ui():
         bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
         vs = tu.get("verify_status", "")
         vs_str = f"**{vs}** | " if vs else ""
-        daily = tu.get("daily_progress", "")
+        api = tu.get("api_status", "")
+        api_str = f"**{api}** | " if api else ""
+        daily = agent.runtime_status.get("daily_progress", "")
         daily_str = f"**{daily}** | " if daily else ""
-        ready = tu.get("daily_ready", False)
+        ready = agent.runtime_status.get("daily_ready", False)
         ready_str = "**📰 结果就绪** | " if ready else ""
         bw = tu.get("budget_warning", "")
         bw_str = f"**{bw}** | " if bw else ""
         return (
             f"**模型**: {agent.model} | "
             f"**上下文**: `{bar}` {pct}% ({last:,}/{limit_k}) | "
+            f"{api_str}"
             f"{vs_str}"
             f"{daily_str}"
             f"{ready_str}"
@@ -554,6 +580,60 @@ def build_ui():
             f"**Tokens**: {tu['total']:,} | "
             f"**话题**: {current_topic['name']} | "
             f"**RAG**: {rag}"
+        )
+
+    def refresh_daily_panel() -> str:
+        """后台任务结果独立展示，避免被写入任意一个会话的聊天记录。"""
+        message = agent.runtime_status.get("daily_message", "")
+        progress = agent.runtime_status.get("daily_progress", "")
+        if message:
+            return f"### 📰 每日检索任务\n\n{message}\n\n{progress}"
+        return ""
+
+    def _session_choices():
+        return [
+            (f"{session['title']} · {session['updated_at'][:16]}", session["thread_id"])
+            for session in agent.list_sessions()
+        ]
+
+    def refresh_chat_ui(history, session_id: str):
+        """对话落库后刷新状态和首条消息自动生成的会话标题。"""
+        return (
+            refresh_status(history, session_id),
+            gr.update(choices=_session_choices(), value=session_id),
+        )
+
+    def new_session():
+        session = agent.create_session()
+        return (
+            gr.update(choices=_session_choices(), value=session["thread_id"]),
+            [],
+            session["thread_id"],
+            refresh_status([], session["thread_id"]),
+            gr.update(value=False),
+        )
+
+    def switch_session(session_id: str):
+        if not agent.sessions.get(session_id):
+            return [], agent.thread_id, refresh_status([], agent.thread_id)
+        return agent.get_history(session_id), session_id, refresh_status([], session_id)
+
+    def delete_current_session(session_id: str, confirmed: bool):
+        if not confirmed:
+            return (
+                gr.update(), gr.update(), gr.update(),
+                gr.update(value=False),
+                "⚠️ 请先勾选“确认永久删除当前会话”。",
+            )
+        agent.delete_session(session_id)
+        remaining = agent.list_sessions()
+        next_session_id = remaining[0]["thread_id"] if remaining else agent.thread_id
+        return (
+            gr.update(choices=_session_choices(), value=next_session_id),
+            agent.get_history(next_session_id),
+            next_session_id,
+            gr.update(value=False),
+            refresh_status([], next_session_id),
         )
 
     # ═══ 笔记面板函数 ═══
@@ -634,6 +714,8 @@ def build_ui():
     # ═══ 构建界面 ═══
 
     with gr.Blocks(title="🔬 Research Assistant") as demo:
+        # gr.State 是浏览器请求级状态，避免两个标签页切换到彼此的会话。
+        session_state = gr.State(value=agent.thread_id)
 
         gr.HTML(
             '<div class="main-header">'
@@ -642,12 +724,25 @@ def build_ui():
         )
 
         with gr.Row():
-            status = gr.Markdown(refresh_status([]), elem_classes=["status-bar"], scale=20)
+            status = gr.Markdown(refresh_status([], agent.thread_id), elem_classes=["status-bar"], scale=20)
             quit_btn = gr.Button("⏻ 退出", scale=1, size="sm", min_width=60, elem_classes=["quit-btn"])
+        daily_panel = gr.Markdown(refresh_daily_panel())
+        daily_timer = gr.Timer(value=1.0)
+        daily_timer.tick(fn=refresh_daily_panel, outputs=[daily_panel], show_progress="hidden")
 
         with gr.Tabs():
             # ── Tab 1: 对话 ──
             with gr.Tab("💬 对话"):
+                with gr.Row():
+                    session_picker = gr.Dropdown(
+                        label="会话", choices=_session_choices(), value=agent.thread_id,
+                        scale=5, interactive=True,
+                    )
+                    new_session_btn = gr.Button("＋ 新建会话", variant="primary", scale=1)
+                    delete_confirm = gr.Checkbox(
+                        label="确认永久删除当前会话", value=False, scale=2,
+                    )
+                    delete_session_btn = gr.Button("删除会话", variant="stop", scale=1)
                 # 拖拽覆盖层（拖文件时显示）
                 gr.HTML("""
                 <div id="drop-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;
@@ -663,7 +758,10 @@ def build_ui():
                 # 多模态输入框（📎 附件按钮）
                 chat = gr.ChatInterface(
                     fn=chat_fn,
-                    chatbot=gr.Chatbot(height=420, render_markdown=True),
+                    chatbot=gr.Chatbot(
+                        value=agent.get_history(agent.thread_id), height=420,
+                        render_markdown=True,
+                    ),
                     textbox=gr.MultimodalTextbox(
                         placeholder="输入问题或命令... 可拖拽/粘贴文件",
                         container=False, scale=7,
@@ -672,14 +770,25 @@ def build_ui():
                     ),
                     multimodal=True,
                     title=None, description=None,
-                    examples=[
-                        "搜索 diffusion model 在网络调度中的最新论文",
-                        "对比已读论文中的损失函数设计",
-                    ],
                     cache_examples=False,
+                    additional_inputs=[session_state],
                 )
                 chat.chatbot.change(
-                    fn=refresh_status, inputs=[chat.chatbot], outputs=[status],
+                    fn=refresh_chat_ui, inputs=[chat.chatbot, session_state],
+                    outputs=[status, session_picker],
+                )
+                session_picker.change(
+                    fn=switch_session, inputs=[session_picker],
+                    outputs=[chat.chatbot, session_state, status],
+                )
+                new_session_btn.click(
+                    fn=new_session,
+                    outputs=[session_picker, chat.chatbot, session_state, status, delete_confirm],
+                )
+                delete_session_btn.click(
+                    fn=delete_current_session,
+                    inputs=[session_state, delete_confirm],
+                    outputs=[session_picker, chat.chatbot, session_state, delete_confirm, status],
                 )
 
             # ── Tab 2: 论文库 ──

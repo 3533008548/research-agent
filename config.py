@@ -21,6 +21,16 @@ _DFLT = {
     "rag_enabled": True,
     "ui_port": 7860,
     "ui_debug": False,
+    "verify_timeout_seconds": 8,
+    "daily_request_timeout_seconds": 8,
+    "api_max_concurrency": 4,
+    "api_queue_size": 20,
+    "api_connect_timeout_seconds": 3.05,
+    "api_read_timeout_seconds": 30,
+    "api_request_deadline_seconds": 45,
+    "api_max_retries": 2,
+    "api_circuit_failure_threshold": 3,
+    "api_circuit_recovery_seconds": 120,
     "checkpoint_db": "checkpoint.db",
     "chroma_dir": "chroma_data",
     "papers_dir": "data/papers",
@@ -40,6 +50,16 @@ class Config:
     ui_port: int = 7860
     ui_debug: bool = False
     daily_search_enabled: bool = False
+    verify_timeout_seconds: int = 8
+    daily_request_timeout_seconds: int = 8
+    api_max_concurrency: int = 4
+    api_queue_size: int = 20
+    api_connect_timeout_seconds: float = 3.05
+    api_read_timeout_seconds: int = 30
+    api_request_deadline_seconds: int = 45
+    api_max_retries: int = 2
+    api_circuit_failure_threshold: int = 3
+    api_circuit_recovery_seconds: int = 120
 
     checkpoint_db: str = "checkpoint.db"
     chroma_dir: str = "chroma_data"
@@ -78,6 +98,23 @@ class Config:
                     cfg["ui_port"] = yaml_cfg["ui"].get("port", cfg["ui_port"])
                 if "daily_search" in yaml_cfg:
                     cfg["daily_search_enabled"] = yaml_cfg["daily_search"].get("enabled", False)
+                    cfg["daily_request_timeout_seconds"] = yaml_cfg["daily_search"].get(
+                        "request_timeout_seconds", cfg["daily_request_timeout_seconds"]
+                    )
+                if "agent" in yaml_cfg:
+                    cfg["verify_timeout_seconds"] = yaml_cfg["agent"].get(
+                        "verify_timeout_seconds", cfg["verify_timeout_seconds"]
+                    )
+                if "api_resilience" in yaml_cfg:
+                    settings = yaml_cfg["api_resilience"]
+                    for key in (
+                        "max_concurrency", "queue_size", "connect_timeout_seconds",
+                        "read_timeout_seconds", "request_deadline_seconds", "max_retries",
+                        "circuit_failure_threshold", "circuit_recovery_seconds",
+                    ):
+                        config_key = f"api_{key}"
+                        if key in settings:
+                            cfg[config_key] = settings[key]
         except Exception:
             pass
 
@@ -107,6 +144,16 @@ class Config:
             ui_port=cfg["ui_port"],
             ui_debug=cfg.get("ui_debug", False),
             daily_search_enabled=cfg.get("daily_search_enabled", False),
+            verify_timeout_seconds=max(3, int(cfg.get("verify_timeout_seconds", 8))),
+            daily_request_timeout_seconds=max(3, int(cfg.get("daily_request_timeout_seconds", 8))),
+            api_max_concurrency=max(1, int(cfg.get("api_max_concurrency", 4))),
+            api_queue_size=max(0, int(cfg.get("api_queue_size", 20))),
+            api_connect_timeout_seconds=max(1.0, float(cfg.get("api_connect_timeout_seconds", 3.05))),
+            api_read_timeout_seconds=max(3, int(cfg.get("api_read_timeout_seconds", 30))),
+            api_request_deadline_seconds=max(5, int(cfg.get("api_request_deadline_seconds", 45))),
+            api_max_retries=max(0, int(cfg.get("api_max_retries", 2))),
+            api_circuit_failure_threshold=max(1, int(cfg.get("api_circuit_failure_threshold", 3))),
+            api_circuit_recovery_seconds=max(10, int(cfg.get("api_circuit_recovery_seconds", 120))),
             checkpoint_db=cfg.get("checkpoint_db", "checkpoint.db"),
             chroma_dir=cfg.get("chroma_dir", "chroma_data"),
             papers_dir=cfg.get("papers_dir", "data/papers"),
