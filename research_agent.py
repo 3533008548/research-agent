@@ -22,6 +22,7 @@ if sys.platform == "win32":
 import json
 import argparse
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -335,7 +336,7 @@ def main():
         print("   或: $env:DEEPSEEK_API_KEY='sk-****'")
         sys.exit(1)
 
-    print(f"🤖 使用模型: {model}", file=sys.stderr)
+    print(f"🤖 使用模型: {cfg.model}", file=sys.stderr)
 
     try:
         agent = ResearchAgent(cfg=cfg)
@@ -414,11 +415,8 @@ def main():
                 continue
             old_model = agent.model
             try:
-                agent = ResearchAgent(
-                    model=new_model,
-                    api_key=agent.api_key,
-                    enable_rag=agent.paper_store is not None,
-                )
+                # 保留当前配置（密钥、RAG、数据目录等），仅替换模型。
+                agent = ResearchAgent(cfg=replace(agent.cfg, model=new_model))
                 print(f"\n✅ 已切换模型: {old_model} → {new_model}")
             except Exception as e:
                 print(f"\n❌ 切换失败: {e}")

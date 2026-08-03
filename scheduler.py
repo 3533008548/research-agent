@@ -28,6 +28,10 @@ class Scheduler:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_db()
 
+    def close(self):
+        """关闭数据库连接（用于应用退出和短生命周期任务）。"""
+        self._conn.close()
+
     def _init_db(self):
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS keywords (
@@ -187,6 +191,25 @@ class Scheduler:
                 self._conn.commit()
 
         return all_new[:max_new] if len(all_new) > max_new else all_new
+
+    def retry_today(self, paper_store=None, max_new: int = 5) -> list[dict]:
+        """清除今天的检索记录后重新执行，用于用户主动重试。"""
+        today = date.today().isoformat()
+        self._conn.execute(
+            "DELETE FROM searches WHERE searched_at LIKE ?", (f"{today}%",)
+        )
+        self._conn.execute(
+            "UPDATE keywords SET search_status='idle' WHERE active=1"
+        )
+        self._conn.commit()
+        return self.run_today(paper_store=paper_store, max_new=max_new)
+
+    def search(self, keyword: str, limit: int = 3) -> list[dict]:
+        """执行一次不写入每日记录的临时多源检索。"""
+        err = self.validate_keyword(keyword)
+        if err:
+            raise ValueError(err)
+        return self._search(keyword.strip(), limit=limit)
 
     def get_progress(self) -> str:
         """返回当前检索进度"""

@@ -122,6 +122,21 @@ class TestQueryPapers(unittest.TestCase):
 class TestVerifyNode(unittest.TestCase):
     """测试3: verify 节点边界不崩溃"""
 
+    class _FakeResponse:
+        """最小 requests.Response 替身，避免状态机测试访问 API。"""
+
+        status_code = 200
+        text = ""
+
+        def __init__(self, message: dict):
+            self._data = {"choices": [{"message": message}]}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._data
+
     def test_verify_skips_no_tools(self):
         """无工具调用时 verify 应跳过（返回空）"""
         # 用 Mock 模拟 LangGraph state
@@ -157,13 +172,49 @@ class TestVerifyNode(unittest.TestCase):
     def test_graph_builds_correctly(self):
         """图结构正常编译（不调用 API）"""
         from graph_builder import build_graph
-        app = build_graph(api_key="test-key", model="deepseek-chat")
-        nodes = list(app.get_graph().nodes.keys())
-        self.assertIn("llm", nodes)
-        self.assertIn("tools", nodes)
-        self.assertIn("verify", nodes)
-        self.assertIn("__start__", nodes)
-        self.assertIn("__end__", nodes)
+        app = build_graph(api_key="test-key", model="deepseek-chat", checkpoint_db=":memory:")
+        try:
+            nodes = list(app.get_graph().nodes.keys())
+            self.assertIn("llm", nodes)
+            self.assertIn("tools", nodes)
+            self.assertIn("verify", nodes)
+            self.assertIn("__start__", nodes)
+            self.assertIn("__end__", nodes)
+        finally:
+            app.checkpointer.conn.close()
+
+    def test_verify_clears_retry_metadata_after_success(self):
+        """修正后的回复通过验证后，不应把旧反馈带入下一轮对话。"""
+        from graph_builder import build_graph
+
+        responses = [
+            self._FakeResponse({
+                "content": None,
+                "tool_calls": [{
+                    "id": "tool-1", "type": "function",
+                    "function": {"name": "list_papers", "arguments": "{}"},
+                }],
+            }),
+            self._FakeResponse({"content": "这是一段超过一百字符的工具结果总结。" * 5}),
+            self._FakeResponse({"content": "OK"}),
+        ]
+        with patch("graph_builder.requests.post", side_effect=responses):
+            app = build_graph(api_key="test-key", checkpoint_db=":memory:")
+            try:
+                result = app.invoke({
+                    "messages": [{"role": "user", "content": "列出本地论文并总结"}],
+                    "metadata": {
+                        "verify_feedback": "旧反馈",
+                        "verify_count": 1,
+                        "verify_issues": "旧问题",
+                        "verify_history": {"minor_repeat": 1},
+                    },
+                }, config={"configurable": {"thread_id": "verify-cleanup"}})
+            finally:
+                app.checkpointer.conn.close()
+
+        self.assertEqual(result["metadata"], {})
+        self.assertIn("工具结果总结", result["messages"][-1]["content"])
 
     def test_tools_module_imports(self):
         """所有工具模块可正常导入"""
@@ -175,6 +226,27 @@ class TestVerifyNode(unittest.TestCase):
         self.assertTrue(callable(search_arxiv))
         self.assertTrue(callable(read_pdf_enhanced))
         self.assertTrue(callable(chunk_text))
+
+
+class TestScheduler(unittest.TestCase):
+    """每日检索的本地命令路径，不调用外部论文 API。"""
+
+    def test_retry_today_and_temporary_search(self):
+        from scheduler import Scheduler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                self.assertEqual(scheduler.add_keyword("TSN scheduling"), "✅ 已添加: TSN scheduling")
+                scheduler._search = lambda keyword, limit=3: [
+                    {"title": f"{keyword} paper", "source": "test"}
+                ]
+
+                self.assertEqual(scheduler.run_today()[0]["title"], "TSN scheduling paper")
+                self.assertEqual(scheduler.retry_today()[0]["title"], "TSN scheduling paper")
+                self.assertEqual(scheduler.search("Diffusion TSN")[0]["title"], "Diffusion TSN paper")
+            finally:
+                scheduler.close()
 
 
 if __name__ == "__main__":

@@ -26,10 +26,10 @@ from datetime import datetime
 try:
     import chromadb
     from chromadb.config import Settings as ChromaSettings
+    from chromadb.utils import embedding_functions
 except ImportError:
     chromadb = None
-
-from chromadb.utils import embedding_functions
+    embedding_functions = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -204,7 +204,7 @@ class PaperStore:
     COLLECTION_NAME = "papers"
 
     def __init__(self, persist_dir: str = "./chroma_data"):
-        if chromadb is None:
+        if chromadb is None or embedding_functions is None:
             raise ImportError(
                 "需要安装 chromadb:\n   pip install chromadb"
             )

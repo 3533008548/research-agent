@@ -45,7 +45,7 @@ def build_ui():
     parser = argparse.ArgumentParser(description="科研助手 Web UI")
     parser.add_argument(
         "-m", "--model",
-        default=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        default=None,
         help="模型名称",
     )
     parser.add_argument("--port", type=int, default=7860, help="端口号")
@@ -67,43 +67,52 @@ def build_ui():
     pending_conflicts = {}
     from scheduler import Scheduler
     scheduler = Scheduler()
-    # 启动时异步推送每日论文
     import threading
+    import queue as _queue
+
+    # 后台搜索结果队列必须在线程启动前创建。
+    pending_messages = _queue.Queue()
+    daily_lock = threading.Lock()
     daily_results = []
+
+    def _format_daily_results(results: list[dict], heading: str) -> str:
+        if not results:
+            return f"{heading}\n\n📭 未找到新论文。"
+        lines = [f"{heading}\n"]
+        diag = results[0].get("diagnostic", "")
+        if diag:
+            lines.append(f"({diag})\n")
+        for r in results[:5]:
+            lines.append(f"- {r['title'][:80]}  [{r.get('source', '')}]")
+        if len(results) > 5:
+            lines.append(f"\n...及另外 {len(results)-5} 篇")
+        return "\n".join(lines)
 
     def _daily_search_bg():
         nonlocal daily_results
-        agent.token_usage["daily_progress"] = "📰 搜索中..."
-        # 先推送已有部分结果
-        today = scheduler.get_today_results()
-        if today:
-            daily_results = [("partial", today)]
-        results = scheduler.run_today(paper_store=agent.paper_store)
-        daily_results.append(("done", results))
-        agent.token_usage["daily_progress"] = scheduler.get_progress()
-        # 推送结果到聊天
-        if results:
-            lines = ["**📰 每日论文速递**\n"]
-            diag = results[0].get("diagnostic", "")
-            if diag:
-                lines.append(f"({diag})\n")
-            for r in results[:5]:
-                src = r.get("source", "")
-                lines.append(f"- {r['title'][:80]}  [{src}]")
-            if len(results) > 5:
-                lines.append(f"\n...及另外 {len(results)-5} 篇")
-            pending_messages.put("\n".join(lines))
+        if not daily_lock.acquire(blocking=False):
+            return
+        try:
+            agent.token_usage["daily_progress"] = "📰 搜索中..."
+            # 先推送已有部分结果
+            today = scheduler.get_today_results()
+            if today:
+                daily_results = [("partial", today)]
+            results = scheduler.run_today(paper_store=agent.paper_store)
+            daily_results.append(("done", results))
+            agent.token_usage["daily_progress"] = scheduler.get_progress()
+            pending_messages.put(_format_daily_results(results, "**📰 每日论文速递**"))
             agent.token_usage["daily_ready"] = True
-        else:
-            pending_messages.put("📰 每日检索完成，今日无新论文。")
+        except Exception as e:
+            agent.token_usage["daily_progress"] = "⚠️ 每日检索失败"
+            pending_messages.put(f"⚠️ 每日检索失败: {type(e).__name__}: {e}")
             agent.token_usage["daily_ready"] = True
-        pending_messages.put(None)
+        finally:
+            pending_messages.put(None)
+            daily_lock.release()
+
     if cfg.rag_enabled and cfg.daily_search_enabled:
         threading.Thread(target=_daily_search_bg, daemon=True).start()
-
-    # 后台搜索结果队列（线程安全）
-    import queue as _queue
-    pending_messages = _queue.Queue()
 
     # ── 帮助文本 ──
     HELP_TEXT = """
@@ -132,6 +141,7 @@ def build_ui():
 | 命令 | 说明 |
 |------|------|
 | `/daily` | 今日检索结果 |
+| `/daily search <词>` | 立即进行一次临时检索 |
 | `/daily on` | 启用每日检索 |
 | `/daily off` | 暂停每日检索 |
 | `/daily add <词>` | 添加关键词 (支持 AND) |
@@ -205,11 +215,15 @@ def build_ui():
             # 处理冲突
             if dup_path and dup_path.name != fname:
                 yield f"⚠️ 文件内容与 `{dup_path.name}` 完全相同。回复「**保存**」继续上传或「**跳过**」取消。"
-                pending_conflicts[fpath] = {"dest": dest, "hash": file_hash, "existing": dup_path}
+                pending_conflicts[fpath] = {
+                    "dest": dest, "hash": file_hash, "existing": dup_path, "text": text,
+                }
                 return
             elif dest.exists():
                 yield f"⚠️ `{fname}` 已存在。回复「**覆盖**」替换或「**重命名**」自动改名。"
-                pending_conflicts[fpath] = {"dest": dest, "hash": file_hash, "existing": dest}
+                pending_conflicts[fpath] = {
+                    "dest": dest, "hash": file_hash, "existing": dest, "text": text,
+                }
                 return
 
             # 无冲突 → 直接保存
@@ -217,19 +231,20 @@ def build_ui():
             text = _build_file_cmd(text, dest, ext)
 
         # 检查是否有待处理的冲突回复
+        msg = text.strip()
         if msg in ("覆盖", "重命名", "保存", "跳过") and pending_conflicts:
             for fpath, info in list(pending_conflicts.items()):
                 if msg == "覆盖":
                     shutil.copy(fpath, info["dest"])
-                    text = _build_file_cmd(text, info["dest"], info["dest"].suffix.lower())
+                    text = _build_file_cmd(info["text"], info["dest"], info["dest"].suffix.lower())
                 elif msg == "重命名":
                     new_name = f"{info['dest'].stem}_1{info['dest'].suffix}"
                     new_dest = info["dest"].parent / new_name
                     shutil.copy(fpath, new_dest)
-                    text = _build_file_cmd(text, new_dest, new_dest.suffix.lower())
+                    text = _build_file_cmd(info["text"], new_dest, new_dest.suffix.lower())
                 elif msg == "保存":
                     shutil.copy(fpath, info["dest"])
-                    text = _build_file_cmd(text, info["dest"], info["dest"].suffix.lower())
+                    text = _build_file_cmd(info["text"], info["dest"], info["dest"].suffix.lower())
                 elif msg == "跳过":
                     yield "✅ 已跳过。"; return
                 pending_conflicts.pop(fpath)
@@ -298,7 +313,14 @@ def build_ui():
             kw = msg[13:].strip()
             if not kw:
                 yield "用法: /daily search <关键词>"; return
-            yield f"🔍 正在搜索: {kw}..."; return
+            yield f"🔍 正在搜索: {kw}..."
+            try:
+                results = scheduler.search(kw)
+            except ValueError as e:
+                yield f"❌ {e}"; return
+            except Exception as e:
+                yield f"❌ 检索失败: {type(e).__name__}: {e}"; return
+            yield _format_daily_results(results, f"**🔍 临时检索结果 — {kw}**"); return
 
         if msg.startswith("/daily add "):
             kw = msg[11:].strip()
@@ -324,7 +346,16 @@ def build_ui():
             yield "✅ 每日检索已启用。下次启动自动运行。"; return
 
         if msg == "/daily retry":
-            yield "🔍 正在重新检索..."; return
+            if not daily_lock.acquire(blocking=False):
+                yield "📰 每日检索正在进行，请稍后再试。"; return
+            yield "🔍 正在重新检索..."
+            try:
+                results = scheduler.retry_today(paper_store=agent.paper_store)
+            except Exception as e:
+                yield f"❌ 重新检索失败: {type(e).__name__}: {e}"; return
+            finally:
+                daily_lock.release()
+            yield _format_daily_results(results, "**📰 每日检索结果**"); return
 
         if msg == "/daily status":
             progress = scheduler.get_progress()
@@ -592,10 +623,9 @@ def build_ui():
         import yaml
         cfg = load_config()
         cfg["model"] = model
-        cfg["rag"]["enabled"] = rag_enabled
-        cfg["pdf"]["max_pages"] = int(max_pages)
-        if "daily_search" not in cfg:
-            cfg["daily_search"] = {}
+        cfg.setdefault("rag", {})["enabled"] = rag_enabled
+        cfg.setdefault("pdf", {})["max_pages"] = int(max_pages)
+        cfg.setdefault("daily_search", {})
         cfg["daily_search"]["enabled"] = daily_enabled_val
         with open("config.yaml", "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)

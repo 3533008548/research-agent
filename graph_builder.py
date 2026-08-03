@@ -247,28 +247,39 @@ def build_graph(
 
     def verify_node(state: AgentState) -> dict:
         messages = state.get("messages", [])
+        metadata = state.get("metadata") or {}
+
+        def _complete_verification() -> dict:
+            """结束本轮验证时清除只对重试有效的状态。"""
+            cleaned = dict(metadata)
+            for key in (
+                "verify_feedback", "verify_count", "verify_issues", "verify_history",
+            ):
+                cleaned.pop(key, None)
+            return {"metadata": cleaned} if cleaned != metadata else {}
+
         if not messages:
-            return {}
+            return _complete_verification()
         last_msg = messages[-1]
         content = last_msg.get("content", "")
         if not content:
-            return {}
+            return _complete_verification()
         recent = list(messages[-8:])
         has_tools = any(m.get("role") == "tool" for m in recent)
 
         # ── 第1层：跳过门控 ──
         if not has_tools:
-            return {}
+            return _complete_verification()
         # 短回复跳过（无事实可查）
         if len(content) < 100:
-            return {}
+            return _complete_verification()
         # 主观问题跳过
         user_q = ""
         for m in reversed(messages):
             if m.get("role") == "user" and "[系统验证" not in m.get("content", ""):
                 user_q = m.get("content", ""); break
         if _is_subjective_question(user_q):
-            return {}
+            return _complete_verification()
 
         # ── 状态提示 ──
         retry_n = state.get("metadata", {}).get("verify_count", 0)
@@ -342,7 +353,7 @@ def build_graph(
             if token_usage:
                 token_usage["verify_status"] = "⚠️ 验证跳过（API 失败）"
             print(f"      ⚠ verify API 失败: {e}", file=sys.stderr)
-            return {}
+            return _complete_verification()
         if "usage" in resp.json() and token_usage:
             vu = resp.json()["usage"]
             for k in ("prompt", "completion", "total"):
@@ -388,7 +399,7 @@ def build_graph(
                     token_usage["budget_warning"] = "⚠️ 上下文 90%+，建议 /new"
                 elif pct_ctx > 0.6 and token_usage:
                     token_usage["budget_warning"] = f"📊 上下文 {int(pct_ctx*100)}%"
-            return {}
+            return _complete_verification()
 
         # ── 分级处理 ──
         severe, minor = _parse_issues(result)
@@ -408,15 +419,21 @@ def build_graph(
         if not need_regenerate and minor:
             # 仅追加提示，不重生成
             note = "\n\n⚠️ 注: " + "; ".join(minor[:2])
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "assistant" and messages[i].get("content"):
-                    messages[i] = dict(messages[i], content=messages[i]["content"] + note)
-                    break
             if token_usage:
                 token_usage.pop("verify_status", None)
-            return {}
+            update = _complete_verification()
+            update["messages"] = [{"role": "assistant", "content": content + note}]
+            return update
 
         # ── 需要重生成 ──
+        if count >= 3:
+            if token_usage:
+                token_usage.pop("verify_status", None)
+            warning = f"⚠️ 以下回答未通过自动验证，可能存在以下问题:\n{result}\n\n---\n"
+            update = _complete_verification()
+            update["messages"] = [{"role": "assistant", "content": warning + content}]
+            return update
+
         feedback = f"[系统验证] 上一轮回答存在以下问题:\n{result}\n\n请修正后重新回答。用户的问题是:\n{user_q[:500]}"
         print(f"      🔍 验证不合格 (第{count}次, {'严重' if severe else '轻微'}) → 反馈 LLM", file=sys.stderr)
         return {"metadata": {
@@ -430,18 +447,6 @@ def build_graph(
 
     def verify_router(state: AgentState) -> str:
         md = state.get("metadata", {})
-        count = md.get("verify_count", 0)
-        if count >= 3:
-            issues = md.get("verify_issues", "")
-            msgs = state.get("messages", [])
-            for i in range(len(msgs) - 1, -1, -1):
-                if msgs[i].get("role") == "assistant" and msgs[i].get("content"):
-                    warning = f"⚠️ 以下回答未通过自动验证，可能存在以下问题:\n{issues}\n\n---\n"
-                    msgs[i] = dict(msgs[i], content=warning + msgs[i]["content"])
-                    break
-            if token_usage:
-                token_usage.pop("verify_status", None)
-            return END
         if md.get("verify_feedback"):
             return "llm"
         return END
