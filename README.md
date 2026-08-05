@@ -58,7 +58,55 @@ python web_ui.py -m deepseek-chat --port 8080
 
 终端版：`python research_agent.py`
 
-不传 `-m` 时，Web UI 和 CLI 都遵循统一配置优先级：命令行 > 环境变量 > `config.yaml` > 默认值。
+不传 `-m` 时，Web UI 和 CLI 都遵循统一配置优先级：命令行 > 环境变量 > `runtime/primary/settings.json` > `config.yaml` > 默认值。
+
+### 运行时数据目录
+
+代码、静态配置和用户数据相互隔离。默认数据目录为项目下的 `runtime/`，也可通过环境变量或启动参数改为其他位置：
+
+```bash
+APP_DATA_DIR=/path/to/research-agent-data python web_ui.py
+python web_ui.py --data-dir ./runtime
+```
+
+`runtime/primary/` 保存 SQLite、论文 PDF、用户画像与设置；`runtime/derived/` 保存可由原始数据重建的 Chroma 索引和 PDF 图片。旧版根目录数据不会自动移动，可先预览再迁移：
+
+```bash
+python scripts/migrate_runtime.py
+python scripts/migrate_runtime.py --apply
+python scripts/backup_runtime.py --output backups/
+```
+
+### Docker Compose 部署
+
+Docker Desktop 启动后，先根据示例创建本地密钥文件，再构建并启动服务：
+
+```powershell
+Copy-Item .env.example .env
+# 编辑 .env，填入 DEEPSEEK_API_KEY
+docker compose up --build -d
+```
+
+镜像以非 root 用户运行，并已为 Chroma/ONNX 等运行时依赖配置独立的可写缓存目录；首次构建向量索引时会下载所需模型文件，耗时会略长于后续启动。下载或初始化超过 8 秒时，`query_papers` 会立即改用本地关键词候选并让语义索引继续在后台完成，避免聊天页面一直等待；该缓存位于 `runtime/derived/`，重建容器后仍会保留。
+
+浏览器访问 `http://localhost:7860`。所有会话、论文、用户画像和设置都会写入宿主机的 `runtime/`，因此可安全执行 `docker compose down` 或升级镜像而不丢失数据。常用运维命令：
+
+```powershell
+docker compose logs -f
+docker compose ps
+docker compose down             # 仅停止并删除容器，不删除 runtime 数据
+docker compose up -d --build    # 代码更新后重建并启动
+```
+
+若需改宿主机端口，在 `.env` 设置 `UI_PORT=8080`，随后访问 `http://localhost:8080`。`.env` 不会被复制到镜像或提交到 Git。
+
+若构建阶段无法访问 Docker Hub（如 `auth.docker.io:443` 超时），这属于网络或 Docker Desktop 代理问题，而非项目依赖问题。优先在 Docker Desktop 的 **Settings → Resources → Proxies** 配置当前网络可用的 HTTP/HTTPS 代理；也可以在 `.env` 设置可访问镜像仓库中的 Python 3.11-slim 地址，例如：
+
+```env
+PYTHON_IMAGE=<你的镜像仓库>/library/python:3.11-slim
+```
+
+保存后重新执行 `docker compose up --build -d`。该变量只替换基础镜像来源，不影响应用镜像名称和 `runtime/` 数据卷。
 
 ---
 
@@ -95,7 +143,7 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 python tests/test_core.py
 ```
 
-当前有 23 个核心回归测试，覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日检索重试与临时检索、多会话隔离和硬删除，以及三源限时并行、verify 熔断、同模型重试、端到端截止时间、半开熔断和流式中断恢复。CI 在 GitHub Actions 中自动运行该命令。
+当前有 26 个核心回归测试，覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日检索重试与临时检索、多会话隔离和硬删除、统一数据目录、无损迁移与 ZIP 备份，以及三源限时并行、verify 熔断、同模型重试、端到端截止时间、半开熔断和流式中断恢复。CI 在 GitHub Actions 中自动运行该命令。
 
 ---
 
@@ -107,13 +155,13 @@ LangGraph ReAct 循环 (graph_builder.py)
 
 Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过或达到重试上限后自动清理，避免影响后续对话。
 
-存储层:
-  checkpoint.db  → LangGraph 对话历史 + 会话目录 + 每会话 Token 统计 (SQLite, 自动剪裁)
-  chroma_data/   → 论文向量库 (ChromaDB ONNX, 章节感知 chunk)
-  notes.db       → 科研笔记 (SQLite)
-  memory.db      → 三元组 + 对话摘要 + 图片描述缓存
-  daily.db       → 每日检索记录 (SQLite)
-  profile.md     → 用户画像 (Markdown, 人+Agent 共维护)
+运行时数据层（APP_DATA_DIR，默认 ./runtime）:
+  primary/db/          → checkpoint、notes、memory、daily SQLite 数据
+  primary/papers/      → 原始论文 PDF
+  primary/profile.md   → 用户画像
+  primary/settings.json→ Web UI 用户设置
+  derived/chroma/      → 论文向量库（可重建）
+  derived/images/      → PDF 提取图片与图注（可重建）
 ```
 
 ---
@@ -134,6 +182,7 @@ research_agent/
 ├── memory.py             # 记忆模块 (三元组+摘要+图片缓存)
 ├── llm_client.py         # 主模型并发/重试/端到端预算（不做模型降级）
 ├── resilience.py         # 通用三态熔断器（closed/open/half_open）
+├── runtime_paths.py       # 运行时数据边界、版本与用户设置
 ├── config.py / config.yaml  # 统一配置
 ├── logger.py             # 结构化日志
 │
@@ -146,7 +195,8 @@ research_agent/
 ├── research_agent.py     # 终端 CLI 入口
 ├── session_store.py       # 会话目录、Token 统计与 checkpoint 联动删除
 ├── web_ui.py             # Web UI (Gradio 4 Tab)
-├── tests/test_core.py    # 23 个核心回归测试
+├── scripts/              # 旧数据迁移与运行时备份
+├── tests/test_core.py    # 26 个核心回归测试
 ├── .github/workflows/    # CI 自动测试
 │
 ├── 需求决策日志.md         # 功能需求与决策记录 (条目 001-025)

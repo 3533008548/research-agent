@@ -85,7 +85,7 @@ class ResearchAgent:
             )
 
         # 用户画像
-        self.profile = ProfileManager()
+        self.profile = ProfileManager(cfg.profile_path)
         print(f"      👤 用户画像: {self.profile.summary() or '待完善'}", file=sys.stderr)
 
         # 每个会话各自保存 Token 统计；请求内新建图实例，避免流式回调跨会话串线。
@@ -110,7 +110,7 @@ class ResearchAgent:
 
         # 记忆模块
         from memory import MemoryStore
-        self.memory = MemoryStore()
+        self.memory = MemoryStore(cfg.memory_db)
 
         # RAG 论文库
         if cfg.rag_enabled:
@@ -431,7 +431,7 @@ def print_help():
 📖 **命令列表**
 
   /help            显示此帮助
-  /new             开始新对话（旧对话保留在 checkpoint.db）
+  /new             开始新对话（旧对话保留在运行时数据目录）
   /papers          列出已下载论文
   /indexed         列出已索引论文（RAG库）
   /model           显示当前模型和 RAG 状态
@@ -447,9 +447,9 @@ def print_help():
   >>> "这3篇的共同趋势是什么？"        ← 跨论文分析
 
 📦 **数据存储**
-  data/papers/     PDF 缓存
-  chroma_data/     RAG 向量库（持久化）
-  checkpoint.db    对话历史（SQLite，重启不丢）
+  runtime/primary/papers/  PDF 缓存
+  runtime/derived/chroma/  RAG 向量库（可重建）
+  runtime/primary/db/      对话、笔记、记忆和每日检索数据
 """
     print(msg)
 
@@ -459,6 +459,7 @@ def main():
     parser.add_argument("-m", "--model", default=None, help="模型名称")
     parser.add_argument("--no-rag", action="store_true", help="禁用 RAG")
     parser.add_argument("--debug", action="store_true", help="DEBUG 日志")
+    parser.add_argument("--data-dir", default=None, help="运行时数据目录（默认: APP_DATA_DIR 或 runtime）")
     args = parser.parse_args()
 
     from config import Config
@@ -469,6 +470,7 @@ def main():
         "model": args.model,
         "rag_enabled": False if args.no_rag else None,
         "ui_debug": True if args.debug else None,
+        "data_dir": args.data_dir,
     }
     cfg = Config.load({k: v for k, v in cli.items() if v is not None})
 

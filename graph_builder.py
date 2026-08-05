@@ -38,6 +38,57 @@ class AgentState(TypedDict):
     metadata: dict
 
 
+def sanitize_model_messages(messages: list[dict]) -> list[dict]:
+    """Return a payload-safe history without mutating persisted checkpoints."""
+    result_ids = {
+        message.get("tool_call_id")
+        for message in messages
+        if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str)
+    }
+    usable_tool_ids: set[str] = set()
+    sanitized: list[dict] = []
+
+    for raw_message in messages:
+        if not isinstance(raw_message, dict):
+            continue
+        message = dict(raw_message)
+        role = message.get("role")
+
+        if role == "assistant":
+            calls = [
+                call for call in (message.get("tool_calls") or [])
+                if isinstance(call, dict)
+                and isinstance(call.get("id"), str)
+                and call["id"] in result_ids
+                and isinstance(call.get("function"), dict)
+                and call["function"].get("name")
+            ]
+            if calls:
+                message["tool_calls"] = calls
+                usable_tool_ids.update(call["id"] for call in calls)
+            else:
+                message.pop("tool_calls", None)
+
+            # DeepSeek requires an assistant message to have content or tool_calls.
+            if message.get("content") in (None, "") and not calls:
+                continue
+            sanitized.append(message)
+            continue
+
+        if role == "tool":
+            if message.get("tool_call_id") not in usable_tool_ids:
+                continue
+            if message.get("content") is None:
+                message["content"] = ""
+            sanitized.append(message)
+            continue
+
+        if role in {"system", "user"} and message.get("content") not in (None, ""):
+            sanitized.append(message)
+
+    return sanitized
+
+
 # ═══════════════════════════════════════════════════════════════
 #  build_graph
 # ═══════════════════════════════════════════════════════════════
@@ -48,7 +99,7 @@ def build_graph(
     model: str = "deepseek-chat",
     paper_store = None,
     token_usage: dict = None,
-    checkpoint_db: str = "checkpoint.db",
+    checkpoint_db: str | None = None,
     glm_api_key: str = "",
     stream_callback = None,
     profile_manager = None,
@@ -57,12 +108,15 @@ def build_graph(
     verify_guard = None,
     llm_client = None,
 ):
+    if checkpoint_db is None:
+        from runtime_paths import get_runtime_paths
+        checkpoint_db = str(get_runtime_paths().checkpoint_db)
     tool_schemas = get_tool_schemas()
 
     # ═══ LLM 节点 ═══
 
     def llm_node(state: AgentState) -> dict:
-        messages = list(state.get("messages", []))
+        messages = sanitize_model_messages(list(state.get("messages", [])))
 
         # 清理孤儿 tool_calls
         valid_ids = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}

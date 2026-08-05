@@ -50,6 +50,12 @@ def build_ui():
         help="模型名称",
     )
     parser.add_argument("--port", type=int, default=7860, help="端口号")
+    parser.add_argument(
+        "--host",
+        default=os.getenv("UI_HOST", "127.0.0.1"),
+        help="监听地址（Docker 中使用 0.0.0.0）",
+    )
+    parser.add_argument("--data-dir", default=None, help="运行时数据目录（默认: APP_DATA_DIR 或 runtime）")
     parser.add_argument("--no-rag", action="store_true", help="禁用 RAG")
     parser.add_argument("--debug", action="store_true", help="DEBUG 日志")
     args = parser.parse_args()
@@ -62,16 +68,19 @@ def build_ui():
         "model": args.model,
         "rag_enabled": False if args.no_rag else None,
         "ui_debug": True if args.debug else None,
+        "data_dir": args.data_dir,
     }
     cfg = Config.load({k: v for k, v in cli.items() if v is not None})
 
     print(f"🤖 模型: {cfg.model}")
     agent = ResearchAgent(cfg=cfg)
-    notes = NoteStore()
+    notes = NoteStore(cfg.notes_db)
     current_topic = {"name": "默认"}
     pending_conflicts = {}
     from scheduler import Scheduler
-    scheduler = Scheduler()
+    scheduler = Scheduler(
+        cfg.daily_db, request_timeout_seconds=cfg.daily_request_timeout_seconds,
+    )
     import threading
 
     daily_lock = threading.Lock()
@@ -193,7 +202,11 @@ def build_ui():
         return cmd if not text else f"{cmd}\n{text}"
 
     def chat_fn(message, history: list[list[str]], session_id: str):
-        session_id = session_id or agent.thread_id
+        # Web 请求必须携带浏览器级 session_state。不能回退到 agent.thread_id，
+        # 否则状态更新乱序时可能把消息写入另一个会话。
+        if not session_id or not agent.sessions.get(session_id):
+            yield "⚠️ 会话已失效，请重新选择或新建会话。"
+            return
         msg = ""
         # 处理多模态输入（文本+文件）
         files = []
@@ -217,9 +230,8 @@ def build_ui():
 
             # 内容 hash
             file_hash = hashlib.md5(Path(fpath).read_bytes()).hexdigest()
-            base_dir = Path("data/papers") if ext == ".pdf" else Path("data/papers/images")
-            base_dir.mkdir(parents=True, exist_ok=True)
-            dest = base_dir / fname
+            base_dir = Path(cfg.papers_dir) if ext == ".pdf" else Path(cfg.images_dir)
+            dest = cfg.runtime_paths.safe_child(base_dir, fname)
 
             # 检查内容重复
             dup_path = None
@@ -363,12 +375,7 @@ def build_ui():
             yield "\n".join(lines); return
 
         if msg in ("/daily on", "/daily start"):
-            cfg = load_config()
-            if "daily_search" not in cfg: cfg["daily_search"] = {}
-            cfg["daily_search"]["enabled"] = True
-            import yaml
-            with open("config.yaml", "w", encoding="utf-8") as f:
-                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            cfg.runtime_paths.update_settings({"daily_search_enabled": True})
             yield "✅ 每日检索已启用。下次启动自动运行。"; return
 
         if msg == "/daily retry":
@@ -383,12 +390,7 @@ def build_ui():
             yield "📰 每日检索未在运行。使用 /daily on 启用。"; return
 
         if msg in ("/daily off", "/daily stop"):
-            cfg = load_config()
-            if "daily_search" not in cfg: cfg["daily_search"] = {}
-            cfg["daily_search"]["enabled"] = False
-            import yaml
-            with open("config.yaml", "w", encoding="utf-8") as f:
-                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            cfg.runtime_paths.update_settings({"daily_search_enabled": False})
             yield "⏸ 每日检索已暂停。"; return
 
         if msg.startswith("/daily want "):
@@ -436,31 +438,41 @@ def build_ui():
         cancelled = [False]
 
         def _run():
-            r = agent.step(
-                msg, context=ctx if ctx else None, on_token=lambda t: q.put(t),
-                session_id=session_id, topic=request_topic,
-            )
-            final.append(r)
-            q.put(None)
+            try:
+                r = agent.step(
+                    msg, context=ctx if ctx else None,
+                    on_token=lambda token: q.put(("token", token)),
+                    session_id=session_id, topic=request_topic,
+                )
+            except BaseException as exc:
+                r = f"❌ 后台请求异常: {type(exc).__name__}: {exc}"
+            finally:
+                final.append(r)
+                q.put(("done", None))
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
 
-        partial = ""
+        partial = "⏳ 正在处理请求…"
+        received_model_token = False
+        yield partial
         try:
             while True:
                 try:
-                    token = q.get(timeout=0.1)
+                    event, value = q.get(timeout=0.1)
                 except queue.Empty:
-                    yield partial  # keep-alive, no change
+                    yield partial
                     continue
-                if token is None:
+                if event == "done":
                     break
-                partial += token
+                if not received_model_token:
+                    partial = ""
+                    received_model_token = True
+                partial += value
                 yield partial
         except GeneratorExit:
             cancelled[0] = True
-            q.put(None)  # unblock thread
+            q.put(("done", None))  # unblock thread
             return
         yield re.sub(r'(?<!\$)\$([^\$]*[\\_^][^\$]*)\$(?!\$)', r'$$\1$$', final[0])
 
@@ -596,15 +608,14 @@ def build_ui():
             for session in agent.list_sessions()
         ]
 
-    def refresh_chat_ui(history, session_id: str):
-        """对话落库后刷新状态和首条消息自动生成的会话标题。"""
-        return (
-            refresh_status(history, session_id),
-            gr.update(choices=_session_choices(), value=session_id),
-        )
+    def refresh_chat_status(history, session_id: str):
+        """聊天框变化后只刷新状态，避免程序化 change 反向切换会话。"""
+        return refresh_status(history, session_id)
 
     def new_session():
         session = agent.create_session()
+        # 同步 CLI 兼容默认值；Web 正常请求仍使用显式 session_state。
+        agent.select_session(session["thread_id"])
         return (
             gr.update(choices=_session_choices(), value=session["thread_id"]),
             [],
@@ -616,6 +627,7 @@ def build_ui():
     def switch_session(session_id: str):
         if not agent.sessions.get(session_id):
             return [], agent.thread_id, refresh_status([], agent.thread_id)
+        agent.select_session(session_id)
         return agent.get_history(session_id), session_id, refresh_status([], session_id)
 
     def delete_current_session(session_id: str, confirmed: bool):
@@ -691,25 +703,14 @@ def build_ui():
 
     # ═══ 设置函数 ───
 
-    def load_config():
-        import yaml
-        try:
-            with open("config.yaml", encoding="utf-8") as f:
-                return yaml.safe_load(f)
-        except Exception:
-            return {}
-
     def save_config(model, rag_enabled, max_pages, daily_enabled_val):
-        import yaml
-        cfg = load_config()
-        cfg["model"] = model
-        cfg.setdefault("rag", {})["enabled"] = rag_enabled
-        cfg.setdefault("pdf", {})["max_pages"] = int(max_pages)
-        cfg.setdefault("daily_search", {})
-        cfg["daily_search"]["enabled"] = daily_enabled_val
-        with open("config.yaml", "w", encoding="utf-8") as f:
-            yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
-        return "✅ 已保存。"
+        cfg.runtime_paths.update_settings({
+            "model": model,
+            "rag_enabled": bool(rag_enabled),
+            "pdf_max_pages": int(max_pages),
+            "daily_search_enabled": bool(daily_enabled_val),
+        })
+        return "✅ 已保存到运行时设置，重启服务后生效。"
 
     # ═══ 构建界面 ═══
 
@@ -774,8 +775,8 @@ def build_ui():
                     additional_inputs=[session_state],
                 )
                 chat.chatbot.change(
-                    fn=refresh_chat_ui, inputs=[chat.chatbot, session_state],
-                    outputs=[status, session_picker],
+                    fn=refresh_chat_status, inputs=[chat.chatbot, session_state],
+                    outputs=[status],
                 )
                 session_picker.change(
                     fn=switch_session, inputs=[session_picker],
@@ -827,16 +828,15 @@ def build_ui():
 
             # ── Tab 4: 设置 ──
             with gr.Tab("⚙ 设置"):
-                cfg = load_config()
                 gr.Markdown("### 基础设置")
                 model_dd = gr.Dropdown(
-                    label="模型", value=cfg.get("model", agent.model),
+                    label="模型", value=cfg.model,
                     choices=["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
                     allow_custom_value=True,
                 )
-                rag_toggle = gr.Checkbox(label="启用 RAG 论文库", value=cfg.get("rag", {}).get("enabled", True))
-                max_pages_slider = gr.Slider(label="PDF 最大页数", minimum=5, maximum=100, step=5, value=cfg.get("pdf", {}).get("max_pages", 15))
-                daily_enabled = gr.Checkbox(label="启用每日自动检索", value=cfg.get("daily_search", {}).get("enabled", False))
+                rag_toggle = gr.Checkbox(label="启用 RAG 论文库", value=cfg.rag_enabled)
+                max_pages_slider = gr.Slider(label="PDF 最大页数", minimum=5, maximum=100, step=5, value=cfg.pdf_max_pages)
+                daily_enabled = gr.Checkbox(label="启用每日自动检索", value=cfg.daily_search_enabled)
                 save_cfg_btn = gr.Button("💾 保存配置", variant="primary")
                 cfg_msg = gr.Markdown("")
                 save_cfg_btn.click(fn=save_config, inputs=[model_dd, rag_toggle, max_pages_slider, daily_enabled], outputs=[cfg_msg])
@@ -863,6 +863,7 @@ def build_ui():
         quit_btn.click(fn=lambda: (demo.close(), os._exit(0)), outputs=[])
 
     demo.launch(
+        server_name=args.host,
         server_port=args.port,
         share=False, show_error=True,
         theme=gr.themes.Soft(),

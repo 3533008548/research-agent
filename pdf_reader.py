@@ -410,7 +410,11 @@ class PaperReader:
 #  图片提取 — PyMuPDF 从 PDF 提取嵌入图片
 # ═══════════════════════════════════════════════════════════════
 
-def extract_images(pdf_path: str, max_pages: int = 15) -> list[str]:
+def extract_images(
+    pdf_path: str,
+    max_pages: int = 15,
+    output_dir: str | Path | None = None,
+) -> list[str]:
     """
     图注感知图片提取：
       1. 找图注文字（Figure N: / Fig. N:）作为锚点
@@ -428,7 +432,10 @@ def extract_images(pdf_path: str, max_pages: int = 15) -> list[str]:
     from pathlib import Path
     import re as _re
 
-    img_dir = Path("data/papers/images")
+    if output_dir is None:
+        from runtime_paths import get_runtime_paths
+        output_dir = get_runtime_paths().images_dir
+    img_dir = Path(output_dir)
     img_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(pdf_path).stem[:30]
 
@@ -547,7 +554,7 @@ def extract_images(pdf_path: str, max_pages: int = 15) -> list[str]:
             pass
 
     if saved:
-        print(f"      🖼 提取 {len(saved)} 张图到 data/papers/images/", file=sys.stderr)
+        print(f"      🖼 提取 {len(saved)} 张图到 {img_dir}/", file=sys.stderr)
     return saved
 
 

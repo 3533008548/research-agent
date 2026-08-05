@@ -15,6 +15,9 @@ import tempfile
 import shutil
 import sys
 import sqlite3
+import os
+import subprocess
+import zipfile
 from pathlib import Path
 
 # 添加项目根目录到 Python 路径
@@ -36,9 +39,9 @@ class TestReadPDFFlow(unittest.TestCase):
     def test_extract_text_from_pdf(self):
         """pdfplumber 能否从真实 PDF 提取文本"""
         from pdf_reader import PaperReader
-        pdfs = list(Path("data/papers").glob("*.pdf"))
+        pdfs = list(Path(os.environ.get("APP_DATA_DIR", "runtime")).joinpath("primary", "papers").glob("*.pdf"))
         if not pdfs:
-            self.skipTest("data/papers/ 中没有 PDF 文件")
+            self.skipTest("运行时论文目录中没有 PDF 文件")
         reader = PaperReader(max_pages=2, max_chars=2000)
         result = reader.read(str(pdfs[0]))
         self.assertIn("📄", result)
@@ -120,6 +123,52 @@ class TestQueryPapers(unittest.TestCase):
         self.assertEqual(len(s2.list_papers()), count_before - 1)
 
 
+class TestToolResponsiveness(unittest.TestCase):
+    def test_bounded_rag_query_returns_while_background_work_continues(self):
+        import time
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from paper_store import PaperStore
+
+        store = PaperStore.__new__(PaperStore)
+        store._query_executor = ThreadPoolExecutor(max_workers=1)
+        store._query_lock = threading.RLock()
+        store._active_query = None
+        store.query = lambda *args: (time.sleep(0.2) or [])
+        store._collection = type("_Collection", (), {
+            "count": lambda self: 1,
+            "get": lambda self, include: {
+                "documents": ["TSN scheduling with diffusion models"],
+                "metadatas": [{"title": "TSN Paper", "section": "Method"}],
+            },
+        })()
+        try:
+            started = time.monotonic()
+            results, pending = store.query_with_timeout("TSN", timeout_seconds=0.02)
+            self.assertEqual(results[0]["retrieval"], "keyword")
+            self.assertIn("首次嵌入模型", pending)
+            self.assertLess(time.monotonic() - started, 0.15)
+        finally:
+            store._query_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_query_tool_returns_without_waiting_for_embedding_initialization(self):
+        from tools.search import handle_query_papers
+
+        class _WarmingStore:
+            def query_with_timeout(self, query, top_k, section):
+                self.query = query
+                self.top_k = top_k
+                self.section = section
+                return None, "嵌入模型仍在后台初始化，请稍后重试同一问题。"
+
+        store = _WarmingStore()
+        result = handle_query_papers(
+            {"query": "TSN scheduling", "top_k": 3}, paper_store=store,
+        )
+        self.assertIn("后台初始化", result)
+        self.assertEqual(store.query, "TSN scheduling")
+
+
 class TestVerifyNode(unittest.TestCase):
     """测试3: verify 节点边界不崩溃"""
 
@@ -169,6 +218,36 @@ class TestVerifyNode(unittest.TestCase):
         messages = state["messages"]
         last_content = messages[-1].get("content", "")
         self.assertEqual(last_content, "", "空回复应安全处理")
+
+    def test_sanitize_model_messages_drops_incomplete_assistant_history(self):
+        from graph_builder import sanitize_model_messages
+
+        messages = [
+            {"role": "user", "content": "问题"},
+            {"role": "assistant", "content": None},
+            {"role": "tool", "tool_call_id": "orphan", "content": "孤立结果"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "unfinished", "function": {"name": "search_papers", "arguments": "{}"},
+            }]},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call-1", "function": {"name": "list_papers", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "结果"},
+            {"role": "assistant", "content": "最终回答"},
+        ]
+
+        sanitized = sanitize_model_messages(messages)
+        self.assertEqual(
+            [message["role"] for message in sanitized],
+            ["user", "assistant", "tool", "assistant"],
+        )
+        self.assertEqual(sanitized[1]["tool_calls"][0]["id"], "call-1")
+        self.assertTrue(all(
+            message["role"] != "assistant"
+            or message.get("content") not in (None, "")
+            or message.get("tool_calls")
+            for message in sanitized
+        ))
 
     def test_graph_builds_correctly(self):
         """图结构正常编译（不调用 API）"""
@@ -531,10 +610,25 @@ class TestLLMClient(unittest.TestCase):
         def raise_for_status(self):
             if self.status_code >= 400:
                 import requests
-                raise requests.HTTPError(f"HTTP {self.status_code}")
+                error = requests.HTTPError(f"HTTP {self.status_code}")
+                error.response = self
+                raise error
 
         def json(self):
             return self._payload
+
+    def test_non_retryable_http_error_exposes_api_detail(self):
+        import requests
+        from llm_client import LLMClient, LLMRequestFailedError
+
+        response = self._Response(status_code=400, text='{"error":{"message":"invalid messages"}}')
+        client = LLMClient("test-key", "https://example.test/chat", max_retries=0)
+
+        with patch("llm_client.requests.post", return_value=response):
+            with self.assertRaises(LLMRequestFailedError) as raised:
+                client.post({"model": "deepseek-v4-flash", "messages": []})
+        self.assertIn("400", str(raised.exception))
+        self.assertIn("invalid messages", str(raised.exception))
 
     def test_retries_same_model_after_timeout(self):
         import requests
@@ -636,6 +730,109 @@ class TestCircuitBreaker(unittest.TestCase):
         breaker.record_failure()
         self.assertEqual(breaker.state, "open")
         self.assertFalse(breaker.allow_request())
+
+
+class TestRuntimePaths(unittest.TestCase):
+    """运行时数据必须与代码目录隔离，并允许通过环境/CLI 改根目录。"""
+
+    def test_runtime_layout_and_user_settings_override_static_config(self):
+        from config import Config
+        from runtime_paths import RuntimePaths
+
+        old_data_dir = os.environ.get("APP_DATA_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = RuntimePaths.from_root(tmp)
+                paths.ensure_initialized()
+                paths.update_settings({
+                    "model": "deepseek-v4-flash",
+                    "rag_enabled": False,
+                    "pdf_max_pages": 31,
+                    "daily_search_enabled": True,
+                })
+                self.assertTrue(paths.state_file.exists())
+                self.assertTrue(paths.database_dir.is_dir())
+                self.assertTrue(paths.papers_dir.is_dir())
+                self.assertTrue(paths.chroma_dir.is_dir())
+                self.assertTrue(paths.images_dir.is_dir())
+                self.assertEqual(paths.safe_child(paths.papers_dir, "../escape.pdf").parent, paths.papers_dir)
+
+                cfg = Config.load({"data_dir": tmp})
+                self.assertEqual(Path(cfg.checkpoint_db), paths.checkpoint_db)
+                self.assertEqual(Path(cfg.memory_db), paths.memory_db)
+                self.assertEqual(Path(cfg.notes_db), paths.notes_db)
+                self.assertEqual(Path(cfg.daily_db), paths.daily_db)
+                self.assertEqual(Path(cfg.chroma_dir), paths.chroma_dir)
+                self.assertEqual(Path(cfg.papers_dir), paths.papers_dir)
+                self.assertEqual(Path(cfg.images_dir), paths.images_dir)
+                self.assertEqual(Path(cfg.profile_path), paths.profile_path)
+                self.assertFalse(cfg.rag_enabled)
+                self.assertEqual(cfg.pdf_max_pages, 31)
+                self.assertTrue(cfg.daily_search_enabled)
+        finally:
+            if old_data_dir is None:
+                os.environ.pop("APP_DATA_DIR", None)
+            else:
+                os.environ["APP_DATA_DIR"] = old_data_dir
+
+    def test_migration_script_previews_then_copies_without_deleting_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy"
+            legacy.mkdir()
+            source_db = legacy / "checkpoint.db"
+            source_conn = sqlite3.connect(source_db)
+            source_conn.execute("CREATE TABLE marker (value TEXT)")
+            source_conn.execute("INSERT INTO marker VALUES ('legacy-kept')")
+            source_conn.commit()
+            source_conn.close()
+            data_dir = root / "runtime"
+
+            base_cmd = [
+                sys.executable, "scripts/migrate_runtime.py",
+                "--source", str(legacy), "--data-dir", str(data_dir),
+            ]
+            subprocess.run(base_cmd, check=True, cwd=Path(__file__).parent.parent)
+            self.assertFalse((data_dir / "primary" / "db" / "checkpoint.db").exists())
+
+            subprocess.run(base_cmd + ["--apply"], check=True, cwd=Path(__file__).parent.parent)
+            self.assertTrue(source_db.exists(), "迁移不应删除旧数据")
+            copied = sqlite3.connect(data_dir / "primary" / "db" / "checkpoint.db")
+            try:
+                self.assertEqual(copied.execute("SELECT value FROM marker").fetchone()[0], "legacy-kept")
+            finally:
+                copied.close()
+
+    def test_backup_script_exports_primary_data_as_zip(self):
+        from runtime_paths import RuntimePaths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root / "runtime")
+            paths.ensure_initialized()
+            conn = sqlite3.connect(paths.notes_db)
+            conn.execute("CREATE TABLE marker (value TEXT)")
+            conn.execute("INSERT INTO marker VALUES ('backup-ok')")
+            conn.commit()
+            conn.close()
+            paths.profile_path.write_text("# 用户画像\n", encoding="utf-8")
+            (paths.papers_dir / "paper.pdf").write_bytes(b"%PDF-test")
+            output = root / "backups"
+
+            subprocess.run(
+                [
+                    sys.executable, "scripts/backup_runtime.py",
+                    "--data-dir", str(paths.root), "--output", str(output),
+                ],
+                check=True,
+                cwd=Path(__file__).parent.parent,
+            )
+            archives = list(output.glob("research-agent-runtime-*.zip"))
+            self.assertEqual(len(archives), 1)
+            with zipfile.ZipFile(archives[0]) as archive:
+                self.assertIn("runtime/primary/db/notes.db", archive.namelist())
+                self.assertIn("runtime/primary/profile.md", archive.namelist())
+                self.assertIn("runtime/primary/papers/paper.pdf", archive.namelist())
 
 
 if __name__ == "__main__":

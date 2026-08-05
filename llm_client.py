@@ -314,6 +314,16 @@ class LLMClient:
     def _format_request_error(error: Exception | None) -> str:
         if isinstance(error, _RetryableHTTPError):
             return f"模型 API 返回 {error.status_code}: {error.body or '服务暂不可用'}"
+        if isinstance(error, requests.HTTPError) and error.response is not None:
+            response = error.response
+            try:
+                body = response.text[:500].replace("\n", " ").strip()
+            except Exception:
+                body = ""
+            return (
+                f"模型 API 返回 {response.status_code}: "
+                f"{body or '未返回错误详情'}"
+            )
         if error:
             return f"模型请求失败: {type(error).__name__}: {error}"
         return "模型请求在总截止时间内未完成"

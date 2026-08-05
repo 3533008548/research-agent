@@ -1,7 +1,7 @@
 """
 🧠 记忆模块 — 对话摘要 + 三元组索引 (SQLite)
 
-结构: memory.db
+结构: APP_DATA_DIR/primary/db/memory.db
   triples   (id, paper_title, relation, value, created_at)
   summaries (id, thread_id, topic, summary, created_at)
 """
@@ -9,13 +9,18 @@
 import sqlite3
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
+from runtime_paths import get_runtime_paths
 
 
 class MemoryStore:
     """轻量记忆存储 — 三元组 + 话题摘要"""
 
-    def __init__(self, db_path: str = "memory.db"):
+    def __init__(self, db_path: str | None = None):
+        db_path = db_path or str(get_runtime_paths().memory_db)
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row

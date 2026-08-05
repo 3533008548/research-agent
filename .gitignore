@@ -3,6 +3,14 @@
 
 # 运行时生成
 __pycache__/
+runtime/
+backups/
+
+# Secrets stay on the host and are injected by Docker Compose at runtime.
+.env
+.env.*
+!.env.example
+# 旧版分散路径（保留忽略以支持显式迁移）
 chroma_data/
 checkpoint.db
 checkpoint.db-*

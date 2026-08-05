@@ -1,7 +1,7 @@
 """
 ⚙️ 统一配置 — 合并 .env + config.yaml + CLI 参数
 
-优先级: CLI > 环境变量 > config.yaml > 默认值
+优先级: CLI > 环境变量 > runtime/settings.json > config.yaml > 默认值
 
 用法:
   cfg = Config.load()
@@ -13,6 +13,8 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from runtime_paths import RuntimePaths
 
 # ── 默认值 ──
 _DFLT = {
@@ -31,9 +33,6 @@ _DFLT = {
     "api_max_retries": 2,
     "api_circuit_failure_threshold": 3,
     "api_circuit_recovery_seconds": 120,
-    "checkpoint_db": "checkpoint.db",
-    "chroma_dir": "chroma_data",
-    "papers_dir": "data/papers",
 }
 
 
@@ -61,9 +60,32 @@ class Config:
     api_circuit_failure_threshold: int = 3
     api_circuit_recovery_seconds: int = 120
 
-    checkpoint_db: str = "checkpoint.db"
-    chroma_dir: str = "chroma_data"
-    papers_dir: str = "data/papers"
+    data_dir: str = "runtime"
+    checkpoint_db: str = ""
+    memory_db: str = ""
+    notes_db: str = ""
+    daily_db: str = ""
+    chroma_dir: str = ""
+    papers_dir: str = ""
+    images_dir: str = ""
+    profile_path: str = ""
+    runtime_paths: RuntimePaths = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        paths = RuntimePaths.from_root(self.data_dir)
+        paths.ensure_initialized()
+        self.runtime_paths = paths
+        self.data_dir = str(paths.root)
+        # 工具模块无需持有 Config；同步到进程环境确保它们使用同一数据根目录。
+        os.environ["APP_DATA_DIR"] = self.data_dir
+        self.checkpoint_db = self.checkpoint_db or str(paths.checkpoint_db)
+        self.memory_db = self.memory_db or str(paths.memory_db)
+        self.notes_db = self.notes_db or str(paths.notes_db)
+        self.daily_db = self.daily_db or str(paths.daily_db)
+        self.chroma_dir = self.chroma_dir or str(paths.chroma_dir)
+        self.papers_dir = self.papers_dir or str(paths.papers_dir)
+        self.images_dir = self.images_dir or str(paths.images_dir)
+        self.profile_path = self.profile_path or str(paths.profile_path)
 
     @classmethod
     def load(cls, cli_overrides: dict | None = None) -> "Config":
@@ -118,7 +140,23 @@ class Config:
         except Exception:
             pass
 
-        # ── 4. 环境变量覆盖 ──
+        # ── 4. 运行时用户设置（UI 修改写入这里，不污染源码配置） ──
+        cli_data_dir = (cli_overrides or {}).get("data_dir")
+        data_dir = cli_data_dir or os.getenv("APP_DATA_DIR") or "runtime"
+        paths = RuntimePaths.from_root(data_dir)
+        paths.ensure_initialized()
+        user_settings = paths.read_settings()
+        validators = {
+            "model": lambda value: isinstance(value, str) and bool(value.strip()),
+            "rag_enabled": lambda value: isinstance(value, bool),
+            "pdf_max_pages": lambda value: isinstance(value, int) and not isinstance(value, bool),
+            "daily_search_enabled": lambda value: isinstance(value, bool),
+        }
+        for key, valid in validators.items():
+            if key in user_settings and valid(user_settings[key]):
+                cfg[key] = user_settings[key]
+
+        # ── 5. 环境变量覆盖 ──
         env_map = {
             "DEEPSEEK_API_KEY": "deepseek_key",
             "GLM_API_KEY": "glm_key",
@@ -130,7 +168,7 @@ class Config:
             if val:
                 cfg[attr] = val
 
-        # ── 5. CLI 覆盖 ──
+        # ── 6. CLI 覆盖 ──
         if cli_overrides:
             cfg.update({k: v for k, v in cli_overrides.items() if v is not None})
 
@@ -154,7 +192,5 @@ class Config:
             api_max_retries=max(0, int(cfg.get("api_max_retries", 2))),
             api_circuit_failure_threshold=max(1, int(cfg.get("api_circuit_failure_threshold", 3))),
             api_circuit_recovery_seconds=max(10, int(cfg.get("api_circuit_recovery_seconds", 120))),
-            checkpoint_db=cfg.get("checkpoint_db", "checkpoint.db"),
-            chroma_dir=cfg.get("chroma_dir", "chroma_data"),
-            papers_dir=cfg.get("papers_dir", "data/papers"),
+            data_dir=str(paths.root),
         )

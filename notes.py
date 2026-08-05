@@ -17,12 +17,17 @@
 import sqlite3
 import os
 from datetime import datetime
+from pathlib import Path
+
+from runtime_paths import get_runtime_paths
 
 
 class NoteStore:
     """科研笔记存储 — 按研究方向分话题"""
 
-    def __init__(self, db_path: str = "notes.db"):
+    def __init__(self, db_path: str | None = None):
+        db_path = db_path or str(get_runtime_paths().notes_db)
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")

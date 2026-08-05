@@ -21,7 +21,6 @@ pdf:
   max_pages: 20
 rag:
   enabled: true
-  persist_dir: chroma_data
 ui:
   port: 7860
   theme: soft

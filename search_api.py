@@ -134,13 +134,15 @@ def search_semantic_scholar(
 
 def list_downloaded_papers() -> str:
     """列出本地已下载的论文 PDF"""
-    pdf_dir = Path("data/papers")
+    from runtime_paths import get_runtime_paths
+
+    pdf_dir = get_runtime_paths().papers_dir
     if not pdf_dir.exists():
         return "📂 尚未下载任何论文。"
 
     pdfs = list(pdf_dir.glob("*.pdf"))
     if not pdfs:
-        return "📂 data/papers/ 目录中没有 PDF 文件。"
+        return f"📂 {pdf_dir} 目录中没有 PDF 文件。"
 
     total_size = sum(f.stat().st_size for f in pdfs)
     lines = [

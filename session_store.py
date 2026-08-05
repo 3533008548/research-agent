@@ -13,6 +13,7 @@ import threading
 import uuid
 from datetime import datetime
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 
@@ -33,6 +34,7 @@ class SessionStore:
 
     def __init__(self, checkpoint_db: str):
         self.db_path = checkpoint_db
+        Path(checkpoint_db).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(checkpoint_db, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row

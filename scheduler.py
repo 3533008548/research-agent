@@ -1,7 +1,7 @@
 """
 📰 每日论文检索调度器
 
-数据库: daily.db
+数据库: APP_DATA_DIR/primary/db/daily.db
   searches   (id, keyword, searched_at, results_json, new_count)
   engagement (id, keyword, paper_title, read_yn, date)
   keywords   (id, keyword, active, added_at, skip_streak)
@@ -17,16 +17,20 @@ import sqlite3
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
+from pathlib import Path
 from typing import Optional
+
+from runtime_paths import get_runtime_paths
 
 
 class Scheduler:
     """每日论文检索调度器"""
 
-    def __init__(self, db_path: str = "daily.db", request_timeout_seconds: int = 8):
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None, request_timeout_seconds: int = 8):
+        self.db_path = db_path or str(get_runtime_paths().daily_db)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self.request_timeout_seconds = max(3, int(request_timeout_seconds))
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
