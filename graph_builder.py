@@ -26,7 +26,13 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from cancellation import RequestCancelledError, raise_if_cancelled
-from llm_client import LLMRequestTimeoutError
+from llm_client import (
+    LLMCircuitOpenError,
+    LLMQueueFullError,
+    LLMRequestTimeoutError,
+    RequestPolicy,
+    RequestPriority,
+)
 from prompts import SYSTEM_PROMPT
 from tool_schemas import get_tool_schemas
 from tools import execute_tool
@@ -113,6 +119,11 @@ def build_graph(
     verify_guard = None,
     llm_client = None,
 ):
+    # A graph must use the process-wide client owned by ResearchAgent. Creating
+    # one here would silently defeat shared admission control in multi-agent
+    # execution.
+    if llm_client is None:
+        raise ValueError("build_graph requires the shared llm_client instance")
     if checkpoint_db is None:
         from runtime_paths import get_runtime_paths
         checkpoint_db = str(get_runtime_paths().checkpoint_db)
@@ -199,26 +210,26 @@ def build_graph(
                 token_usage["api_status"] = message
             emit("llm_status", status=message)
 
-        request_budget = llm_client.new_request_budget() if llm_client else None
+        request_budget = llm_client.new_request_budget(
+            RequestPolicy(
+                purpose="chat",
+                priority=RequestPriority.INTERACTIVE,
+            )
+        )
         request_started = time.perf_counter()
         emit("llm_request_started", model=model, stream=stream_callback is not None)
-        if llm_client:
-            try:
-                post_args = {
-                    "stream": stream_callback is not None,
-                    "on_status": _api_status,
-                    "budget": request_budget,
-                }
-                if cancel_event is not None:
-                    post_args["cancel_event"] = cancel_event
-                resp = llm_client.post(payload, **post_args)
-            except Exception as exc:
-                emit("llm_request_failed", error_type=type(exc).__name__)
-                raise
-        else:
-            resp = requests.post(api_url, headers={
-                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-            }, json=payload, timeout=120)
+        try:
+            post_args = {
+                "stream": stream_callback is not None,
+                "on_status": _api_status,
+                "budget": request_budget,
+            }
+            if cancel_event is not None:
+                post_args["cancel_event"] = cancel_event
+            resp = llm_client.post(payload, **post_args)
+        except Exception as exc:
+            emit("llm_request_failed", error_type=type(exc).__name__)
+            raise
         emit("llm_response_headers", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
 
         if resp.status_code == 429:
@@ -374,7 +385,11 @@ def build_graph(
                     {"id": v["id"], "type": "function", "function": v["function"]}
                     for v in sorted(tool_calls_acc.values(), key=lambda x: x.get("id", ""))
                 ]
-            emit("llm_request_finished", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
+            emit(
+                "llm_request_finished",
+                duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
+                **request_budget.metrics(),
+            )
             return {"messages": [assistant_msg]}
 
         # 非流式模式
@@ -399,7 +414,11 @@ def build_graph(
                 {"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
                 for tc in msg["tool_calls"]
             ]
-        emit("llm_request_finished", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
+        emit(
+            "llm_request_finished",
+            duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
+            **request_budget.metrics(),
+        )
         return {"messages": [assistant_msg]}
 
     # ═══ 路由 ═══
@@ -595,20 +614,51 @@ def build_graph(
             f"\n--- Response ---\n{content[:1500]}\n\nIssues (or OK):"
         )
 
+        verify_policy = RequestPolicy(
+            purpose="verify",
+            priority=RequestPriority.VERIFY,
+            deadline_seconds=verify_timeout_seconds,
+            max_retries=0,
+        )
+
+        def _verify_status(message: str) -> None:
+            if token_usage:
+                token_usage["verify_status"] = f"🔎 验证中：{message}"
+            emit("verify_status", status=message)
+
         try:
-            resp = requests.post(api_url, headers={
-                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-            }, json={"model": model, "messages": [{"role": "user", "content": verify_prompt}],
-                      "stream": False, "temperature": 0.1},
-                timeout=(3.05, verify_timeout_seconds))
-            resp.raise_for_status()
+            verify_budget = llm_client.new_request_budget(
+                verify_policy,
+            )
+            emit("verify_request_started", model=model, **verify_budget.metrics())
+            resp = llm_client.post(
+                {"model": model, "messages": [{"role": "user", "content": verify_prompt}],
+                 "stream": False, "temperature": 0.1},
+                stream=False,
+                on_status=_verify_status,
+                budget=verify_budget,
+                cancel_event=cancel_event,
+            )
             result = resp.json()["choices"][0]["message"]["content"].strip()
+            emit("verify_request_finished", **verify_budget.metrics())
+        except RequestCancelledError:
+            emit("verify_request_cancelled")
+            raise
+        except (LLMQueueFullError, LLMCircuitOpenError) as e:
+            # Queue pressure and the shared model circuit do not mean that the
+            # verify feature itself is unhealthy. Skip this optional stage
+            # without opening its local feature guard.
+            if token_usage:
+                token_usage["verify_status"] = "⚠️ 验证跳过（模型繁忙或暂不可用）"
+            emit("verify_request_skipped", error_type=type(e).__name__)
+            return _complete_verification()
         except Exception as e:
             # ── 快速降级：失败两次后熔断，后续请求直接返回主回答 ──
             if verify_guard:
                 verify_guard.record_failure()
             if token_usage:
                 token_usage["verify_status"] = "⚠️ 验证跳过（服务超时或不可用）"
+            emit("verify_request_failed", error_type=type(e).__name__)
             print(f"      ⚠ verify 跳过: {type(e).__name__}: {e}", file=sys.stderr)
             return _complete_verification()
         if verify_guard:
@@ -644,15 +694,27 @@ def build_graph(
                             recent_msgs.append(f"[{m.get('role','')}] {c[:300]}")
                         raw = "\n".join(recent_msgs)
                         sum_prompt = f"Summarize this research conversation in 150 chars Chinese:\n{raw[:3000]}"
-                        sr = requests.post(api_url, headers={
-                            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-                        }, json={"model": model, "messages": [{"role": "user", "content": sum_prompt}],
-                                  "stream": False, "temperature": 0.2},
-                            timeout=(3.05, verify_timeout_seconds))
+                        summary_budget = llm_client.new_request_budget(
+                            RequestPolicy(
+                                purpose="summary",
+                                priority=RequestPriority.SUMMARY,
+                                deadline_seconds=verify_timeout_seconds,
+                                max_retries=0,
+                            ),
+                        )
+                        sr = llm_client.post(
+                            {"model": model, "messages": [{"role": "user", "content": sum_prompt}],
+                             "stream": False, "temperature": 0.2},
+                            stream=False,
+                            budget=summary_budget,
+                            cancel_event=cancel_event,
+                        )
                         if sr.status_code == 200:
                             summary = sr.json()["choices"][0]["message"]["content"].strip()[:300]
                             topic = state.get("metadata", {}).get("topic", "")
                             memory_store.add_summary(thread_id, topic, summary)
+                    except RequestCancelledError:
+                        raise
                     except Exception:
                         pass
                 # ── 预算预警前置：> 60% 提示（> 90% 强警告）──

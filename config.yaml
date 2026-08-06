@@ -10,6 +10,7 @@ agent:
   verify_timeout_seconds: 8
 api_resilience:
   max_concurrency: 4
+  interactive_reserved_slots: 1
   queue_size: 20
   connect_timeout_seconds: 3.05
   read_timeout_seconds: 30

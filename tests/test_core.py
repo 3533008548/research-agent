@@ -253,7 +253,11 @@ class TestVerifyNode(unittest.TestCase):
     def test_graph_builds_correctly(self):
         """图结构正常编译（不调用 API）"""
         from graph_builder import build_graph
-        app = build_graph(api_key="test-key", model="deepseek-chat", checkpoint_db=":memory:")
+        from llm_client import LLMClient
+        app = build_graph(
+            api_key="test-key", model="deepseek-chat", checkpoint_db=":memory:",
+            llm_client=LLMClient("test-key", "https://example.test/chat"),
+        )
         try:
             nodes = list(app.get_graph().nodes.keys())
             self.assertIn("llm", nodes)
@@ -279,8 +283,12 @@ class TestVerifyNode(unittest.TestCase):
             self._FakeResponse({"content": "这是一段超过一百字符的工具结果总结。" * 5}),
             self._FakeResponse({"content": "OK"}),
         ]
-        with patch("graph_builder.requests.post", side_effect=responses):
-            app = build_graph(api_key="test-key", checkpoint_db=":memory:")
+        with patch("llm_client.requests.post", side_effect=responses):
+            from llm_client import LLMClient
+            app = build_graph(
+                api_key="test-key", checkpoint_db=":memory:",
+                llm_client=LLMClient("test-key", "https://example.test/chat"),
+            )
             try:
                 result = app.invoke({
                     "messages": [{"role": "user", "content": "列出本地论文并总结"}],
@@ -306,9 +314,11 @@ class TestVerifyNode(unittest.TestCase):
                 return f"{thread_id}:{topic}"
 
         responses = [self._FakeResponse({"content": "收到"}) for _ in range(2)]
-        with patch("graph_builder.requests.post", side_effect=responses) as post:
+        from llm_client import LLMClient
+        with patch("llm_client.requests.post", side_effect=responses) as post:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", memory_store=_Memory(),
+                llm_client=LLMClient("test-key", "https://example.test/chat"),
             )
             try:
                 for thread_id in ("session-a", "session-b"):
@@ -335,6 +345,7 @@ class TestVerifyNode(unittest.TestCase):
         """验证服务超时时快速降级，并打开熔断器避免下一轮继续等待。"""
         import requests
         from graph_builder import build_graph
+        from llm_client import LLMClient
         from resilience import CircuitBreaker
 
         responses = [
@@ -350,10 +361,15 @@ class TestVerifyNode(unittest.TestCase):
         ]
         usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
         guard = CircuitBreaker(failure_threshold=1, recovery_seconds=60)
-        with patch("graph_builder.requests.post", side_effect=responses) as post:
+        events = []
+        client = LLMClient(
+            "test-key", "https://example.test/chat", max_retries=0,
+        )
+        with patch("llm_client.requests.post", side_effect=responses) as post:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", token_usage=usage,
-                verify_timeout_seconds=4, verify_guard=guard,
+                verify_timeout_seconds=4, verify_guard=guard, llm_client=client,
+                event_callback=events.append,
             )
             try:
                 app.invoke(
@@ -368,9 +384,15 @@ class TestVerifyNode(unittest.TestCase):
             if call.kwargs["json"].get("temperature") == 0.1
         ]
         self.assertEqual(len(verify_calls), 1)
-        self.assertEqual(verify_calls[0].kwargs["timeout"], (3.05, 4))
+        connect_timeout, read_timeout = verify_calls[0].kwargs["timeout"]
+        self.assertEqual(connect_timeout, 3.05)
+        self.assertGreater(read_timeout, 3.5)
+        self.assertLessEqual(read_timeout, 4)
         self.assertFalse(guard.allow_request())
         self.assertIn("验证跳过", usage["verify_status"])
+        verify_started = next(event for event in events if event["type"] == "verify_request_started")
+        self.assertEqual(verify_started["purpose"], "verify")
+        self.assertEqual(verify_started["priority"], "verify")
 
     def test_stream_retries_same_model_before_first_token(self):
         """流式连接在尚未输出 token 时可以安全重放一次同模型请求。"""
@@ -414,7 +436,11 @@ class TestVerifyNode(unittest.TestCase):
                     self.retries_used += 1
                     return True
 
-            def new_request_budget(self):
+                def metrics(self):
+                    return {"purpose": "chat", "priority": "interactive", "queue_wait_ms": 0,
+                            "attempts": 1, "retries_used": self.retries_used}
+
+            def new_request_budget(self, policy=None, **_kwargs):
                 return self._Budget()
 
             @staticmethod
@@ -746,6 +772,66 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "deepseek-v4-flash")
         self.assertEqual(post.call_args_list[0].kwargs["timeout"], (2, 9))
 
+    def test_request_policy_controls_budget_and_retry_limit(self):
+        import requests
+        from llm_client import LLMClient, LLMRequestTimeoutError, RequestPolicy, RequestPriority
+
+        client = LLMClient("test-key", "https://example.test/chat", max_retries=2)
+        policy = RequestPolicy(
+            purpose="verify", priority=RequestPriority.VERIFY,
+            deadline_seconds=4, max_retries=0,
+        )
+        budget = client.new_request_budget(policy)
+        with patch("llm_client.requests.post", side_effect=requests.exceptions.ReadTimeout("slow")) as post:
+            with self.assertRaises(LLMRequestTimeoutError):
+                client.post({"model": "deepseek-v4-flash", "messages": []}, budget=budget)
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(budget.metrics()["purpose"], "verify")
+        self.assertEqual(budget.metrics()["priority"], "verify")
+        self.assertEqual(budget.metrics()["attempts"], 1)
+
+    def test_background_work_preserves_interactive_capacity(self):
+        import threading
+        from llm_client import LLMClient, RequestPolicy, RequestPriority
+
+        client = LLMClient(
+            "test-key", "https://example.test/chat", max_concurrency=2,
+            interactive_reserved_slots=1,
+        )
+        background = RequestPolicy("verify", RequestPriority.VERIFY)
+        payload = {"model": "deepseek-v4-flash", "messages": []}
+        pending = []
+        errors = []
+
+        with patch("llm_client.requests.post", side_effect=[
+            self._Response(), self._Response(), self._Response(),
+        ]) as post:
+            first_background = client.post(payload, stream=True, policy=background)
+
+            def _second_background():
+                try:
+                    pending.append(client.post(payload, stream=True, policy=background))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=_second_background)
+            worker.start()
+            time.sleep(0.05)
+            self.assertEqual(post.call_count, 1, "第二个后台请求必须等待后台额度")
+
+            interactive = client.post(payload, stream=True)
+            self.assertEqual(post.call_count, 2, "交互请求应使用保留并发槽")
+
+            client.finish_stream(first_background, success=True)
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(post.call_count, 3)
+
+            client.finish_stream(interactive, success=True)
+            client.finish_stream(pending[0], success=True)
+
     def test_opens_circuit_after_exhausted_same_model_failures(self):
         import requests
         from llm_client import LLMClient, LLMCircuitOpenError, LLMRequestTimeoutError
@@ -829,11 +915,13 @@ class TestCancellationPropagation(unittest.TestCase):
         import threading
         from cancellation import RequestCancelledError
         from graph_builder import build_graph
+        from llm_client import LLMClient
 
         cancel_event = threading.Event()
         cancel_event.set()
         app = build_graph(
             api_key="test-key", checkpoint_db=":memory:", cancel_event=cancel_event,
+            llm_client=LLMClient("test-key", "https://example.test/chat"),
         )
         try:
             with self.assertRaises(RequestCancelledError):
@@ -843,6 +931,12 @@ class TestCancellationPropagation(unittest.TestCase):
                 )
         finally:
             app.checkpointer.conn.close()
+
+    def test_graph_requires_shared_llm_client(self):
+        from graph_builder import build_graph
+
+        with self.assertRaisesRegex(ValueError, "shared llm_client"):
+            build_graph(api_key="test-key", checkpoint_db=":memory:")
 
     def test_agent_returns_cancelled_status_without_building_graph(self):
         import threading

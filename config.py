@@ -26,6 +26,7 @@ _DFLT = {
     "verify_timeout_seconds": 8,
     "daily_request_timeout_seconds": 8,
     "api_max_concurrency": 4,
+    "api_interactive_reserved_slots": 1,
     "api_queue_size": 20,
     "api_connect_timeout_seconds": 3.05,
     "api_read_timeout_seconds": 30,
@@ -54,6 +55,7 @@ class Config:
     verify_timeout_seconds: int = 8
     daily_request_timeout_seconds: int = 8
     api_max_concurrency: int = 4
+    api_interactive_reserved_slots: int = 1
     api_queue_size: int = 20
     api_connect_timeout_seconds: float = 3.05
     api_read_timeout_seconds: int = 30
@@ -132,7 +134,7 @@ class Config:
                 if "api_resilience" in yaml_cfg:
                     settings = yaml_cfg["api_resilience"]
                     for key in (
-                        "max_concurrency", "queue_size", "connect_timeout_seconds",
+                        "max_concurrency", "interactive_reserved_slots", "queue_size", "connect_timeout_seconds",
                         "read_timeout_seconds", "request_deadline_seconds", "max_retries",
                         "circuit_failure_threshold", "circuit_recovery_seconds",
                     ):
@@ -189,6 +191,9 @@ class Config:
             verify_timeout_seconds=max(3, int(cfg.get("verify_timeout_seconds", 8))),
             daily_request_timeout_seconds=max(3, int(cfg.get("daily_request_timeout_seconds", 8))),
             api_max_concurrency=max(1, int(cfg.get("api_max_concurrency", 4))),
+            api_interactive_reserved_slots=max(
+                0, int(cfg.get("api_interactive_reserved_slots", 1))
+            ),
             api_queue_size=max(0, int(cfg.get("api_queue_size", 20))),
             api_connect_timeout_seconds=max(1.0, float(cfg.get("api_connect_timeout_seconds", 3.05))),
             api_read_timeout_seconds=max(3, int(cfg.get("api_read_timeout_seconds", 30))),

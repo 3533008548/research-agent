@@ -100,6 +100,7 @@ class ResearchAgent:
             api_key=self.api_key,
             api_url=cfg.api_url,
             max_concurrency=cfg.api_max_concurrency,
+            interactive_reserved_slots=cfg.api_interactive_reserved_slots,
             queue_size=cfg.api_queue_size,
             connect_timeout_seconds=cfg.api_connect_timeout_seconds,
             read_timeout_seconds=cfg.api_read_timeout_seconds,
