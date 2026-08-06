@@ -1,7 +1,7 @@
 """
 👤 用户画像 — Markdown 持久化偏好与研究方向
 
-文件: profile.md（人 + Agent 共维护，Git 版本控制友好）
+文件: APP_DATA_DIR/primary/profile.md（人 + Agent 共维护）
 
 结构:
   # 用户画像
@@ -25,16 +25,19 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+from runtime_paths import get_runtime_paths
+
 
 class ProfileManager:
     """用户画像管理器 — 读写 profile.md"""
 
-    def __init__(self, path: str = "profile.md"):
-        self.path = Path(path)
+    def __init__(self, path: str | None = None):
+        self.path = Path(path) if path else get_runtime_paths().profile_path
         self._ensure_exists()
 
     def _ensure_exists(self):
         if not self.path.exists():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(
                 "# 用户画像\n\n"
                 "## 研究方向\n\n"

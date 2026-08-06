@@ -1,0 +1,22 @@
+services:
+  research-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
+    image: research-agent:local
+    env_file:
+      - .env
+    environment:
+      APP_DATA_DIR: /app/runtime
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai
+    ports:
+      - "${UI_PORT:-7860}:7860"
+    volumes:
+      # 只挂载统一运行时目录；镜像升级、容器重建不会丢失用户数据。
+      - ./runtime:/app/runtime
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s

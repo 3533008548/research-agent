@@ -19,6 +19,8 @@ import sys
 import re
 import uuid
 import json
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -26,10 +28,10 @@ from datetime import datetime
 try:
     import chromadb
     from chromadb.config import Settings as ChromaSettings
+    from chromadb.utils import embedding_functions
 except ImportError:
     chromadb = None
-
-from chromadb.utils import embedding_functions
+    embedding_functions = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -194,7 +196,7 @@ class PaperStore:
     论文向量存储 — 基于 ChromaDB + SentenceTransformer。
 
     存储结构:
-      chroma_data/
+      APP_DATA_DIR/derived/chroma/
         └── collection "papers"
               ├── embedding: 384维向量 (all-MiniLM-L6-v2)
               ├── metadata: {paper_id, title, chunk_index, char_start, char_end}
@@ -203,12 +205,15 @@ class PaperStore:
 
     COLLECTION_NAME = "papers"
 
-    def __init__(self, persist_dir: str = "./chroma_data"):
-        if chromadb is None:
+    def __init__(self, persist_dir: str | None = None):
+        if chromadb is None or embedding_functions is None:
             raise ImportError(
                 "需要安装 chromadb:\n   pip install chromadb"
             )
 
+        if persist_dir is None:
+            from runtime_paths import get_runtime_paths
+            persist_dir = str(get_runtime_paths().chroma_dir)
         persist_dir = Path(persist_dir)
         persist_dir = persist_dir.resolve()
         self.persist_dir = str(persist_dir)
@@ -234,6 +239,11 @@ class PaperStore:
             embedding_function=self._embed_fn,
             metadata={"hnsw:space": "cosine"},
         )
+        self._query_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rag-query",
+        )
+        self._query_lock = threading.RLock()
+        self._active_query: Future | None = None
 
     # ── 公开接口 ──
 
@@ -350,6 +360,98 @@ class PaperStore:
 
         return results
 
+    def query_with_timeout(
+        self,
+        query_text: str,
+        top_k: int = 3,
+        paper_ids: Optional[list[str]] = None,
+        section: Optional[str] = None,
+        timeout_seconds: float = 8.0,
+    ) -> tuple[list[dict] | None, str | None]:
+        """有界执行 RAG 查询，初始化期间立即退回本地关键词检索。"""
+        with self._query_lock:
+            active = self._active_query
+            if active is not None and not active.done():
+                return self.query_lexical(query_text, top_k, paper_ids, section), (
+                    "嵌入模型仍在后台初始化，以下为本地关键词候选结果。"
+                )
+            future = self._query_executor.submit(
+                self.query, query_text, top_k, paper_ids, section,
+            )
+            self._active_query = future
+
+            def _clear_finished(done: Future) -> None:
+                with self._query_lock:
+                    if self._active_query is done:
+                        self._active_query = None
+
+            future.add_done_callback(_clear_finished)
+
+        try:
+            return future.result(timeout=max(0.1, timeout_seconds)), None
+        except FutureTimeout:
+            return self.query_lexical(query_text, top_k, paper_ids, section), (
+                "首次嵌入模型正在后台下载或初始化，以下为本地关键词候选结果；"
+                "完成后会自动恢复语义检索。"
+            )
+        except Exception as exc:
+            return self.query_lexical(query_text, top_k, paper_ids, section), (
+                f"RAG 语义检索暂不可用，已改用本地关键词检索："
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    @staticmethod
+    def _query_terms(query_text: str) -> list[str]:
+        """提取适合中英文论文文本的轻量关键词。"""
+        latin_terms = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{1,}", query_text.lower())
+        cjk = "".join(re.findall(r"[\u4e00-\u9fff]", query_text))
+        cjk_terms = [cjk[i:i + 2] for i in range(max(len(cjk) - 1, 0))]
+        return list(dict.fromkeys(latin_terms + cjk_terms))
+
+    def query_lexical(
+        self,
+        query_text: str,
+        top_k: int = 3,
+        paper_ids: Optional[list[str]] = None,
+        section: Optional[str] = None,
+    ) -> list[dict]:
+        """不依赖 embedding 的本地关键词检索，用于模型首次下载期间。"""
+        if self._collection.count() == 0:
+            return []
+        terms = self._query_terms(query_text)
+        if not terms:
+            return []
+
+        raw = self._collection.get(include=["documents", "metadatas"])
+        candidates = []
+        for doc, meta in zip(raw.get("documents") or [], raw.get("metadatas") or []):
+            meta = meta or {}
+            if paper_ids and meta.get("paper_id") not in paper_ids:
+                continue
+            if section and meta.get("section") != section:
+                continue
+            searchable = "\n".join((
+                str(meta.get("title", "")), str(meta.get("section", "")), doc or "",
+            )).lower()
+            score = sum(searchable.count(term.lower()) for term in terms)
+            if score <= 0:
+                continue
+            candidates.append({
+                "text": doc or "",
+                "section": meta.get("section", "未标注"),
+                "title": meta.get("title", "Unknown"),
+                "paper_id": meta.get("paper_id", ""),
+                "chunk_index": meta.get("chunk_index", 0),
+                "char_start": meta.get("char_start", 0),
+                "char_end": meta.get("char_end", 0),
+                "keyword_score": score,
+                "retrieval": "keyword",
+            })
+        return sorted(
+            candidates,
+            key=lambda item: (-item["keyword_score"], item["title"], item["chunk_index"]),
+        )[:top_k]
+
     def list_papers(self) -> list[dict]:
         """列出所有已索引的论文（去重）"""
         if self._collection.count() == 0:
@@ -423,6 +525,7 @@ class PaperStore:
 class NoOpStore:
     """空操作存储 — ChromaDB 离线时保持 Agent 可用"""
     def query(self, *a, **kw): return []
+    def query_with_timeout(self, *a, **kw): return [], None
     def index_paper(self, *a, **kw): return ""
     def list_papers(self): return []
     def delete_paper(self, *a, **kw): return 0

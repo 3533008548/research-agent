@@ -1,15 +1,26 @@
 daily_search:
   enabled: true
+  request_timeout_seconds: 8
   keywords: []
   max_results_per_keyword: 3
   sources:
   - semantic_scholar
 model: deepseek-v4-flash
+agent:
+  verify_timeout_seconds: 8
+api_resilience:
+  max_concurrency: 4
+  queue_size: 20
+  connect_timeout_seconds: 3.05
+  read_timeout_seconds: 30
+  request_deadline_seconds: 45
+  max_retries: 2
+  circuit_failure_threshold: 3
+  circuit_recovery_seconds: 120
 pdf:
   max_pages: 20
 rag:
   enabled: true
-  persist_dir: chroma_data
 ui:
   port: 7860
   theme: soft

@@ -6,14 +6,15 @@ import sys
 import requests
 from pathlib import Path
 from pdf_reader import read_pdf_enhanced
+from runtime_paths import get_runtime_paths
 
 
-def handle_read_pdf(args: dict, paper_store=None, **kw) -> str:
+def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **kw) -> str:
     url_or_path = args.get("url_or_path", "")
     max_pages = args.get("max_pages", 15)
 
-    pdf_dir = Path("data/papers")
-    pdf_dir.mkdir(parents=True, exist_ok=True)
+    paths = get_runtime_paths()
+    pdf_dir = paths.papers_dir
 
     # ── URL 解析 & 下载 ──
     if url_or_path.startswith(("http://", "https://")):
@@ -29,7 +30,7 @@ def handle_read_pdf(args: dict, paper_store=None, **kw) -> str:
                     filename += ".pdf"
             else:
                 filename = f"paper_{hash(url_or_path) & 0xFFFFFFFF:08x}.pdf"
-        pdf_path = pdf_dir / filename
+        pdf_path = paths.safe_child(pdf_dir, filename)
         if not pdf_path.exists():
             print(f"      📥 正在下载 PDF...", file=sys.stderr)
             try:
@@ -49,7 +50,7 @@ def handle_read_pdf(args: dict, paper_store=None, **kw) -> str:
             if alt.exists():
                 pdf_path = alt
             else:
-                return f"❌ 本地文件不存在: {url_or_path}\n   已尝试: data/papers/{pdf_path.name}"
+                return f"❌ 本地文件不存在: {url_or_path}\n   已尝试: {pdf_dir / pdf_path.name}"
 
     # ── 文本提取 ──
     try:
@@ -63,7 +64,9 @@ def handle_read_pdf(args: dict, paper_store=None, **kw) -> str:
     if result and not result.startswith("❌"):
         try:
             from pdf_reader import extract_images
-            imgs = extract_images(str(pdf_path), max_pages=max_pages)
+            imgs = extract_images(
+                str(pdf_path), max_pages=max_pages, output_dir=paths.images_dir,
+            )
             if imgs:
                 result += "\n\n🖼 **提取的图片**:\n" + "\n".join(f"  - {i}" for i in imgs)
         except Exception as e:
@@ -100,7 +103,8 @@ def handle_read_pdf(args: dict, paper_store=None, **kw) -> str:
             title = pdf_path.stem.replace("_", " ")
             # 从文本中提取方法关键词和实验结果
             from memory import MemoryStore
-            ms = MemoryStore()
+            owns_memory_store = memory_store is None
+            ms = memory_store or MemoryStore(str(paths.memory_db))
             # 简单关键词匹配（不需要模型）
             import re
             methods = re.findall(r'(?:使用|采用|基于|提出|方法[是为]|model[ is]|method[ is]|approach[ is])\s*[：:]*\s*(.{10,60})', result[:5000])
@@ -109,6 +113,8 @@ def handle_read_pdf(args: dict, paper_store=None, **kw) -> str:
             nums = re.findall(r'(\d+\.?\d*\s*%)', result[:5000])
             for n in nums[:2]:
                 ms.add_triple(title, "achieves", n.strip())
+            if owns_memory_store:
+                ms.close()
         except Exception:
             pass
 

@@ -21,7 +21,8 @@ if sys.platform == "win32":
         pass
 import json
 import argparse
-import uuid
+import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -45,8 +46,11 @@ except ImportError:
 
 # ── 项目模块 ──
 from graph_builder import build_graph
+from llm_client import LLMClient, LLMClientError
 from profile import ProfileManager
+from resilience import CircuitBreaker
 from search_api import list_downloaded_papers
+from session_store import SessionStore
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -81,16 +85,32 @@ class ResearchAgent:
             )
 
         # 用户画像
-        self.profile = ProfileManager()
+        self.profile = ProfileManager(cfg.profile_path)
         print(f"      👤 用户画像: {self.profile.summary() or '待完善'}", file=sys.stderr)
 
-        # Token 统计
-        self.token_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
-        self._stream_cb = [None]
+        # 每个会话各自保存 Token 统计；请求内新建图实例，避免流式回调跨会话串线。
+        self._usage_cache: dict[str, dict] = {}
+        self._retry_inputs: dict[str, dict] = {}
+        self.runtime_status: dict[str, object] = {}
+        self.verify_guard = CircuitBreaker(failure_threshold=2, recovery_seconds=120)
+        self.llm_client = LLMClient(
+            api_key=self.api_key,
+            api_url="https://api.deepseek.com/chat/completions",
+            max_concurrency=cfg.api_max_concurrency,
+            queue_size=cfg.api_queue_size,
+            connect_timeout_seconds=cfg.api_connect_timeout_seconds,
+            read_timeout_seconds=cfg.api_read_timeout_seconds,
+            request_deadline_seconds=cfg.api_request_deadline_seconds,
+            max_retries=cfg.api_max_retries,
+            circuit_failure_threshold=cfg.api_circuit_failure_threshold,
+            circuit_recovery_seconds=cfg.api_circuit_recovery_seconds,
+        )
+        self._session_locks: dict[str, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
 
         # 记忆模块
         from memory import MemoryStore
-        self.memory = MemoryStore()
+        self.memory = MemoryStore(cfg.memory_db)
 
         # RAG 论文库
         if cfg.rag_enabled:
@@ -108,56 +128,74 @@ class ResearchAgent:
                 self._paper_store = NoOpStore()
                 print(f"      ⚠️ RAG 降级运行（{e}）", file=sys.stderr)
 
-        # LangGraph
-        self._app = build_graph(
-            api_key=self.api_key,
-            model=self.model,
-            paper_store=self._paper_store,
-            token_usage=self.token_usage,
-            checkpoint_db=cfg.checkpoint_db,
-            glm_api_key=cfg.glm_key,
-            stream_callback=lambda t: self._stream_cb[0](t) if self._stream_cb[0] else None,
-            profile_manager=self.profile,
-            memory_store=self.memory,
-        )
+        # 会话目录与 LangGraph checkpoint 共用同一个 SQLite 文件，便于原子删除。
+        self.sessions = SessionStore(cfg.checkpoint_db)
+        if self.sessions.ensure_legacy_session():
+            print("      💾 已迁移旧对话为「历史会话」", file=sys.stderr)
+        existing_sessions = self.sessions.list()
+        if existing_sessions:
+            self._thread_id = existing_sessions[0]["thread_id"]
+        else:
+            self._thread_id = self.sessions.create()["thread_id"]
 
-        # 会话配置：固定 thread_id 实现跨重启恢复
-        self._thread_id = "research-main"
-        self._config = {"configurable": {"thread_id": self._thread_id}}
-
-        # 检查是否有历史对话 + 估算上下文占比
-        if Path("checkpoint.db").exists():
-            size = Path("checkpoint.db").stat().st_size
-            print(f"      💾 对话历史: checkpoint.db ({size / 1024:.0f} KB)", file=sys.stderr)
-            self._load_context_from_checkpoint()
+        checkpoint_path = Path(cfg.checkpoint_db)
+        if checkpoint_path.exists():
+            size = checkpoint_path.stat().st_size
+            print(f"      💾 对话历史: {checkpoint_path.name} ({size / 1024:.0f} KB)", file=sys.stderr)
+            self._load_context_from_checkpoint(self._thread_id)
             self._prune_checkpoint(max_snapshots=50)
 
     # ── 公开 API ──
 
-    def step(self, user_input: str, context: str | None = None, on_token = None) -> str:
+    def step(
+        self,
+        user_input: str,
+        context: str | None = None,
+        on_token=None,
+        session_id: str | None = None,
+        topic: str | None = None,
+    ) -> str:
         """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文。
-           on_token(token) 可选，用于流式输出回调。"""
-        state = {"messages": []}
+           ``session_id`` 省略时使用当前 CLI 会话；Web 请求必须显式传入。"""
+        thread_id = session_id or self._thread_id
+        state = {"messages": [], "metadata": {"session_id": thread_id}}
+        if topic:
+            state["metadata"]["topic"] = topic
         if context:
             state["messages"].append({"role": "system", "content": context})
         state["messages"].append({"role": "user", "content": user_input})
 
-        # 设置流式回调
-        self._stream_cb[0] = on_token
-
-        try:
-            result = self._app.invoke(state, config=self._config)
-            messages = result.get("messages", [])
-            if not messages:
-                return "⚠️ Agent 未返回任何消息。"
-
-            last = messages[-1]
-            return last.get("content", "") or ""
-
-        except requests.RequestException as e:
-            return f"❌ 网络请求失败: {e}\n   请检查网络和 API Key。"
-        except Exception as e:
-            return f"❌ Agent 错误: {type(e).__name__}: {e}"
+        # 同一会话的对话和删除互斥；不同会话仍可并行执行。
+        with self._lock_for(thread_id):
+            if not self.sessions.get(thread_id):
+                return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
+            self._retry_inputs[thread_id] = {
+                "user_input": user_input, "context": context, "topic": topic,
+            }
+            usage = self.get_usage(thread_id)
+            app = self._build_app(usage, on_token)
+            try:
+                result = app.invoke(
+                    state, config={"configurable": {"thread_id": thread_id}}
+                )
+                messages = result.get("messages", [])
+                if not messages:
+                    return "⚠️ Agent 未返回任何消息。"
+                last = messages[-1]
+                return last.get("content", "") or ""
+            except LLMClientError as e:
+                return f"⚠️ {e}"
+            except requests.RequestException as e:
+                return f"❌ 网络请求失败: {e}\n   请检查网络和 API Key。"
+            except Exception as e:
+                return f"❌ Agent 错误: {type(e).__name__}: {e}"
+            finally:
+                # 成功完成后不在状态栏残留“模型响应中”；流中断提示则保留给用户。
+                if not str(usage.get("api_status", "")).startswith("⚠️"):
+                    usage.pop("api_status", None)
+                self.sessions.touch(thread_id, user_input)
+                self.sessions.save_usage(thread_id, usage)
+                self._close_app(app)
 
     def chat(self, user_input: str):
         """打印格式化回复"""
@@ -175,13 +213,17 @@ class ResearchAgent:
                 f"({self.token_usage['calls']} 次调用)"
             )
 
-    def _load_context_from_checkpoint(self):
-        """从 checkpoint.db 读取当前 thread 的已有消息，估算上下文占比"""
+    def _load_context_from_checkpoint(self, thread_id: str):
+        """读取一个会话已有消息，估算它自己的上下文占比。"""
+        usage = self.get_usage(thread_id)
+        app = self._build_app(usage)
         try:
-            state = self._app.get_state(self._config)
+            state = app.get_state({"configurable": {"thread_id": thread_id}})
             messages = state.values.get("messages", []) if state.values else []
         except Exception:
             messages = []
+        finally:
+            self._close_app(app)
         if not messages:
             return
         # 清理不完整的 tool_calls（assistant 有 tool_calls 但无对应 tool 结果）
@@ -199,22 +241,23 @@ class ResearchAgent:
             context_limit = 65536
         elif "flash" in self.model:
             context_limit = 1000000  # deepseek-v4-flash 官方 1M
-        self.token_usage["prompt"] = est_tokens
-        self.token_usage["total"] = est_tokens
-        self.token_usage["last_prompt"] = est_tokens
-        self.token_usage["context_limit"] = context_limit
+        usage["prompt"] = est_tokens
+        usage["total"] = est_tokens
+        usage["last_prompt"] = est_tokens
+        usage["context_limit"] = context_limit
+        self.sessions.save_usage(thread_id, usage)
         pct = min(int(est_tokens / context_limit * 100), 99)
         print(f"      📊 已有上下文: ~{est_tokens:,} tokens ({pct}%)", file=sys.stderr)
-        # 上下文快满 → 自动开新对话，避免首次提问就 400
+        # 不自动新建会话：保留历史可见，由状态栏提示用户手动新建。
         if pct > 80:
-            self.reset()
-            print("      ⚠ 上下文过高，已自动开新对话", file=sys.stderr)
+            usage["budget_warning"] = "⚠️ 上下文 80%+，建议新建会话"
+            self.sessions.save_usage(thread_id, usage)
 
     def _prune_checkpoint(self, max_snapshots: int = 50):
         """剪裁 checkpoint——只保留最近 N 个快照（每个 thread）"""
         import sqlite3
         try:
-            conn = sqlite3.connect("checkpoint.db")
+            conn = sqlite3.connect(self.cfg.checkpoint_db)
             # 获取所有 thread_id
             threads = conn.execute(
                 "SELECT DISTINCT thread_id FROM checkpoints"
@@ -240,20 +283,77 @@ class ResearchAgent:
             pass  # 剪裁失败不影响正常使用
 
     def reset(self):
-        """重置会话（新 thread_id，旧对话永久保留在 checkpoint.db 中）"""
-        self._thread_id = f"session-{uuid.uuid4().hex[:8]}"
-        self._config = {"configurable": {"thread_id": self._thread_id}}
-        # 清零现有 dict（不能新建，否则 graph 闭包仍写旧引用）
-        for k in self.token_usage:
-            self.token_usage[k] = 0
-        limit = 131072
-        if "reasoner" in self.model:
-            limit = 65536
-        elif "flash" in self.model:
-            limit = 1000000
-        self.token_usage["context_limit"] = limit
-        self.token_usage["calls"] = 0
+        """创建并切换到新会话（兼容 CLI 的 /new 命令）。"""
+        self._thread_id = self.create_session()["thread_id"]
         print(f"\n🔄 已开始新对话 (thread: {self._thread_id})。", file=sys.stderr)
+        return self._thread_id
+
+    def create_session(self, title: str | None = None) -> dict:
+        session = self.sessions.create(title)
+        self._usage_cache[session["thread_id"]] = self._new_usage()
+        return session
+
+    def list_sessions(self) -> list[dict]:
+        return self.sessions.list()
+
+    def select_session(self, thread_id: str) -> dict:
+        session = self.sessions.get(thread_id)
+        if not session:
+            raise KeyError(f"会话不存在: {thread_id}")
+        self._thread_id = thread_id
+        self.get_usage(thread_id)
+        return session
+
+    def delete_session(self, thread_id: str) -> bool:
+        """硬删除会话、checkpoint 和会话摘要；调用方需先完成二次确认。"""
+        with self._lock_for(thread_id):
+            deleted = self.sessions.delete(thread_id)
+            if not deleted:
+                return False
+            self.memory.delete_summaries(thread_id)
+            self._usage_cache.pop(thread_id, None)
+            self._retry_inputs.pop(thread_id, None)
+            if self._thread_id == thread_id:
+                remaining = self.sessions.list()
+                self._thread_id = remaining[0]["thread_id"] if remaining else self.create_session()["thread_id"]
+            return True
+
+    def get_usage(self, thread_id: str | None = None) -> dict:
+        thread_id = thread_id or self._thread_id
+        if thread_id not in self._usage_cache:
+            stored = self.sessions.get_usage(thread_id)
+            usage = self._new_usage()
+            usage.update(stored)
+            self._usage_cache[thread_id] = usage
+        return self._usage_cache[thread_id]
+
+    def get_retry_input(self, thread_id: str | None = None) -> dict | None:
+        """返回本进程内最后一个模型请求，用于 UI 的 `/retry`。"""
+        return self._retry_inputs.get(thread_id or self._thread_id)
+
+    @property
+    def token_usage(self) -> dict:
+        """兼容 CLI 旧调用；Web UI 请用 ``get_usage(session_id)``。"""
+        return self.get_usage(self._thread_id)
+
+    def get_history(self, thread_id: str) -> list[dict]:
+        """返回可直接交给 Gradio Chatbot 的用户/助手消息。"""
+        with self._lock_for(thread_id):
+            if not self.sessions.get(thread_id):
+                return []
+            app = self._build_app(self.get_usage(thread_id))
+            try:
+                state = app.get_state({"configurable": {"thread_id": thread_id}})
+                messages = state.values.get("messages", []) if state.values else []
+            except Exception:
+                messages = []
+            finally:
+                self._close_app(app)
+        return [
+            {"role": m["role"], "content": m.get("content") or ""}
+            for m in messages
+            if m.get("role") in {"user", "assistant"} and m.get("content")
+        ]
 
     @property
     def paper_store(self):
@@ -261,6 +361,47 @@ class ResearchAgent:
         return self._paper_store
 
     # ── 内部 ──
+
+    def _new_usage(self) -> dict:
+        limit = 131072
+        if "reasoner" in self.model:
+            limit = 65536
+        elif "flash" in self.model:
+            limit = 1000000
+        return {
+            "prompt": 0, "completion": 0, "total": 0, "calls": 0,
+            "cached": 0, "cost": 0, "last_round_cost": 0,
+            "last_prompt": 0, "context_limit": limit,
+        }
+
+    def _build_app(self, usage: dict, on_token=None):
+        return build_graph(
+            api_key=self.api_key,
+            model=self.model,
+            paper_store=self._paper_store,
+            token_usage=usage,
+            checkpoint_db=self.cfg.checkpoint_db,
+            glm_api_key=self.cfg.glm_key,
+            stream_callback=on_token,
+            profile_manager=self.profile,
+            memory_store=self.memory,
+            verify_timeout_seconds=self.cfg.verify_timeout_seconds,
+            verify_guard=self.verify_guard,
+            llm_client=self.llm_client,
+        )
+
+    @staticmethod
+    def _close_app(app) -> None:
+        try:
+            app.checkpointer.conn.close()
+        except Exception:
+            pass
+
+    def _lock_for(self, thread_id: str) -> threading.RLock:
+        with self._locks_guard:
+            if thread_id not in self._session_locks:
+                self._session_locks[thread_id] = threading.RLock()
+            return self._session_locks[thread_id]
 
     @property
     def thread_id(self) -> str:
@@ -290,7 +431,7 @@ def print_help():
 📖 **命令列表**
 
   /help            显示此帮助
-  /new             开始新对话（旧对话保留在 checkpoint.db）
+  /new             开始新对话（旧对话保留在运行时数据目录）
   /papers          列出已下载论文
   /indexed         列出已索引论文（RAG库）
   /model           显示当前模型和 RAG 状态
@@ -306,9 +447,9 @@ def print_help():
   >>> "这3篇的共同趋势是什么？"        ← 跨论文分析
 
 📦 **数据存储**
-  data/papers/     PDF 缓存
-  chroma_data/     RAG 向量库（持久化）
-  checkpoint.db    对话历史（SQLite，重启不丢）
+  runtime/primary/papers/  PDF 缓存
+  runtime/derived/chroma/  RAG 向量库（可重建）
+  runtime/primary/db/      对话、笔记、记忆和每日检索数据
 """
     print(msg)
 
@@ -318,14 +459,20 @@ def main():
     parser.add_argument("-m", "--model", default=None, help="模型名称")
     parser.add_argument("--no-rag", action="store_true", help="禁用 RAG")
     parser.add_argument("--debug", action="store_true", help="DEBUG 日志")
+    parser.add_argument("--data-dir", default=None, help="运行时数据目录（默认: APP_DATA_DIR 或 runtime）")
     args = parser.parse_args()
 
     from config import Config
     from logger import setup_logging
     setup_logging(debug=args.debug)
 
-    cli = {"model": args.model, "rag_enabled": not args.no_rag, "ui_debug": args.debug}
-    cfg = Config.load({k: v for k, v in cli.items() if v is not None and v is not False})
+    cli = {
+        "model": args.model,
+        "rag_enabled": False if args.no_rag else None,
+        "ui_debug": True if args.debug else None,
+        "data_dir": args.data_dir,
+    }
+    cfg = Config.load({k: v for k, v in cli.items() if v is not None})
 
     Path(cfg.papers_dir).mkdir(parents=True, exist_ok=True)
 
@@ -335,7 +482,7 @@ def main():
         print("   或: $env:DEEPSEEK_API_KEY='sk-****'")
         sys.exit(1)
 
-    print(f"🤖 使用模型: {model}", file=sys.stderr)
+    print(f"🤖 使用模型: {cfg.model}", file=sys.stderr)
 
     try:
         agent = ResearchAgent(cfg=cfg)
@@ -414,11 +561,8 @@ def main():
                 continue
             old_model = agent.model
             try:
-                agent = ResearchAgent(
-                    model=new_model,
-                    api_key=agent.api_key,
-                    enable_rag=agent.paper_store is not None,
-                )
+                # 保留当前配置（密钥、RAG、数据目录等），仅替换模型。
+                agent = ResearchAgent(cfg=replace(agent.cfg, model=new_model))
                 print(f"\n✅ 已切换模型: {old_model} → {new_model}")
             except Exception as e:
                 print(f"\n❌ 切换失败: {e}")

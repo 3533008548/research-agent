@@ -1,7 +1,7 @@
 """
 📰 每日论文检索调度器
 
-数据库: daily.db
+数据库: APP_DATA_DIR/primary/db/daily.db
   searches   (id, keyword, searched_at, results_json, new_count)
   engagement (id, keyword, paper_title, read_yn, date)
   keywords   (id, keyword, active, added_at, skip_streak)
@@ -15,18 +15,30 @@
 
 import sqlite3
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
+from pathlib import Path
 from typing import Optional
+
+from runtime_paths import get_runtime_paths
 
 
 class Scheduler:
     """每日论文检索调度器"""
 
-    def __init__(self, db_path: str = "daily.db"):
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+    def __init__(self, db_path: str | None = None, request_timeout_seconds: int = 8):
+        self.db_path = db_path or str(get_runtime_paths().daily_db)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.request_timeout_seconds = max(3, int(request_timeout_seconds))
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_db()
+
+    def close(self):
+        """关闭数据库连接（用于应用退出和短生命周期任务）。"""
+        self._conn.close()
 
     def _init_db(self):
         self._conn.executescript("""
@@ -182,11 +194,31 @@ class Scheduler:
                     self._conn.execute("UPDATE keywords SET active=0, search_status='idle' WHERE keyword=?", (kw,))
                     self._conn.commit()
             except Exception:
-                self._conn.execute("ROLLBACK")
+                # 前面的状态更新可能已经提交；用连接 API 回滚不会因“无事务”再抛异常。
+                self._conn.rollback()
                 self._conn.execute("UPDATE keywords SET search_status='idle' WHERE keyword=?", (kw,))
                 self._conn.commit()
 
         return all_new[:max_new] if len(all_new) > max_new else all_new
+
+    def retry_today(self, paper_store=None, max_new: int = 5) -> list[dict]:
+        """清除今天的检索记录后重新执行，用于用户主动重试。"""
+        today = date.today().isoformat()
+        self._conn.execute(
+            "DELETE FROM searches WHERE searched_at LIKE ?", (f"{today}%",)
+        )
+        self._conn.execute(
+            "UPDATE keywords SET search_status='idle' WHERE active=1"
+        )
+        self._conn.commit()
+        return self.run_today(paper_store=paper_store, max_new=max_new)
+
+    def search(self, keyword: str, limit: int = 3) -> list[dict]:
+        """执行一次不写入每日记录的临时多源检索。"""
+        err = self.validate_keyword(keyword)
+        if err:
+            raise ValueError(err)
+        return self._search(keyword.strip(), limit=limit)
 
     def get_progress(self) -> str:
         """返回当前检索进度"""
@@ -205,65 +237,79 @@ class Scheduler:
         return ""
 
     def _search(self, keyword: str, limit: int = 3) -> list[dict]:
-        """全量搜索：Semantic Scholar + arXiv + OpenAlex，合并去重"""
-        import time
-        all_results = []
-        source_counts = {}  # 跟踪每个源的返回数
+        """并行查询三源，并限制每个源的网络等待时间。"""
+        import urllib.parse
+        import xml.etree.ElementTree as ET
+        import requests
 
-        # ── 1. Semantic Scholar ──
-        try:
+        def semantic_scholar() -> tuple[str, list[dict]]:
             from search_api import search_semantic_scholar
-            raw = search_semantic_scholar(keyword, limit=limit)
-            count = 0
+            raw = search_semantic_scholar(
+                keyword, limit=limit,
+                timeout=(3.05, self.request_timeout_seconds),
+            )
+            results = []
             for line in raw.split("\n"):
                 if "**" in line and len(line.strip("-* ")) > 10:
-                    all_results.append({"title": line.strip("-* "), "source": "semantic_scholar"})
-                    count += 1
-            source_counts["SS"] = count
-        except Exception as e:
-            source_counts["SS"] = f"失败: {e}"
+                    results.append({"title": line.strip("-* "), "source": "semantic_scholar"})
+            return "SS", results
 
-        time.sleep(1)
-
-        # ── 2. arXiv ──
-        try:
-            import urllib.parse, xml.etree.ElementTree as ET, requests
-            url = f"http://export.arxiv.org/api/query?search_query=all:{urllib.parse.quote(keyword)}&start=0&max_results={limit}&sortBy=submittedDate&sortOrder=descending"
-            resp = requests.get(url, timeout=30)
+        def arxiv() -> tuple[str, list[dict]]:
+            url = (
+                "https://export.arxiv.org/api/query?search_query=all:"
+                f"{urllib.parse.quote(keyword)}&start=0&max_results={limit}"
+                "&sortBy=submittedDate&sortOrder=descending"
+            )
+            resp = requests.get(url, timeout=(3.05, self.request_timeout_seconds))
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
             ns = {"a": "http://www.w3.org/2005/Atom"}
-            count = 0
+            results = []
             for entry in root.findall("a:entry", ns):
                 title = entry.find("a:title", ns)
                 ttl = title.text.strip().replace("\n", " ") if title is not None else ""
                 link = entry.find("a:id", ns)
                 url_link = link.text.strip() if link is not None else ""
                 if ttl:
-                    all_results.append({"title": ttl, "source": "arxiv", "url": url_link})
-                    count += 1
-            source_counts["arXiv"] = count
-        except Exception as e:
-            source_counts["arXiv"] = f"失败: {e}"
+                    results.append({"title": ttl, "source": "arxiv", "url": url_link})
+            return "arXiv", results
 
-        time.sleep(1)
-
-        # ── 3. OpenAlex ──
-        try:
-            import requests as req
-            resp = req.get("https://api.openalex.org/works",
-                           params={"search": keyword, "per_page": limit, "sort": "publication_date:desc"}, timeout=30)
+        def openalex() -> tuple[str, list[dict]]:
+            resp = requests.get(
+                "https://api.openalex.org/works",
+                params={
+                    "search": keyword, "per_page": limit,
+                    "sort": "publication_date:desc",
+                },
+                timeout=(3.05, self.request_timeout_seconds),
+            )
             resp.raise_for_status()
-            count = 0
-            for w in resp.json().get("results", []):
-                ttl = w.get("title", "")
-                doi = w.get("doi", "")
-                if ttl:
-                    all_results.append({"title": ttl, "source": "openalex", "url": f"https://doi.org/{doi}" if doi else ""})
-                    count += 1
-            source_counts["OpenAlex"] = count
-        except Exception as e:
-            source_counts["OpenAlex"] = f"失败: {e}"
+            results = []
+            for work in resp.json().get("results", []):
+                title = work.get("title", "")
+                doi = work.get("doi", "")
+                if title:
+                    results.append({
+                        "title": title, "source": "openalex",
+                        "url": f"https://doi.org/{doi}" if doi else "",
+                    })
+            return "OpenAlex", results
+
+        all_results = []
+        source_counts = {}
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="daily-search") as executor:
+            futures = {
+                executor.submit(fn): name
+                for name, fn in (("SS", semantic_scholar), ("arXiv", arxiv), ("OpenAlex", openalex))
+            }
+            for future in as_completed(futures):
+                source_name = futures[future]
+                try:
+                    reported_name, results = future.result()
+                    all_results.extend(results)
+                    source_counts[reported_name] = len(results)
+                except Exception as e:
+                    source_counts[source_name] = f"失败: {type(e).__name__}"
 
         # ── 去重 ──
         deduped = []

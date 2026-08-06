@@ -5,6 +5,7 @@
 import sys
 from pathlib import Path
 from search_api import search_arxiv, search_semantic_scholar, list_downloaded_papers
+from runtime_paths import get_runtime_paths
 
 
 def handle_search_papers(args: dict, **kw) -> str:
@@ -22,13 +23,25 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     query = args.get("query", "")
     top_k = min(args.get("top_k", 3), 5)
     section = args.get("section", None)
-    results = paper_store.query(query, top_k=top_k, section=section)
+    results, pending = paper_store.query_with_timeout(
+        query, top_k=top_k, section=section,
+    )
+    if pending and results is None:
+        return f"⏳ {pending}"
     if not results:
-        return "📭 未找到相关内容。请先阅读并索引论文（read_pdf 会自动索引）。"
-    lines = [f"📚 检索结果 — 「{query}」（共 {len(results)} 条）\n"]
+        prefix = f"⏳ {pending}\n\n" if pending else ""
+        return prefix + "📭 未找到相关内容。请先阅读并索引论文（read_pdf 会自动索引）。"
+    is_keyword_result = results[0].get("retrieval") == "keyword"
+    prefix = f"⏳ {pending}\n\n" if pending else ""
+    heading = "关键词候选" if is_keyword_result else "检索结果"
+    lines = [f"{prefix}📚 {heading} — 「{query}」（共 {len(results)} 条）\n"]
     for i, r in enumerate(results, 1):
         sec = r.get("section", "未标注")
-        lines.append(f"  {i}. [{r['title']} · {sec}章节]  距离: {r['distance']}\n     {r['text']}")
+        metric = (
+            f"关键词分: {r['keyword_score']}"
+            if is_keyword_result else f"距离: {r['distance']}"
+        )
+        lines.append(f"  {i}. [{r['title']} · {sec}章节]  {metric}\n     {r['text']}")
     return "\n".join(lines)
 
 
@@ -66,7 +79,7 @@ def handle_delete_paper(args: dict, paper_store=None, **kw) -> str:
     deleted_imgs = 0
     try:
         stem = found["title"].replace(" ", "_")[:30]
-        img_dir = Path("data/papers/images")
+        img_dir = get_runtime_paths().images_dir
         if img_dir.exists():
             for img in img_dir.glob(f"{stem}_*"):
                 img.unlink(missing_ok=True)
