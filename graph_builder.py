@@ -16,6 +16,8 @@
 import json
 import sys
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Annotated, TypedDict
 
@@ -23,6 +25,7 @@ import requests
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from cancellation import RequestCancelledError, raise_if_cancelled
 from llm_client import LLMRequestTimeoutError
 from prompts import SYSTEM_PROMPT
 from tool_schemas import get_tool_schemas
@@ -102,6 +105,8 @@ def build_graph(
     checkpoint_db: str | None = None,
     glm_api_key: str = "",
     stream_callback = None,
+    event_callback = None,
+    cancel_event: threading.Event | None = None,
     profile_manager = None,
     memory_store = None,  # MemoryStore 实例
     verify_timeout_seconds: int = 8,
@@ -113,9 +118,43 @@ def build_graph(
         checkpoint_db = str(get_runtime_paths().checkpoint_db)
     tool_schemas = get_tool_schemas()
 
+    def emit(event_type: str, **details) -> None:
+        """Best-effort trace hook; instrumentation must never interrupt inference."""
+        if not event_callback:
+            return
+        try:
+            event_callback({"type": event_type, **details})
+        except Exception:
+            pass
+
+    def ensure_active(stage: str) -> None:
+        """在图节点边界停止已取消的请求，避免启动下一次外部调用。"""
+        if cancel_event is not None and cancel_event.is_set():
+            emit("request_cancelled", stage=stage)
+        raise_if_cancelled(cancel_event, f"请求已在 {stage} 取消")
+
+    def watch_stream_cancellation(response):
+        """取消时关闭已建立的 SSE 连接，打断 ``iter_lines`` 的阻塞读取。"""
+        if cancel_event is None:
+            return lambda: None
+        stopped = threading.Event()
+
+        def _watch() -> None:
+            while not stopped.wait(0.1):
+                if cancel_event.is_set():
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+
+        threading.Thread(target=_watch, daemon=True, name="cancel-sse-watch").start()
+        return stopped.set
+
     # ═══ LLM 节点 ═══
 
     def llm_node(state: AgentState) -> dict:
+        ensure_active("llm")
         messages = sanitize_model_messages(list(state.get("messages", [])))
 
         # 清理孤儿 tool_calls
@@ -158,19 +197,29 @@ def build_graph(
         def _api_status(message: str) -> None:
             if token_usage is not None:
                 token_usage["api_status"] = message
+            emit("llm_status", status=message)
 
         request_budget = llm_client.new_request_budget() if llm_client else None
+        request_started = time.perf_counter()
+        emit("llm_request_started", model=model, stream=stream_callback is not None)
         if llm_client:
-            resp = llm_client.post(
-                payload,
-                stream=stream_callback is not None,
-                on_status=_api_status,
-                budget=request_budget,
-            )
+            try:
+                post_args = {
+                    "stream": stream_callback is not None,
+                    "on_status": _api_status,
+                    "budget": request_budget,
+                }
+                if cancel_event is not None:
+                    post_args["cancel_event"] = cancel_event
+                resp = llm_client.post(payload, **post_args)
+            except Exception as exc:
+                emit("llm_request_failed", error_type=type(exc).__name__)
+                raise
         else:
             resp = requests.post(api_url, headers={
                 "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
             }, json=payload, timeout=120)
+        emit("llm_response_headers", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
 
         if resp.status_code == 429:
             return {"messages": [{"role": "assistant", "content": "⚠️ API 限流，请稍后再试"}]}
@@ -189,10 +238,18 @@ def build_graph(
                 nonlocal full_text
                 lines = iter(response.iter_lines(decode_unicode=True))
                 while True:
-                    if llm_client and not llm_client.prepare_stream_read(
-                        response, request_budget
-                    ):
-                        raise requests.exceptions.ReadTimeout("stream deadline exceeded")
+                    ensure_active("stream_read")
+                    if llm_client:
+                        if cancel_event is None:
+                            stream_read_ready = llm_client.prepare_stream_read(
+                                response, request_budget,
+                            )
+                        else:
+                            stream_read_ready = llm_client.prepare_stream_read(
+                                response, request_budget, cancel_event=cancel_event,
+                            )
+                        if not stream_read_ready:
+                            raise requests.exceptions.ReadTimeout("stream deadline exceeded")
                     try:
                         line = next(lines)
                     except StopIteration:
@@ -237,6 +294,7 @@ def build_graph(
                         token_usage["last_round_cost"] = cost
 
             while True:
+                stop_watch = watch_stream_cancellation(resp)
                 try:
                     completed = _consume_stream(resp)
                     if not completed:
@@ -246,7 +304,27 @@ def build_graph(
                     if llm_client:
                         llm_client.finish_stream(resp, success=True)
                     break
+                except RequestCancelledError:
+                    if llm_client:
+                        llm_client.finish_stream(resp, success=False, cancelled=True)
+                    else:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    emit("request_cancelled", stage="stream")
+                    raise
                 except requests.RequestException as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        if llm_client:
+                            llm_client.finish_stream(resp, success=False, cancelled=True)
+                        else:
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                        emit("request_cancelled", stage="stream")
+                        raise RequestCancelledError("模型流式响应已取消") from exc
                     if llm_client:
                         llm_client.finish_stream(resp, success=False)
                     else:
@@ -259,10 +337,14 @@ def build_graph(
                         not full_text and llm_client
                         and request_budget.reserve_retry()
                     ):
-                        resp = llm_client.post(
-                            payload, stream=True, on_status=_api_status,
-                            budget=request_budget,
-                        )
+                        retry_args = {
+                            "stream": True,
+                            "on_status": _api_status,
+                            "budget": request_budget,
+                        }
+                        if cancel_event is not None:
+                            retry_args["cancel_event"] = cancel_event
+                        resp = llm_client.post(payload, **retry_args)
                         continue
                     if not full_text:
                         raise LLMRequestTimeoutError(
@@ -284,12 +366,15 @@ def build_graph(
                         except Exception:
                             pass
                     raise
+                finally:
+                    stop_watch()
             assistant_msg = {"role": "assistant", "content": full_text or None}
             if tool_calls_acc:
                 assistant_msg["tool_calls"] = [
                     {"id": v["id"], "type": "function", "function": v["function"]}
                     for v in sorted(tool_calls_acc.values(), key=lambda x: x.get("id", ""))
                 ]
+            emit("llm_request_finished", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
             return {"messages": [assistant_msg]}
 
         # 非流式模式
@@ -314,11 +399,13 @@ def build_graph(
                 {"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
                 for tc in msg["tool_calls"]
             ]
+        emit("llm_request_finished", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
         return {"messages": [assistant_msg]}
 
     # ═══ 路由 ═══
 
     def router(state: AgentState) -> str:
+        ensure_active("route")
         messages = state.get("messages", [])
         if not messages:
             return END
@@ -330,17 +417,34 @@ def build_graph(
     # ═══ 工具节点 ═══
 
     def tool_node(state: AgentState) -> dict:
+        ensure_active("tools")
         messages = state.get("messages", [])
         tool_calls = messages[-1].get("tool_calls", [])
         tool_msgs = []
         for tc in tool_calls:
+            ensure_active("before_tool")
             name = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
                 args = {}
             print(f"      🔧 {name}({json.dumps(args, ensure_ascii=False)})", file=sys.stderr)
-            result = execute_tool(name, args, paper_store=paper_store, glm_api_key=glm_api_key, profile_manager=profile_manager, memory_store=memory_store)
+            tool_started = time.perf_counter()
+            emit("tool_started", tool=name)
+            try:
+                result = execute_tool(
+                    name, args, paper_store=paper_store, glm_api_key=glm_api_key,
+                    profile_manager=profile_manager, memory_store=memory_store,
+                    cancel_event=cancel_event,
+                )
+            except Exception as exc:
+                emit(
+                    "tool_failed", tool=name,
+                    duration_ms=round((time.perf_counter() - tool_started) * 1000, 1),
+                    error_type=type(exc).__name__,
+                )
+                raise
+            ensure_active("after_tool")
             if isinstance(result, str):
                 # ── 按工具类型差异化截断 ──
                 limits = {
@@ -353,6 +457,11 @@ def build_graph(
                 limit = limits.get(name, 3000)
                 if len(result) > limit:
                     result = result[:limit] + f"\n\n...（截断至 {limit} 字符）"
+            emit(
+                "tool_finished", tool=name,
+                duration_ms=round((time.perf_counter() - tool_started) * 1000, 1),
+                rag_keyword_fallback=name == "query_papers" and "关键词候选" in str(result),
+            )
             tool_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         return {"messages": tool_msgs}
 
@@ -381,6 +490,7 @@ def build_graph(
         return severe, minor
 
     def verify_node(state: AgentState) -> dict:
+        ensure_active("verify")
         messages = state.get("messages", [])
         metadata = state.get("metadata") or {}
 

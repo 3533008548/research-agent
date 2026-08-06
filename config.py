@@ -33,6 +33,7 @@ _DFLT = {
     "api_max_retries": 2,
     "api_circuit_failure_threshold": 3,
     "api_circuit_recovery_seconds": 120,
+    "api_url": "https://api.deepseek.com/chat/completions",
 }
 
 
@@ -40,6 +41,7 @@ _DFLT = {
 class Config:
     model: str = "deepseek-chat"
     deepseek_key: str = ""
+    api_url: str = "https://api.deepseek.com/chat/completions"
     glm_key: str = ""
     hf_endpoint: str = ""
 
@@ -159,6 +161,7 @@ class Config:
         # ── 5. 环境变量覆盖 ──
         env_map = {
             "DEEPSEEK_API_KEY": "deepseek_key",
+            "DEEPSEEK_API_URL": "api_url",
             "GLM_API_KEY": "glm_key",
             "HF_ENDPOINT": "hf_endpoint",
             "DEEPSEEK_MODEL": "model",
@@ -175,6 +178,7 @@ class Config:
         return cls(
             model=cfg["model"],
             deepseek_key=cfg.get("deepseek_key", "") or os.getenv("DEEPSEEK_API_KEY", ""),
+            api_url=cfg.get("api_url", _DFLT["api_url"]),
             glm_key=cfg.get("glm_key", "") or os.getenv("GLM_API_KEY", ""),
             hf_endpoint=cfg.get("hf_endpoint", ""),
             pdf_max_pages=cfg["pdf_max_pages"],

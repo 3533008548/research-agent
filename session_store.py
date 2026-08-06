@@ -230,5 +230,32 @@ class SessionStore:
         return True
 
     @_synchronized
+    def cleanup_orphaned_checkpoints(self) -> dict[str, int]:
+        """删除没有会话目录记录的 checkpoint 行。
+
+        这类行来自早期版本的删除缺陷，当前 UI 无法访问它们。迁移完
+        ``research-main`` 后调用，可避免已删除对话长期残留在数据库中。
+        """
+        session_tables = {"agent_sessions", "agent_session_usage"}
+        rows = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        checkpoint_tables = [
+            row["name"]
+            for row in rows
+            if row["name"] not in session_tables
+            and self._table_has_column(row["name"], "thread_id")
+        ]
+        deleted: dict[str, int] = {}
+        with self._conn:
+            for table in checkpoint_tables:
+                cursor = self._conn.execute(
+                    f"DELETE FROM [{table}] "
+                    "WHERE thread_id NOT IN (SELECT thread_id FROM agent_sessions)"
+                )
+                deleted[table] = cursor.rowcount
+        return deleted
+
+    @_synchronized
     def close(self) -> None:
         self._conn.close()

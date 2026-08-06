@@ -1,7 +1,7 @@
 """
 🌐 科研助手 Web UI — 极简聊天界面
 
-基于 Gradio ChatInterface，支持：
+基于 Gradio Blocks + 受控 Chatbot 状态，支持：
   - 斜杠命令: /model /tokens /indexed /new /help
   - 笔记命令: /note topics /note add /note list /note del
   - ChromaDB RAG 论文检索
@@ -40,6 +40,7 @@ load_dotenv()
 
 from research_agent import ResearchAgent
 from notes import NoteStore
+from ui_request_guard import BrowserRunGuard
 
 
 def build_ui():
@@ -85,6 +86,14 @@ def build_ui():
 
     daily_lock = threading.Lock()
     daily_task = {"thread": None}
+    browser_run_guard = BrowserRunGuard()
+
+    def _browser_id(request: gr.Request | None) -> str:
+        """取得 Gradio 浏览器标签页的稳定标识；仅用于请求失效控制。"""
+        return getattr(request, "session_hash", None) or "anonymous-browser"
+
+    def _invalidate_browser_request(request: gr.Request | None) -> None:
+        browser_run_guard.invalidate(_browser_id(request))
 
     def _format_daily_results(results: list[dict], heading: str) -> str:
         if not results:
@@ -201,7 +210,10 @@ def build_ui():
             cmd = f"describe_image {dest}"
         return cmd if not text else f"{cmd}\n{text}"
 
-    def chat_fn(message, history: list[list[str]], session_id: str):
+    def assistant_reply(
+        message, session_id: str,
+        request: gr.Request | None = None,
+    ):
         # Web 请求必须携带浏览器级 session_state。不能回退到 agent.thread_id，
         # 否则状态更新乱序时可能把消息写入另一个会话。
         if not session_id or not agent.sessions.get(session_id):
@@ -430,12 +442,18 @@ def build_ui():
             yield "❌ 编号无效"; return
 
         # 正常对话（流式）
+        browser_id = _browser_id(request)
+        request_generation = browser_run_guard.begin(browser_id)
+        cancel_event = browser_run_guard.cancellation_event(browser_id, request_generation)
+
+        def can_update_chat() -> bool:
+            return browser_run_guard.is_current(browser_id, request_generation)
+
         ctx = retry_request["context"] if retry_request else _build_context()
         request_topic = retry_request["topic"] if retry_request else current_topic["name"]
         import queue, threading
         q = queue.Queue()
         final = []
-        cancelled = [False]
 
         def _run():
             try:
@@ -443,6 +461,7 @@ def build_ui():
                     msg, context=ctx if ctx else None,
                     on_token=lambda token: q.put(("token", token)),
                     session_id=session_id, topic=request_topic,
+                    cancel_event=cancel_event,
                 )
             except BaseException as exc:
                 r = f"❌ 后台请求异常: {type(exc).__name__}: {exc}"
@@ -455,13 +474,17 @@ def build_ui():
 
         partial = "⏳ 正在处理请求…"
         received_model_token = False
-        yield partial
+        if can_update_chat():
+            yield partial
         try:
             while True:
+                if not can_update_chat():
+                    return
                 try:
                     event, value = q.get(timeout=0.1)
                 except queue.Empty:
-                    yield partial
+                    if can_update_chat():
+                        yield partial
                     continue
                 if event == "done":
                     break
@@ -469,12 +492,50 @@ def build_ui():
                     partial = ""
                     received_model_token = True
                 partial += value
-                yield partial
+                if can_update_chat():
+                    yield partial
+            if can_update_chat():
+                yield re.sub(r'(?<!\$)\$([^\$]*[\\_^][^\$]*)\$(?!\$)', r'$$\1$$', final[0])
         except GeneratorExit:
-            cancelled[0] = True
-            q.put(("done", None))  # unblock thread
             return
-        yield re.sub(r'(?<!\$)\$([^\$]*[\\_^][^\$]*)\$(?!\$)', r'$$\1$$', final[0])
+        finally:
+            browser_run_guard.finish(browser_id, request_generation)
+
+    def _message_text(message) -> str:
+        """把多模态输入转换为聊天框中安全、简短的用户消息。"""
+        if isinstance(message, dict):
+            text = str(message.get("text") or "").strip()
+            files = [Path(path).name for path in (message.get("files") or [])]
+            attachment_text = "\n".join(f"📎 {name}" for name in files)
+            return "\n".join(part for part in (attachment_text, text) if part)
+        return str(message or "").strip()
+
+    def prepare_user_message(message, history: list[dict]):
+        """立即显示用户消息，并将原始上传路径只保存到本次请求状态。"""
+        shown = _message_text(message)
+        history = list(history or [])
+        if not shown:
+            return gr.update(), history, history, None
+        updated = history + [{"role": "user", "content": shown}]
+        return gr.update(value=None), updated, updated, message
+
+    def stream_reply(
+        message,
+        history: list[dict],
+        session_id: str,
+        request: gr.Request | None = None,
+    ):
+        """将 Agent 的逐段文本更新为受控聊天历史，不依赖 ChatInterface 内部 State。"""
+        if not _message_text(message):
+            return
+        base_history = list(history or [])
+        for reply in assistant_reply(message, session_id, request):
+            updated = base_history + [{"role": "assistant", "content": reply}]
+            yield updated, updated
+
+    def stop_active_reply(request: gr.Request | None = None):
+        """停止当前浏览器的流式输出，并向 Agent 传播取消令牌。"""
+        _invalidate_browser_request(request)
 
     def _handle_note_cmd(msg: str) -> str:
         parts = msg[5:].strip()  # 去掉 "/note"
@@ -612,40 +673,48 @@ def build_ui():
         """聊天框变化后只刷新状态，避免程序化 change 反向切换会话。"""
         return refresh_status(history, session_id)
 
-    def new_session():
+    def new_session(request: gr.Request | None = None):
+        _invalidate_browser_request(request)
         session = agent.create_session()
-        # 同步 CLI 兼容默认值；Web 正常请求仍使用显式 session_state。
-        agent.select_session(session["thread_id"])
         return (
             gr.update(choices=_session_choices(), value=session["thread_id"]),
+            [],
             [],
             session["thread_id"],
             refresh_status([], session["thread_id"]),
             gr.update(value=False),
         )
 
-    def switch_session(session_id: str):
+    def switch_session(session_id: str, request: gr.Request | None = None):
+        _invalidate_browser_request(request)
         if not agent.sessions.get(session_id):
-            return [], agent.thread_id, refresh_status([], agent.thread_id)
-        agent.select_session(session_id)
-        return agent.get_history(session_id), session_id, refresh_status([], session_id)
+            return [], [], agent.thread_id, refresh_status([], agent.thread_id)
+        history = agent.get_history(session_id)
+        return history, history, session_id, refresh_status(history, session_id)
 
-    def delete_current_session(session_id: str, confirmed: bool):
+    def delete_current_session(
+        session_id: str, confirmed: bool, request: gr.Request | None = None,
+    ):
         if not confirmed:
             return (
-                gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(),
                 gr.update(value=False),
                 "⚠️ 请先勾选“确认永久删除当前会话”。",
             )
+        _invalidate_browser_request(request)
         agent.delete_session(session_id)
+        for key in [key for key in pending_conflicts if key[0] == session_id]:
+            pending_conflicts.pop(key, None)
         remaining = agent.list_sessions()
         next_session_id = remaining[0]["thread_id"] if remaining else agent.thread_id
+        history = agent.get_history(next_session_id)
         return (
             gr.update(choices=_session_choices(), value=next_session_id),
-            agent.get_history(next_session_id),
+            history,
+            history,
             next_session_id,
             gr.update(value=False),
-            refresh_status([], next_session_id),
+            refresh_status(history, next_session_id),
         )
 
     # ═══ 笔记面板函数 ═══
@@ -756,40 +825,67 @@ def build_ui():
                     label="", file_types=[".pdf", ".png", ".jpg", ".jpeg"],
                     visible=False, elem_id="drop-file-input",
                 )
-                # 多模态输入框（📎 附件按钮）
-                chat = gr.ChatInterface(
-                    fn=chat_fn,
-                    chatbot=gr.Chatbot(
-                        value=agent.get_history(agent.thread_id), height=420,
-                        render_markdown=True,
-                    ),
-                    textbox=gr.MultimodalTextbox(
+                # 受控聊天状态：不使用 ChatInterface 的私有 chatbot_state，
+                # 会话切换后的可见历史与请求历史只有同一个 browser State。
+                initial_history = agent.get_history(agent.thread_id)
+                chat_history_state = gr.State(value=initial_history)
+                chatbot = gr.Chatbot(
+                    value=initial_history, height=420, render_markdown=True,
+                )
+                with gr.Row():
+                    chat_input = gr.MultimodalTextbox(
                         placeholder="输入问题或命令... 可拖拽/粘贴文件",
                         container=False, scale=7,
                         file_types=[".pdf", ".png", ".jpg", ".jpeg"],
-                        submit_btn="发送", stop_btn="停止",
-                    ),
-                    multimodal=True,
-                    title=None, description=None,
-                    cache_examples=False,
-                    additional_inputs=[session_state],
+                        submit_btn="发送", stop_btn=False,
+                    )
+                    stop_reply_btn = gr.Button("停止", variant="stop", scale=1)
+                pending_message = gr.State(value=None)
+
+                submit_event = chat_input.submit(
+                    fn=prepare_user_message,
+                    inputs=[chat_input, chat_history_state],
+                    outputs=[chat_input, chatbot, chat_history_state, pending_message],
+                    queue=False,
                 )
-                chat.chatbot.change(
-                    fn=refresh_chat_status, inputs=[chat.chatbot, session_state],
+                reply_event = submit_event.then(
+                    fn=stream_reply,
+                    inputs=[pending_message, chat_history_state, session_state],
+                    outputs=[chatbot, chat_history_state],
+                    concurrency_limit=4,
+                    show_progress="hidden",
+                )
+                stop_reply_btn.click(
+                    fn=stop_active_reply,
+                    outputs=[],
+                    queue=False,
+                    cancels=[reply_event],
+                )
+                chatbot.change(
+                    fn=refresh_chat_status, inputs=[chat_history_state, session_state],
                     outputs=[status],
                 )
                 session_picker.change(
                     fn=switch_session, inputs=[session_picker],
-                    outputs=[chat.chatbot, session_state, status],
+                    outputs=[chatbot, chat_history_state, session_state, status],
+                    queue=False,
                 )
                 new_session_btn.click(
                     fn=new_session,
-                    outputs=[session_picker, chat.chatbot, session_state, status, delete_confirm],
+                    outputs=[
+                        session_picker, chatbot, chat_history_state,
+                        session_state, status, delete_confirm,
+                    ],
+                    queue=False,
                 )
                 delete_session_btn.click(
                     fn=delete_current_session,
                     inputs=[session_state, delete_confirm],
-                    outputs=[session_picker, chat.chatbot, session_state, delete_confirm, status],
+                    outputs=[
+                        session_picker, chatbot, chat_history_state,
+                        session_state, delete_confirm, status,
+                    ],
+                    queue=False,
                 )
 
             # ── Tab 2: 论文库 ──

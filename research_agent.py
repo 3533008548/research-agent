@@ -22,6 +22,7 @@ if sys.platform == "win32":
 import json
 import argparse
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
@@ -45,6 +46,7 @@ except ImportError:
     pass
 
 # ── 项目模块 ──
+from cancellation import RequestCancelledError, raise_if_cancelled
 from graph_builder import build_graph
 from llm_client import LLMClient, LLMClientError
 from profile import ProfileManager
@@ -91,11 +93,12 @@ class ResearchAgent:
         # 每个会话各自保存 Token 统计；请求内新建图实例，避免流式回调跨会话串线。
         self._usage_cache: dict[str, dict] = {}
         self._retry_inputs: dict[str, dict] = {}
+        self._last_traces: dict[str, dict] = {}
         self.runtime_status: dict[str, object] = {}
         self.verify_guard = CircuitBreaker(failure_threshold=2, recovery_seconds=120)
         self.llm_client = LLMClient(
             api_key=self.api_key,
-            api_url="https://api.deepseek.com/chat/completions",
+            api_url=cfg.api_url,
             max_concurrency=cfg.api_max_concurrency,
             queue_size=cfg.api_queue_size,
             connect_timeout_seconds=cfg.api_connect_timeout_seconds,
@@ -132,6 +135,13 @@ class ResearchAgent:
         self.sessions = SessionStore(cfg.checkpoint_db)
         if self.sessions.ensure_legacy_session():
             print("      💾 已迁移旧对话为「历史会话」", file=sys.stderr)
+        cleaned_checkpoints = self.sessions.cleanup_orphaned_checkpoints()
+        cleaned_rows = sum(cleaned_checkpoints.values())
+        if cleaned_rows:
+            print(
+                f"      🧹 已清理 {cleaned_rows} 条无归属的已删除会话记录",
+                file=sys.stderr,
+            )
         existing_sessions = self.sessions.list()
         if existing_sessions:
             self._thread_id = existing_sessions[0]["thread_id"]
@@ -154,9 +164,14 @@ class ResearchAgent:
         on_token=None,
         session_id: str | None = None,
         topic: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> str:
         """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文。
            ``session_id`` 省略时使用当前 CLI 会话；Web 请求必须显式传入。"""
+        try:
+            raise_if_cancelled(cancel_event, "请求已取消")
+        except RequestCancelledError:
+            return "⏹️ 请求已取消。"
         thread_id = session_id or self._thread_id
         state = {"messages": [], "metadata": {"session_id": thread_id}}
         if topic:
@@ -165,30 +180,77 @@ class ResearchAgent:
             state["messages"].append({"role": "system", "content": context})
         state["messages"].append({"role": "user", "content": user_input})
 
-        # 同一会话的对话和删除互斥；不同会话仍可并行执行。
-        with self._lock_for(thread_id):
+        # 同一会话的对话和删除互斥；不同会话仍可并行执行。等待锁时也响应取消。
+        session_lock = self._lock_for(thread_id)
+        while not session_lock.acquire(timeout=0.2):
+            try:
+                raise_if_cancelled(cancel_event, "等待会话操作时已取消")
+            except RequestCancelledError:
+                return "⏹️ 请求已取消。"
+        try:
             if not self.sessions.get(thread_id):
                 return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
             self._retry_inputs[thread_id] = {
                 "user_input": user_input, "context": context, "topic": topic,
             }
             usage = self.get_usage(thread_id)
-            app = self._build_app(usage, on_token)
+            usage_before = dict(usage)
+            started_at = time.perf_counter()
+            trace_events: list[dict] = []
+            first_token_ms: float | None = None
+            outcome = "error"
+            answer = ""
+
+            def _record_event(event: dict) -> None:
+                trace_events.append({
+                    **event,
+                    "at_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                })
+
+            def _on_token(token: str) -> None:
+                nonlocal first_token_ms
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if first_token_ms is None:
+                    first_token_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                    _record_event({"type": "first_token"})
+                if on_token:
+                    on_token(token)
+
+            app = self._build_app(
+                usage, _on_token if on_token else None, _record_event,
+                cancel_event=cancel_event,
+            )
             try:
                 result = app.invoke(
                     state, config={"configurable": {"thread_id": thread_id}}
                 )
                 messages = result.get("messages", [])
                 if not messages:
-                    return "⚠️ Agent 未返回任何消息。"
+                    answer = "⚠️ Agent 未返回任何消息。"
+                    outcome = "empty_response"
+                    return answer
                 last = messages[-1]
-                return last.get("content", "") or ""
+                answer = last.get("content", "") or ""
+                outcome = "success"
+                return answer
+            except RequestCancelledError:
+                answer = "⏹️ 请求已取消。"
+                outcome = "cancelled"
+                _record_event({"type": "request_cancelled"})
+                return answer
             except LLMClientError as e:
-                return f"⚠️ {e}"
+                answer = f"⚠️ {e}"
+                outcome = "llm_error"
+                return answer
             except requests.RequestException as e:
-                return f"❌ 网络请求失败: {e}\n   请检查网络和 API Key。"
+                answer = f"❌ 网络请求失败: {e}\n   请检查网络和 API Key。"
+                outcome = "network_error"
+                return answer
             except Exception as e:
-                return f"❌ Agent 错误: {type(e).__name__}: {e}"
+                answer = f"❌ Agent 错误: {type(e).__name__}: {e}"
+                outcome = "agent_error"
+                return answer
             finally:
                 # 成功完成后不在状态栏残留“模型响应中”；流中断提示则保留给用户。
                 if not str(usage.get("api_status", "")).startswith("⚠️"):
@@ -196,6 +258,23 @@ class ResearchAgent:
                 self.sessions.touch(thread_id, user_input)
                 self.sessions.save_usage(thread_id, usage)
                 self._close_app(app)
+                tool_events = [event for event in trace_events if event.get("type") == "tool_finished"]
+                self._last_traces[thread_id] = {
+                    "session_id": thread_id,
+                    "model": self.model,
+                    "outcome": outcome,
+                    "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                    "first_token_ms": first_token_ms,
+                    "tool_trace": tool_events,
+                    "events": trace_events,
+                    "usage_delta": {
+                        key: usage.get(key, 0) - usage_before.get(key, 0)
+                        for key in ("prompt", "completion", "total", "calls")
+                    },
+                    "answer_chars": len(answer),
+                }
+        finally:
+            session_lock.release()
 
     def chat(self, user_input: str):
         """打印格式化回复"""
@@ -331,6 +410,11 @@ class ResearchAgent:
         """返回本进程内最后一个模型请求，用于 UI 的 `/retry`。"""
         return self._retry_inputs.get(thread_id or self._thread_id)
 
+    def get_last_trace(self, thread_id: str | None = None) -> dict | None:
+        """返回最近一轮的脱敏链路追踪，供评测和诊断使用。"""
+        trace = self._last_traces.get(thread_id or self._thread_id)
+        return json.loads(json.dumps(trace, ensure_ascii=False)) if trace else None
+
     @property
     def token_usage(self) -> dict:
         """兼容 CLI 旧调用；Web UI 请用 ``get_usage(session_id)``。"""
@@ -374,7 +458,7 @@ class ResearchAgent:
             "last_prompt": 0, "context_limit": limit,
         }
 
-    def _build_app(self, usage: dict, on_token=None):
+    def _build_app(self, usage: dict, on_token=None, event_callback=None, cancel_event=None):
         return build_graph(
             api_key=self.api_key,
             model=self.model,
@@ -383,6 +467,8 @@ class ResearchAgent:
             checkpoint_db=self.cfg.checkpoint_db,
             glm_api_key=self.cfg.glm_key,
             stream_callback=on_token,
+            event_callback=event_callback,
+            cancel_event=cancel_event,
             profile_manager=self.profile,
             memory_store=self.memory,
             verify_timeout_seconds=self.cfg.verify_timeout_seconds,

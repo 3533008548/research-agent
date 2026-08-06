@@ -17,6 +17,7 @@ import sys
 import sqlite3
 import os
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 
@@ -596,6 +597,100 @@ class TestSessionStore(unittest.TestCase):
                 memory.close()
                 store.close()
 
+    def test_cleanup_orphaned_checkpoints_keeps_registered_sessions(self):
+        """早期删除遗留的 checkpoint 不能在运行时数据库中持续累积。"""
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_db = Path(tmp) / "checkpoint.db"
+            conn = sqlite3.connect(checkpoint_db)
+            conn.executescript("""
+                CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT);
+                CREATE TABLE writes (thread_id TEXT, value TEXT);
+            """)
+            conn.executemany(
+                "INSERT INTO checkpoints VALUES (?, 'checkpoint')",
+                [("kept",), ("orphan",)],
+            )
+            conn.executemany(
+                "INSERT INTO writes VALUES (?, 'write')",
+                [("kept",), ("orphan",)],
+            )
+            conn.commit()
+            conn.close()
+
+            store = SessionStore(str(checkpoint_db))
+            try:
+                with store._conn:
+                    store._conn.execute(
+                        "INSERT INTO agent_sessions VALUES (?, '保留', '', 'now', 'now')",
+                        ("kept",),
+                    )
+                self.assertEqual(
+                    store.cleanup_orphaned_checkpoints(),
+                    {"checkpoints": 1, "writes": 1},
+                )
+            finally:
+                store.close()
+
+            conn = sqlite3.connect(checkpoint_db)
+            try:
+                for table in ("checkpoints", "writes"):
+                    self.assertEqual(
+                        conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE thread_id='orphan'"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE thread_id='kept'"
+                        ).fetchone()[0],
+                        1,
+                    )
+            finally:
+                conn.close()
+
+
+class TestBrowserRunGuard(unittest.TestCase):
+    """切换会话必须使旧流式回调失效。"""
+
+    def test_new_request_and_invalidation_supersede_old_request(self):
+        from ui_request_guard import BrowserRunGuard
+
+        guard = BrowserRunGuard()
+        first = guard.begin("browser-a")
+        self.assertTrue(guard.is_current("browser-a", first))
+
+        second = guard.begin("browser-a")
+        self.assertFalse(guard.is_current("browser-a", first))
+        self.assertTrue(guard.is_current("browser-a", second))
+
+        guard.invalidate("browser-a")
+        self.assertFalse(guard.is_current("browser-a", second))
+
+    def test_invalidation_signals_the_active_agent_request(self):
+        from ui_request_guard import BrowserRunGuard
+
+        guard = BrowserRunGuard()
+        generation = guard.begin("browser-a")
+        cancel_event = guard.cancellation_event("browser-a", generation)
+        self.assertFalse(cancel_event.is_set())
+
+        guard.invalidate("browser-a")
+        self.assertTrue(cancel_event.wait(0.05))
+
+    def test_finishing_old_request_cannot_remove_new_request(self):
+        from ui_request_guard import BrowserRunGuard
+
+        guard = BrowserRunGuard()
+        first = guard.begin("browser-a")
+        second = guard.begin("browser-a")
+        guard.finish("browser-a", first)
+        self.assertTrue(guard.is_current("browser-a", second))
+        guard.finish("browser-a", second)
+        self.assertFalse(guard.is_current("browser-a", second))
+
 
 class TestLLMClient(unittest.TestCase):
     """主模型请求韧性层：只重试同一模型，不做降级。"""
@@ -688,6 +783,22 @@ class TestLLMClient(unittest.TestCase):
         finally:
             client._slots.release()
 
+    def test_cancelled_request_does_not_enter_model_queue(self):
+        import threading
+        from cancellation import RequestCancelledError
+        from llm_client import LLMClient
+
+        client = LLMClient("test-key", "https://example.test/chat")
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with patch("llm_client.requests.post") as post:
+            with self.assertRaises(RequestCancelledError):
+                client.post(
+                    {"model": "deepseek-v4-flash", "messages": []},
+                    cancel_event=cancel_event,
+                )
+        self.assertFalse(post.called)
+
     def test_stream_holds_slot_and_clears_failure_only_after_done(self):
         """SSE 首包成功不应提前释放并发槽或清除熔断失败记录。"""
         from llm_client import LLMClient
@@ -709,6 +820,80 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(client._circuit._failures, 0)
         self.assertTrue(client._slots.acquire(blocking=False))
         client._slots.release()
+
+
+class TestCancellationPropagation(unittest.TestCase):
+    """取消不是模型故障，且不得继续进入后续图节点。"""
+
+    def test_pre_cancelled_graph_skips_llm_and_tools(self):
+        import threading
+        from cancellation import RequestCancelledError
+        from graph_builder import build_graph
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+        app = build_graph(
+            api_key="test-key", checkpoint_db=":memory:", cancel_event=cancel_event,
+        )
+        try:
+            with self.assertRaises(RequestCancelledError):
+                app.invoke(
+                    {"messages": [{"role": "user", "content": "不应请求模型"}], "metadata": {}},
+                    config={"configurable": {"thread_id": "cancelled-graph"}},
+                )
+        finally:
+            app.checkpointer.conn.close()
+
+    def test_agent_returns_cancelled_status_without_building_graph(self):
+        import threading
+        from config import Config
+        from research_agent import ResearchAgent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(deepseek_key="test-key", rag_enabled=False, data_dir=tmp))
+            cancel_event = threading.Event()
+            cancel_event.set()
+            with patch.object(agent, "_build_app") as build_app:
+                self.assertEqual(agent.step("取消测试", cancel_event=cancel_event), "⏹️ 请求已取消。")
+            self.assertFalse(build_app.called)
+            agent.memory.close()
+            agent.sessions.close()
+
+    def test_agent_stops_an_inflight_graph_when_cancel_event_is_set(self):
+        import threading
+        from cancellation import RequestCancelledError
+        from config import Config
+        from research_agent import ResearchAgent
+
+        class _SlowApp:
+            def __init__(self, cancel_event):
+                self.cancel_event = cancel_event
+
+            def invoke(self, _state, config):
+                while not self.cancel_event.wait(0.01):
+                    pass
+                raise RequestCancelledError("test cancellation")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(deepseek_key="test-key", rag_enabled=False, data_dir=tmp))
+            cancel_event = threading.Event()
+            result = []
+
+            def fake_build(_usage, on_token=None, event_callback=None, cancel_event=None):
+                return _SlowApp(cancel_event)
+
+            worker = threading.Thread(
+                target=lambda: result.append(agent.step("慢请求", cancel_event=cancel_event)),
+            )
+            with patch.object(agent, "_build_app", side_effect=fake_build):
+                worker.start()
+                time.sleep(0.05)
+                cancel_event.set()
+                worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, ["⏹️ 请求已取消。"])
+            agent.memory.close()
+            agent.sessions.close()
 
 
 class TestCircuitBreaker(unittest.TestCase):
@@ -833,6 +1018,84 @@ class TestRuntimePaths(unittest.TestCase):
                 self.assertIn("runtime/primary/db/notes.db", archive.namelist())
                 self.assertIn("runtime/primary/profile.md", archive.namelist())
                 self.assertIn("runtime/primary/papers/paper.pdf", archive.namelist())
+
+
+class TestResearchBenchmark(unittest.TestCase):
+    """版本化评测集不读取用户数据，并能稳定检查结果结构。"""
+
+    def test_manifest_defines_ten_distinct_research_tasks(self):
+        from evals.benchmark import load_manifest, validate_manifest
+
+        manifest = load_manifest()
+        self.assertEqual(validate_manifest(manifest), [])
+        self.assertEqual(len(manifest["tasks"]), 10)
+        self.assertEqual(len({task["id"] for task in manifest["tasks"]}), 10)
+
+    def test_scorer_checks_answer_and_tool_trace(self):
+        from evals.benchmark import load_manifest, score_task
+
+        task = load_manifest()["tasks"][0]
+        score = score_task(task, {
+            "answer": "前向扩散会加噪，反向去噪预测噪声；训练目标包含 MSE 和 deadline 约束。",
+            "tool_trace": ["read_pdf", "query_papers"],
+            "state": {},
+        })
+        self.assertTrue(score["passed"])
+
+    def test_example_results_exercise_all_ten_tasks(self):
+        import json
+        from evals.benchmark import ROOT, load_manifest, score_submission
+
+        results = json.loads((ROOT / "example_results.json").read_text(encoding="utf-8"))
+        report = score_submission(load_manifest(), results)
+        self.assertEqual((report["passed"], report["total"]), (10, 10))
+
+    def test_trace_capture_exports_latency_and_tools_without_payloads(self):
+        from evals.capture import result_from_trace
+
+        captured = result_from_trace("T10", "关键词候选", {
+            "duration_ms": 9100,
+            "first_token_ms": 1200,
+            "tool_trace": [{
+                "type": "tool_finished", "tool": "query_papers",
+                "duration_ms": 8100, "rag_keyword_fallback": True,
+            }],
+        })
+        self.assertEqual(captured["tool_trace"][0]["tool"], "query_papers")
+        self.assertEqual(captured["metrics"]["max_tool_duration_ms"], 8100)
+        self.assertNotIn("arguments", str(captured))
+
+
+class TestRequestTracing(unittest.TestCase):
+    """真实调用前后都应产生脱敏的可评分追踪。"""
+
+    def test_agent_exposes_last_trace_without_prompt_or_tool_payload(self):
+        from config import Config
+        from research_agent import ResearchAgent
+
+        class _FakeApp:
+            def invoke(self, state, config):
+                return {"messages": [{"role": "assistant", "content": "完成"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+
+            def fake_build(usage, on_token=None, event_callback=None, cancel_event=None):
+                event_callback({
+                    "type": "tool_finished", "tool": "query_papers",
+                    "duration_ms": 12.5, "rag_keyword_fallback": False,
+                })
+                return _FakeApp()
+
+            with patch.object(agent, "_build_app", side_effect=fake_build):
+                self.assertEqual(agent.step("不应出现在追踪中的完整问题"), "完成")
+            trace = agent.get_last_trace()
+            self.assertEqual(trace["outcome"], "success")
+            self.assertEqual(trace["tool_trace"][0]["tool"], "query_papers")
+            self.assertNotIn("完整问题", str(trace))
+            agent.memory._conn.close()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 __pycache__/
 runtime/
 backups/
+evals/reports/*.json
 
 # Secrets stay on the host and are injected by Docker Compose at runtime.
 .env

@@ -28,7 +28,7 @@
 | 👤 **用户画像** | Markdown 自动维护，Agent 从对话中学习偏好 |
 | ✅ **自动验证** | verify 分级（严重重生成/轻微提示）+ 跳过门控 + 8 秒限时熔断降级 |
 | 📊 **Token 管理** | 按工具差异化截断 + 缓存命中统计 + 预算预警 + 费用估算 |
-| 🛡️ **请求韧性** | 同模型重试、429 排队、端到端截止时间、半开熔断与流式中断恢复；不自动降级模型 |
+| 🛡️ **请求韧性** | 同模型重试、429 排队、端到端截止时间、半开熔断、流式中断恢复与用户主动取消；不自动降级模型 |
 
 ---
 
@@ -48,6 +48,8 @@ pip install -r requirements.txt
 DEEPSEEK_API_KEY=sk-***
 GLM_API_KEY=***         # 可选，用于看图
 ```
+
+`DEEPSEEK_API_URL` 默认为官方 DeepSeek 地址；仅在自建兼容网关或本地测试模拟服务时覆盖，正常使用无需设置。
 
 ### 3. 启动（Web UI）
 
@@ -141,9 +143,22 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 
 ```bash
 python tests/test_core.py
+python -m evals.benchmark
 ```
 
-当前有 26 个核心回归测试，覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日检索重试与临时检索、多会话隔离和硬删除、统一数据目录、无损迁移与 ZIP 备份，以及三源限时并行、verify 熔断、同模型重试、端到端截止时间、半开熔断和流式中断恢复。CI 在 GitHub Actions 中自动运行该命令。
+核心回归测试覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日检索、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复，以及取消令牌从浏览器到模型/工具节点的传播。
+
+会话隔离另有真实浏览器回归测试：它会启动本地 SSE 模拟服务，复现“旧会话流式输出中，新建会话并发送第一条命令”的竞态，确保旧历史不会重新出现。首次运行需安装 Chromium：
+
+```bash
+pip install -r requirements-dev.txt
+python -m playwright install chromium
+python -m unittest tests.test_session_e2e
+```
+
+GitHub Actions 会分别运行核心回归和浏览器会话隔离测试。
+
+另提供 10 项版本化科研 Agent 评测任务，使用合成语料和模拟状态，不读取个人运行数据、不调用真实模型 API。任务、预期证据、工具轨迹、性能门槛和人工评分量表位于 [evals/README.md](evals/README.md)。真实运行可通过 `ResearchAgent.get_last_trace()` 自动采集脱敏链路数据，并保存带时间戳的评测报告，用于每次重构后的可复现对比与面试展示。
 
 ---
 
@@ -180,7 +195,8 @@ research_agent/
 ├── notes.py              # 科研笔记 (SQLite)
 ├── profile.py            # 用户画像 (Markdown)
 ├── memory.py             # 记忆模块 (三元组+摘要+图片缓存)
-├── llm_client.py         # 主模型并发/重试/端到端预算（不做模型降级）
+├── llm_client.py         # 主模型并发/重试/端到端预算/取消（不做模型降级）
+├── cancellation.py       # 浏览器请求的协作式取消原语
 ├── resilience.py         # 通用三态熔断器（closed/open/half_open）
 ├── runtime_paths.py       # 运行时数据边界、版本与用户设置
 ├── config.py / config.yaml  # 统一配置
@@ -194,9 +210,9 @@ research_agent/
 │
 ├── research_agent.py     # 终端 CLI 入口
 ├── session_store.py       # 会话目录、Token 统计与 checkpoint 联动删除
-├── web_ui.py             # Web UI (Gradio 4 Tab)
+├── web_ui.py             # Web UI：受控 Chatbot 状态，避免跨会话回写
 ├── scripts/              # 旧数据迁移与运行时备份
-├── tests/test_core.py    # 26 个核心回归测试
+├── tests/                # 核心回归 + Playwright 浏览器会话隔离测试
 ├── .github/workflows/    # CI 自动测试
 │
 ├── 需求决策日志.md         # 功能需求与决策记录 (条目 001-025)

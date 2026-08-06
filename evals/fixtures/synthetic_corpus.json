@@ -1,0 +1,42 @@
+{
+  "version": "synthetic-research-corpus-v1",
+  "notice": "本文件为可公开、可复现的合成科研语料，不是用户上传论文。",
+  "papers": [
+    {
+      "id": "diffusion-tsn",
+      "title": "Conditional Diffusion for Multi-Agent TSN Scheduling",
+      "sections": {
+        "Method": "The scheduler adds Gaussian noise to a feasible schedule x0 during forward diffusion. A conditional denoiser reverses the process using traffic load and topology. The training objective combines noise-prediction MSE with a deadline-violation penalty.",
+        "Experiments": "On BurstTSN with 20, 50 and 100 flows, DiffTSN reduces deadline violations by 18 percent relative to PPO under bursty traffic."
+      }
+    },
+    {
+      "id": "attention-tsn",
+      "title": "Graph Attention Actor-Critic for TSN Scheduling",
+      "sections": {
+        "Method": "A graph-attention encoder represents flow contention and an actor-critic policy selects scheduling actions directly. The method does not use iterative denoising.",
+        "Experiments": "The policy is fast at inference but its performance drops when the burst distribution differs from the training distribution."
+      }
+    },
+    {
+      "id": "robust-tsn",
+      "title": "Robust TSN Scheduling under Dynamic Load",
+      "sections": {
+        "Method": "The controller optimizes a risk-sensitive objective and reports deadline violations, latency and schedule feasibility separately.",
+        "Experiments": "Robustness should be evaluated under distribution shift rather than only average latency on the training load."
+      }
+    }
+  ],
+  "daily_feed": [
+    {
+      "source": "arXiv",
+      "title": "Diffusion Models for Network Scheduling",
+      "year": 2026
+    },
+    {
+      "source": "Semantic Scholar",
+      "title": "Multi-Agent TSN under Bursty Traffic",
+      "year": 2026
+    }
+  ]
+}

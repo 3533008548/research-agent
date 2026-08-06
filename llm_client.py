@@ -15,6 +15,7 @@ from typing import Callable
 
 import requests
 
+from cancellation import RequestCancelledError, raise_if_cancelled
 from resilience import CircuitBreaker
 
 
@@ -109,6 +110,7 @@ class LLMClient:
         stream: bool = False,
         on_status: Callable[[str], None] | None = None,
         budget: RequestBudget | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> requests.Response:
         """提交同模型请求。
 
@@ -116,6 +118,7 @@ class LLMClient:
         排队或流式断开而重置总截止时间或重试计数。
         """
         budget = budget or self.new_request_budget()
+        raise_if_cancelled(cancel_event, "模型请求已取消")
         if budget.remaining_seconds() <= 0:
             raise LLMRequestTimeoutError("模型请求在总截止时间内未完成")
         if not self._circuit.allow_request():
@@ -125,8 +128,11 @@ class LLMClient:
             )
 
         try:
-            acquired = self._acquire_slot(on_status, budget)
+            acquired = self._acquire_slot(on_status, budget, cancel_event)
         except LLMQueueFullError:
+            self._circuit.release_probe()
+            raise
+        except RequestCancelledError:
             self._circuit.release_probe()
             raise
         if not acquired:
@@ -138,6 +144,7 @@ class LLMClient:
         release_slot = True
         try:
             while True:
+                raise_if_cancelled(cancel_event, "模型请求已取消")
                 remaining = budget.remaining_seconds()
                 if remaining <= 0:
                     break
@@ -160,6 +167,7 @@ class LLMClient:
                         ),
                         stream=stream,
                     )
+                    raise_if_cancelled(cancel_event, "模型请求已取消")
                     if response.status_code == 429 or response.status_code >= 500:
                         raise _RetryableHTTPError(response)
                     response.raise_for_status()
@@ -174,6 +182,10 @@ class LLMClient:
                         on_status("🤖 模型响应中...")
                     return response
                 except (_RetryableHTTPError, requests.Timeout, requests.ConnectionError) as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        if isinstance(exc, _RetryableHTTPError):
+                            self._close_response(exc.response)
+                        raise RequestCancelledError("模型请求已取消") from exc
                     last_error = exc
                     if isinstance(exc, _RetryableHTTPError):
                         self._close_response(exc.response)
@@ -184,11 +196,19 @@ class LLMClient:
                         break
                     if on_status:
                         on_status(f"⏳ 请求失败，{delay:.1f}s 后重试...")
-                    time.sleep(delay)
+                    if cancel_event is not None and cancel_event.wait(delay):
+                        raise RequestCancelledError("模型请求已取消")
+                    if cancel_event is None:
+                        time.sleep(delay)
                 except requests.RequestException as exc:
                     # 4xx（除 429）通常是鉴权、参数或请求格式问题，重试没有意义。
                     self._circuit.record_failure()
                     raise LLMRequestFailedError(self._format_request_error(exc)) from exc
+                except RequestCancelledError:
+                    if response is not None:
+                        self._close_response(response)
+                    self._circuit.release_probe()
+                    raise
                 except BaseException:
                     # 状态回调取消等异常发生在已拿到 SSE 首包之后时，也必须归还槽位。
                     if stream and not release_slot and response is not None:
@@ -219,9 +239,13 @@ class LLMClient:
         )
 
     def prepare_stream_read(
-        self, response: requests.Response, budget: RequestBudget
+        self,
+        response: requests.Response,
+        budget: RequestBudget,
+        cancel_event: threading.Event | None = None,
     ) -> bool:
         """在读取下一条 SSE 事件前收紧 socket 超时，避免正文越过总截止时间。"""
+        raise_if_cancelled(cancel_event, "模型流式响应已取消")
         remaining = budget.remaining_seconds()
         if remaining <= 0:
             return False
@@ -245,7 +269,13 @@ class LLMClient:
                     continue
         return True
 
-    def finish_stream(self, response: requests.Response, *, success: bool) -> None:
+    def finish_stream(
+        self,
+        response: requests.Response,
+        *,
+        success: bool,
+        cancelled: bool = False,
+    ) -> None:
         """关闭 SSE 响应、释放并发槽，并在完整结束时才记录成功。"""
         with self._lock:
             if not getattr(response, "_llm_stream_slot_owned", False):
@@ -257,6 +287,8 @@ class LLMClient:
             self._slots.release()
         if success:
             self._circuit.record_success()
+        elif cancelled:
+            self._circuit.release_probe()
         else:
             self._circuit.record_failure()
 
@@ -264,7 +296,9 @@ class LLMClient:
         self,
         on_status: Callable[[str], None] | None,
         budget: RequestBudget,
+        cancel_event: threading.Event | None = None,
     ) -> bool:
+        raise_if_cancelled(cancel_event, "模型排队已取消")
         if self._slots.acquire(blocking=False):
             return True
         with self._lock:
@@ -275,7 +309,11 @@ class LLMClient:
         try:
             if on_status:
                 on_status(f"⏳ 模型繁忙，正在排队（前方约 {position} 个请求）...")
-            return self._slots.acquire(timeout=max(0.0, budget.remaining_seconds()))
+            while budget.remaining_seconds() > 0:
+                raise_if_cancelled(cancel_event, "模型排队已取消")
+                if self._slots.acquire(timeout=min(0.2, budget.remaining_seconds())):
+                    return True
+            return False
         finally:
             with self._lock:
                 self._waiting -= 1
