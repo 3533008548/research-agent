@@ -18,12 +18,12 @@
 
 | 功能 | 说明 |
 |------|------|
-| 🔍 **论文搜索** | Semantic Scholar + arXiv + OpenAlex 三源全量搜索，合并去重 |
+| 🔍 **论文搜索** | OpenAlex 通用检索 + arXiv 临时/深度研究预印本检索；结果统一去重 |
 | 📄 **PDF 阅读** | pdfplumber 表格/双栏/章节 + 图注感知图片提取（保留子图关系） |
 | 💬 **多会话管理** | 新建、切换、加载和永久删除会话；历史、摘要、Token 统计互相隔离 |
 | 🧠 **RAG 检索** | 章节感知分层切块 + 章节加权 + 章节过滤 + 公式保护 |
 | 🖼 **多模态看图** | GLM-4V 描述 + 图注附带 + 描述缓存（省 token） |
-| 📰 **每日速递** | 自定义关键词，三源并行限时的后台自动/临时检索，支持重试和待读清单管理 |
+| 📰 **每日速递** | OpenAlex + OpenAIRE + DBLP 并行限时的后台推送；临时检索改用 OpenAlex + arXiv，支持重试和待读清单管理 |
 | 📝 **科研笔记** | SQLite 按话题分组，关联论文 |
 | 👤 **用户画像** | Markdown 自动维护，Agent 从对话中学习偏好 |
 | ✅ **自动验证** | verify 分级（严重重生成/轻微提示）+ 跳过门控 + 8 秒限时熔断降级 |
@@ -43,6 +43,13 @@ pip install -r requirements.txt
 ### 2. 配置
 
 `.env` 中设置 API Key，`config.yaml` 管理其他设置：
+
+```env
+# OpenAlex 只填写原始 Key；不加 Bearer 前缀，也不要提交 .env
+OPENALEX_API_KEY=your-openalex-key
+```
+
+每日推送固定使用 OpenAlex、OpenAIRE 与 DBLP；`/daily search` 和“深度研究”的公开文献部分只使用 OpenAlex 与 arXiv。OpenAlex Key 未配置时接口仍可尝试匿名请求，但生产使用应配置该变量以获得稳定额度与可观测的限流响应。
 
 ```env
 DEEPSEEK_API_KEY=sk-***
@@ -124,6 +131,10 @@ PYTHON_IMAGE=<你的镜像仓库>/library/python:3.11-slim
 
 Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾选确认；旧版固定的 `research-main` 历史会自动迁移为“历史会话”。CLI 中仍可用 `/new` 新建会话。
 
+需要对一个问题做有边界的深度研究时，在对话框输入问题后点击 **🧭 深度研究**（可选择“本地论文 + 公开文献 / 仅本地论文 / 仅公开文献”）。它会先规划问题，再由最多两名研究员并行收集证据，最后完成综合、质检和最多一次修订；最终报告附带 `[E1]` 等证据编号与来源索引。研究只保存用户问题和最终报告，不会把内部工具消息写进会话历史。中途点击“停止”会保留已经收集的证据；在同一会话点击“继续上次研究”或输入 `/research continue` 可从这些证据继续。
+
+深度研究使用受限的工具集：本地研究员只能读取当前论文库，公开研究员只能检索公开论文；若需要新上传文件，请先在普通对话中完成上传和索引，再发起研究。
+
 常用 Web UI 命令：
 
 | 命令 | 说明 |
@@ -133,9 +144,13 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 | `/indexed` | 查看已索引论文 |
 | `/note ...` | 管理按话题归档的科研笔记 |
 | `/daily add <关键词>` | 添加每日检索关键词 |
-| `/daily search <关键词>` | 立即执行一次不落库的三源临时检索 |
+| `/daily search <关键词>` | 立即执行一次不落库的 OpenAlex + arXiv 临时检索 |
 | `/daily retry` | 清除当日检索记录后重新检索已启用关键词 |
+| `/daily resume` | 从上次停止或失败时已保存的候选继续，不重复访问来源 API |
 | `/daily unread` | 查看最近三天的待读清单 |
+| `/research <问题>` | 以默认的本地 + 公开来源启动深度研究 |
+| `/research --sources=local <问题>` | 只检索已索引的本地论文（也可用 `public`） |
+| `/research continue` | 在当前会话中继续上次未完成的深度研究 |
 
 ---
 
@@ -146,7 +161,7 @@ python tests/test_core.py
 python -m evals.benchmark
 ```
 
-核心回归测试覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日检索、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复，以及取消令牌从浏览器到模型/工具节点的传播。
+核心回归测试覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订，以及取消令牌从浏览器到模型/工具节点的传播。
 
 会话隔离另有真实浏览器回归测试：它会启动本地 SSE 模拟服务，复现“旧会话流式输出中，新建会话并发送第一条命令”的竞态，确保旧历史不会重新出现。首次运行需安装 Chromium：
 
@@ -167,6 +182,17 @@ GitHub Actions 会分别运行核心回归和浏览器会话隔离测试。
 ```
 LangGraph ReAct 循环 (graph_builder.py)
   START → LLM ⇄ Tools → Verify(分级) → END
+
+深度研究闭环 (research_orchestrator.py)
+  Planner → 本地证据研究员 ∥ 公开文献研究员 → Synthesis → Critic → Revision(最多一次)
+
+研究运行记录与会话共用 checkpoint.db，以 thread_id 关联；删除会话会同步删除可恢复的计划、证据、质检结果和最终报告。
+
+每日检索闭环 (daily_orchestrator.py)
+  Rule Planner → OpenAlex Scout ∥ OpenAIRE Scout ∥ DBLP Scout
+  → Normalizer/Deduper → Quality Gate → Curator(整次任务一次) → Conditional Critic → Delivery
+
+每日运行记录保存在 daily.db；来源请求按域名限流，任务停止或失败时可从保存的候选恢复。Curator 使用共享 LLMClient 的低优先级请求，模型暂不可用时只保留可解释的规则排序，不切换模型。
 
 Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过或达到重试上限后自动清理，避免影响后续对话。
 
@@ -190,8 +216,9 @@ research_agent/
 ├── graph_builder.py      # LangGraph 图定义 + verify 分级
 ├── pdf_reader.py         # PDF 增强提取 (表格/双栏/章节/图注图片)
 ├── paper_store.py        # ChromaDB RAG (章节感知切块) + NoOpStore
-├── search_api.py         # arXiv / Semantic Scholar / OpenAlex API
+├── search_api.py         # OpenAlex / arXiv 交互式与深度研究检索 API
 ├── scheduler.py          # 每日论文检索调度器（自动/临时/重试）
+├── daily_orchestrator.py # 每日多 Agent 编排、候选质量门控与恢复
 ├── notes.py              # 科研笔记 (SQLite)
 ├── profile.py            # 用户画像 (Markdown)
 ├── memory.py             # 记忆模块 (三元组+摘要+图片缓存)
@@ -209,8 +236,9 @@ research_agent/
 │   └── profile_tool.py   # 画像更新
 │
 ├── research_agent.py     # 终端 CLI 入口
-├── session_store.py       # 会话目录、Token 统计与 checkpoint 联动删除
-├── web_ui.py             # Web UI：受控 Chatbot 状态，避免跨会话回写
+├── research_orchestrator.py # 有边界的 Planner / Researcher / Critic 闭环
+├── session_store.py       # 会话目录、研究运行记录、Token 统计与 checkpoint 联动删除
+├── web_ui.py             # Web UI：受控 Chatbot 状态，深度研究进度/停止/继续
 ├── scripts/              # 旧数据迁移与运行时备份
 ├── tests/                # 核心回归 + Playwright 浏览器会话隔离测试
 ├── .github/workflows/    # CI 自动测试

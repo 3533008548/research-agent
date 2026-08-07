@@ -483,12 +483,13 @@ class TestVerifyNode(unittest.TestCase):
 
     def test_tools_module_imports(self):
         """所有工具模块可正常导入"""
-        from search_api import search_arxiv, search_semantic_scholar, list_downloaded_papers
+        from search_api import search_arxiv, search_openalex, list_downloaded_papers
         from pdf_reader import read_pdf_enhanced, extract_images
         from paper_store import PaperStore, chunk_text
         from notes import NoteStore
         from profile import ProfileManager
         self.assertTrue(callable(search_arxiv))
+        self.assertTrue(callable(search_openalex))
         self.assertTrue(callable(read_pdf_enhanced))
         self.assertTrue(callable(chunk_text))
 
@@ -541,15 +542,215 @@ class TestScheduler(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             scheduler = Scheduler(str(Path(tmp) / "daily.db"), request_timeout_seconds=4)
             try:
-                with patch("search_api.search_semantic_scholar", return_value="- **Semantic paper**") as semantic, \
-                     patch("requests.get", side_effect=fake_get) as request_get:
+                with patch("requests.get", side_effect=fake_get) as request_get:
                     results = scheduler.search("TSN scheduling", limit=1)
-                self.assertEqual(semantic.call_args.kwargs["timeout"], (3.05, 4))
                 self.assertEqual(request_get.call_count, 2)
                 self.assertEqual(
                     {result["source"] for result in results},
-                    {"semantic_scholar", "arxiv", "openalex"},
+                    {"arxiv", "openalex"},
                 )
+            finally:
+                scheduler.close()
+
+
+class TestDailyMultiAgentOrchestration(unittest.TestCase):
+    """每日检索必须可恢复、可降级，且不会为每篇论文调用一次模型。"""
+
+    @staticmethod
+    def _candidate(orchestrator, *, keyword, source, title, doi, abstract="有效摘要", year=2025):
+        return orchestrator._candidate(
+            keyword=keyword,
+            source=source,
+            title=title,
+            doi=doi,
+            abstract=abstract,
+            authors=["Alice"],
+            year=year,
+            published_at=f"{year}-01-02",
+            venue="TestConf",
+            citation_count=20,
+            url=f"https://example.test/{doi}",
+            source_id=doi,
+        )
+
+    def test_daily_run_deduplicates_then_uses_one_batch_curator(self):
+        from daily_orchestrator import DailyResearchOrchestrator
+        from scheduler import Scheduler
+
+        class _Response:
+            def __init__(self, content):
+                self.content = content
+
+            def json(self):
+                return {"choices": [{"message": {"content": self.content}}]}
+
+            def close(self):
+                return None
+
+        class _LLM:
+            def __init__(self):
+                self.calls = []
+
+            def new_request_budget(self, policy):
+                return policy
+
+            def post(self, payload, **_kwargs):
+                self.calls.append(payload)
+                return _Response(
+                    '{"brief":"两篇候选已排序", "rankings": ['
+                    '{"id":"%s","score":90,"reason":"高度相关","tags":["TSN"]},'
+                    '{"id":"%s","score":80,"reason":"补充方法","tags":["调度"]}]}'
+                    % (self.ids[0], self.ids[1])
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                scheduler.add_keyword("TSN scheduling")
+                llm = _LLM()
+                orchestrator = DailyResearchOrchestrator(
+                    scheduler=scheduler, llm_client=llm, model="deepseek-chat",
+                )
+                first = self._candidate(
+                    orchestrator, keyword="TSN scheduling", source="arxiv",
+                    title="Diffusion Scheduling for TSN", doi="10.1/a",
+                )
+                duplicate = self._candidate(
+                    orchestrator, keyword="TSN scheduling", source="openalex",
+                    title="Diffusion Scheduling for TSN", doi="10.1/a",
+                )
+                second = self._candidate(
+                    orchestrator, keyword="TSN scheduling", source="dblp",
+                    title="Reinforcement Learning for TSN", doi="10.1/b",
+                )
+                llm.ids = [first["candidate_id"], second["candidate_id"]]
+                stats = {"TSN scheduling": {
+                    "arxiv": {"status": "ok", "count": 1},
+                    "openalex": {"status": "ok", "count": 1},
+                    "dblp": {"status": "ok", "count": 1},
+                }}
+                with patch.object(orchestrator, "_run_scouts", return_value=([first, duplicate, second], stats)):
+                    result = orchestrator.run("daily")
+
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(len(result.candidates), 2, "跨源同一 DOI 应合并")
+                self.assertEqual(len(llm.calls), 1, "Curator 必须按整次任务批处理")
+                self.assertEqual(result.candidates[0]["curation"]["reason"], "高度相关")
+                saved = scheduler.get_daily_run(result.run_id)
+                self.assertEqual(saved["status"], "completed")
+                self.assertGreaterEqual(len(scheduler.get_daily_agent_events(result.run_id)), 5)
+                self.assertEqual(scheduler.get_today_results()[0]["new_count"], 2)
+            finally:
+                scheduler.close()
+
+    def test_source_sets_keep_arxiv_out_of_daily_and_send_raw_openalex_key(self):
+        from daily_orchestrator import DailyResearchOrchestrator
+        from scheduler import Scheduler
+
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"results": []}
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                orchestrator = DailyResearchOrchestrator(
+                    scheduler=scheduler,
+                    openalex_api_key="oa-test-key",
+                )
+                self.assertEqual(orchestrator.daily_sources, ("openalex", "openaire", "dblp"))
+                self.assertEqual(orchestrator.temporary_sources, ("openalex", "arxiv"))
+                with patch("daily_orchestrator.requests.get", return_value=_Response()) as request_get:
+                    self.assertEqual(orchestrator._openalex_scout("TSN", None), [])
+                self.assertEqual(request_get.call_args.kwargs["params"]["api_key"], "oa-test-key")
+            finally:
+                scheduler.close()
+
+    def test_resume_reuses_saved_candidates_without_fetching_again(self):
+        from daily_orchestrator import DailyResearchOrchestrator
+        from scheduler import Scheduler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                scheduler.add_keyword("TSN scheduling")
+                orchestrator = DailyResearchOrchestrator(scheduler=scheduler)
+                run = scheduler.create_daily_run("daily", ["TSN scheduling"], {"planner": "rule_based"})
+                candidate = self._candidate(
+                    orchestrator, keyword="TSN scheduling", source="arxiv",
+                    title="Saved Candidate", doi="10.1/saved",
+                )
+                candidate["quality"] = {"score": 6, "issues": [], "eligible": True}
+                scheduler.save_daily_candidates(run["run_id"], [candidate])
+                scheduler.update_daily_run(run["run_id"], status="failed")
+
+                with patch.object(orchestrator, "_run_scouts") as scouts:
+                    result = orchestrator.run("daily", resume=True)
+
+                self.assertEqual(result.run_id, run["run_id"])
+                self.assertEqual(result.status, "completed")
+                self.assertFalse(scouts.called)
+                self.assertEqual(scheduler.get_daily_run(run["run_id"])["status"], "completed")
+            finally:
+                scheduler.close()
+
+    def test_critic_is_conditional_for_small_or_low_quality_candidate_sets(self):
+        from daily_orchestrator import DailyResearchOrchestrator
+        from scheduler import Scheduler
+
+        class _Response:
+            def __init__(self, content):
+                self.content = content
+
+            def json(self):
+                return {"choices": [{"message": {"content": self.content}}]}
+
+            def close(self):
+                return None
+
+        class _LLM:
+            def __init__(self, candidate_id):
+                self.candidate_id = candidate_id
+                self.calls = 0
+
+            def new_request_budget(self, policy):
+                return policy
+
+            def post(self, _payload, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return _Response(
+                        '{"brief":"单篇候选", "rankings":[{"id":"%s","score":90,"reason":"相关","tags":[]}]}'
+                        % self.candidate_id
+                    )
+                return _Response('{"warnings":["候选较少"],"drop_ids":[]}')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                scheduler.add_keyword("TSN scheduling")
+                seed = DailyResearchOrchestrator(scheduler=scheduler)
+                candidate = self._candidate(
+                    seed, keyword="TSN scheduling", source="arxiv",
+                    title="Only Candidate", doi="10.1/only",
+                )
+                llm = _LLM(candidate["candidate_id"])
+                orchestrator = DailyResearchOrchestrator(
+                    scheduler=scheduler, llm_client=llm, model="deepseek-chat",
+                )
+                stats = {"TSN scheduling": {"arxiv": {"status": "ok", "count": 1}}}
+                with patch.object(orchestrator, "_run_scouts", return_value=([candidate], stats)):
+                    result = orchestrator.run("daily")
+
+                self.assertEqual(llm.calls, 2, "候选不足时才追加一次 Critic")
+                self.assertTrue(result.critique["ran"])
+                self.assertEqual(result.critique["warnings"], ["候选较少"])
             finally:
                 scheduler.close()
 
@@ -654,7 +855,7 @@ class TestSessionStore(unittest.TestCase):
                     )
                 self.assertEqual(
                     store.cleanup_orphaned_checkpoints(),
-                    {"checkpoints": 1, "writes": 1},
+                    {"checkpoints": 1, "writes": 1, "research_runs": 0},
                 )
             finally:
                 store.close()
@@ -676,6 +877,189 @@ class TestSessionStore(unittest.TestCase):
                     )
             finally:
                 conn.close()
+
+    def test_research_run_is_session_scoped_and_deleted_with_session(self):
+        """深度研究的可恢复中间态必须跟随会话删除，不能成为孤儿数据。"""
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                session = store.create()
+                run = store.create_research_run(session["thread_id"], "比较两种调度方法")
+                self.assertEqual(run["status"], "running")
+                self.assertEqual(run["evidence"], [])
+
+                saved = store.update_research_run(
+                    run["run_id"],
+                    status="failed",
+                    plan={"objective": "比较"},
+                    evidence=[{"id": "E1", "source": "本地论文"}],
+                    critique={"verdict": "pass", "issues": []},
+                    final_answer="保留的研究结果",
+                    trace={"stages": ["planner"]},
+                )
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(saved["plan"]["objective"], "比较")
+                self.assertEqual(saved["evidence"][0]["id"], "E1")
+                self.assertEqual(
+                    store.get_latest_research_run(session["thread_id"])["run_id"],
+                    run["run_id"],
+                )
+
+                self.assertTrue(store.delete(session["thread_id"]))
+                self.assertIsNone(store.get_research_run(run["run_id"]))
+            finally:
+                store.close()
+
+
+class TestResearchOrchestration(unittest.TestCase):
+    """不访问真实模型，验证深度研究的持久化、修订和继续语义。"""
+
+    @staticmethod
+    def _worker_result(role="local"):
+        return {
+            "role": role,
+            "label": "本地证据研究员",
+            "status": "completed",
+            "message": "获得 1 条证据",
+            "answer": "工具检索完成",
+            "evidence": [{
+                "id": "",
+                "researcher": role,
+                "source_type": "query_papers",
+                "source": "TSN Paper",
+                "excerpt": "TSN 论文中的可核验证据。",
+                "uncertainty": "需要结合原文核验。",
+            }],
+            "usage": {"prompt": 2, "completion": 3, "total": 5, "calls": 1},
+            "trace": {"role": role},
+        }
+
+    def _orchestrator(self, store):
+        from research_orchestrator import ResearchOrchestrator
+
+        return ResearchOrchestrator(
+            session_store=store,
+            api_key="test-key",
+            model="deepseek-chat",
+            paper_store=None,
+            glm_api_key="",
+            llm_client=MagicMock(),
+            verify_timeout_seconds=3,
+        )
+
+    def test_completed_research_runs_one_bounded_revision_and_persists_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from session_store import SessionStore
+
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                session = store.create()
+                orchestrator = self._orchestrator(store)
+                calls = []
+
+                def fake_model(*, stage, usage, **_kwargs):
+                    calls.append(stage)
+                    usage["calls"] += 1
+                    return {
+                        "planner": '{"objective":"TSN","subtasks":[{"id":"local","focus":"本地证据"}]}',
+                        "synthesis": "初稿结论 [E1]",
+                        "critic": '{"verdict":"revise","issues":["补充局限"]}',
+                        "revision": "修订后结论 [E1]",
+                    }[stage]
+
+                events = []
+                with patch.object(orchestrator, "_call_model", side_effect=fake_model), \
+                     patch.object(orchestrator, "_run_workers", return_value=[self._worker_result()]):
+                    result = orchestrator.run(
+                        "TSN 中两种调度方法的差异是什么？",
+                        thread_id=session["thread_id"],
+                        on_progress=events.append,
+                    )
+
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(calls, ["planner", "synthesis", "critic", "revision"])
+                self.assertIn("修订后结论 [E1]", result.answer)
+                self.assertIn("证据索引", result.answer)
+                saved = store.get_research_run(result.run_id)
+                self.assertEqual(saved["status"], "completed")
+                self.assertEqual(saved["evidence"][0]["id"], "E1")
+                self.assertEqual(saved["critique"]["verdict"], "revise")
+                self.assertTrue(any(event["stage"] == "completed" for event in events))
+            finally:
+                store.close()
+
+
+    def test_research_turn_is_visible_as_only_user_and_final_report(self):
+        """研究员的内部工具消息不得污染普通会话历史。"""
+        from config import Config
+        from research_agent import ResearchAgent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(deepseek_key="test-key", rag_enabled=False, data_dir=tmp))
+            try:
+                thread_id = agent.thread_id
+                agent._append_research_turn(
+                    thread_id,
+                    "研究 TSN 调度方法",
+                    "# 深度研究报告\n\n结论 [E1]",
+                )
+                self.assertEqual(
+                    agent.get_history(thread_id),
+                    [
+                        {"role": "user", "content": "研究 TSN 调度方法"},
+                        {"role": "assistant", "content": "# 深度研究报告\n\n结论 [E1]"},
+                    ],
+                )
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_continue_reuses_saved_evidence_without_replanning_or_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from session_store import SessionStore
+
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                session = store.create()
+                previous = store.create_research_run(session["thread_id"], "继续测试")
+                store.update_research_run(
+                    previous["run_id"],
+                    status="failed",
+                    plan={"objective": "继续测试", "subtasks": []},
+                    evidence=[self._worker_result()["evidence"][0]],
+                )
+                orchestrator = self._orchestrator(store)
+                calls = []
+
+                def fake_model(*, stage, **_kwargs):
+                    calls.append(stage)
+                    return {
+                        "synthesis": "基于保留证据的结论 [E1]",
+                        "critic": '{"verdict":"pass","issues":[]}',
+                    }[stage]
+
+                with patch.object(orchestrator, "_call_model", side_effect=fake_model), \
+                     patch.object(orchestrator, "_run_workers") as workers:
+                    result = orchestrator.run(
+                        "", thread_id=session["thread_id"], resume=True,
+                    )
+
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.run_id, previous["run_id"])
+                self.assertEqual(calls, ["synthesis", "critic"])
+                self.assertFalse(workers.called)
+
+                with patch.object(orchestrator, "_call_model") as no_model:
+                    already_done = orchestrator.run(
+                        "", thread_id=session["thread_id"], resume=True,
+                    )
+                self.assertEqual(already_done.run_id, previous["run_id"])
+                self.assertIn("已经完成", already_done.answer)
+                self.assertFalse(no_model.called)
+            finally:
+                store.close()
 
 
 class TestBrowserRunGuard(unittest.TestCase):
@@ -932,6 +1316,45 @@ class TestCancellationPropagation(unittest.TestCase):
         finally:
             app.checkpointer.conn.close()
 
+    def test_research_worker_graph_ends_without_verify_request(self):
+        """研究员工具循环结束后不再额外调用一次 verify。"""
+        from graph_builder import build_graph
+        from llm_client import LLMClient
+
+        class _Response:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"choices": [{"message": {"content": "已完成本地证据整理"}}]}
+
+        with patch(
+            "llm_client.requests.post",
+            return_value=_Response(),
+        ) as post:
+            app = build_graph(
+                api_key="test-key",
+                checkpoint_db=":memory:",
+                enable_verify=False,
+                allowed_tool_names={"query_papers"},
+                llm_client=LLMClient("test-key", "https://example.test/chat"),
+            )
+            try:
+                result = app.invoke(
+                    {"messages": [{"role": "user", "content": "收集本地证据"}], "metadata": {}},
+                    config={"configurable": {"thread_id": "research-worker"}},
+                )
+            finally:
+                app.checkpointer.conn.close()
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(result["messages"][-1]["content"], "已完成本地证据整理")
+
     def test_graph_requires_shared_llm_client(self):
         from graph_builder import build_graph
 
@@ -1053,6 +1476,16 @@ class TestRuntimePaths(unittest.TestCase):
                 os.environ.pop("APP_DATA_DIR", None)
             else:
                 os.environ["APP_DATA_DIR"] = old_data_dir
+
+    def test_openalex_key_uses_a_dedicated_environment_variable(self):
+        from config import Config
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"OPENALEX_API_KEY": "oa-test-key"}, clear=False,
+        ):
+            cfg = Config.load({"data_dir": tmp})
+            self.assertEqual(cfg.openalex_api_key, "oa-test-key")
+            self.assertEqual(cfg.daily_sources, ("openalex", "openaire", "dblp"))
 
     def test_migration_script_previews_then_copies_without_deleting_source(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -118,6 +118,10 @@ def build_graph(
     verify_timeout_seconds: int = 8,
     verify_guard = None,
     llm_client = None,
+    system_prompt: str | None = None,
+    allowed_tool_names: set[str] | None = None,
+    enable_verify: bool = True,
+    request_policy: RequestPolicy | None = None,
 ):
     # A graph must use the process-wide client owned by ResearchAgent. Creating
     # one here would silently defeat shared admission control in multi-agent
@@ -128,6 +132,11 @@ def build_graph(
         from runtime_paths import get_runtime_paths
         checkpoint_db = str(get_runtime_paths().checkpoint_db)
     tool_schemas = get_tool_schemas()
+    if allowed_tool_names is not None:
+        tool_schemas = [
+            schema for schema in tool_schemas
+            if schema.get("function", {}).get("name") in allowed_tool_names
+        ]
 
     def emit(event_type: str, **details) -> None:
         """Best-effort trace hook; instrumentation must never interrupt inference."""
@@ -182,7 +191,7 @@ def build_graph(
 
         # 话题/笔记上下文也会以 system message 传入，不能因此跳过核心约束提示词。
         profile_text = profile_manager.summary() if profile_manager else ""
-        prompt = SYSTEM_PROMPT
+        prompt = system_prompt or SYSTEM_PROMPT
         if profile_text:
             prompt = f"[用户画像] {profile_text}\n\n{prompt}"
         messages.insert(0, {"role": "system", "content": prompt})
@@ -211,7 +220,7 @@ def build_graph(
             emit("llm_status", status=message)
 
         request_budget = llm_client.new_request_budget(
-            RequestPolicy(
+            request_policy or RequestPolicy(
                 purpose="chat",
                 priority=RequestPriority.INTERACTIVE,
             )
@@ -431,7 +440,7 @@ def build_graph(
         last = messages[-1]
         if last.get("tool_calls"):
             return "tools"
-        return "verify"
+        return "verify" if enable_verify else END
 
     # ═══ 工具节点 ═══
 
@@ -443,6 +452,12 @@ def build_graph(
         for tc in tool_calls:
             ensure_active("before_tool")
             name = tc["function"]["name"]
+            if allowed_tool_names is not None and name not in allowed_tool_names:
+                tool_msgs.append({
+                    "role": "tool", "tool_call_id": tc["id"],
+                    "content": f"Tool is not available in this research role: {name}",
+                })
+                continue
             try:
                 args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
@@ -781,7 +796,9 @@ def build_graph(
     graph.add_node("tools", tool_node)
     graph.add_node("verify", verify_node)
     graph.set_entry_point("llm")
-    graph.add_conditional_edges("llm", router, {"tools": "tools", "verify": "verify"})
+    graph.add_conditional_edges(
+        "llm", router, {"tools": "tools", "verify": "verify", END: END},
+    )
     graph.add_edge("tools", "llm")
     graph.add_conditional_edges("verify", verify_router, {"llm": "llm", END: END})
 

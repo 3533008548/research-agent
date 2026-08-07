@@ -27,7 +27,7 @@ SYSTEM_PROMPT = (
     "4. **明确来源** — 回答中用 [已读][搜索][推测] 标记每条信息\n\n"
     "## 核心能力\n"
     "1. query_papers — 本地论文库精准检索（方法细节、公式、实验数据）\n"
-    "2. search_papers — Semantic Scholar / arXiv 搜索新论文\n"
+    "2. search_papers — OpenAlex / arXiv 搜索新论文\n"
     "3. read_pdf — 下载并阅读论文（自动索引，读完后生成摘要卡片）\n"
     "4. describe_image — 用视觉模型理解论文中的架构图、流程图、实验图\n"
     "4. 方向分析 — 综合多篇论文，对比技术趋势\n"

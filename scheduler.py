@@ -13,8 +13,10 @@
   results = s.run_today()  # 当天未检索则执行，返回 [(title, url, summary, is_new)]
 """
 
+import os
 import sqlite3
 import json
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 from pathlib import Path
@@ -66,6 +68,43 @@ class Scheduler:
                 status TEXT DEFAULT 'skipped',  -- skipped / want_read / read
                 date TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS daily_runs (
+                run_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                keywords_json TEXT NOT NULL DEFAULT '[]',
+                plan_json TEXT NOT NULL DEFAULT '{}',
+                source_stats_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '[]',
+                critique_json TEXT NOT NULL DEFAULT '{}',
+                error_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_daily_runs_updated
+                ON daily_runs(updated_at DESC);
+            CREATE TABLE IF NOT EXISTS daily_candidates (
+                run_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                candidate_json TEXT NOT NULL,
+                quality_json TEXT NOT NULL DEFAULT '{}',
+                rank INTEGER,
+                selected INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(run_id, candidate_id),
+                FOREIGN KEY(run_id) REFERENCES daily_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS daily_agent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                status TEXT NOT NULL,
+                message TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES daily_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_daily_agent_events_run
+                ON daily_agent_events(run_id, id);
         """)
         self._conn.commit()
         # 兼容旧表
@@ -73,6 +112,145 @@ class Scheduler:
         if "search_status" not in cols:
             self._conn.execute("ALTER TABLE keywords ADD COLUMN search_status TEXT DEFAULT 'idle'")
             self._conn.commit()
+
+    # ── 多 Agent 每日运行记录 ──
+
+    @staticmethod
+    def _decode_json(raw: str | None, fallback):
+        try:
+            value = json.loads(raw or "")
+        except (TypeError, json.JSONDecodeError):
+            return fallback
+        return value
+
+    @classmethod
+    def _run_row(cls, row: sqlite3.Row) -> dict:
+        item = dict(row)
+        for key, fallback in (
+            ("keywords_json", []), ("plan_json", {}), ("source_stats_json", {}),
+            ("result_json", []), ("critique_json", {}),
+        ):
+            item[key.removesuffix("_json")] = cls._decode_json(item.pop(key, None), fallback)
+        return item
+
+    def create_daily_run(self, kind: str, keywords: list[str], plan: dict | None = None) -> dict:
+        run_id = f"daily-{uuid.uuid4().hex[:12]}"
+        now = datetime.now().isoformat()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO daily_runs (run_id, kind, status, keywords_json, plan_json, created_at, updated_at) "
+                "VALUES (?, ?, 'running', ?, ?, ?, ?)",
+                (
+                    run_id, kind, json.dumps(keywords, ensure_ascii=False),
+                    json.dumps(plan or {}, ensure_ascii=False), now, now,
+                ),
+            )
+        return self.get_daily_run(run_id) or {}
+
+    def get_daily_run(self, run_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM daily_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return self._run_row(row) if row else None
+
+    def get_latest_resumable_run(self, kind: str | None = None) -> dict | None:
+        where = "WHERE status IN ('running', 'partial_failed', 'failed', 'cancelled')"
+        values: list[str] = []
+        if kind:
+            where += " AND kind=?"
+            values.append(kind)
+        row = self._conn.execute(
+            f"SELECT * FROM daily_runs {where} ORDER BY updated_at DESC LIMIT 1", values,
+        ).fetchone()
+        return self._run_row(row) if row else None
+
+    def update_daily_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        source_stats: dict | None = None,
+        results: list[dict] | None = None,
+        critique: dict | None = None,
+        error_text: str | None = None,
+    ) -> dict | None:
+        values: dict[str, object] = {"run_id": run_id, "updated_at": datetime.now().isoformat()}
+        sets = ["updated_at=:updated_at"]
+        updates = {
+            "status": status,
+            "source_stats_json": json.dumps(source_stats, ensure_ascii=False) if source_stats is not None else None,
+            "result_json": json.dumps(results, ensure_ascii=False) if results is not None else None,
+            "critique_json": json.dumps(critique, ensure_ascii=False) if critique is not None else None,
+            "error_text": error_text,
+        }
+        for column, value in updates.items():
+            if value is not None:
+                values[column] = value
+                sets.append(f"{column}=:{column}")
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE daily_runs SET {', '.join(sets)} WHERE run_id=:run_id", values,
+            )
+        return self.get_daily_run(run_id)
+
+    def save_daily_candidates(self, run_id: str, candidates: list[dict]) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM daily_candidates WHERE run_id=?", (run_id,))
+            self._conn.executemany(
+                "INSERT INTO daily_candidates (run_id, candidate_id, candidate_json, quality_json, rank, selected) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        run_id, str(candidate["candidate_id"]),
+                        json.dumps(candidate, ensure_ascii=False),
+                        json.dumps(candidate.get("quality", {}), ensure_ascii=False),
+                        candidate.get("rank"), int(bool(candidate.get("selected"))),
+                    )
+                    for candidate in candidates
+                ],
+            )
+
+    def get_daily_candidates(self, run_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT candidate_json, quality_json, rank, selected FROM daily_candidates "
+            "WHERE run_id=? ORDER BY selected DESC, rank ASC, candidate_id ASC", (run_id,),
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            item = self._decode_json(row["candidate_json"], {})
+            if not isinstance(item, dict):
+                continue
+            item["quality"] = self._decode_json(row["quality_json"], {})
+            item["rank"] = row["rank"]
+            item["selected"] = bool(row["selected"])
+            candidates.append(item)
+        return candidates
+
+    def add_daily_agent_event(
+        self, run_id: str, agent: str, status: str, message: str, details: dict | None = None,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO daily_agent_events (run_id, agent, status, message, details_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    run_id, agent, status, message,
+                    json.dumps(details or {}, ensure_ascii=False), datetime.now().isoformat(),
+                ),
+            )
+
+    def get_daily_agent_events(self, run_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT agent, status, message, details_json, created_at FROM daily_agent_events "
+            "WHERE run_id=? ORDER BY id", (run_id,),
+        ).fetchall()
+        return [
+            {
+                **dict(row),
+                "details": self._decode_json(row["details_json"], {}),
+            }
+            for row in rows
+        ]
 
     # ── 关键词管理 ──
 
@@ -201,6 +379,46 @@ class Scheduler:
 
         return all_new[:max_new] if len(all_new) > max_new else all_new
 
+    def prepare_daily_keywords(self, *, retry: bool = False) -> list[str]:
+        """为多 Agent 编排器返回本次应处理的关键词，并保留原有“每日一次”语义。"""
+        if retry:
+            today = date.today().isoformat()
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM searches WHERE searched_at LIKE ?", (f"{today}%",)
+                )
+                self._conn.execute(
+                    "UPDATE keywords SET search_status='idle' WHERE active=1"
+                )
+        return [keyword for keyword in self.get_active_keywords() if not self.searched_today(keyword)]
+
+    def record_daily_keyword_result(self, keyword: str, results: list[dict]) -> None:
+        """将编排器已筛选的结果写回旧的每日概览表，兼容 /daily 等现有命令。"""
+        now = datetime.now().isoformat()
+        payload = json.dumps(results, ensure_ascii=False, separators=(",", ":"))
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO searches (keyword, searched_at, results_json, new_count) VALUES (?, ?, ?, ?)",
+                (keyword, now, payload, len(results)),
+            )
+            if results:
+                self._conn.execute(
+                    "UPDATE keywords SET search_status='done', hit_count=hit_count+?, skip_streak=0 WHERE keyword=?",
+                    (len(results), keyword),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE keywords SET search_status='done', skip_streak=skip_streak+1 WHERE keyword=?",
+                    (keyword,),
+                )
+            row = self._conn.execute(
+                "SELECT skip_streak FROM keywords WHERE keyword=?", (keyword,)
+            ).fetchone()
+            if row and row["skip_streak"] >= 3:
+                self._conn.execute(
+                    "UPDATE keywords SET active=0, search_status='idle' WHERE keyword=?", (keyword,)
+                )
+
     def retry_today(self, paper_store=None, max_new: int = 5) -> list[dict]:
         """清除今天的检索记录后重新执行，用于用户主动重试。"""
         today = date.today().isoformat()
@@ -242,23 +460,11 @@ class Scheduler:
         import xml.etree.ElementTree as ET
         import requests
 
-        def semantic_scholar() -> tuple[str, list[dict]]:
-            from search_api import search_semantic_scholar
-            raw = search_semantic_scholar(
-                keyword, limit=limit,
-                timeout=(3.05, self.request_timeout_seconds),
-            )
-            results = []
-            for line in raw.split("\n"):
-                if "**" in line and len(line.strip("-* ")) > 10:
-                    results.append({"title": line.strip("-* "), "source": "semantic_scholar"})
-            return "SS", results
-
         def arxiv() -> tuple[str, list[dict]]:
             url = (
                 "https://export.arxiv.org/api/query?search_query=all:"
                 f"{urllib.parse.quote(keyword)}&start=0&max_results={limit}"
-                "&sortBy=submittedDate&sortOrder=descending"
+                "&sortBy=relevance&sortOrder=descending"
             )
             resp = requests.get(url, timeout=(3.05, self.request_timeout_seconds))
             resp.raise_for_status()
@@ -280,6 +486,7 @@ class Scheduler:
                 params={
                     "search": keyword, "per_page": limit,
                     "sort": "publication_date:desc",
+                    **({"api_key": os.getenv("OPENALEX_API_KEY", "")} if os.getenv("OPENALEX_API_KEY") else {}),
                 },
                 timeout=(3.05, self.request_timeout_seconds),
             )
@@ -297,10 +504,10 @@ class Scheduler:
 
         all_results = []
         source_counts = {}
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="daily-search") as executor:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="daily-search") as executor:
             futures = {
                 executor.submit(fn): name
-                for name, fn in (("SS", semantic_scholar), ("arXiv", arxiv), ("OpenAlex", openalex))
+                for name, fn in (("arXiv", arxiv), ("OpenAlex", openalex))
             }
             for future in as_completed(futures):
                 source_name = futures[future]

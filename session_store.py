@@ -60,6 +60,23 @@ class SessionStore:
             );
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated_at
                 ON agent_sessions(updated_at DESC);
+            CREATE TABLE IF NOT EXISTS research_runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                status TEXT NOT NULL,
+                plan_json TEXT NOT NULL DEFAULT '{}',
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                critique_json TEXT NOT NULL DEFAULT '{}',
+                final_answer TEXT NOT NULL DEFAULT '',
+                trace_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_runs_thread_updated
+                ON research_runs(thread_id, updated_at DESC);
             """
         )
         self._conn.commit()
@@ -205,6 +222,90 @@ class SessionStore:
                 "updated_at=excluded.updated_at",
                 (thread_id, encoded, now),
             )
+
+    @staticmethod
+    def _decode_json(value: str, fallback: Any) -> Any:
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return fallback
+        return decoded
+
+    @classmethod
+    def _research_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["plan"] = cls._decode_json(item.pop("plan_json", "{}"), {})
+        item["evidence"] = cls._decode_json(item.pop("evidence_json", "[]"), [])
+        item["critique"] = cls._decode_json(item.pop("critique_json", "{}"), {})
+        item["trace"] = cls._decode_json(item.pop("trace_json", "{}"), {})
+        return item
+
+    @_synchronized
+    def create_research_run(self, thread_id: str, query: str) -> dict[str, Any]:
+        if not self.get(thread_id):
+            raise KeyError(f"会话不存在: {thread_id}")
+        now = self._now()
+        run_id = f"research-{uuid.uuid4().hex[:12]}"
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO research_runs "
+                "(run_id, thread_id, query, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'running', ?, ?)",
+                (run_id, thread_id, query, now, now),
+            )
+        return self.get_research_run(run_id) or {}
+
+    @_synchronized
+    def get_research_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM research_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return self._research_row(row) if row else None
+
+    @_synchronized
+    def get_latest_research_run(self, thread_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM research_runs WHERE thread_id=? "
+            "ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+        return self._research_row(row) if row else None
+
+    @_synchronized
+    def update_research_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        plan: dict[str, Any] | None = None,
+        evidence: list[dict[str, Any]] | None = None,
+        critique: dict[str, Any] | None = None,
+        final_answer: str | None = None,
+        trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        existing = self.get_research_run(run_id)
+        if not existing:
+            return None
+        values: dict[str, Any] = {"run_id": run_id, "updated_at": self._now()}
+        sets = ["updated_at=:updated_at"]
+        updates = {
+            "status": status,
+            "plan_json": json.dumps(plan, ensure_ascii=False, separators=(",", ":")) if plan is not None else None,
+            "evidence_json": json.dumps(evidence, ensure_ascii=False, separators=(",", ":")) if evidence is not None else None,
+            "critique_json": json.dumps(critique, ensure_ascii=False, separators=(",", ":")) if critique is not None else None,
+            "final_answer": final_answer,
+            "trace_json": json.dumps(trace, ensure_ascii=False, separators=(",", ":")) if trace is not None else None,
+        }
+        for column, value in updates.items():
+            if value is not None:
+                values[column] = value
+                sets.append(f"{column}=:{column}")
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE research_runs SET {', '.join(sets)} WHERE run_id=:run_id",
+                values,
+            )
+        return self.get_research_run(run_id)
 
     @_synchronized
     def delete(self, thread_id: str) -> bool:

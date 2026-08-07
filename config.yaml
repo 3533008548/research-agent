@@ -1,10 +1,13 @@
 daily_search:
   enabled: true
   request_timeout_seconds: 8
+  keyword_concurrency: 2
   keywords: []
   max_results_per_keyword: 3
   sources:
-  - semantic_scholar
+  - openalex
+  - openaire
+  - dblp
 model: deepseek-v4-flash
 agent:
   verify_timeout_seconds: 8

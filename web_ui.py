@@ -19,6 +19,7 @@ import re
 import sys
 import shutil
 import hashlib
+import time
 from pathlib import Path
 
 # ── Windows GBK 兼容 ──
@@ -85,7 +86,7 @@ def build_ui():
     import threading
 
     daily_lock = threading.Lock()
-    daily_task = {"thread": None}
+    daily_task = {"thread": None, "cancel_event": None}
     browser_run_guard = BrowserRunGuard()
 
     def _browser_id(request: gr.Request | None) -> str:
@@ -95,39 +96,88 @@ def build_ui():
     def _invalidate_browser_request(request: gr.Request | None) -> None:
         browser_run_guard.invalidate(_browser_id(request))
 
-    def _format_daily_results(results: list[dict], heading: str) -> str:
+    def _format_daily_results(
+        results: list[dict], heading: str, *, brief: str = "", critique: dict | None = None,
+        run_id: str = "",
+    ) -> str:
         if not results:
-            return f"{heading}\n\n📭 未找到新论文。"
+            suffix = f"\n\n运行：`{run_id}`" if run_id else ""
+            return f"{heading}\n\n📭 未找到新论文。{suffix}"
         lines = [f"{heading}\n"]
-        diag = results[0].get("diagnostic", "")
-        if diag:
-            lines.append(f"({diag})\n")
+        if brief:
+            lines.append(f"> {brief}\n")
         for r in results[:5]:
-            lines.append(f"- {r['title'][:80]}  [{r.get('source', '')}]")
+            sources = ", ".join(r.get("sources") or [r.get("source", "")])
+            year = r.get("year") or "年份未知"
+            citations = r.get("citation_count")
+            citation_text = f" · 引用 {citations}" if citations is not None else ""
+            lines.append(f"- **{r['title'][:100]}**  `[{sources}]`")
+            lines.append(f"  {year}{citation_text}")
+            reason = (r.get("curation") or {}).get("reason", "")
+            if reason:
+                lines.append(f"  推荐理由：{reason}")
+            tags = (r.get("curation") or {}).get("tags", [])
+            if tags:
+                lines.append(f"  标签：{' · '.join(tags)}")
+            if r.get("url"):
+                lines.append(f"  [查看论文]({r['url']})")
         if len(results) > 5:
             lines.append(f"\n...及另外 {len(results)-5} 篇")
+        warnings = (critique or {}).get("warnings") or []
+        if warnings:
+            lines.append("\n**质量提示**：" + "；".join(warnings[:2]))
+        if run_id:
+            lines.append(f"\n运行：`{run_id}`。可用 `/daily resume` 继续未完成任务。")
         return "\n".join(lines)
 
-    def _daily_search_bg(task_type: str, keyword: str | None = None):
+    def _daily_search_bg(
+        task_type: str, keyword: str | None = None, resume: bool = False,
+        cancel_event: threading.Event | None = None,
+    ):
         """长时检索只在后台线程运行，完成后写入独立任务面板而非聊天记录。"""
         worker = None
         try:
+            from daily_orchestrator import DailyResearchOrchestrator
             worker = Scheduler(
                 scheduler.db_path,
                 request_timeout_seconds=cfg.daily_request_timeout_seconds,
             )
-            agent.runtime_status["daily_progress"] = "📰 搜索中..."
-            if task_type == "retry":
-                results = worker.retry_today(paper_store=agent.paper_store)
-                heading = "**📰 每日检索结果（已重试）**"
-            elif task_type == "search":
-                results = worker.search(keyword or "")
-                heading = f"**🔍 临时检索结果 — {keyword}**"
-            else:
-                results = worker.run_today(paper_store=agent.paper_store)
-                heading = "**📰 每日论文速递**"
-            agent.runtime_status["daily_progress"] = worker.get_progress()
-            agent.runtime_status["daily_message"] = _format_daily_results(results, heading)
+            orchestrator = DailyResearchOrchestrator(
+                scheduler=worker,
+                llm_client=agent.llm_client,
+                model=agent.model,
+                request_timeout_seconds=cfg.daily_request_timeout_seconds,
+                max_keyword_concurrency=cfg.daily_keyword_concurrency,
+                max_results_per_keyword=cfg.daily_max_results_per_keyword,
+                daily_sources=cfg.daily_sources,
+                openalex_api_key=cfg.openalex_api_key,
+            )
+
+            def _daily_progress(event: dict) -> None:
+                agent.runtime_status["daily_progress"] = (
+                    f"📰 {event.get('stage', 'daily')}：{event.get('message', '处理中')}"
+                )
+
+            kind = "search" if task_type == "search" else task_type
+            result = orchestrator.run(
+                kind,
+                keyword=keyword,
+                paper_store=agent.paper_store,
+                resume=resume,
+                cancel_event=cancel_event,
+                on_progress=_daily_progress,
+            )
+            heading = {
+                "retry": "**📰 每日检索结果（已重试）**",
+                "search": f"**🔍 临时检索结果 — {keyword}**",
+            }.get(kind, "**📰 每日论文速递**")
+            agent.runtime_status["daily_progress"] = (
+                f"📰 {result.status} · {len(result.candidates)} 篇推荐"
+            )
+            agent.runtime_status["daily_message"] = _format_daily_results(
+                result.candidates, heading, brief=result.brief,
+                critique=result.critique, run_id=result.run_id,
+            )
             agent.runtime_status["daily_ready"] = True
         except Exception as e:
             agent.runtime_status["daily_progress"] = "⚠️ 每日检索失败"
@@ -138,16 +188,22 @@ def build_ui():
         finally:
             if worker:
                 worker.close()
+            daily_task["cancel_event"] = None
             daily_lock.release()
 
-    def _start_daily_task(task_type: str, keyword: str | None = None) -> bool:
+    def _start_daily_task(
+        task_type: str, keyword: str | None = None, *, resume: bool = False,
+    ) -> bool:
         if not daily_lock.acquire(blocking=False):
             return False
         agent.runtime_status["daily_ready"] = False
         agent.runtime_status["daily_message"] = "📰 任务已开始，可继续使用其他功能。"
+        cancel_event = threading.Event()
+        daily_task["cancel_event"] = cancel_event
         try:
             worker = threading.Thread(
-                target=_daily_search_bg, args=(task_type, keyword), daemon=True,
+                target=_daily_search_bg,
+                args=(task_type, keyword, resume, cancel_event), daemon=True,
                 name=f"daily-{task_type}",
             )
             daily_task["thread"] = worker
@@ -158,7 +214,7 @@ def build_ui():
             raise
 
     if cfg.daily_search_enabled:
-        _start_daily_task("daily")
+        _start_daily_task("daily", resume=True)
 
     # ── 帮助文本 ──
     HELP_TEXT = """
@@ -197,6 +253,7 @@ def build_ui():
 | `/daily read <N>` | 标记已读 |
 | `/daily skip <N>` | 跳过 |
 | `/daily retry` | 重新检索 |
+| `/daily resume` | 继续上次未完成任务 |
 | `/daily status` | 查看进度 |
     """.strip()
 
@@ -395,6 +452,11 @@ def build_ui():
                 yield "📰 已有每日检索任务在运行，请等待它完成。"; return
             yield "📰 重试任务已转入后台，可继续聊天；结果会显示在页面顶部的任务面板。"; return
 
+        if msg == "/daily resume":
+            if not _start_daily_task("daily", resume=True):
+                yield "📰 已有每日检索任务在运行，请等待它完成。"; return
+            yield "📰 正在继续上次未完成的每日检索；已保存候选不会重复请求。"; return
+
         if msg == "/daily status":
             progress = agent.runtime_status.get("daily_progress") or scheduler.get_progress()
             if progress:
@@ -403,6 +465,10 @@ def build_ui():
 
         if msg in ("/daily off", "/daily stop"):
             cfg.runtime_paths.update_settings({"daily_search_enabled": False})
+            active_cancel = daily_task.get("cancel_event")
+            if active_cancel:
+                active_cancel.set()
+                yield "⏹ 已停止当前每日检索并关闭自动运行；已保存候选可用 `/daily resume` 继续。"; return
             yield "⏸ 每日检索已暂停。"; return
 
         if msg.startswith("/daily want "):
@@ -440,6 +506,88 @@ def build_ui():
                 scheduler.mark_read(u["keyword"], u["paper_title"])
                 yield f"📖 已标记已读: {u['paper_title'][:60]}"; return
             yield "❌ 编号无效"; return
+
+        research_match = re.match(
+            r"^/research(?:\s+--sources=(both|local|public))?\s*(.*)$",
+            msg,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if research_match:
+            research_scope = research_match.group(1) or "both"
+            research_query = research_match.group(2).strip()
+            resume_research = research_query.lower() in {"continue", "继续"}
+            if not research_query and not resume_research:
+                yield "用法：`/research <研究问题>`，或输入 `/research continue` 继续上一次未完成的研究。"
+                return
+
+            browser_id = _browser_id(request)
+            request_generation = browser_run_guard.begin(browser_id)
+            cancel_event = browser_run_guard.cancellation_event(browser_id, request_generation)
+            import queue
+            q = queue.Queue()
+            final = []
+
+            def _research_progress(event: dict) -> None:
+                q.put(("progress", event))
+
+            def _run_research():
+                try:
+                    result = agent.research(
+                        "" if resume_research else research_query,
+                        scope=research_scope,
+                        context=_build_context(),
+                        session_id=session_id,
+                        resume=resume_research,
+                        cancel_event=cancel_event,
+                        on_progress=_research_progress,
+                    )
+                except BaseException as exc:
+                    result = f"❌ 深度研究后台错误: {type(exc).__name__}: {exc}"
+                finally:
+                    final.append(result)
+                    q.put(("done", None))
+
+            threading.Thread(target=_run_research, daemon=True, name="deep-research").start()
+            partial = "## 🧭 深度研究\n\n正在启动研究任务…"
+            latest_stage = "启动中"
+            latest_message = "正在启动研究任务…"
+            last_heartbeat = time.monotonic()
+            if browser_run_guard.is_current(browser_id, request_generation):
+                yield partial
+            try:
+                while True:
+                    if not browser_run_guard.is_current(browser_id, request_generation):
+                        return
+                    try:
+                        event, value = q.get(timeout=0.5)
+                    except queue.Empty:
+                        # Avoid flooding Gradio with identical updates while a
+                        # model request is queued or a tool is running. A low
+                        # frequency heartbeat still makes long waits visible.
+                        if time.monotonic() - last_heartbeat >= 3:
+                            partial = (
+                                f"## 🧭 深度研究\n\n**{latest_stage}**：{latest_message}"
+                                "\n\n_仍在处理中；可随时点击“停止”保留已有证据。_"
+                            )
+                            last_heartbeat = time.monotonic()
+                            if browser_run_guard.is_current(browser_id, request_generation):
+                                yield partial
+                        continue
+                    if event == "done":
+                        break
+                    latest_stage = value.get("stage", "research")
+                    latest_message = value.get("message", "正在处理")
+                    partial = f"## 🧭 深度研究\n\n**{latest_stage}**：{latest_message}"
+                    last_heartbeat = time.monotonic()
+                    if browser_run_guard.is_current(browser_id, request_generation):
+                        yield partial
+                if browser_run_guard.is_current(browser_id, request_generation):
+                    yield re.sub(r'(?<!\$)\$([^\$]*[\\_^][^\$]*)\$(?!\$)', r'$$\1$$', final[0])
+            except GeneratorExit:
+                return
+            finally:
+                browser_run_guard.finish(browser_id, request_generation)
+            return
 
         # 正常对话（流式）
         browser_id = _browser_id(request)
@@ -518,6 +666,31 @@ def build_ui():
             return gr.update(), history, history, None
         updated = history + [{"role": "user", "content": shown}]
         return gr.update(value=None), updated, updated, message
+
+    def prepare_research_message(message, history: list[dict], scope: str):
+        """Show the natural-language question while sending an explicit research command."""
+        shown = _message_text(message)
+        history = list(history or [])
+        if not shown:
+            return gr.update(), history, history, None
+        if isinstance(message, dict) and message.get("files"):
+            # The researcher has deliberately bounded tool access. File import
+            # remains an explicit normal-chat action so its path never becomes
+            # part of a slash command or a worker prompt accidentally.
+            updated = history + [{"role": "assistant", "content": "⚠️ 请先在普通对话中上传并索引文件，再发起深度研究。"}]
+            return gr.update(), updated, updated, None
+        if isinstance(message, dict):
+            pending = dict(message)
+        else:
+            pending = {"text": str(message), "files": []}
+        pending["text"] = f"/research --sources={scope} {str(pending.get('text') or '').strip()}"
+        updated = history + [{"role": "user", "content": shown}]
+        return gr.update(value=None), updated, updated, pending
+
+    def prepare_continue_research(history: list[dict]):
+        history = list(history or [])
+        updated = history + [{"role": "user", "content": "继续上次深度研究"}]
+        return updated, updated, {"text": "/research continue", "files": []}
 
     def stream_reply(
         message,
@@ -840,6 +1013,18 @@ def build_ui():
                         submit_btn="发送", stop_btn=False,
                     )
                     stop_reply_btn = gr.Button("停止", variant="stop", scale=1)
+                with gr.Row():
+                    research_scope = gr.Dropdown(
+                        label="深度研究来源",
+                        choices=[
+                            ("本地论文 + 公开文献", "both"),
+                            ("仅本地论文", "local"),
+                            ("仅公开文献", "public"),
+                        ],
+                        value="both", scale=3,
+                    )
+                    deep_research_btn = gr.Button("🧭 深度研究", variant="secondary", scale=2)
+                    continue_research_btn = gr.Button("继续上次研究", scale=2)
                 pending_message = gr.State(value=None)
 
                 submit_event = chat_input.submit(
@@ -855,11 +1040,37 @@ def build_ui():
                     concurrency_limit=4,
                     show_progress="hidden",
                 )
+                research_submit_event = deep_research_btn.click(
+                    fn=prepare_research_message,
+                    inputs=[chat_input, chat_history_state, research_scope],
+                    outputs=[chat_input, chatbot, chat_history_state, pending_message],
+                    queue=False,
+                )
+                research_reply_event = research_submit_event.then(
+                    fn=stream_reply,
+                    inputs=[pending_message, chat_history_state, session_state],
+                    outputs=[chatbot, chat_history_state],
+                    concurrency_limit=4,
+                    show_progress="hidden",
+                )
+                continue_submit_event = continue_research_btn.click(
+                    fn=prepare_continue_research,
+                    inputs=[chat_history_state],
+                    outputs=[chatbot, chat_history_state, pending_message],
+                    queue=False,
+                )
+                continue_reply_event = continue_submit_event.then(
+                    fn=stream_reply,
+                    inputs=[pending_message, chat_history_state, session_state],
+                    outputs=[chatbot, chat_history_state],
+                    concurrency_limit=4,
+                    show_progress="hidden",
+                )
                 stop_reply_btn.click(
                     fn=stop_active_reply,
                     outputs=[],
                     queue=False,
-                    cancels=[reply_event],
+                    cancels=[reply_event, research_reply_event, continue_reply_event],
                 )
                 chatbot.change(
                     fn=refresh_chat_status, inputs=[chat_history_state, session_state],

@@ -4,17 +4,17 @@
 
 import sys
 from pathlib import Path
-from search_api import search_arxiv, search_semantic_scholar, list_downloaded_papers
+from search_api import search_arxiv, search_openalex, list_downloaded_papers
 from runtime_paths import get_runtime_paths
 
 
 def handle_search_papers(args: dict, **kw) -> str:
     query = args.get("query", "")
-    source = args.get("source", "semantic_scholar")
+    source = args.get("source", "openalex")
     limit = min(args.get("limit", 5), 10)
     if source == "arxiv":
         return search_arxiv(query, max_results=limit)
-    return search_semantic_scholar(query, limit=limit)
+    return search_openalex(query, limit=limit)
 
 
 def handle_query_papers(args: dict, paper_store=None, **kw) -> str:

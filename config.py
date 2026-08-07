@@ -25,6 +25,9 @@ _DFLT = {
     "ui_debug": False,
     "verify_timeout_seconds": 8,
     "daily_request_timeout_seconds": 8,
+    "daily_keyword_concurrency": 2,
+    "daily_max_results_per_keyword": 3,
+    "daily_sources": ("openalex", "openaire", "dblp"),
     "api_max_concurrency": 4,
     "api_interactive_reserved_slots": 1,
     "api_queue_size": 20,
@@ -45,6 +48,7 @@ class Config:
     api_url: str = "https://api.deepseek.com/chat/completions"
     glm_key: str = ""
     hf_endpoint: str = ""
+    openalex_api_key: str = ""
 
     pdf_max_pages: int = 15
     rag_enabled: bool = True
@@ -54,6 +58,9 @@ class Config:
     daily_search_enabled: bool = False
     verify_timeout_seconds: int = 8
     daily_request_timeout_seconds: int = 8
+    daily_keyword_concurrency: int = 2
+    daily_max_results_per_keyword: int = 3
+    daily_sources: tuple[str, ...] = ("openalex", "openaire", "dblp")
     api_max_concurrency: int = 4
     api_interactive_reserved_slots: int = 1
     api_queue_size: int = 20
@@ -127,6 +134,22 @@ class Config:
                     cfg["daily_request_timeout_seconds"] = yaml_cfg["daily_search"].get(
                         "request_timeout_seconds", cfg["daily_request_timeout_seconds"]
                     )
+                    cfg["daily_keyword_concurrency"] = yaml_cfg["daily_search"].get(
+                        "keyword_concurrency", cfg["daily_keyword_concurrency"]
+                    )
+                    cfg["daily_max_results_per_keyword"] = yaml_cfg["daily_search"].get(
+                        "max_results_per_keyword", cfg["daily_max_results_per_keyword"]
+                    )
+                    configured_sources = yaml_cfg["daily_search"].get("sources")
+                    if isinstance(configured_sources, list):
+                        allowed_sources = {"openalex", "openaire", "dblp"}
+                        sources = tuple(
+                            str(source).strip().lower()
+                            for source in configured_sources
+                            if str(source).strip().lower() in allowed_sources
+                        )
+                        if sources:
+                            cfg["daily_sources"] = sources
                 if "agent" in yaml_cfg:
                     cfg["verify_timeout_seconds"] = yaml_cfg["agent"].get(
                         "verify_timeout_seconds", cfg["verify_timeout_seconds"]
@@ -166,6 +189,7 @@ class Config:
             "DEEPSEEK_API_URL": "api_url",
             "GLM_API_KEY": "glm_key",
             "HF_ENDPOINT": "hf_endpoint",
+            "OPENALEX_API_KEY": "openalex_api_key",
             "DEEPSEEK_MODEL": "model",
         }
         for env, attr in env_map.items():
@@ -183,6 +207,7 @@ class Config:
             api_url=cfg.get("api_url", _DFLT["api_url"]),
             glm_key=cfg.get("glm_key", "") or os.getenv("GLM_API_KEY", ""),
             hf_endpoint=cfg.get("hf_endpoint", ""),
+            openalex_api_key=cfg.get("openalex_api_key", "") or os.getenv("OPENALEX_API_KEY", ""),
             pdf_max_pages=cfg["pdf_max_pages"],
             rag_enabled=cfg["rag_enabled"],
             ui_port=cfg["ui_port"],
@@ -190,6 +215,9 @@ class Config:
             daily_search_enabled=cfg.get("daily_search_enabled", False),
             verify_timeout_seconds=max(3, int(cfg.get("verify_timeout_seconds", 8))),
             daily_request_timeout_seconds=max(3, int(cfg.get("daily_request_timeout_seconds", 8))),
+            daily_keyword_concurrency=max(1, min(2, int(cfg.get("daily_keyword_concurrency", 2)))),
+            daily_max_results_per_keyword=max(1, min(5, int(cfg.get("daily_max_results_per_keyword", 3)))),
+            daily_sources=tuple(cfg.get("daily_sources", _DFLT["daily_sources"])),
             api_max_concurrency=max(1, int(cfg.get("api_max_concurrency", 4))),
             api_interactive_reserved_slots=max(
                 0, int(cfg.get("api_interactive_reserved_slots", 1))

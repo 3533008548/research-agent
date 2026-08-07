@@ -43,7 +43,7 @@ class ProfileManager:
                 "## 研究方向\n\n"
                 "## 偏好设置\n"
                 "- 模型: deepseek-v4-flash\n"
-                "- 论文源: Semantic Scholar\n"
+                "- 论文源: OpenAlex（通用）+ arXiv（预印本）\n"
                 "- 语言: 中文\n\n"
                 "## 活跃问题\n\n"
                 "## 已读论文\n\n"

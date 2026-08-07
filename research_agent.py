@@ -50,6 +50,7 @@ from cancellation import RequestCancelledError, raise_if_cancelled
 from graph_builder import build_graph
 from llm_client import LLMClient, LLMClientError
 from profile import ProfileManager
+from research_orchestrator import ResearchOrchestrator
 from resilience import CircuitBreaker
 from search_api import list_downloaded_papers
 from session_store import SessionStore
@@ -276,6 +277,111 @@ class ResearchAgent:
                 }
         finally:
             session_lock.release()
+
+    def research(
+        self,
+        query: str = "",
+        *,
+        scope: str = "both",
+        context: str | None = None,
+        session_id: str | None = None,
+        resume: bool = False,
+        cancel_event: threading.Event | None = None,
+        on_progress=None,
+    ) -> str:
+        """Run the bounded multi-agent research loop for one explicit session."""
+        thread_id = session_id or self._thread_id
+        session_lock = self._lock_for(thread_id)
+        while not session_lock.acquire(timeout=0.2):
+            try:
+                raise_if_cancelled(cancel_event, "等待会话操作时已取消")
+            except RequestCancelledError:
+                return "⚠️ 深度研究已取消。"
+        try:
+            if not self.sessions.get(thread_id):
+                return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
+            usage = self.get_usage(thread_id)
+            usage_before = dict(usage)
+            started_at = time.perf_counter()
+            events: list[dict] = []
+
+            def _record_progress(event: dict) -> None:
+                events.append({
+                    **event,
+                    "at_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                })
+                if on_progress:
+                    on_progress(event)
+
+            orchestrator = ResearchOrchestrator(
+                session_store=self.sessions,
+                api_key=self.api_key,
+                model=self.model,
+                paper_store=self._paper_store,
+                glm_api_key=self.cfg.glm_key,
+                llm_client=self.llm_client,
+                verify_timeout_seconds=self.cfg.verify_timeout_seconds,
+            )
+            result = orchestrator.run(
+                query,
+                thread_id=thread_id,
+                scope=scope,
+                context=context,
+                resume=resume,
+                cancel_event=cancel_event,
+                on_progress=_record_progress,
+            )
+            for key in ("prompt", "completion", "total", "calls"):
+                usage[key] = usage.get(key, 0) + result.usage.get(key, 0)
+            usage["last_round_cost"] = 0
+            visible_query = "继续上次深度研究" if resume else query
+            self.sessions.touch(thread_id, visible_query)
+            self.sessions.save_usage(thread_id, usage)
+            self._append_research_turn(
+                thread_id,
+                visible_query,
+                result.answer,
+            )
+            self._last_traces[thread_id] = {
+                "session_id": thread_id,
+                "model": self.model,
+                "outcome": result.status,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                "events": events,
+                "research_run_id": result.run_id,
+                "usage_delta": {
+                    key: usage.get(key, 0) - usage_before.get(key, 0)
+                    for key in ("prompt", "completion", "total", "calls")
+                },
+                "answer_chars": len(result.answer),
+            }
+            return result.answer
+        except RequestCancelledError:
+            return "⚠️ 深度研究已取消。"
+        except ValueError as exc:
+            return f"⚠️ {exc}"
+        except Exception as exc:
+            return f"❌ 深度研究错误: {type(exc).__name__}: {exc}"
+        finally:
+            session_lock.release()
+
+    def _append_research_turn(self, thread_id: str, query: str, answer: str) -> None:
+        """Persist only the user-visible research turn, never worker messages."""
+        app = self._build_app(self.get_usage(thread_id))
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            app.update_state(
+                config,
+                {
+                    "messages": [
+                        {"role": "user", "content": query},
+                        {"role": "assistant", "content": answer},
+                    ],
+                    "metadata": {"session_id": thread_id},
+                },
+            )
+        finally:
+            self._close_app(app)
 
     def chat(self, user_input: str):
         """打印格式化回复"""

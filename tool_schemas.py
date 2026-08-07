@@ -10,12 +10,12 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "search_papers",
-                "description": "搜索学术论文。semantic_scholar（含引用数+PDF）和 arxiv 双源。",
+                "description": "搜索学术论文。openalex 用于通用文献，arxiv 用于预印本与近期研究。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "搜索关键词"},
-                        "source": {"type": "string", "enum": ["semantic_scholar", "arxiv"], "description": "数据源"},
+                        "source": {"type": "string", "enum": ["openalex", "arxiv"], "description": "数据源"},
                         "limit": {"type": "integer", "description": "返回数（1-10）"},
                     },
                     "required": ["query"],
