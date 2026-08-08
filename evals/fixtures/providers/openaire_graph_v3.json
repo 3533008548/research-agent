@@ -1,0 +1,15 @@
+{
+  "results": [
+    {
+      "id": "openaire::offline-fixture-001",
+      "mainTitle": "Offline Fixture for Resilient Research Workflows",
+      "authors": [{"fullName": "Fixture Curator"}],
+      "pids": [{"scheme": "doi", "value": "10.5555/offline.openaire"}],
+      "instances": [{"urls": ["https://example.invalid/openaire-fixture"]}],
+      "descriptions": ["Raw OpenAIRE Graph v3-shaped fixture used only for parser replay."],
+      "publicationDate": "2026-02-01",
+      "container": {"name": "Offline Open Science Archive"},
+      "indicators": {"citationImpact": {"citationCount": 8}}
+    }
+  ]
+}

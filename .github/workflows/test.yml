@@ -1,39 +1,137 @@
-name: tests
+name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_chroma_integration:
+        description: Run Chroma/ONNX integration tests (may download the embedding model)
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  offline-quality:
+    name: Offline quality gate
     runs-on: ubuntu-latest
+    env:
+      # The core gate must never fetch the Chroma ONNX embedding model.
+      SKIP_CHROMA_INTEGRATION: "1"
+      APP_DATA_DIR: ${{ runner.temp }}/research-agent-runtime
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install --requirement requirements.txt
 
-      - name: Run tests
-        run: python tests/test_core.py
+      - name: Run offline unit tests
+        run: python -m unittest tests.test_core -v
+
+      - name: Score versioned capability benchmark
+        run: python -m evals.benchmark --results evals/example_results.json --strict
+
+      - name: Replay runtime reliability scenarios
+        run: python -m evals.runtime_replay --strict
 
   session-e2e:
+    name: Browser session isolation
     runs-on: ubuntu-latest
+    env:
+      APP_DATA_DIR: ${{ runner.temp }}/research-agent-runtime
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Install browser-test dependencies
         run: |
-          pip install -r requirements-dev.txt
+          python -m pip install --requirement requirements-dev.txt
           python -m playwright install --with-deps chromium
 
       - name: Run session isolation browser regression
-        run: python -m unittest tests.test_session_e2e
+        run: python -m unittest tests.test_session_e2e -v
+
+  container-smoke:
+    name: Docker build and health check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --tag research-agent:ci .
+
+      - name: Start UI without RAG and wait for health endpoint
+        run: |
+          docker run --detach --name research-agent-ci --publish 7860:7860 \
+            --env DEEPSEEK_API_KEY=ci-test-key \
+            research-agent:ci python web_ui.py --host 0.0.0.0 --port 7860 --data-dir /tmp/ci-runtime --no-rag
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:7860/ > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs research-agent-ci
+          exit 1
+
+      - name: Print container logs on failure
+        if: failure()
+        run: docker logs research-agent-ci || true
+
+      - name: Remove smoke-test container
+        if: always()
+        run: docker rm --force research-agent-ci || true
+
+  chroma-integration:
+    name: Scheduled Chroma integration
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_chroma_integration)
+    runs-on: ubuntu-latest
+    env:
+      APP_DATA_DIR: ${{ runner.temp }}/research-agent-runtime
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/chroma
+          key: chroma-onnx-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run Chroma/ONNX integration tests
+        run: |
+          python -m unittest \
+            tests.test_core.TestReadPDFFlow \
+            tests.test_core.TestQueryPapers -v

@@ -1,0 +1,19 @@
+{
+  "result": {
+    "hits": {
+      "hit": [
+        {
+          "info": {
+            "title": "Offline Fixture for Agent Evaluation Replays",
+            "authors": {"author": ["Fixture Evaluator"]},
+            "year": "2026",
+            "venue": "Offline Systems Workshop",
+            "doi": "10.5555/offline.dblp",
+            "ee": "https://example.invalid/dblp-fixture",
+            "key": "conf/offline/fixture2026"
+          }
+        }
+      ]
+    }
+  }
+}

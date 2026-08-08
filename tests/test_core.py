@@ -26,6 +26,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from unittest.mock import patch, MagicMock
 
 
+RUN_CHROMA_INTEGRATION = os.getenv("SKIP_CHROMA_INTEGRATION") != "1"
+
+
+@unittest.skipUnless(
+    RUN_CHROMA_INTEGRATION,
+    "CI offline quality gate skips Chroma/ONNX integration; run it in the scheduled integration job.",
+)
 class TestReadPDFFlow(unittest.TestCase):
     """测试1: read_pdf 完整链路"""
 
@@ -77,6 +84,10 @@ class TestReadPDFFlow(unittest.TestCase):
         self.assertEqual(len(test_papers), 1, "去重失败：同名论文出现多次")
 
 
+@unittest.skipUnless(
+    RUN_CHROMA_INTEGRATION,
+    "CI offline quality gate skips Chroma/ONNX integration; run it in the scheduled integration job.",
+)
 class TestQueryPapers(unittest.TestCase):
     """测试2: query_papers 命中率"""
 
@@ -1550,13 +1561,13 @@ class TestRuntimePaths(unittest.TestCase):
 class TestResearchBenchmark(unittest.TestCase):
     """版本化评测集不读取用户数据，并能稳定检查结果结构。"""
 
-    def test_manifest_defines_ten_distinct_research_tasks(self):
+    def test_manifest_defines_fifteen_distinct_research_tasks(self):
         from evals.benchmark import load_manifest, validate_manifest
 
         manifest = load_manifest()
         self.assertEqual(validate_manifest(manifest), [])
-        self.assertEqual(len(manifest["tasks"]), 10)
-        self.assertEqual(len({task["id"] for task in manifest["tasks"]}), 10)
+        self.assertEqual(len(manifest["tasks"]), 15)
+        self.assertEqual(len({task["id"] for task in manifest["tasks"]}), 15)
 
     def test_scorer_checks_answer_and_tool_trace(self):
         from evals.benchmark import load_manifest, score_task
@@ -1569,13 +1580,27 @@ class TestResearchBenchmark(unittest.TestCase):
         })
         self.assertTrue(score["passed"])
 
-    def test_example_results_exercise_all_ten_tasks(self):
+    def test_example_results_exercise_all_fifteen_tasks_and_emit_metrics(self):
         import json
         from evals.benchmark import ROOT, load_manifest, score_submission
 
         results = json.loads((ROOT / "example_results.json").read_text(encoding="utf-8"))
         report = score_submission(load_manifest(), results)
-        self.assertEqual((report["passed"], report["total"]), (10, 10))
+        self.assertEqual((report["passed"], report["total"]), (15, 15))
+        self.assertEqual(report["summary"]["citation_traceability_rate"], 1.0)
+        self.assertEqual(report["summary"]["source_failures"], 1)
+
+    def test_report_comparison_calculates_versioned_deltas(self):
+        from evals.benchmark import compare_reports
+
+        comparison = compare_reports(
+            {"summary": {"success_rate": 0.9, "average_duration_ms": 800}},
+            {"generated_at": "2026-08-01T00:00:00+00:00", "benchmark_version": "v1.0",
+             "summary": {"success_rate": 0.8, "average_duration_ms": 1000}},
+        )
+        self.assertEqual(comparison["baseline_version"], "v1.0")
+        self.assertEqual(comparison["deltas"]["success_rate"], 0.1)
+        self.assertEqual(comparison["deltas"]["average_duration_ms"], -200)
 
     def test_trace_capture_exports_latency_and_tools_without_payloads(self):
         from evals.capture import result_from_trace
@@ -1587,10 +1612,27 @@ class TestResearchBenchmark(unittest.TestCase):
                 "type": "tool_finished", "tool": "query_papers",
                 "duration_ms": 8100, "rag_keyword_fallback": True,
             }],
+            "usage_delta": {"calls": 1},
         })
         self.assertEqual(captured["tool_trace"][0]["tool"], "query_papers")
         self.assertEqual(captured["metrics"]["max_tool_duration_ms"], 8100)
+        self.assertEqual(captured["metrics"]["model_calls"], 1)
         self.assertNotIn("arguments", str(captured))
+
+    def test_daily_capture_keeps_source_health_without_candidate_content(self):
+        from evals.capture import result_from_daily_run
+
+        class _DailyResult:
+            status = "partial_failed"
+            brief = "已保留可恢复候选"
+            candidates = [{"title": "不应写入评测结果"}]
+            source_stats = {"TSN": {"openalex": {"status": "ok", "count": 1}}}
+
+        captured = result_from_daily_run("T12", _DailyResult())
+        self.assertEqual(captured["state"]["run_status"], "partial_failed")
+        self.assertEqual(captured["state"]["candidate_count"], 1)
+        self.assertEqual(captured["source_stats"]["TSN"]["openalex"]["status"], "ok")
+        self.assertNotIn("不应写入评测结果", str(captured))
 
 
 class TestRequestTracing(unittest.TestCase):
@@ -1623,6 +1665,42 @@ class TestRequestTracing(unittest.TestCase):
             self.assertEqual(trace["tool_trace"][0]["tool"], "query_papers")
             self.assertNotIn("完整问题", str(trace))
             agent.memory._conn.close()
+
+
+class TestRuntimeReplay(unittest.TestCase):
+    """离线回放必须走真实编排，且不暴露运行时数据。"""
+
+    def test_runtime_replay_executes_all_reliability_cases(self):
+        from evals.runtime_replay import run_suite
+
+        report = run_suite(seed=17)
+        self.assertEqual(report["total"], 5)
+        self.assertEqual(report["passed"], 5, report)
+        self.assertEqual(report["metadata"]["selected_cases"], ["R01", "R02", "R03", "R04", "R05"])
+        self.assertGreater(report["summary"]["source_requests"], 0)
+        self.assertGreater(report["summary"]["source_failure_rate"], 0)
+        self.assertNotIn("offline-private-input-must-not-leak", str(report))
+
+    def test_runtime_replay_rejects_unknown_case_and_compares_same_suite_only(self):
+        from evals.runtime_replay import compare_reports, run_suite
+
+        with self.assertRaisesRegex(ValueError, "unknown runtime replay case"):
+            run_suite(case_ids=["R99"])
+        report = run_suite(case_ids=["R01"], seed=3)
+        comparison = compare_reports(report, {"suite_version": "runtime-replay-v1", "summary": report["summary"]})
+        self.assertEqual(comparison["deltas"]["success_rate"], 0.0)
+        with self.assertRaisesRegex(ValueError, "different runtime replay suite"):
+            compare_reports(report, {"suite_version": "other", "summary": {}})
+
+
+class TestWebRendering(unittest.TestCase):
+    def test_chatbot_enables_inline_and_display_latex_delimiters(self):
+        from web_ui import CHAT_LATEX_DELIMITERS
+
+        self.assertIn({"left": "$", "right": "$", "display": False}, CHAT_LATEX_DELIMITERS)
+        self.assertIn({"left": "$$", "right": "$$", "display": True}, CHAT_LATEX_DELIMITERS)
+        self.assertIn({"left": "\\(", "right": "\\)", "display": False}, CHAT_LATEX_DELIMITERS)
+        self.assertIn({"left": "\\[", "right": "\\]", "display": True}, CHAT_LATEX_DELIMITERS)
 
 
 if __name__ == "__main__":

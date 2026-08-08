@@ -44,6 +44,17 @@ from notes import NoteStore
 from ui_request_guard import BrowserRunGuard
 
 
+# Gradio does not enable inline delimiters unless they are supplied explicitly.
+# Keep display delimiters before `$...$` so a block expression is never split
+# into two malformed inline fragments.
+CHAT_LATEX_DELIMITERS = [
+    {"left": "$$", "right": "$$", "display": True},
+    {"left": "\\[", "right": "\\]", "display": True},
+    {"left": "$", "right": "$", "display": False},
+    {"left": "\\(", "right": "\\)", "display": False},
+]
+
+
 def build_ui():
     parser = argparse.ArgumentParser(description="科研助手 Web UI")
     parser.add_argument(
@@ -1003,7 +1014,10 @@ def build_ui():
                 initial_history = agent.get_history(agent.thread_id)
                 chat_history_state = gr.State(value=initial_history)
                 chatbot = gr.Chatbot(
-                    value=initial_history, height=420, render_markdown=True,
+                    value=initial_history,
+                    height=420,
+                    render_markdown=True,
+                    latex_delimiters=CHAT_LATEX_DELIMITERS,
                 )
                 with gr.Row():
                     chat_input = gr.MultimodalTextbox(

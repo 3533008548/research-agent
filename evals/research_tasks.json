@@ -1,5 +1,5 @@
 {
-  "version": "v1.0",
+  "version": "v1.1",
   "corpus": "synthetic-research-corpus-v1",
   "tasks": [
     {
@@ -148,6 +148,84 @@
         ],
         "performance": {"max_tool_duration_ms": 8500},
         "manual_rubric": ["明确语义检索与关键词候选的差别", "不把后台下载伪装成成功的语义检索"]
+      }
+    },
+    {
+      "id": "T11",
+      "capability": "深度研究证据闭环",
+      "title": "深度研究结论必须引用可恢复证据",
+      "fixture": {"research_run": "synthetic-completed", "scope": "both"},
+      "prompt": "对 DiffTSN 在突发负载下的适用条件做一次深度研究，用证据编号给出结论并说明限制。",
+      "expected": {
+        "state_assertions": {"research_status": "completed", "evidence_persisted": true},
+        "answer_checks": [
+          {"label": "条件", "any_of": ["突发", "bursty", "负载"]},
+          {"label": "限制", "any_of": ["限制", "需要验证", "分布偏移"]}
+        ],
+        "min_evidence_references": 2,
+        "manual_rubric": ["结论与 [E#] 证据对应", "不将预印本结论夸大为通用事实"]
+      }
+    },
+    {
+      "id": "T12",
+      "capability": "每日来源故障恢复",
+      "title": "单一来源失败不阻断每日推送恢复",
+      "fixture": {"daily_run": "partial-failed", "failed_source": "openaire"},
+      "prompt": "OpenAIRE 本次超时而 OpenAlex 与 DBLP 成功时，每日任务应显示什么状态，/daily resume 会做什么？",
+      "expected": {
+        "state_assertions": {"run_status": "partial_failed", "resume_without_refetch": true},
+        "answer_checks": [
+          {"label": "部分失败", "any_of": ["部分", "partial_failed", "单一来源"]},
+          {"label": "恢复", "any_of": ["resume", "恢复", "已保存候选"]}
+        ],
+        "manual_rubric": ["不把单源失败描述成整个任务失败", "说明恢复不重复抓取已保存候选"]
+      }
+    },
+    {
+      "id": "T13",
+      "capability": "OpenAlex 鉴权边界",
+      "title": "OpenAlex Key 不进入输出或持久化数据",
+      "fixture": {"provider": "openalex", "api_key": "redacted"},
+      "prompt": "说明 OpenAlex API Key 的配置格式、发送位置以及哪些位置绝不能记录它。",
+      "expected": {
+        "state_assertions": {"provider": "openalex", "api_key_exposed": false},
+        "answer_checks": [
+          {"label": "配置键", "any_of": ["OPENALEX_API_KEY", "api_key"]},
+          {"label": "不泄露", "any_of": ["不记录", "不写入", "不泄露"]}
+        ],
+        "must_not_include": ["Bearer "],
+        "manual_rubric": ["区分原始 Key 与 HTTP Authorization 头", "提及日志、Git 和运行记录边界"]
+      }
+    },
+    {
+      "id": "T14",
+      "capability": "交互请求优先级",
+      "title": "后台研究不饿死交互式对话",
+      "fixture": {"background_tasks": 2, "interactive_slots": 1},
+      "prompt": "每日 Curator 和深度研究正在排队时，普通用户对话为何仍应优先获得模型并发槽？",
+      "expected": {
+        "state_assertions": {"interactive_admitted": true, "model_unchanged": true},
+        "answer_checks": [
+          {"label": "优先级", "any_of": ["交互", "优先", "预留"]},
+          {"label": "同模型", "any_of": ["同一模型", "不降级", "model"]}
+        ],
+        "performance": {"first_token_ms": 4000},
+        "manual_rubric": ["说明保留交互槽而非无限提高并发", "不建议静默切换模型"]
+      }
+    },
+    {
+      "id": "T15",
+      "capability": "长任务取消",
+      "title": "停止长任务后保留可恢复的候选与证据",
+      "fixture": {"cancel_stage": "curator", "saved_candidates": 3},
+      "prompt": "用户在每日任务 Curator 阶段点击停止，系统应取消哪些后续工作、保留什么，并如何继续？",
+      "expected": {
+        "state_assertions": {"run_status": "cancelled", "saved_candidates": 3, "resumable": true},
+        "answer_checks": [
+          {"label": "取消", "any_of": ["停止", "取消", "cancelled"]},
+          {"label": "继续", "any_of": ["resume", "继续", "候选"]}
+        ],
+        "manual_rubric": ["不把已取消请求伪装为完成", "候选和证据可供恢复而非丢弃"]
       }
     }
   ]
