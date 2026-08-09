@@ -1667,6 +1667,15 @@ class TestResearchBenchmark(unittest.TestCase):
         self.assertEqual(len(manifest["tasks"]), 15)
         self.assertEqual(len({task["id"] for task in manifest["tasks"]}), 15)
 
+    def test_engineering_explanation_tasks_do_not_require_a_tool_trace(self):
+        from evals.benchmark import load_manifest
+
+        manifest = load_manifest()
+        expectations = {task["id"]: task["expected"] for task in manifest["tasks"]}
+        self.assertEqual(manifest["version"], "v1.2")
+        self.assertNotIn("tool_trace_contains", expectations["T04"])
+        self.assertNotIn("tool_trace_contains", expectations["T10"])
+
     def test_scorer_checks_answer_and_tool_trace(self):
         from evals.benchmark import load_manifest, score_task
 

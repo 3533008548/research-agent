@@ -50,7 +50,9 @@ python -m evals.benchmark --results evals/example_results.json
 
 `example_results.json` 是评分器的合成格式样例，预期得到 15/15；它不代表真实模型表现。真实评测应保存一次实际 Agent 运行产生的回答、工具轨迹和状态快照，再使用同一命令评分。
 
-`ResearchAgent.get_last_trace()` 可取得一轮脱敏追踪：模型名、总耗时、首 token 时间、工具名/耗时、RAG 是否走关键词候选、错误类型和 token 增量。它不包含 API Key、完整 prompt 或工具原文。`result_from_trace()` 会自动携带模型调用次数；每日任务可额外传入 `source_stats`。对带性能门槛的任务，评分器会校验 `metrics`；例如 T10 要求 `query_papers` 在 8.5 秒内返回。
+`ResearchAgent.get_last_trace()` 可取得一轮脱敏追踪：模型名、总耗时、首 token 时间、工具名/耗时、RAG 是否走关键词候选、错误类型和 token 增量。它不包含 API Key、完整 prompt 或工具原文。`result_from_trace()` 会自动携带模型调用次数；每日任务可额外传入 `source_stats`。对带性能门槛的任务，评分器会校验 `metrics`；例如 T10 在走 RAG 工具时要求其在 8.5 秒内返回关键词候选或语义结果。
+
+T04（鲁棒性评估设计）与 T10（RAG 初始化降级）是工程/方法解释题：若用户没有要求论文、引用或具体实验数据，Agent 可以直接说明项目约束，不必为制造引用调用工具。工具轨迹在这两题是可选证据；其他明确要求取证的任务仍保留强制工具断言。
 
 真实执行一项任务时，可直接转换为评分输入：
 

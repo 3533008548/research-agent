@@ -1,5 +1,5 @@
 {
-  "version": "v1.1",
+  "version": "v1.2",
   "corpus": "synthetic-research-corpus-v1",
   "tasks": [
     {
@@ -53,12 +53,11 @@
     },
     {
       "id": "T04",
-      "capability": "证据约束回答",
+      "capability": "鲁棒性评估设计",
       "title": "避免把训练条件误当成实验结论",
       "fixture": {"paper_ids": ["diffusion-tsn", "robust-tsn"]},
       "prompt": "说明验证动态负载下 TSN 调度鲁棒性时，至少应报告哪些指标和实验设置。",
       "expected": {
-        "tool_trace_contains": ["query_papers"],
         "answer_checks": [
           {"label": "指标", "any_of": ["截止期违例", "deadline", "latency", "feasibility"]},
           {"label": "设置", "any_of": ["分布偏移", "动态负载", "bursty"]}
@@ -141,7 +140,6 @@
       "fixture": {"embedding_state": "cold", "paper_ids": ["diffusion-tsn"]},
       "prompt": "首次 RAG 检索遇到嵌入模型下载很慢时，系统应如何保证用户仍能获得可解释的结果？",
       "expected": {
-        "tool_trace_contains": ["query_papers"],
         "answer_checks": [
           {"label": "有界等待", "any_of": ["8 秒", "有界", "不等待"]},
           {"label": "关键词候选", "any_of": ["关键词", "本地候选", "后台初始化"]}
