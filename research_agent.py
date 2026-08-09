@@ -198,6 +198,7 @@ class ResearchAgent:
         session_id: str | None = None,
         topic: str | None = None,
         cancel_event: threading.Event | None = None,
+        run_id: str | None = None,
     ) -> str:
         """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文。
            ``session_id`` 省略时使用当前 CLI 会话；Web 请求必须显式传入。"""
@@ -229,7 +230,14 @@ class ResearchAgent:
             usage = self.get_usage(thread_id)
             usage_before = dict(usage)
             started_at = time.perf_counter()
-            chat_run = self.sessions.create_chat_run(thread_id, self.model)
+            if run_id:
+                chat_run = self.sessions.get_chat_run(run_id)
+                if not chat_run or chat_run.get("thread_id") != thread_id:
+                    raise ValueError("聊天运行不存在，或不属于当前会话")
+                if chat_run.get("status") not in {"running", "cancelling"}:
+                    raise ValueError("聊天运行不是可执行状态")
+            else:
+                chat_run = self.sessions.create_chat_run(thread_id, self.model)
             chat_run_id = str(chat_run["run_id"])
             self.sessions.add_run_event(
                 thread_id, chat_run_id, "chat", "single_agent", "queue", "running",
@@ -334,6 +342,7 @@ class ResearchAgent:
                 self.sessions.update_chat_run(
                     chat_run_id,
                     status=run_status,
+                    answer=answer,
                     duration_ms=duration_ms,
                     metrics={
                         "model_calls": usage.get("calls", 0) - usage_before.get("calls", 0),
@@ -354,6 +363,7 @@ class ResearchAgent:
                     error_type="" if run_status == "completed" else outcome,
                 )
                 self._last_traces[thread_id] = {
+                    "chat_run_id": chat_run_id,
                     "session_id": thread_id,
                     "model": self.model,
                     "outcome": outcome,

@@ -30,7 +30,11 @@ def _synchronized(method):
 
 
 class SessionStore:
-    """管理本地会话目录；不保存聊天正文，正文由 LangGraph checkpoint 保存。"""
+    """管理本地会话目录与运行元数据。
+
+    完整对话仍由 LangGraph checkpoint 保存；``chat_runs.answer_text`` 仅镜像一轮
+    最终可见回答，使 API 客户端在断开 SSE 后仍能查询该运行的结果。
+    """
 
     def __init__(self, checkpoint_db: str):
         self.db_path = checkpoint_db
@@ -82,6 +86,7 @@ class SessionStore:
                 thread_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 model TEXT NOT NULL DEFAULT '',
+                answer_text TEXT NOT NULL DEFAULT '',
                 duration_ms REAL,
                 metrics_json TEXT NOT NULL DEFAULT '{}',
                 error_type TEXT NOT NULL DEFAULT '',
@@ -114,6 +119,12 @@ class SessionStore:
                 ON agent_run_events(thread_id, created_at DESC);
             """
         )
+        # Existing runtime databases predate the API run-result endpoint.
+        # SQLite ADD COLUMN is atomic here and preserves all prior chat rows.
+        if not self._table_has_column("chat_runs", "answer_text"):
+            self._conn.execute(
+                "ALTER TABLE chat_runs ADD COLUMN answer_text TEXT NOT NULL DEFAULT ''"
+            )
         self._conn.commit()
 
     @staticmethod
@@ -281,6 +292,7 @@ class SessionStore:
     def _chat_row(cls, row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["metrics"] = cls._decode_json(item.pop("metrics_json", "{}"), {})
+        item["answer"] = item.pop("answer_text", "")
         return item
 
     @staticmethod
@@ -358,6 +370,7 @@ class SessionStore:
         run_id: str,
         *,
         status: str | None = None,
+        answer: str | None = None,
         duration_ms: float | None = None,
         metrics: dict[str, Any] | None = None,
         error_type: str | None = None,
@@ -374,6 +387,9 @@ class SessionStore:
             if status in {"completed", "failed", "cancelled"}:
                 values["completed_at"] = now
                 sets.append("completed_at=:completed_at")
+        if answer is not None:
+            values["answer"] = str(answer)
+            sets.append("answer_text=:answer")
         if duration_ms is not None:
             values["duration_ms"] = round(float(duration_ms), 1)
             sets.append("duration_ms=:duration_ms")

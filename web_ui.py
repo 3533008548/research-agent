@@ -56,7 +56,7 @@ CHAT_LATEX_DELIMITERS = [
 ]
 
 
-def build_ui():
+def build_ui(*, cfg=None, agent=None, launch: bool = True):
     parser = argparse.ArgumentParser(description="科研助手 Web UI")
     parser.add_argument(
         "-m", "--model",
@@ -72,7 +72,7 @@ def build_ui():
     parser.add_argument("--data-dir", default=None, help="运行时数据目录（默认: APP_DATA_DIR 或 runtime）")
     parser.add_argument("--no-rag", action="store_true", help="禁用 RAG")
     parser.add_argument("--debug", action="store_true", help="DEBUG 日志")
-    args = parser.parse_args()
+    args = parser.parse_args() if cfg is None else parser.parse_args([])
 
     from logger import setup_logging
     setup_logging(debug=args.debug)
@@ -84,10 +84,10 @@ def build_ui():
         "ui_debug": True if args.debug else None,
         "data_dir": args.data_dir,
     }
-    cfg = Config.load({k: v for k, v in cli.items() if v is not None})
+    cfg = cfg or Config.load({k: v for k, v in cli.items() if v is not None})
 
     print(f"🤖 模型: {cfg.model}")
-    agent = ResearchAgent(cfg=cfg)
+    agent = agent or ResearchAgent(cfg=cfg)
     notes = NoteStore(cfg.notes_db)
     pending_conflicts = {}
     from scheduler import Scheduler
@@ -1291,9 +1291,10 @@ def build_ui():
 
         quit_btn.click(fn=lambda: (demo.close(), os._exit(0)), outputs=[])
 
-    demo.launch(
-        server_name=args.host,
-        server_port=args.port,
+    launch_fn = demo.launch if launch else (lambda **_kwargs: demo)
+    launch_fn(
+        server_name=args.host if args else os.getenv("UI_HOST", "127.0.0.1"),
+        server_port=args.port if args else int(os.getenv("UI_PORT", "7860")),
         share=False, show_error=True,
         theme=gr.themes.Soft(),
         css="""
@@ -1334,6 +1335,7 @@ def build_ui():
         }
         """,
     )
+    return demo
 
 
 if __name__ == "__main__":

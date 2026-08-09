@@ -30,6 +30,6 @@ USER app
 EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:7860/', timeout=3).status == 200" || exit 1
+    CMD python -c "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:7860/api/v1/health', timeout=3).status == 200" || exit 1
 
-CMD ["python", "web_ui.py", "--host", "0.0.0.0", "--port", "7860", "--data-dir", "/app/runtime"]
+CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "7860"]

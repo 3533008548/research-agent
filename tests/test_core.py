@@ -29,6 +29,117 @@ from unittest.mock import patch, MagicMock
 RUN_CHROMA_INTEGRATION = os.getenv("SKIP_CHROMA_INTEGRATION") != "1"
 
 
+class TestFastAPIService(unittest.TestCase):
+    """API 外观层复用既有会话存储，不调用真实模型。"""
+
+    class _FakeAgent:
+        model = "fake-model"
+
+        def __init__(self, sessions):
+            self.sessions = sessions
+            self._traces = {}
+
+        def create_session(self, title=None):
+            return self.sessions.create(title)
+
+        def list_sessions(self):
+            return self.sessions.list()
+
+        def delete_session(self, session_id):
+            return self.sessions.delete(session_id)
+
+        def step(self, message, *, session_id, run_id, cancel_event, on_token):
+            if cancel_event.is_set():
+                answer, outcome, status = "已取消", "cancelled", "cancelled"
+            else:
+                on_token("API")
+                on_token(" 回复")
+                answer, outcome, status = f"已收到：{message}", "success", "completed"
+            self.sessions.update_chat_run(
+                run_id, status=status, answer=answer, duration_ms=12.5,
+                metrics={"model_calls": 1}, error_type="" if status == "completed" else outcome,
+            )
+            self._traces[session_id] = {"outcome": outcome, "duration_ms": 12.5}
+            return answer
+
+        def get_last_trace(self, session_id):
+            return self._traces.get(session_id)
+
+    class _BlockingFakeAgent(_FakeAgent):
+        def step(self, *args, cancel_event, **kwargs):
+            cancel_event.wait(timeout=1)
+            return super().step(*args, cancel_event=cancel_event, **kwargs)
+
+    def setUp(self):
+        from session_store import SessionStore
+
+        self.tmp = tempfile.mkdtemp()
+        self.store = SessionStore(str(Path(self.tmp) / "checkpoint.db"))
+        self.agent = self._FakeAgent(self.store)
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_chat_run_streams_sse_and_persists_final_answer(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        client = TestClient(create_app(agent=self.agent))
+        created = client.post("/api/v1/sessions", json={"title": "API 测试"})
+        self.assertEqual(created.status_code, 201)
+        session_id = created.json()["thread_id"]
+
+        started = client.post(
+            f"/api/v1/sessions/{session_id}/chat-runs",
+            json={"message": "测试 SSE"},
+        )
+        self.assertEqual(started.status_code, 202)
+        run_id = started.json()["run_id"]
+
+        events = client.get(f"/api/v1/runs/{run_id}/events")
+        self.assertEqual(events.status_code, 200)
+        self.assertIn("event: token", events.text)
+        self.assertIn("event: done", events.text)
+
+        detail = client.get(f"/api/v1/runs/{run_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["status"], "completed")
+        self.assertEqual(detail.json()["answer"], "已收到：测试 SSE")
+
+    def test_cannot_claim_cross_process_cancellation(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        session_id = self.agent.create_session("API 测试")["thread_id"]
+        run = self.store.create_chat_run(session_id, self.agent.model)
+        client = TestClient(create_app(agent=self.agent))
+
+        response = client.post(f"/api/v1/runs/{run['run_id']}/cancel")
+        self.assertEqual(response.status_code, 409)
+
+    def test_active_chat_run_uses_cooperative_cancellation(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        agent = self._BlockingFakeAgent(self.store)
+        client = TestClient(create_app(agent=agent))
+        session_id = agent.create_session("API 测试")["thread_id"]
+        started = client.post(
+            f"/api/v1/sessions/{session_id}/chat-runs",
+            json={"message": "等待取消"},
+        )
+        run_id = started.json()["run_id"]
+
+        cancelled = client.post(f"/api/v1/runs/{run_id}/cancel")
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["status"], "cancelling")
+
+        events = client.get(f"/api/v1/runs/{run_id}/events")
+        self.assertIn('"status":"cancelled"', events.text)
+        self.assertEqual(client.get(f"/api/v1/runs/{run_id}").json()["status"], "cancelled")
+
+
 class TestRetrievalAdmissionPolicy(unittest.TestCase):
     """工程解释不应为了生成引用而触发昂贵的文献工具链。"""
 
