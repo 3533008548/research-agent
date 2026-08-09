@@ -66,11 +66,22 @@ class ResearchOrchestrator:
         scope: str = "both",
         context: str | None = None,
         resume: bool = False,
+        run_id: str | None = None,
         cancel_event: threading.Event | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> ResearchResult:
-        run = self.sessions.get_latest_research_run(thread_id) if resume else None
         query = (query or "").strip()
+        if run_id and resume:
+            raise ValueError("不能同时指定现有研究运行和 resume")
+        if run_id:
+            run = self.sessions.get_research_run(run_id)
+            if not run or run.get("thread_id") != thread_id:
+                raise ValueError("深度研究运行不存在，或不属于当前会话")
+            if run.get("status") not in {"queued", "running", "cancelling"}:
+                raise ValueError("深度研究运行不是可执行状态")
+            query = query or str(run.get("query") or "").strip()
+        else:
+            run = self.sessions.get_latest_research_run(thread_id) if resume else None
         if resume and run is None:
             raise ValueError("当前会话没有可继续的深度研究，请先输入一个研究问题")
         if resume and run and run.get("status") == "completed":
@@ -94,6 +105,7 @@ class ResearchOrchestrator:
             scope = "both"
         reuse_evidence = bool(
             run
+            and not run_id
             and run.get("status") in {"cancelled", "failed", "running"}
             and run.get("evidence")
         )
@@ -101,6 +113,10 @@ class ResearchOrchestrator:
             run_id = str(run["run_id"])
             query = str(run["query"])
             plan = dict(run.get("plan") or self._fallback_plan(query))
+            evidence = list(run.get("evidence") or [])
+            self.sessions.update_research_run(run_id, status="running")
+        elif run_id:
+            plan = dict(run.get("plan") or {})
             evidence = list(run.get("evidence") or [])
             self.sessions.update_research_run(run_id, status="running")
         else:

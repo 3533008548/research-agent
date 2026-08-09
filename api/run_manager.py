@@ -170,6 +170,9 @@ class ChatRunManager:
 
     @staticmethod
     def _sse(event: dict[str, Any]) -> str:
-        event_type = str(event.get("type") or "message")
+        event_type = str(event.get("type") or "status")
+        if event_type not in {"status", "token", "tool", "done", "error"}:
+            event_type = "status"
+            event = {"type": "status", "status": "running"}
         data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         return f"event: {event_type}\ndata: {data}\n\n"

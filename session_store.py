@@ -315,17 +315,25 @@ class SessionStore:
         return safe
 
     @_synchronized
-    def create_research_run(self, thread_id: str, query: str) -> dict[str, Any]:
+    def create_research_run(
+        self,
+        thread_id: str,
+        query: str,
+        *,
+        status: str = "running",
+    ) -> dict[str, Any]:
         if not self.get(thread_id):
             raise KeyError(f"会话不存在: {thread_id}")
+        if status not in {"queued", "running", "cancelling"}:
+            raise ValueError(f"深度研究运行的初始状态无效: {status}")
         now = self._now()
         run_id = f"research-{uuid.uuid4().hex[:12]}"
         with self._conn:
             self._conn.execute(
                 "INSERT INTO research_runs "
                 "(run_id, thread_id, query, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'running', ?, ?)",
-                (run_id, thread_id, query, now, now),
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, thread_id, query, status, now, now),
             )
         return self.get_research_run(run_id) or {}
 

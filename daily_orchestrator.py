@@ -83,6 +83,7 @@ class DailyResearchOrchestrator:
         keyword: str | None = None,
         paper_store=None,
         resume: bool = False,
+        run_id: str | None = None,
         cancel_event: threading.Event | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> DailyRunResult:
@@ -90,25 +91,40 @@ class DailyResearchOrchestrator:
             raise ValueError(f"未知每日任务类型: {kind}")
         sources = self.temporary_sources if kind == "search" else self.daily_sources
 
-        reused = self.scheduler.get_latest_resumable_run(kind) if resume else None
-        candidates = self.scheduler.get_daily_candidates(reused["run_id"]) if reused else []
-        if reused and candidates:
-            run_id = str(reused["run_id"])
-            keywords = list(reused.get("keywords") or [])
-            source_stats = dict(reused.get("source_stats") or {})
-            self.scheduler.update_daily_run(run_id, status="running")
-            self._event(
-                run_id, "orchestrator", "resumed", "复用已保存候选，跳过外部检索",
-                on_progress,
-            )
+        if run_id and resume:
+            raise ValueError("不能同时指定现有每日运行和 resume")
+        if run_id:
+            existing = self.scheduler.get_daily_run(run_id)
+            if not existing or existing.get("kind") != kind:
+                raise ValueError("每日检索运行不存在或类型不匹配")
+            if existing.get("status") not in {"queued", "running", "cancelling"}:
+                raise ValueError("每日检索运行不是可执行状态")
+            keywords = list(existing.get("keywords") or [])
+            plan = dict(existing.get("plan") or self._build_plan(keywords, sources))
+            candidates = self.scheduler.get_daily_candidates(run_id)
+            source_stats = dict(existing.get("source_stats") or {})
+            self.scheduler.update_daily_run(run_id, status="running", plan=plan)
+            self._event(run_id, "planner", "completed", "已加载已排队的每日检索计划", on_progress, plan)
         else:
-            keywords = self._resolve_keywords(kind, keyword)
-            plan = self._build_plan(keywords, sources)
-            run = self.scheduler.create_daily_run(kind, keywords, plan)
-            run_id = str(run["run_id"])
-            candidates = []
-            source_stats: dict[str, Any] = {}
-            self._event(run_id, "planner", "completed", "已生成规则化检索计划", on_progress, plan)
+            reused = self.scheduler.get_latest_resumable_run(kind) if resume else None
+            candidates = self.scheduler.get_daily_candidates(reused["run_id"]) if reused else []
+            if reused and candidates:
+                run_id = str(reused["run_id"])
+                keywords = list(reused.get("keywords") or [])
+                source_stats = dict(reused.get("source_stats") or {})
+                self.scheduler.update_daily_run(run_id, status="running")
+                self._event(
+                    run_id, "orchestrator", "resumed", "复用已保存候选，跳过外部检索",
+                    on_progress,
+                )
+            else:
+                keywords = self._resolve_keywords(kind, keyword)
+                plan = self._build_plan(keywords, sources)
+                run = self.scheduler.create_daily_run(kind, keywords, plan)
+                run_id = str(run["run_id"])
+                candidates = []
+                source_stats: dict[str, Any] = {}
+                self._event(run_id, "planner", "completed", "已生成规则化检索计划", on_progress, plan)
 
         try:
             self._ensure_active(cancel_event)

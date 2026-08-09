@@ -133,15 +133,24 @@ class Scheduler:
             item[key.removesuffix("_json")] = cls._decode_json(item.pop(key, None), fallback)
         return item
 
-    def create_daily_run(self, kind: str, keywords: list[str], plan: dict | None = None) -> dict:
+    def create_daily_run(
+        self,
+        kind: str,
+        keywords: list[str],
+        plan: dict | None = None,
+        *,
+        status: str = "running",
+    ) -> dict:
+        if status not in {"queued", "running", "cancelling"}:
+            raise ValueError(f"每日检索运行的初始状态无效: {status}")
         run_id = f"daily-{uuid.uuid4().hex[:12]}"
         now = datetime.now().isoformat()
         with self._conn:
             self._conn.execute(
                 "INSERT INTO daily_runs (run_id, kind, status, keywords_json, plan_json, created_at, updated_at) "
-                "VALUES (?, ?, 'running', ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    run_id, kind, json.dumps(keywords, ensure_ascii=False),
+                    run_id, kind, status, json.dumps(keywords, ensure_ascii=False),
                     json.dumps(plan or {}, ensure_ascii=False), now, now,
                 ),
             )
@@ -185,6 +194,7 @@ class Scheduler:
         source_stats: dict | None = None,
         results: list[dict] | None = None,
         critique: dict | None = None,
+        plan: dict | None = None,
         error_text: str | None = None,
     ) -> dict | None:
         values: dict[str, object] = {"run_id": run_id, "updated_at": datetime.now().isoformat()}
@@ -194,6 +204,7 @@ class Scheduler:
             "source_stats_json": json.dumps(source_stats, ensure_ascii=False) if source_stats is not None else None,
             "result_json": json.dumps(results, ensure_ascii=False) if results is not None else None,
             "critique_json": json.dumps(critique, ensure_ascii=False) if critique is not None else None,
+            "plan_json": json.dumps(plan, ensure_ascii=False) if plan is not None else None,
             "error_text": error_text,
         }
         for column, value in updates.items():

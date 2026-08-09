@@ -14,6 +14,8 @@ def create_app(
     agent,
     title: str = "Research Agent API",
     chat_run_manager=None,
+    research_run_manager=None,
+    daily_run_manager=None,
     api_key: str | None = None,
     require_api_key: bool = False,
 ) -> FastAPI:
@@ -21,6 +23,11 @@ def create_app(
     app = FastAPI(title=title, version="v1")
     app.state.agent = agent
     app.state.chat_run_manager = chat_run_manager or ChatRunManager(agent)
+    # ``None`` means that this deployment has not configured the durable Redis
+    # worker boundary; the canonical route then returns a clear 503 for the
+    # unavailable run kind instead of silently starting local background work.
+    app.state.research_run_manager = research_run_manager
+    app.state.daily_run_manager = daily_run_manager
     app.state.api_authenticator = APIKeyAuthenticator(api_key, required=require_api_key)
     app.include_router(router)
     return app

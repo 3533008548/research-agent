@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 
-_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial_failed"}
 
 
 class QueueUnavailableError(RuntimeError):
@@ -32,7 +32,12 @@ class QueuedChatRun:
 
 
 class RedisChatRunBroker:
-    """A thin synchronous Redis Streams adapter used by API processes and workers."""
+    """A synchronous Redis Streams adapter for one durable run kind.
+
+    Subclasses only change the stream/group names and job encoding.  Event and
+    cancellation keys deliberately use ``run_id`` alone, so every public run
+    type has the same SSE/cancellation protocol.
+    """
 
     def __init__(
         self,
@@ -219,6 +224,82 @@ class RedisChatRunBroker:
             return
 
 
+@dataclass(frozen=True)
+class QueuedResearchRun:
+    message_id: str
+    run_id: str
+    session_id: str
+    query: str
+    scope: str
+
+
+class RedisResearchRunBroker(RedisChatRunBroker):
+    """Redis stream for durable deep-research work."""
+
+    @property
+    def queue_key(self) -> str:
+        return f"{self.prefix}:research-runs"
+
+    @property
+    def group_name(self) -> str:
+        return f"{self.prefix}:research-workers"
+
+    def enqueue(self, run_id: str, session_id: str, query: str, scope: str) -> str:
+        try:
+            item_id = self._redis.xadd(
+                self.queue_key,
+                {"run_id": run_id, "session_id": session_id, "query": query, "scope": scope},
+            )
+            return str(item_id)
+        except Exception as exc:
+            raise QueueUnavailableError("could not enqueue research run") from exc
+
+    @staticmethod
+    def _decode_job(message_id: str, fields: dict[str, Any]) -> QueuedResearchRun | None:
+        try:
+            return QueuedResearchRun(
+                message_id=str(message_id), run_id=str(fields["run_id"]),
+                session_id=str(fields["session_id"]), query=str(fields["query"]),
+                scope=str(fields.get("scope") or "both"),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+@dataclass(frozen=True)
+class QueuedDailyRun:
+    message_id: str
+    run_id: str
+    kind: str
+
+
+class RedisDailyRunBroker(RedisChatRunBroker):
+    """Redis stream for scheduled/daily discovery work."""
+
+    @property
+    def queue_key(self) -> str:
+        return f"{self.prefix}:daily-runs"
+
+    @property
+    def group_name(self) -> str:
+        return f"{self.prefix}:daily-workers"
+
+    def enqueue(self, run_id: str, kind: str) -> str:
+        try:
+            return str(self._redis.xadd(self.queue_key, {"run_id": run_id, "kind": kind}))
+        except Exception as exc:
+            raise QueueUnavailableError("could not enqueue daily run") from exc
+
+    @staticmethod
+    def _decode_job(message_id: str, fields: dict[str, Any]) -> QueuedDailyRun | None:
+        try:
+            return QueuedDailyRun(
+                message_id=str(message_id), run_id=str(fields["run_id"]), kind=str(fields["kind"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
 class RedisChatRunManager:
     """HTTP-side manager: persist metadata, enqueue work, stream Redis events."""
 
@@ -292,9 +373,7 @@ class RedisChatRunManager:
 
     @staticmethod
     def _sse(event: dict[str, Any]) -> str:
-        event_type = str(event.get("type") or "message")
-        data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-        return f"event: {event_type}\ndata: {data}\n\n"
+        return _sse(event)
 
 
 class RedisChatRunWorker:
@@ -371,6 +450,15 @@ class RedisChatRunWorker:
                 on_token=on_token,
             )
             trace = self.agent.get_last_trace(job.session_id) or {}
+            # Only the existing trace's tool identifier and its lifecycle are
+            # exposed.  Arguments, search results and model text never enter
+            # the Redis event log.
+            for tool_event in trace.get("tool_trace", []):
+                tool_name = str(tool_event.get("tool") or "")[:80]
+                if tool_name:
+                    self.broker.publish(job.run_id, {
+                        "type": "tool", "tool": tool_name, "status": "completed",
+                    })
             current = self.agent.sessions.get_chat_run(job.run_id) or run
             outcome = trace.get("outcome")
             result_status = "cancelled" if cancel_event.is_set() or outcome == "cancelled" else (
@@ -401,4 +489,311 @@ class RedisChatRunWorker:
             summary="Queued API chat run was cancelled before execution",
         )
         self.broker.publish(job.run_id, {"type": "done", "status": "cancelled", "answer": ""})
+        self.broker.clear_cancel(job.run_id)
+
+
+def _sse(event: dict[str, Any]) -> str:
+    """Render one event from the fixed public SSE vocabulary."""
+    event_type = str(event.get("type") or "status")
+    if event_type not in {"status", "token", "tool", "done", "error"}:
+        event_type = "status"
+        event = {"type": "status", "status": "running"}
+    data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event_type}\\ndata: {data}\\n\\n"
+
+
+def _safe_status_event(event: dict[str, Any]) -> dict[str, str]:
+    """Keep only de-identified stage/status fields from existing progress traces."""
+    return {
+        "type": "status",
+        "stage": str(event.get("stage") or "run")[:80],
+        "status": str(event.get("status") or "running")[:40],
+    }
+
+
+class _RedisRunStream:
+    """Shared read/cancel/SSE behavior for persisted Redis-backed run records."""
+
+    broker: RedisChatRunBroker
+
+    def _stream(self, run_id: str, *, answer_key: str = "answer") -> Iterator[str]:
+        run = self.get(run_id)
+        if not run:
+            raise KeyError(run_id)
+        yield _sse({"type": "status", "status": run["status"], "run_id": run_id})
+        cursor = "0-0"
+        while True:
+            events, cursor = self.broker.events(run_id, cursor)
+            for event in events:
+                yield _sse(event)
+                if event.get("type") == "done":
+                    return
+            run = self.get(run_id)
+            if not run:
+                return
+            if run.get("status") in _TERMINAL_STATUSES:
+                done = {"type": "done", "status": run["status"]}
+                if answer_key and run.get(answer_key):
+                    done["answer"] = run[answer_key]
+                yield _sse(done)
+                return
+            yield ": keep-alive\\n\\n"
+
+
+class RedisResearchRunManager(_RedisRunStream):
+    """HTTP-side coordinator for deep-research runs."""
+
+    def __init__(self, agent, broker: RedisResearchRunBroker) -> None:
+        self.agent = agent
+        self.broker = broker
+
+    def start(self, session_id: str, query: str, scope: str = "both") -> dict[str, Any]:
+        if not self.agent.sessions.get(session_id):
+            raise KeyError(session_id)
+        if scope not in {"both", "local", "public"}:
+            raise ValueError("invalid research scope")
+        run = self.agent.sessions.create_research_run(session_id, query, status="queued")
+        run_id = str(run["run_id"])
+        try:
+            self.broker.enqueue(run_id, session_id, query, scope)
+            self.broker.publish(run_id, {"type": "status", "status": "queued", "run_id": run_id})
+        except QueueUnavailableError:
+            self.agent.sessions.update_research_run(run_id, status="failed")
+            raise
+        self.agent.sessions.add_run_event(
+            session_id, run_id, "research", "api", "queue", "queued",
+            summary="API research run queued for a durable worker",
+        )
+        return self.get(run_id) or run
+
+    def get(self, run_id: str) -> dict[str, Any] | None:
+        return self.agent.sessions.get_research_run(run_id)
+
+    def list_for_session(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return self.agent.sessions.list_research_runs(session_id, limit=limit)
+
+    def cancel(self, run_id: str) -> dict[str, Any] | None:
+        run = self.get(run_id)
+        if not run or run.get("status") in _TERMINAL_STATUSES:
+            return run
+        self.broker.request_cancel(run_id)
+        updated = self.agent.sessions.update_research_run(run_id, status="cancelling")
+        if updated:
+            self.broker.publish(run_id, {"type": "status", "status": "cancelling", "run_id": run_id})
+            self.agent.sessions.add_run_event(
+                updated["thread_id"], run_id, "research", "api", "cancel", "cancelling",
+                summary="Cancellation requested by API client",
+            )
+        return updated
+
+    def cancel_for_session(self, session_id: str) -> None:
+        for run in self.list_for_session(session_id, limit=100):
+            if run.get("status") not in _TERMINAL_STATUSES:
+                self.cancel(str(run["run_id"]))
+
+    def stream(self, run_id: str) -> Iterator[str]:
+        return self._stream(run_id, answer_key="final_answer")
+
+
+class RedisResearchRunWorker:
+    """Durably execute one persisted deep-research run at a time."""
+
+    def __init__(
+        self, agent, broker: RedisResearchRunBroker, *, consumer: str | None = None,
+        claim_idle_ms: int = 120_000,
+    ) -> None:
+        self.agent = agent
+        self.broker = broker
+        self.consumer = consumer or f"research-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.claim_idle_ms = max(1_000, int(claim_idle_ms))
+
+    def run_once(self, *, block_ms: int = 1_000) -> bool:
+        job = self.broker.claim_stale(self.consumer, min_idle_ms=self.claim_idle_ms)
+        if job is None:
+            job = self.broker.reserve(self.consumer, block_ms=block_ms)
+        if job is None:
+            return False
+        try:
+            self._process(job)
+        finally:
+            self.broker.acknowledge(job.message_id)
+        return True
+
+    def run_forever(self) -> None:
+        while True:
+            self.run_once(block_ms=5_000)
+
+    def _process(self, job: QueuedResearchRun) -> None:
+        run = self.agent.sessions.get_research_run(job.run_id)
+        if not run or run.get("thread_id") != job.session_id or run.get("status") in _TERMINAL_STATUSES:
+            return
+        if self.broker.cancel_requested(job.run_id):
+            self._finish_cancelled(job)
+            return
+        self.agent.sessions.update_research_run(job.run_id, status="running")
+        self.broker.publish(job.run_id, {"type": "status", "status": "running", "run_id": job.run_id})
+        cancel_event, stop_monitor, monitor = self._cancel_monitor(job.run_id)
+        try:
+            self.agent.research(
+                job.query, scope=job.scope, session_id=job.session_id, run_id=job.run_id,
+                cancel_event=cancel_event,
+                on_progress=lambda event: self.broker.publish(job.run_id, _safe_status_event(event)),
+            )
+            current = self.agent.sessions.get_research_run(job.run_id) or run
+            result_status = str(current.get("status") or "failed")
+            if result_status not in _TERMINAL_STATUSES:
+                result_status = "cancelled" if cancel_event.is_set() else "failed"
+                self.agent.sessions.update_research_run(job.run_id, status=result_status)
+            self.broker.publish(job.run_id, {
+                "type": "done", "status": result_status,
+                "answer": str(current.get("final_answer") or ""),
+            })
+        except Exception as exc:
+            self.agent.sessions.update_research_run(job.run_id, status="failed")
+            self.broker.publish(job.run_id, {"type": "error", "error_type": type(exc).__name__})
+            self.broker.publish(job.run_id, {"type": "done", "status": "failed"})
+        finally:
+            stop_monitor.set()
+            monitor.join(timeout=0.2)
+            self.broker.clear_cancel(job.run_id)
+
+    def _cancel_monitor(self, run_id: str) -> tuple[threading.Event, threading.Event, threading.Thread]:
+        cancel_event = threading.Event()
+        stop_monitor = threading.Event()
+
+        def monitor_cancel() -> None:
+            while not stop_monitor.wait(0.1):
+                if self.broker.cancel_requested(run_id):
+                    cancel_event.set()
+                    return
+
+        monitor = threading.Thread(target=monitor_cancel, name=f"api-cancel-{run_id[-8:]}", daemon=True)
+        monitor.start()
+        return cancel_event, stop_monitor, monitor
+
+    def _finish_cancelled(self, job: QueuedResearchRun) -> None:
+        self.agent.sessions.update_research_run(job.run_id, status="cancelled", final_answer="")
+        self.agent.sessions.add_run_event(
+            job.session_id, job.run_id, "research", "api_worker", "run", "cancelled",
+            summary="Queued API research run was cancelled before execution",
+        )
+        self.broker.publish(job.run_id, {"type": "done", "status": "cancelled"})
+        self.broker.clear_cancel(job.run_id)
+
+
+class RedisDailyRunManager(_RedisRunStream):
+    """HTTP-side coordinator for daily and ad-hoc paper-discovery runs."""
+
+    def __init__(self, scheduler, broker: RedisDailyRunBroker) -> None:
+        self.scheduler = scheduler
+        self.broker = broker
+
+    def start(self, kind: str, keyword: str | None = None) -> dict[str, Any]:
+        if kind not in {"daily", "retry", "search"}:
+            raise ValueError("invalid daily run kind")
+        if kind == "search":
+            error = self.scheduler.validate_keyword(keyword or "")
+            if error:
+                raise ValueError(error)
+            keywords = [str(keyword).strip()]
+        else:
+            keywords = self.scheduler.prepare_daily_keywords(retry=kind == "retry")
+        run = self.scheduler.create_daily_run(kind, keywords, status="queued")
+        run_id = str(run["run_id"])
+        try:
+            self.broker.enqueue(run_id, kind)
+            self.broker.publish(run_id, {"type": "status", "status": "queued", "run_id": run_id})
+        except QueueUnavailableError:
+            self.scheduler.update_daily_run(run_id, status="failed", error_text="QueueUnavailableError")
+            raise
+        return self.get(run_id) or run
+
+    def get(self, run_id: str) -> dict[str, Any] | None:
+        return self.scheduler.get_daily_run(run_id)
+
+    def list(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self.scheduler.list_daily_runs(limit=limit)
+
+    def cancel(self, run_id: str) -> dict[str, Any] | None:
+        run = self.get(run_id)
+        if not run or run.get("status") in _TERMINAL_STATUSES:
+            return run
+        self.broker.request_cancel(run_id)
+        updated = self.scheduler.update_daily_run(run_id, status="cancelling")
+        if updated:
+            self.broker.publish(run_id, {"type": "status", "status": "cancelling", "run_id": run_id})
+        return updated
+
+    def stream(self, run_id: str) -> Iterator[str]:
+        return self._stream(run_id, answer_key="")
+
+
+class RedisDailyRunWorker:
+    """Execute daily discovery work from the shared low-priority Redis stream."""
+
+    def __init__(
+        self, orchestrator, scheduler, broker: RedisDailyRunBroker, *, consumer: str | None = None,
+        claim_idle_ms: int = 120_000, paper_store=None,
+    ) -> None:
+        self.orchestrator = orchestrator
+        self.scheduler = scheduler
+        self.broker = broker
+        self.consumer = consumer or f"daily-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.claim_idle_ms = max(1_000, int(claim_idle_ms))
+        self.paper_store = paper_store
+
+    def run_once(self, *, block_ms: int = 1_000) -> bool:
+        job = self.broker.claim_stale(self.consumer, min_idle_ms=self.claim_idle_ms)
+        if job is None:
+            job = self.broker.reserve(self.consumer, block_ms=block_ms)
+        if job is None:
+            return False
+        try:
+            self._process(job)
+        finally:
+            self.broker.acknowledge(job.message_id)
+        return True
+
+    def run_forever(self) -> None:
+        while True:
+            self.run_once(block_ms=5_000)
+
+    def _process(self, job: QueuedDailyRun) -> None:
+        run = self.scheduler.get_daily_run(job.run_id)
+        if not run or run.get("kind") != job.kind or run.get("status") in _TERMINAL_STATUSES:
+            return
+        if self.broker.cancel_requested(job.run_id):
+            self._finish_cancelled(job)
+            return
+        self.scheduler.update_daily_run(job.run_id, status="running")
+        self.broker.publish(job.run_id, {"type": "status", "status": "running", "run_id": job.run_id})
+        cancel_event = threading.Event()
+        stop_monitor = threading.Event()
+
+        def monitor_cancel() -> None:
+            while not stop_monitor.wait(0.1):
+                if self.broker.cancel_requested(job.run_id):
+                    cancel_event.set()
+                    return
+
+        monitor = threading.Thread(target=monitor_cancel, name=f"api-cancel-{job.run_id[-8:]}", daemon=True)
+        monitor.start()
+        try:
+            result = self.orchestrator.run(
+                job.kind, run_id=job.run_id, paper_store=self.paper_store, cancel_event=cancel_event,
+                on_progress=lambda event: self.broker.publish(job.run_id, _safe_status_event(event)),
+            )
+            self.broker.publish(job.run_id, {"type": "done", "status": result.status})
+        except Exception as exc:
+            self.scheduler.update_daily_run(job.run_id, status="failed", error_text=type(exc).__name__)
+            self.broker.publish(job.run_id, {"type": "error", "error_type": type(exc).__name__})
+            self.broker.publish(job.run_id, {"type": "done", "status": "failed"})
+        finally:
+            stop_monitor.set()
+            monitor.join(timeout=0.2)
+            self.broker.clear_cancel(job.run_id)
+
+    def _finish_cancelled(self, job: QueuedDailyRun) -> None:
+        self.scheduler.update_daily_run(job.run_id, status="cancelled")
+        self.broker.publish(job.run_id, {"type": "done", "status": "cancelled"})
         self.broker.clear_cancel(job.run_id)

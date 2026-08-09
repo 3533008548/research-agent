@@ -19,6 +19,7 @@ import os
 import subprocess
 import time
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 
 # 添加项目根目录到 Python 路径
@@ -65,6 +66,14 @@ class TestFastAPIService(unittest.TestCase):
         def get_last_trace(self, session_id):
             return self._traces.get(session_id)
 
+        def research(self, query, *, session_id, run_id, cancel_event, on_progress, **_kwargs):
+            on_progress({"stage": "planner", "status": "running", "message": query})
+            status = "cancelled" if cancel_event.is_set() else "completed"
+            answer = "" if status == "cancelled" else f"研究完成：{query}"
+            self.sessions.update_research_run(run_id, status=status, final_answer=answer)
+            self._traces[session_id] = {"outcome": status}
+            return answer
+
     class _BlockingFakeAgent(_FakeAgent):
         def step(self, *args, cancel_event, **kwargs):
             cancel_event.wait(timeout=1)
@@ -110,6 +119,32 @@ class TestFastAPIService(unittest.TestCase):
         def clear_cancel(self, run_id):
             self.cancelled.discard(run_id)
 
+    class _FakeResearchBroker(_FakeRunBroker):
+        def enqueue(self, run_id, session_id, query, scope):
+            self.jobs.append((run_id, session_id, query, scope))
+            return str(len(self.jobs))
+
+        def reserve(self, _consumer, **_kwargs):
+            if not self.jobs:
+                return None
+            from api.redis_runs import QueuedResearchRun
+
+            run_id, session_id, query, scope = self.jobs.pop(0)
+            return QueuedResearchRun("research-job-1", run_id, session_id, query, scope)
+
+    class _FakeDailyBroker(_FakeRunBroker):
+        def enqueue(self, run_id, kind):
+            self.jobs.append((run_id, kind))
+            return str(len(self.jobs))
+
+        def reserve(self, _consumer, **_kwargs):
+            if not self.jobs:
+                return None
+            from api.redis_runs import QueuedDailyRun
+
+            run_id, kind = self.jobs.pop(0)
+            return QueuedDailyRun("daily-job-1", run_id, kind)
+
     def setUp(self):
         from session_store import SessionStore
 
@@ -146,6 +181,20 @@ class TestFastAPIService(unittest.TestCase):
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.json()["status"], "completed")
         self.assertEqual(detail.json()["answer"], "已收到：测试 SSE")
+
+    def test_canonical_run_endpoint_creates_chat_run(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        client = TestClient(create_app(agent=self.agent))
+        session_id = client.post("/api/v1/sessions", json={"title": "统一运行"}).json()["thread_id"]
+        started = client.post("/api/v1/runs", json={
+            "kind": "chat", "session_id": session_id, "message": "统一入口",
+        })
+        self.assertEqual(started.status_code, 202)
+        self.assertEqual(started.json()["kind"], "chat")
+        detail = client.get(f"/api/v1/runs/{started.json()['run_id']}")
+        self.assertEqual(detail.json()["kind"], "chat")
 
     def test_cannot_claim_cross_process_cancellation(self):
         from fastapi.testclient import TestClient
@@ -222,6 +271,44 @@ class TestFastAPIService(unittest.TestCase):
         manager.cancel(cancelled["run_id"])
         self.assertTrue(worker.run_once(block_ms=1))
         self.assertEqual(manager.get(cancelled["run_id"])["status"], "cancelled")
+
+    def test_durable_worker_executes_queued_research_run(self):
+        from api.redis_runs import RedisResearchRunManager, RedisResearchRunWorker
+
+        broker = self._FakeResearchBroker()
+        manager = RedisResearchRunManager(self.agent, broker)
+        session_id = self.agent.create_session("研究队列") ["thread_id"]
+        started = manager.start(session_id, "RAG 重排方法", "public")
+        self.assertEqual(started["status"], "queued")
+        worker = RedisResearchRunWorker(self.agent, broker, consumer="research-test-worker")
+        self.assertTrue(worker.run_once(block_ms=1))
+        completed = manager.get(started["run_id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["final_answer"], "研究完成：RAG 重排方法")
+        self.assertTrue(any(event["type"] == "status" for event in broker.events[started["run_id"]]))
+
+    def test_durable_worker_executes_queued_daily_run(self):
+        from api.redis_runs import RedisDailyRunManager, RedisDailyRunWorker
+        from scheduler import Scheduler
+
+        scheduler = Scheduler(str(Path(self.tmp) / "daily.db"))
+        broker = self._FakeDailyBroker()
+
+        class _FakeDailyOrchestrator:
+            def run(self, kind, *, run_id, paper_store, cancel_event, on_progress):
+                on_progress({"stage": "scouts", "status": "running", "message": "private keyword"})
+                outcome = "cancelled" if cancel_event.is_set() else "completed"
+                scheduler.update_daily_run(run_id, status=outcome, results={"selected": []})
+                return SimpleNamespace(status=outcome)
+
+        manager = RedisDailyRunManager(scheduler, broker)
+        started = manager.start("search", "retrieval augmented generation")
+        self.assertEqual(started["status"], "queued")
+        worker = RedisDailyRunWorker(_FakeDailyOrchestrator(), scheduler, broker, consumer="daily-test-worker")
+        self.assertTrue(worker.run_once(block_ms=1))
+        self.assertEqual(manager.get(started["run_id"])["status"], "completed")
+        self.assertTrue(any(event["type"] == "status" for event in broker.events[started["run_id"]]))
+        scheduler.close()
 
 
 class TestRetrievalAdmissionPolicy(unittest.TestCase):

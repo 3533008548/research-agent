@@ -388,6 +388,7 @@ class ResearchAgent:
         context: str | None = None,
         session_id: str | None = None,
         resume: bool = False,
+        run_id: str | None = None,
         cancel_event: threading.Event | None = None,
         on_progress=None,
     ) -> str:
@@ -430,6 +431,7 @@ class ResearchAgent:
                 scope=scope,
                 context=context,
                 resume=resume,
+                run_id=run_id,
                 cancel_event=cancel_event,
                 on_progress=_record_progress,
             )

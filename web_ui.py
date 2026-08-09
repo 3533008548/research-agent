@@ -19,6 +19,7 @@ import re
 import sys
 import shutil
 import hashlib
+import json
 import time
 from pathlib import Path
 
@@ -169,15 +170,53 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             _session_topics.pop(session_id or "", None)
 
     daily_lock = threading.Lock()
-    daily_task = {"thread": None, "cancel_event": None}
+    daily_task = {"thread": None, "cancel_event": None, "api_run_id": None}
     browser_run_guard = BrowserRunGuard()
+    # When mounted under FastAPI, Gradio is deliberately an HTTP client of the
+    # same public run boundary.  Standalone ``python web_ui.py`` remains a
+    # developer fallback and continues to use the in-process agent.
+    api_run_client_enabled = bool(not launch and os.getenv("REDIS_URL", "").strip())
+    api_run_base = os.getenv("INTERNAL_API_URL", "http://127.0.0.1:7860").rstrip("/")
+    api_run_token = os.getenv("API_AUTH_TOKEN", "").strip()
+    _api_runs_by_browser: dict[str, str] = {}
+    _api_runs_lock = threading.RLock()
+
+    def _api_headers() -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if api_run_token:
+            headers["X-API-Key"] = api_run_token
+        return headers
+
+    def _remember_api_run(browser_id: str, run_id: str) -> None:
+        with _api_runs_lock:
+            _api_runs_by_browser[browser_id] = run_id
+
+    def _forget_api_run(browser_id: str, run_id: str | None = None) -> None:
+        with _api_runs_lock:
+            active = _api_runs_by_browser.get(browser_id)
+            if active and (run_id is None or active == run_id):
+                _api_runs_by_browser.pop(browser_id, None)
 
     def _browser_id(request: gr.Request | None) -> str:
         """取得 Gradio 浏览器标签页的稳定标识；仅用于请求失效控制。"""
         return getattr(request, "session_hash", None) or "anonymous-browser"
 
     def _invalidate_browser_request(request: gr.Request | None) -> None:
-        browser_run_guard.invalidate(_browser_id(request))
+        browser_id = _browser_id(request)
+        with _api_runs_lock:
+            run_id = _api_runs_by_browser.get(browser_id)
+        if run_id and api_run_client_enabled:
+            try:
+                import requests
+                requests.post(
+                    f"{api_run_base}/api/v1/runs/{run_id}/cancel",
+                    headers=_api_headers(), timeout=(1, 2),
+                )
+            except Exception:
+                # Browser invalidation still prevents stale output; the durable
+                # worker's cancellation marker is a best-effort delivery here.
+                pass
+        browser_run_guard.invalidate(browser_id)
 
     def _format_daily_results(
         results: list[dict], heading: str, *, brief: str = "", critique: dict | None = None,
@@ -279,6 +318,28 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
     ) -> bool:
         if not daily_lock.acquire(blocking=False):
             return False
+        if api_run_client_enabled:
+            try:
+                import requests
+                response = requests.post(
+                    f"{api_run_base}/api/v1/runs",
+                    headers=_api_headers(),
+                    json={"kind": "daily", "daily_kind": task_type, "keyword": keyword},
+                    timeout=(3, 10),
+                )
+                response.raise_for_status()
+                run_id = str(response.json()["run_id"])
+                daily_task["api_run_id"] = run_id
+                agent.runtime_status["daily_ready"] = False
+                agent.runtime_status["daily_progress"] = f"📰 queued · {run_id}"
+                agent.runtime_status["daily_message"] = "📰 每日检索已提交到共享队列。"
+                return True
+            except Exception as exc:
+                agent.runtime_status["daily_ready"] = True
+                agent.runtime_status["daily_message"] = f"⚠️ 每日检索 API 请求失败：{type(exc).__name__}"
+                return False
+            finally:
+                daily_lock.release()
         agent.runtime_status["daily_ready"] = False
         agent.runtime_status["daily_message"] = "📰 任务已开始，可继续使用其他功能。"
         cancel_event = threading.Event()
@@ -541,6 +602,24 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             yield "📰 正在继续上次未完成的每日检索；已保存候选不会重复请求。"; return
 
         if msg == "/daily status":
+            api_run_id = daily_task.get("api_run_id")
+            if api_run_id and api_run_client_enabled:
+                try:
+                    import requests
+                    response = requests.get(
+                        f"{api_run_base}/api/v1/runs/{api_run_id}",
+                        headers=_api_headers(), timeout=(3, 10),
+                    )
+                    response.raise_for_status()
+                    api_run = response.json()
+                    state = str(api_run.get("status") or "unknown")
+                    if state in {"completed", "failed", "cancelled", "partial_failed"}:
+                        agent.runtime_status["daily_ready"] = True
+                        daily_task["api_run_id"] = None
+                    yield f"📰 `{api_run_id}`：{state}"
+                    return
+                except Exception:
+                    pass
             progress = agent.runtime_status.get("daily_progress") or scheduler.get_progress()
             if progress:
                 yield progress; return
@@ -548,6 +627,19 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
 
         if msg in ("/daily off", "/daily stop"):
             cfg.runtime_paths.update_settings({"daily_search_enabled": False})
+            api_run_id = daily_task.get("api_run_id")
+            if api_run_id and api_run_client_enabled:
+                try:
+                    import requests
+                    requests.post(
+                        f"{api_run_base}/api/v1/runs/{api_run_id}/cancel",
+                        headers=_api_headers(), timeout=(1, 3),
+                    )
+                    daily_task["api_run_id"] = None
+                    yield "⏸ 已请求停止共享队列中的每日检索。"
+                    return
+                except Exception:
+                    pass
             active_cancel = daily_task.get("cancel_event")
             if active_cancel:
                 active_cancel.set()
@@ -601,6 +693,66 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             resume_research = research_query.lower() in {"continue", "继续"}
             if not research_query and not resume_research:
                 yield "用法：`/research <研究问题>`，或输入 `/research continue` 继续上一次未完成的研究。"
+                return
+
+            if api_run_client_enabled and not resume_research:
+                browser_id = _browser_id(request)
+                request_generation = browser_run_guard.begin(browser_id)
+                run_id = ""
+                partial = "## 🔬 深度研究\n\n正在排队…"
+                if browser_run_guard.is_current(browser_id, request_generation):
+                    yield partial
+                try:
+                    import requests
+
+                    response = requests.post(
+                        f"{api_run_base}/api/v1/runs",
+                        headers=_api_headers(),
+                        json={
+                            "kind": "research", "session_id": session_id,
+                            "query": research_query, "scope": research_scope,
+                        },
+                        timeout=(3, 10),
+                    )
+                    response.raise_for_status()
+                    run_id = str(response.json()["run_id"])
+                    _remember_api_run(browser_id, run_id)
+                    event_name = "status"
+                    with requests.get(
+                        f"{api_run_base}/api/v1/runs/{run_id}/events",
+                        headers=_api_headers(), stream=True, timeout=(3, 600),
+                    ) as stream:
+                        stream.raise_for_status()
+                        for raw_line in stream.iter_lines(decode_unicode=True):
+                            if not browser_run_guard.is_current(browser_id, request_generation):
+                                return
+                            line = str(raw_line or "")
+                            if line.startswith("event: "):
+                                event_name = line[7:].strip()
+                                continue
+                            if not line.startswith("data: "):
+                                continue
+                            try:
+                                event = json.loads(line[6:])
+                            except json.JSONDecodeError:
+                                continue
+                            if event_name == "status":
+                                stage = str(event.get("stage") or "research")
+                                state = str(event.get("status") or "running")
+                                partial = f"## 🔬 深度研究\n\n**{stage}**：{state}"
+                                yield partial
+                            elif event_name == "error":
+                                yield f"⚠️ 深度研究失败：{event.get('error_type', 'UnknownError')}"
+                            elif event_name == "done":
+                                answer = str(event.get("answer") or partial)
+                                yield re.sub(r'(?<!\$)\$([^\$]*[\_^][^\$]*)\$(?!\$)', r'$$\1$$', answer)
+                                return
+                except Exception as exc:
+                    if browser_run_guard.is_current(browser_id, request_generation):
+                        yield f"⚠️ 深度研究 API 请求失败：{type(exc).__name__}"
+                finally:
+                    _forget_api_run(browser_id, run_id or None)
+                    browser_run_guard.finish(browser_id, request_generation)
                 return
 
             browser_id = _browser_id(request)
@@ -673,6 +825,68 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             return
 
         # 正常对话（流式）
+        if api_run_client_enabled:
+            browser_id = _browser_id(request)
+            request_generation = browser_run_guard.begin(browser_id)
+            run_id = ""
+            partial = "⌛ 正在排队处理请求…"
+            received_model_token = False
+            if browser_run_guard.is_current(browser_id, request_generation):
+                yield partial
+            try:
+                import requests
+
+                response = requests.post(
+                    f"{api_run_base}/api/v1/runs",
+                    headers=_api_headers(),
+                    json={"kind": "chat", "session_id": session_id, "message": msg},
+                    timeout=(3, 10),
+                )
+                response.raise_for_status()
+                run_id = str(response.json()["run_id"])
+                _remember_api_run(browser_id, run_id)
+                event_name = "status"
+                with requests.get(
+                    f"{api_run_base}/api/v1/runs/{run_id}/events",
+                    headers=_api_headers(), stream=True, timeout=(3, 300),
+                ) as stream:
+                    stream.raise_for_status()
+                    for raw_line in stream.iter_lines(decode_unicode=True):
+                        if not browser_run_guard.is_current(browser_id, request_generation):
+                            return
+                        line = str(raw_line or "")
+                        if line.startswith("event: "):
+                            event_name = line[7:].strip()
+                            continue
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            event = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        if event_name == "token":
+                            text = str(event.get("text") or "")
+                            if text:
+                                if not received_model_token:
+                                    partial = ""
+                                    received_model_token = True
+                                partial += text
+                                yield partial
+                        elif event_name == "error":
+                            partial = f"⚠️ 后台请求失败：{event.get('error_type', 'UnknownError')}"
+                            yield partial
+                        elif event_name == "done":
+                            answer = str(event.get("answer") or partial)
+                            yield re.sub(r'(?<!\$)\$([^\$]*[\_^][^\$]*)\$(?!\$)', r'$$\1$$', answer)
+                            return
+            except Exception as exc:
+                if browser_run_guard.is_current(browser_id, request_generation):
+                    yield f"⚠️ API 对话请求失败：{type(exc).__name__}"
+            finally:
+                _forget_api_run(browser_id, run_id or None)
+                browser_run_guard.finish(browser_id, request_generation)
+            return
+
         browser_id = _browser_id(request)
         request_generation = browser_run_guard.begin(browser_id)
         cancel_event = browser_run_guard.cancellation_event(browser_id, request_generation)
