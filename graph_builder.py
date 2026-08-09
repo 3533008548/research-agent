@@ -209,10 +209,15 @@ def build_graph(
                 messages.append({"role": "system", "content": f"[对话摘要] {recent}"})
 
         payload = {
-            "model": model, "messages": messages, "tools": tool_schemas,
-            "tool_choice": "auto", "temperature": 0.7,
-            "stream": stream_callback is not None,
+            "model": model, "messages": messages,
+            "temperature": 0.7, "stream": stream_callback is not None,
         }
+        # An empty tool list with ``tool_choice=auto`` is rejected by some
+        # OpenAI-compatible providers.  Direct engineering answers therefore
+        # omit tool fields completely instead of relying on model compliance.
+        if tool_schemas:
+            payload["tools"] = tool_schemas
+            payload["tool_choice"] = "auto"
 
         def _api_status(message: str) -> None:
             if token_usage is not None:

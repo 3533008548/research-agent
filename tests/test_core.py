@@ -29,6 +29,33 @@ from unittest.mock import patch, MagicMock
 RUN_CHROMA_INTEGRATION = os.getenv("SKIP_CHROMA_INTEGRATION") != "1"
 
 
+class TestRetrievalAdmissionPolicy(unittest.TestCase):
+    """工程解释不应为了生成引用而触发昂贵的文献工具链。"""
+
+    def test_engineering_questions_disable_retrieval_tools(self):
+        from research_agent import should_answer_without_tools
+
+        self.assertTrue(should_answer_without_tools(
+            "首次 RAG 检索遇到嵌入模型下载很慢时，系统应如何保证结果？"
+        ))
+        self.assertTrue(should_answer_without_tools(
+            "每日 Curator 排队时，普通用户对话为什么仍应优先获得并发槽？"
+        ))
+        self.assertTrue(should_answer_without_tools(
+            "验证动态负载下 TSN 调度鲁棒性时，至少应报告哪些指标和实验设置？"
+        ))
+
+    def test_explicit_evidence_requests_keep_retrieval_tools(self):
+        from research_agent import should_answer_without_tools
+
+        self.assertFalse(should_answer_without_tools(
+            "检索三篇关于动态负载 TSN 鲁棒性的论文并给出引用。"
+        ))
+        self.assertFalse(should_answer_without_tools(
+            "这篇论文的原文实验数据和作者是谁？"
+        ))
+
+
 @unittest.skipUnless(
     RUN_CHROMA_INTEGRATION,
     "CI offline quality gate skips Chroma/ONNX integration; run it in the scheduled integration job.",

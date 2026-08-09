@@ -127,7 +127,10 @@ class TestSessionIsolationE2E(unittest.TestCase):
 
     def _send(self, text: str):
         self.page.locator("textarea").first.fill(text)
-        self.page.get_by_role("button", name="发送").click()
+        # Gradio exposes the submit control with the fixed aria-label "Submit",
+        # even when its visible, localized label is "发送".  Locate the user-facing
+        # text so this browser regression stays aligned with the actual UI.
+        self.page.get_by_text("发送", exact=True).click()
 
     def test_new_session_first_message_never_restores_old_stream(self):
         new_session = self.page.get_by_role("button", name="＋ 新建会话")

@@ -62,6 +62,31 @@ from session_store import SessionStore
 MAX_AGENT_GRAPH_STEPS = 16
 
 
+_DIRECT_ENGINEERING_MARKERS = (
+    "系统应如何", "系统应该如何", "为什么仍应", "为何仍应", "为什么要",
+    "超时", "熔断", "降级", "并发槽", "优先级", "取消", "会话隔离",
+    "会话删除", "配置格式", "安全边界", "绝不能记录", "至少应报告", "实验设置",
+)
+_EXPLICIT_EVIDENCE_MARKERS = (
+    "论文", "文献", "引用", "原文", "最新进展", "最新研究", "搜索论文",
+    "检索论文", "找论文", "doi", "arxiv", "paper", "作者", "哪篇",
+)
+
+
+def should_answer_without_tools(user_input: str) -> bool:
+    """Keep explanatory engineering turns out of the expensive research loop.
+
+    This is intentionally narrow: explicit requests for papers or citations
+    still receive the full retrieval tool set.  The rule prevents a generic
+    design question from downloading unrelated papers merely to manufacture
+    references before a useful answer can be streamed.
+    """
+    text = str(user_input or "").casefold()
+    if not text or not any(marker in text for marker in _DIRECT_ENGINEERING_MARKERS):
+        return False
+    return not any(marker in text for marker in _EXPLICIT_EVIDENCE_MARKERS)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  ResearchAgent — LangGraph 包装器
 # ═══════════════════════════════════════════════════════════════
@@ -233,12 +258,24 @@ class ResearchAgent:
                 if on_token:
                     on_token(token)
 
+            allowed_tool_names = set() if should_answer_without_tools(user_input) else None
+            if allowed_tool_names is not None:
+                _record_event({"type": "tool_policy", "policy": "direct_engineering_answer"})
             app = None
             try:
-                app = self._build_app(
-                    usage, _on_token if on_token else None, _record_event,
-                    cancel_event=cancel_event,
-                )
+                if allowed_tool_names is None:
+                    # Preserve the long-standing default call shape so custom
+                    # integrations and lightweight test doubles do not need
+                    # to accept a no-op policy argument.
+                    app = self._build_app(
+                        usage, _on_token if on_token else None, _record_event,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    app = self._build_app(
+                        usage, _on_token if on_token else None, _record_event,
+                        cancel_event=cancel_event, allowed_tool_names=allowed_tool_names,
+                    )
                 result = app.invoke(
                     state,
                     config={
@@ -691,7 +728,10 @@ class ResearchAgent:
             error_type=str(event.get("error_type") or "")[:120],
         )
 
-    def _build_app(self, usage: dict, on_token=None, event_callback=None, cancel_event=None):
+    def _build_app(
+        self, usage: dict, on_token=None, event_callback=None, cancel_event=None,
+        allowed_tool_names: set[str] | None = None,
+    ):
         return build_graph(
             api_key=self.api_key,
             model=self.model,
@@ -707,6 +747,7 @@ class ResearchAgent:
             verify_timeout_seconds=self.cfg.verify_timeout_seconds,
             verify_guard=self.verify_guard,
             llm_client=self.llm_client,
+            allowed_tool_names=allowed_tool_names,
         )
 
     @staticmethod
