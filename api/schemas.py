@@ -58,7 +58,7 @@ class RunCreateRequest(BaseModel):
     message: str | None = Field(default=None, max_length=12_000)
     query: str | None = Field(default=None, max_length=12_000)
     scope: Literal["both", "local", "public"] = "both"
-    daily_kind: Literal["daily", "retry", "search"] | None = None
+    daily_kind: Literal["daily", "retry", "search", "resume"] | None = None
     keyword: str | None = Field(default=None, max_length=500)
 
 

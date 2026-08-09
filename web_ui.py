@@ -324,7 +324,11 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                 response = requests.post(
                     f"{api_run_base}/api/v1/runs",
                     headers=_api_headers(),
-                    json={"kind": "daily", "daily_kind": task_type, "keyword": keyword},
+                    json={
+                        "kind": "daily",
+                        "daily_kind": "resume" if resume else task_type,
+                        "keyword": keyword,
+                    },
                     timeout=(3, 10),
                 )
                 response.raise_for_status()

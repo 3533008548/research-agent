@@ -302,12 +302,16 @@ class TestFastAPIService(unittest.TestCase):
                 return SimpleNamespace(status=outcome)
 
         manager = RedisDailyRunManager(scheduler, broker)
-        started = manager.start("search", "retrieval augmented generation")
+        started = manager.start("daily")
         self.assertEqual(started["status"], "queued")
         worker = RedisDailyRunWorker(_FakeDailyOrchestrator(), scheduler, broker, consumer="daily-test-worker")
         self.assertTrue(worker.run_once(block_ms=1))
         self.assertEqual(manager.get(started["run_id"])["status"], "completed")
         self.assertTrue(any(event["type"] == "status" for event in broker.events[started["run_id"]]))
+        scheduler.update_daily_run(started["run_id"], status="failed")
+        resumed = manager.start("resume")
+        self.assertEqual(resumed["run_id"], started["run_id"])
+        self.assertEqual(resumed["status"], "queued")
         scheduler.close()
 
 

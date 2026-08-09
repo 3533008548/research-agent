@@ -75,6 +75,8 @@ publishing it to a network.
 
 `POST /api/v1/sessions/{session_id}/chat-runs` remains a compatibility alias
 while clients migrate to the canonical endpoint.
+For daily work, `daily_kind` accepts `daily`, `retry`, `search`, or `resume`;
+`resume` requeues the latest recoverable daily run under its existing `run_id`.
 
 Example:
 

@@ -689,8 +689,23 @@ class RedisDailyRunManager(_RedisRunStream):
         self.broker = broker
 
     def start(self, kind: str, keyword: str | None = None) -> dict[str, Any]:
-        if kind not in {"daily", "retry", "search"}:
+        if kind not in {"daily", "retry", "search", "resume"}:
             raise ValueError("invalid daily run kind")
+        run_kind = "daily" if kind == "resume" else kind
+        if kind == "resume":
+            run = self.scheduler.get_latest_resumable_run("daily")
+            if not run:
+                raise ValueError("no resumable daily run")
+            run_id = str(run["run_id"])
+            self.scheduler.update_daily_run(run_id, status="queued")
+            run = self.get(run_id) or run
+            try:
+                self.broker.enqueue(run_id, run_kind)
+                self.broker.publish(run_id, {"type": "status", "status": "queued", "run_id": run_id})
+            except QueueUnavailableError:
+                self.scheduler.update_daily_run(run_id, status="failed", error_text="QueueUnavailableError")
+                raise
+            return run
         if kind == "search":
             error = self.scheduler.validate_keyword(keyword or "")
             if error:
@@ -698,10 +713,10 @@ class RedisDailyRunManager(_RedisRunStream):
             keywords = [str(keyword).strip()]
         else:
             keywords = self.scheduler.prepare_daily_keywords(retry=kind == "retry")
-        run = self.scheduler.create_daily_run(kind, keywords, status="queued")
+        run = self.scheduler.create_daily_run(run_kind, keywords, status="queued")
         run_id = str(run["run_id"])
         try:
-            self.broker.enqueue(run_id, kind)
+            self.broker.enqueue(run_id, run_kind)
             self.broker.publish(run_id, {"type": "status", "status": "queued", "run_id": run_id})
         except QueueUnavailableError:
             self.scheduler.update_daily_run(run_id, status="failed", error_text="QueueUnavailableError")
