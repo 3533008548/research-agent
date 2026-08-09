@@ -70,6 +70,46 @@ class TestFastAPIService(unittest.TestCase):
             cancel_event.wait(timeout=1)
             return super().step(*args, cancel_event=cancel_event, **kwargs)
 
+    class _FakeRunBroker:
+        """In-memory contract double for the Redis queue/stream adapter."""
+
+        def __init__(self):
+            self.jobs = []
+            self.events = {}
+            self.cancelled = set()
+            self.acknowledged = []
+
+        def enqueue(self, run_id, session_id, message):
+            self.jobs.append((run_id, session_id, message))
+            return str(len(self.jobs))
+
+        def publish(self, run_id, event):
+            self.events.setdefault(run_id, []).append(dict(event))
+            return str(len(self.events[run_id]))
+
+        def claim_stale(self, _consumer, **_kwargs):
+            return None
+
+        def reserve(self, _consumer, **_kwargs):
+            if not self.jobs:
+                return None
+            from api.redis_runs import QueuedChatRun
+
+            run_id, session_id, message = self.jobs.pop(0)
+            return QueuedChatRun("job-1", run_id, session_id, message)
+
+        def acknowledge(self, message_id):
+            self.acknowledged.append(message_id)
+
+        def request_cancel(self, run_id):
+            self.cancelled.add(run_id)
+
+        def cancel_requested(self, run_id):
+            return run_id in self.cancelled
+
+        def clear_cancel(self, run_id):
+            self.cancelled.discard(run_id)
+
     def setUp(self):
         from session_store import SessionStore
 
@@ -133,11 +173,55 @@ class TestFastAPIService(unittest.TestCase):
 
         cancelled = client.post(f"/api/v1/runs/{run_id}/cancel")
         self.assertEqual(cancelled.status_code, 200)
-        self.assertEqual(cancelled.json()["status"], "cancelling")
+        self.assertIn(cancelled.json()["status"], {"cancelling", "cancelled"})
 
         events = client.get(f"/api/v1/runs/{run_id}/events")
         self.assertIn('"status":"cancelled"', events.text)
         self.assertEqual(client.get(f"/api/v1/runs/{run_id}").json()["status"], "cancelled")
+
+    def test_api_key_can_be_required_without_hiding_health(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        client = TestClient(create_app(
+            agent=self.agent, api_key="phase-two-secret", require_api_key=True,
+        ))
+        self.assertEqual(client.get("/api/v1/health").status_code, 200)
+        self.assertEqual(client.get("/api/v1/sessions").status_code, 401)
+        created = client.post(
+            "/api/v1/sessions",
+            headers={"X-API-Key": "phase-two-secret"},
+            json={"title": "受保护 API 会话"},
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(
+            client.get(
+                "/api/v1/sessions",
+                headers={"Authorization": "Bearer phase-two-secret"},
+            ).status_code,
+            200,
+        )
+
+    def test_durable_worker_executes_and_cancels_queued_chat_runs(self):
+        from api.redis_runs import RedisChatRunManager, RedisChatRunWorker
+
+        broker = self._FakeRunBroker()
+        manager = RedisChatRunManager(self.agent, broker)
+        session_id = self.agent.create_session("Durable API 测试")["thread_id"]
+        started = manager.start(session_id, "队列执行")
+        self.assertEqual(started["status"], "queued")
+        worker = RedisChatRunWorker(self.agent, broker, consumer="test-worker")
+        self.assertTrue(worker.run_once(block_ms=1))
+        completed = manager.get(started["run_id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["answer"], "已收到：队列执行")
+        self.assertIn("job-1", broker.acknowledged)
+        self.assertTrue(any(event["type"] == "token" for event in broker.events[started["run_id"]]))
+
+        cancelled = manager.start(session_id, "排队后取消")
+        manager.cancel(cancelled["run_id"])
+        self.assertTrue(worker.run_once(block_ms=1))
+        self.assertEqual(manager.get(cancelled["run_id"])["status"], "cancelled")
 
 
 class TestRetrievalAdmissionPolicy(unittest.TestCase):

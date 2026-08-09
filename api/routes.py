@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 
+from api.auth import require_api_key
+from api.redis_runs import QueueUnavailableError
 from api.schemas import (
     CancelRunResponse,
     ChatRunCreateRequest,
@@ -54,17 +56,26 @@ def health(request: Request) -> dict[str, str]:
     return {"status": "ok", "model": str(request.app.state.agent.model)}
 
 
-@router.get("/sessions", response_model=list[SessionResponse])
+@router.get("/sessions", response_model=list[SessionResponse], dependencies=[Depends(require_api_key)])
 def list_sessions(request: Request) -> list[dict]:
     return [_session_payload(item) for item in request.app.state.agent.list_sessions()]
 
 
-@router.post("/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/sessions",
+    response_model=SessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_api_key)],
+)
 def create_session(payload: SessionCreateRequest, request: Request) -> dict:
     return _session_payload(request.app.state.agent.create_session(payload.title))
 
 
-@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/sessions/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_api_key)],
+)
 def delete_session(session_id: str, request: Request) -> Response:
     _manager(request).cancel_for_session(session_id)
     if not request.app.state.agent.delete_session(session_id):
@@ -72,7 +83,11 @@ def delete_session(session_id: str, request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/sessions/{session_id}/runs", response_model=list[ChatRunResponse])
+@router.get(
+    "/sessions/{session_id}/runs",
+    response_model=list[ChatRunResponse],
+    dependencies=[Depends(require_api_key)],
+)
 def list_session_runs(session_id: str, request: Request, limit: int = 20) -> list[dict]:
     if not request.app.state.agent.sessions.get(session_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found")
@@ -84,6 +99,7 @@ def list_session_runs(session_id: str, request: Request, limit: int = 20) -> lis
     "/sessions/{session_id}/chat-runs",
     response_model=ChatRunStartResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_api_key)],
 )
 def create_chat_run(session_id: str, payload: ChatRunCreateRequest, request: Request) -> dict:
     if not payload.message.strip():
@@ -93,6 +109,8 @@ def create_chat_run(session_id: str, payload: ChatRunCreateRequest, request: Req
         run = manager.start(session_id, payload.message)
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found") from None
+    except QueueUnavailableError:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="chat queue unavailable") from None
     return {
         "run_id": run["run_id"],
         "session_id": session_id,
@@ -101,7 +119,11 @@ def create_chat_run(session_id: str, payload: ChatRunCreateRequest, request: Req
     }
 
 
-@router.get("/runs/{run_id}", response_model=ChatRunResponse)
+@router.get(
+    "/runs/{run_id}",
+    response_model=ChatRunResponse,
+    dependencies=[Depends(require_api_key)],
+)
 def get_run(run_id: str, request: Request) -> dict:
     manager = _manager(request)
     run = manager.get(run_id)
@@ -111,7 +133,7 @@ def get_run(run_id: str, request: Request) -> dict:
     return _run_payload(run, events)
 
 
-@router.get("/runs/{run_id}/events")
+@router.get("/runs/{run_id}/events", dependencies=[Depends(require_api_key)])
 def stream_run_events(run_id: str, request: Request) -> StreamingResponse:
     manager = _manager(request)
     if not manager.get(run_id):
@@ -123,9 +145,16 @@ def stream_run_events(run_id: str, request: Request) -> StreamingResponse:
     )
 
 
-@router.post("/runs/{run_id}/cancel", response_model=CancelRunResponse)
+@router.post(
+    "/runs/{run_id}/cancel",
+    response_model=CancelRunResponse,
+    dependencies=[Depends(require_api_key)],
+)
 def cancel_run(run_id: str, request: Request) -> dict:
-    run = _manager(request).cancel(run_id)
+    try:
+        run = _manager(request).cancel(run_id)
+    except QueueUnavailableError:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="chat queue unavailable") from None
     if run is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

@@ -40,9 +40,13 @@ class SessionStore:
         self.db_path = checkpoint_db
         Path(checkpoint_db).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(checkpoint_db, check_same_thread=False)
+        self._conn = sqlite3.connect(checkpoint_db, check_same_thread=False, timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # The API and durable worker use separate SQLite connections.  WAL
+        # still permits only one writer, so wait briefly for a concurrent
+        # metadata update instead of failing an otherwise valid chat run.
+        self._conn.execute("PRAGMA busy_timeout=10000")
         self._init_db()
 
     def _init_db(self) -> None:
@@ -335,17 +339,25 @@ class SessionStore:
         return [self._research_row(row) for row in rows]
 
     @_synchronized
-    def create_chat_run(self, thread_id: str, model: str) -> dict[str, Any]:
+    def create_chat_run(
+        self,
+        thread_id: str,
+        model: str,
+        *,
+        status: str = "running",
+    ) -> dict[str, Any]:
         if not self.get(thread_id):
             raise KeyError(f"会话不存在: {thread_id}")
+        if status not in {"queued", "running", "cancelling"}:
+            raise ValueError(f"聊天运行的初始状态无效: {status}")
         now = self._now()
         run_id = f"chat-{uuid.uuid4().hex[:12]}"
         with self._conn:
             self._conn.execute(
                 "INSERT INTO chat_runs "
                 "(run_id, thread_id, status, model, created_at, updated_at) "
-                "VALUES (?, ?, 'running', ?, ?, ?)",
-                (run_id, thread_id, str(model or "")[:120], now, now),
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, thread_id, status, str(model or "")[:120], now, now),
             )
             self._prune_chat_runs(thread_id)
         return self.get_chat_run(run_id) or {}

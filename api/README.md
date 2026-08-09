@@ -1,47 +1,86 @@
-# FastAPI 服务层（第一阶段）
+# FastAPI service layer
 
-容器启动后，Gradio 界面仍位于 `http://localhost:7860/`；FastAPI 的
-OpenAPI 文档位于 `http://localhost:7860/docs`，健康检查为：
+The Gradio UI remains available at `http://localhost:7860/`; the OpenAPI
+document is at `http://localhost:7860/docs`.
+
+## Phase two boundary
+
+Interactive chat runs now use a durable Redis Stream and a separate
+`api-worker` process:
 
 ```text
-GET /api/v1/health
+API request -> SQLite run metadata (queued) -> Redis Stream -> api-worker
+                                                       |-> Redis SSE events
 ```
 
-当前提供的 API 是交互式对话的稳定服务边界：
+- Queue entries hold the request text only while a worker needs it.
+- Redis event streams contain transient status/token events for 24 hours.
+- Final answers, safe metrics and the audit timeline remain in SQLite, so
+  `GET /api/v1/runs/{run_id}` still works after event expiry.
+- Cancellation writes a Redis marker. The worker monitors it and supplies the
+  existing cooperative cancellation token to the agent.
+- A Redis consumer group keeps unacknowledged work pending after a worker
+  crash; the next worker claims it after two minutes.
 
-| 接口 | 用途 |
-|---|---|
-| `GET` / `POST /api/v1/sessions` | 列出或创建会话 |
-| `DELETE /api/v1/sessions/{session_id}` | 删除会话；会先向本进程运行中的请求发送取消信号 |
-| `POST /api/v1/sessions/{session_id}/chat-runs` | 创建异步对话运行，返回 `run_id` 与 SSE 地址 |
-| `GET /api/v1/runs/{run_id}` | 查询状态、脱敏指标和最终回答 |
-| `GET /api/v1/runs/{run_id}/events` | SSE：`status`、`token`、`done`、`error` |
-| `POST /api/v1/runs/{run_id}/cancel` | 协作式取消当前进程中的运行 |
+The Compose profile deliberately keeps one worker, because SQLite remains the
+primary user-data store. This phase makes API delivery and cancellation
+cross-process; it does **not** claim arbitrary multi-worker SQLite writes are
+safe. Daily retrieval and deep-research jobs remain out of the public API.
 
-创建会话与运行示例：
+## Authentication and network boundary
+
+All `/api/v1/*` routes except `GET /api/v1/health` accept either:
+
+```http
+X-API-Key: <API_AUTH_TOKEN>
+```
+
+or:
+
+```http
+Authorization: Bearer <API_AUTH_TOKEN>
+```
+
+Set these in the untracked `.env` file before a public deployment:
+
+```env
+API_AUTH_TOKEN=use-a-long-random-secret
+API_AUTH_REQUIRED=1
+```
+
+If a token is present it is enforced. `API_AUTH_REQUIRED=1` also makes startup
+fail fast when the token is absent. Compose binds port 7860 to `127.0.0.1` by
+default; use a TLS reverse proxy and keep authentication enabled before
+publishing it to a network.
+
+## Endpoints
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/health` | unauthenticated health check |
+| `GET`, `POST` | `/api/v1/sessions` | list or create a session |
+| `DELETE` | `/api/v1/sessions/{session_id}` | cancel active runs and delete a session |
+| `GET` | `/api/v1/sessions/{session_id}/runs` | list recent chat runs |
+| `POST` | `/api/v1/sessions/{session_id}/chat-runs` | enqueue a chat run and return its SSE URL |
+| `GET` | `/api/v1/runs/{run_id}` | inspect status, safe metrics and final answer |
+| `GET` | `/api/v1/runs/{run_id}/events` | read SSE `status`, `token`, `done`, `error` events |
+| `POST` | `/api/v1/runs/{run_id}/cancel` | request cross-process cooperative cancellation |
+
+Example:
 
 ```bash
+TOKEN='your-long-random-secret'
+
 curl -X POST http://localhost:7860/api/v1/sessions \
+  -H "X-API-Key: $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"title":"API 会话"}'
+  -d '{"title":"API session"}'
 
 curl -X POST http://localhost:7860/api/v1/sessions/<session_id>/chat-runs \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"message":"解释 RAG 冷启动的降级策略"}'
+  -d '{"message":"Explain the RAG cold-start fallback."}'
 
-curl -N http://localhost:7860/api/v1/runs/<run_id>/events
+curl -N -H "X-API-Key: $TOKEN" \
+  http://localhost:7860/api/v1/runs/<run_id>/events
 ```
-
-第二条请求返回 `stream_url`。使用 `GET <stream_url>` 建立 SSE 连接；完成后可用
-`GET /api/v1/runs/<run_id>` 获取最终回答。最终回答会与运行元数据一起保存，使 SSE
-断开后仍可读取结果；提示词、工具参数和 API Key 不写入 API 运行记录。
-
-## 当前部署边界
-
-这一阶段刻意采用单个 Uvicorn 进程，让 Gradio 与 API 共用同一个
-`ResearchAgent`、会话锁和模型并发槽。不要增加 `--workers`，也不要把长时间的每日
-检索或深度研究放入 FastAPI `BackgroundTasks`：那会使内存中的取消令牌和并发槽失去
-进程间一致性。
-
-在启用公网访问、多副本部署或每日/深度研究 API 前，下一阶段需要加入认证、共享队列
-和 Redis 等跨进程并发控制；目前仅适用于受信任网络中的单实例服务。

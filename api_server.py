@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+
 import gradio as gr
 
 from api.app import create_app
+from api.redis_runs import RedisChatRunBroker, RedisChatRunManager
 from config import Config
 from research_agent import ResearchAgent
 from web_ui import UI_CSS, UI_JS, UI_THEME, build_ui
@@ -13,7 +16,19 @@ from web_ui import UI_CSS, UI_JS, UI_THEME, build_ui
 def create_server():
     cfg = Config.load()
     agent = ResearchAgent(cfg=cfg)
-    app = create_app(agent=agent)
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    if redis_url:
+        broker = RedisChatRunBroker(redis_url)
+        broker.ping()
+        manager = RedisChatRunManager(agent, broker)
+    else:
+        manager = None
+    app = create_app(
+        agent=agent,
+        chat_run_manager=manager,
+        api_key=os.getenv("API_AUTH_TOKEN"),
+        require_api_key=os.getenv("API_AUTH_REQUIRED", "").strip().lower() in {"1", "true", "yes"},
+    )
     ui = build_ui(cfg=cfg, agent=agent, launch=False)
     return gr.mount_gradio_app(
         app,

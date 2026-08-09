@@ -1,4 +1,16 @@
 services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - ./runtime/derived/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   research-agent:
     build:
       context: .
@@ -10,13 +22,45 @@ services:
       - .env
     environment:
       APP_DATA_DIR: /app/runtime
+      REDIS_URL: redis://redis:6379/0
+      # API_AUTH_TOKEN protects /api/v1/* with X-API-Key or Bearer auth.
+      # Set API_AUTH_REQUIRED=1 for every public or reverse-proxy deployment.
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      API_AUTH_REQUIRED: ${API_AUTH_REQUIRED:-0}
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Shanghai
     ports:
-      - "${UI_PORT:-7860}:7860"
+      # Keep the default local-only. Put a TLS reverse proxy in front before
+      # publishing the service, and require API authentication there as well.
+      - "127.0.0.1:${UI_PORT:-7860}:7860"
     volumes:
-      # 只挂载统一运行时目录；镜像升级、容器重建不会丢失用户数据。
       - ./runtime:/app/runtime
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  api-worker:
+    image: research-agent:local
+    command: ["python", "api_worker.py"]
+    env_file:
+      - .env
+    environment:
+      APP_DATA_DIR: /app/runtime
+      REDIS_URL: redis://redis:6379/0
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai
+    volumes:
+      - ./runtime:/app/runtime
+    init: true
+    # The image-level health check probes the ASGI HTTP port, which this
+    # queue-only process intentionally does not expose.
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      redis:
+        condition: service_healthy
