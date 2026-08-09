@@ -601,7 +601,7 @@ class DailyResearchOrchestrator:
             text = self._call_model(
                 prompt, RequestPolicy(
                     purpose="daily_curator", priority=RequestPriority.SUMMARY,
-                    deadline_seconds=20, max_retries=1,
+                    deadline_seconds=20, max_retries=1, counts_toward_circuit=False,
                 ), cancel_event,
             )
             parsed = self._parse_json(text)
@@ -658,7 +658,7 @@ class DailyResearchOrchestrator:
             parsed = self._parse_json(self._call_model(
                 prompt, RequestPolicy(
                     purpose="daily_critic", priority=RequestPriority.VERIFY,
-                    deadline_seconds=12, max_retries=0,
+                    deadline_seconds=12, max_retries=0, counts_toward_circuit=False,
                 ), cancel_event,
             ))
             allowed = {candidate["candidate_id"] for candidate in selected}

@@ -56,6 +56,12 @@ from search_api import list_downloaded_papers
 from session_store import SessionStore
 
 
+# Keep a normal chat turn bounded even when the model repeatedly requests tools.
+# A graph "round" contains several internal nodes, so this still leaves room for
+# multiple search/read calls while preventing an accidental unbounded cost loop.
+MAX_AGENT_GRAPH_STEPS = 16
+
+
 # ═══════════════════════════════════════════════════════════════
 #  ResearchAgent — LangGraph 包装器
 # ═══════════════════════════════════════════════════════════════
@@ -198,16 +204,24 @@ class ResearchAgent:
             usage = self.get_usage(thread_id)
             usage_before = dict(usage)
             started_at = time.perf_counter()
+            chat_run = self.sessions.create_chat_run(thread_id, self.model)
+            chat_run_id = str(chat_run["run_id"])
+            self.sessions.add_run_event(
+                thread_id, chat_run_id, "chat", "single_agent", "queue", "running",
+                summary="请求已进入交互队列",
+            )
             trace_events: list[dict] = []
             first_token_ms: float | None = None
             outcome = "error"
             answer = ""
 
             def _record_event(event: dict) -> None:
+                at_ms = round((time.perf_counter() - started_at) * 1000, 1)
                 trace_events.append({
                     **event,
-                    "at_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                    "at_ms": at_ms,
                 })
+                self._persist_chat_event(thread_id, chat_run_id, event, at_ms)
 
             def _on_token(token: str) -> None:
                 nonlocal first_token_ms
@@ -219,13 +233,18 @@ class ResearchAgent:
                 if on_token:
                     on_token(token)
 
-            app = self._build_app(
-                usage, _on_token if on_token else None, _record_event,
-                cancel_event=cancel_event,
-            )
+            app = None
             try:
+                app = self._build_app(
+                    usage, _on_token if on_token else None, _record_event,
+                    cancel_event=cancel_event,
+                )
                 result = app.invoke(
-                    state, config={"configurable": {"thread_id": thread_id}}
+                    state,
+                    config={
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": MAX_AGENT_GRAPH_STEPS,
+                    },
                 )
                 messages = result.get("messages", [])
                 if not messages:
@@ -250,22 +269,58 @@ class ResearchAgent:
                 outcome = "network_error"
                 return answer
             except Exception as e:
+                if type(e).__name__ == "GraphRecursionError":
+                    answer = (
+                        "⚠️ 本轮 Agent 已达到工具调用上限，已停止继续执行。"
+                        "请缩小问题范围后重试。"
+                    )
+                    outcome = "agent_limit"
+                    return answer
                 answer = f"❌ Agent 错误: {type(e).__name__}: {e}"
                 outcome = "agent_error"
                 return answer
             finally:
-                # 成功完成后不在状态栏残留“模型响应中”；流中断提示则保留给用户。
-                if not str(usage.get("api_status", "")).startswith("⚠️"):
-                    usage.pop("api_status", None)
+                # Status-bar text describes only the live request.  Completed
+                # interruptions and optional verification failures are visible
+                # in the answer/run timeline, not as stale session-wide alerts.
+                usage.pop("api_status", None)
+                usage.pop("verify_status", None)
                 self.sessions.touch(thread_id, user_input)
                 self.sessions.save_usage(thread_id, usage)
                 self._close_app(app)
                 tool_events = [event for event in trace_events if event.get("type") == "tool_finished"]
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                run_status = {
+                    "success": "completed",
+                    "cancelled": "cancelled",
+                }.get(outcome, "failed")
+                self.sessions.update_chat_run(
+                    chat_run_id,
+                    status=run_status,
+                    duration_ms=duration_ms,
+                    metrics={
+                        "model_calls": usage.get("calls", 0) - usage_before.get("calls", 0),
+                        "tool_count": len(tool_events),
+                        "event_count": len(trace_events),
+                    },
+                    error_type="" if run_status == "completed" else outcome,
+                )
+                terminal_summaries = {
+                    "completed": "本轮对话已完成",
+                    "cancelled": "本轮对话已取消",
+                    "failed": "本轮对话未完成，可重试",
+                }
+                self.sessions.add_run_event(
+                    thread_id, chat_run_id, "chat", "single_agent", "run", run_status,
+                    summary=terminal_summaries[run_status],
+                    metrics={"duration_ms": duration_ms},
+                    error_type="" if run_status == "completed" else outcome,
+                )
                 self._last_traces[thread_id] = {
                     "session_id": thread_id,
                     "model": self.model,
                     "outcome": outcome,
-                    "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                    "duration_ms": duration_ms,
                     "first_token_ms": first_token_ms,
                     "tool_trace": tool_events,
                     "events": trace_events,
@@ -508,6 +563,16 @@ class ResearchAgent:
         thread_id = thread_id or self._thread_id
         if thread_id not in self._usage_cache:
             stored = self.sessions.get_usage(thread_id)
+            # ``api_status`` and ``verify_status`` describe in-flight work only.
+            # Older versions persisted them, so discard any stale value on first
+            # loading a session after restart.
+            transient_removed = False
+            for key in ("api_status", "verify_status"):
+                if key in stored:
+                    stored.pop(key, None)
+                    transient_removed = True
+            if transient_removed:
+                self.sessions.save_usage(thread_id, stored)
             usage = self._new_usage()
             usage.update(stored)
             self._usage_cache[thread_id] = usage
@@ -564,6 +629,67 @@ class ResearchAgent:
             "cached": 0, "cost": 0, "last_round_cost": 0,
             "last_prompt": 0, "context_limit": limit,
         }
+
+    def _persist_chat_event(
+        self,
+        thread_id: str,
+        run_id: str,
+        event: dict,
+        at_ms: float,
+    ) -> None:
+        """Project graph traces onto an intentionally small, non-content event schema."""
+        event_type = str(event.get("type") or "")
+        metrics = {"at_ms": at_ms}
+        if isinstance(event.get("duration_ms"), (int, float)):
+            metrics["duration_ms"] = event["duration_ms"]
+
+        event_map = {
+            "llm_request_started": ("single_agent", "model", "running", "模型请求已开始"),
+            "llm_response_headers": ("single_agent", "model", "running", "模型服务已响应"),
+            "llm_request_finished": ("single_agent", "model", "completed", "模型请求已完成"),
+            "llm_request_failed": ("single_agent", "model", "failed", "模型请求失败，可重试"),
+            "llm_status": ("single_agent", "model", "waiting", "模型请求正在排队或重试"),
+            "first_token": ("single_agent", "model", "streaming", "已收到首个输出片段"),
+            "request_cancelled": ("single_agent", "run", "cancelled", "请求已取消"),
+            "verify_request_started": ("verifier", "verify", "running", "事实核验已开始"),
+            "verify_request_finished": ("verifier", "verify", "completed", "事实核验已完成"),
+            "verify_request_cancelled": ("verifier", "verify", "cancelled", "事实核验已取消"),
+            "verify_request_skipped": ("verifier", "verify", "skipped", "事实核验暂时跳过"),
+            "verify_request_failed": ("verifier", "verify", "failed", "事实核验失败，已继续生成回复"),
+            "verify_status": ("verifier", "verify", "waiting", "事实核验正在等待服务"),
+        }
+        if event_type in {"tool_started", "tool_finished", "tool_failed"}:
+            tool_name = str(event.get("tool") or "")
+            tool_labels = {
+                "query_papers": "论文检索",
+                "search_papers": "论文搜索",
+                "read_pdf": "论文阅读",
+                "describe_image": "图像分析",
+                "memory_search": "记忆检索",
+            }
+            label = tool_labels.get(tool_name, "工具调用")
+            status = {
+                "tool_started": "running",
+                "tool_finished": "completed",
+                "tool_failed": "failed",
+            }[event_type]
+            message = {
+                "tool_started": f"{label}已开始",
+                "tool_finished": f"{label}已完成",
+                "tool_failed": f"{label}失败，可重试",
+            }[event_type]
+            agent, stage, summary = "single_agent", "tool", message
+        elif event_type in event_map:
+            agent, stage, status, summary = event_map[event_type]
+        else:
+            return
+
+        self.sessions.add_run_event(
+            thread_id, run_id, "chat", agent, stage, status,
+            summary=summary,
+            metrics=metrics,
+            error_type=str(event.get("error_type") or "")[:120],
+        )
 
     def _build_app(self, usage: dict, on_token=None, event_callback=None, cancel_event=None):
         return build_graph(

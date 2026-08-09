@@ -153,6 +153,19 @@ class Scheduler:
         ).fetchone()
         return self._run_row(row) if row else None
 
+    def list_daily_runs(self, limit: int = 20) -> list[dict]:
+        """Return daily-run summaries for the operational timeline.
+
+        Callers that render these records must not expose ``keywords`` or result
+        payloads: those remain owned by the daily-search UI.
+        """
+        rows = self._conn.execute(
+            "SELECT run_id, kind, status, created_at, updated_at FROM daily_runs "
+            "ORDER BY updated_at DESC, created_at DESC LIMIT ?",
+            (max(1, min(int(limit), 100)),),
+        ).fetchall()
+        return [self._run_row(row) for row in rows]
+
     def get_latest_resumable_run(self, kind: str | None = None) -> dict | None:
         where = "WHERE status IN ('running', 'partial_failed', 'failed', 'cancelled')"
         values: list[str] = []

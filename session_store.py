@@ -77,13 +77,50 @@ class SessionStore:
             );
             CREATE INDEX IF NOT EXISTS idx_research_runs_thread_updated
                 ON research_runs(thread_id, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS chat_runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                duration_ms REAL,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                error_type TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_runs_thread_updated
+                ON chat_runs(thread_id, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS agent_run_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                run_kind TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                error_type TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_run_events_run
+                ON agent_run_events(run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_agent_run_events_thread_created
+                ON agent_run_events(thread_id, created_at DESC);
             """
         )
         self._conn.commit()
 
     @staticmethod
     def _now() -> str:
-        return datetime.now().isoformat(timespec="seconds")
+        # Second-level timestamps made sessions/runs created in one UI callback
+        # sort nondeterministically. Keep enough precision for stable ordering.
+        return datetime.now().isoformat(timespec="microseconds")
 
     @staticmethod
     def _first_message_title(text: str) -> str:
@@ -159,7 +196,7 @@ class SessionStore:
     def list(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT thread_id, title, preview, created_at, updated_at "
-            "FROM agent_sessions ORDER BY updated_at DESC, created_at DESC"
+            "FROM agent_sessions ORDER BY updated_at DESC, created_at DESC, rowid DESC"
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -240,6 +277,27 @@ class SessionStore:
         item["trace"] = cls._decode_json(item.pop("trace_json", "{}"), {})
         return item
 
+    @classmethod
+    def _chat_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["metrics"] = cls._decode_json(item.pop("metrics_json", "{}"), {})
+        return item
+
+    @staticmethod
+    def _safe_event_metrics(metrics: dict[str, Any] | None) -> dict[str, int | float]:
+        """Keep only bounded aggregate metrics; traces must never contain payloads."""
+        allowed = {
+            "at_ms", "duration_ms", "queue_wait_ms", "attempt", "model_calls",
+            "tool_count", "candidate_count", "source_failures", "event_count",
+        }
+        safe: dict[str, int | float] = {}
+        for key, value in (metrics or {}).items():
+            if key not in allowed or isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                safe[key] = round(value, 1) if isinstance(value, float) else value
+        return safe
+
     @_synchronized
     def create_research_run(self, thread_id: str, query: str) -> dict[str, Any]:
         if not self.get(thread_id):
@@ -256,6 +314,152 @@ class SessionStore:
         return self.get_research_run(run_id) or {}
 
     @_synchronized
+    def list_research_runs(self, thread_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM research_runs WHERE thread_id=? "
+            "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?",
+            (thread_id, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [self._research_row(row) for row in rows]
+
+    @_synchronized
+    def create_chat_run(self, thread_id: str, model: str) -> dict[str, Any]:
+        if not self.get(thread_id):
+            raise KeyError(f"会话不存在: {thread_id}")
+        now = self._now()
+        run_id = f"chat-{uuid.uuid4().hex[:12]}"
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO chat_runs "
+                "(run_id, thread_id, status, model, created_at, updated_at) "
+                "VALUES (?, ?, 'running', ?, ?, ?)",
+                (run_id, thread_id, str(model or "")[:120], now, now),
+            )
+            self._prune_chat_runs(thread_id)
+        return self.get_chat_run(run_id) or {}
+
+    @_synchronized
+    def get_chat_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM chat_runs WHERE run_id=?", (run_id,)).fetchone()
+        return self._chat_row(row) if row else None
+
+    @_synchronized
+    def list_chat_runs(self, thread_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM chat_runs WHERE thread_id=? "
+            "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?",
+            (thread_id, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [self._chat_row(row) for row in rows]
+
+    @_synchronized
+    def update_chat_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        duration_ms: float | None = None,
+        metrics: dict[str, Any] | None = None,
+        error_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        existing = self.get_chat_run(run_id)
+        if not existing:
+            return None
+        now = self._now()
+        values: dict[str, Any] = {"run_id": run_id, "updated_at": now}
+        sets = ["updated_at=:updated_at"]
+        if status is not None:
+            values["status"] = str(status)[:40]
+            sets.append("status=:status")
+            if status in {"completed", "failed", "cancelled"}:
+                values["completed_at"] = now
+                sets.append("completed_at=:completed_at")
+        if duration_ms is not None:
+            values["duration_ms"] = round(float(duration_ms), 1)
+            sets.append("duration_ms=:duration_ms")
+        if metrics is not None:
+            values["metrics_json"] = json.dumps(
+                self._safe_event_metrics(metrics), ensure_ascii=False, separators=(",", ":"),
+            )
+            sets.append("metrics_json=:metrics_json")
+        if error_type is not None:
+            values["error_type"] = str(error_type)[:120]
+            sets.append("error_type=:error_type")
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE chat_runs SET {', '.join(sets)} WHERE run_id=:run_id", values,
+            )
+        return self.get_chat_run(run_id)
+
+    def _prune_chat_runs(self, thread_id: str, keep: int = 100) -> None:
+        stale = self._conn.execute(
+            "SELECT run_id FROM chat_runs WHERE thread_id=? "
+            "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT -1 OFFSET ?",
+            (thread_id, keep),
+        ).fetchall()
+        run_ids = [str(row["run_id"]) for row in stale]
+        if not run_ids:
+            return
+        placeholders = ",".join("?" for _ in run_ids)
+        self._conn.execute(
+            f"DELETE FROM agent_run_events WHERE thread_id=? AND run_id IN ({placeholders})",
+            [thread_id, *run_ids],
+        )
+        self._conn.execute(f"DELETE FROM chat_runs WHERE run_id IN ({placeholders})", run_ids)
+
+    @_synchronized
+    def add_run_event(
+        self,
+        thread_id: str,
+        run_id: str,
+        run_kind: str,
+        agent: str,
+        stage: str,
+        status: str,
+        *,
+        summary: str = "",
+        metrics: dict[str, Any] | None = None,
+        error_type: str = "",
+    ) -> None:
+        if not self.get(thread_id):
+            return
+        if run_kind not in {"chat", "research"}:
+            raise ValueError(f"未知运行类型: {run_kind}")
+        compact_summary = " ".join(str(summary or "").split())[:240]
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO agent_run_events "
+                "(run_id, thread_id, run_kind, agent, stage, status, summary, metrics_json, error_type, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id, thread_id, run_kind,
+                    str(agent or "agent")[:80], str(stage or "run")[:80], str(status or "running")[:40],
+                    compact_summary,
+                    json.dumps(self._safe_event_metrics(metrics), ensure_ascii=False, separators=(",", ":")),
+                    str(error_type or "")[:120], self._now(),
+                ),
+            )
+
+    @_synchronized
+    def get_run_events(self, run_id: str, thread_id: str | None = None) -> list[dict[str, Any]]:
+        query = (
+            "SELECT run_kind, agent, stage, status, summary, metrics_json, error_type, created_at "
+            "FROM agent_run_events WHERE run_id=?"
+        )
+        values: list[str] = [run_id]
+        if thread_id:
+            query += " AND thread_id=?"
+            values.append(thread_id)
+        query += " ORDER BY id"
+        rows = self._conn.execute(query, values).fetchall()
+        events = []
+        for row in rows:
+            item = dict(row)
+            item["metrics"] = self._decode_json(item.pop("metrics_json", "{}"), {})
+            events.append(item)
+        return events
+
+    @_synchronized
     def get_research_run(self, run_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM research_runs WHERE run_id=?", (run_id,)
@@ -266,7 +470,7 @@ class SessionStore:
     def get_latest_research_run(self, thread_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM research_runs WHERE thread_id=? "
-            "ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1",
             (thread_id,),
         ).fetchone()
         return self._research_row(row) if row else None

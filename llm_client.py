@@ -68,6 +68,10 @@ class RequestPolicy:
     priority: RequestPriority = RequestPriority.INTERACTIVE
     deadline_seconds: float | None = None
     max_retries: int | None = None
+    # Optional quality stages use short budgets. Their timeout can reflect queue
+    # pressure rather than a bad main-model endpoint, so it must not open the
+    # shared circuit used by interactive requests.
+    counts_toward_circuit: bool = True
 
 
 @dataclass
@@ -78,6 +82,7 @@ class RequestBudget:
     max_retries: int
     purpose: str = "chat"
     priority: RequestPriority = RequestPriority.INTERACTIVE
+    counts_toward_circuit: bool = True
     retries_used: int = 0
     queue_wait_seconds: float = 0.0
     attempts: int = 0
@@ -107,6 +112,7 @@ class RequestBudget:
             return {
                 "purpose": self.purpose,
                 "priority": self.priority.name.lower(),
+                "counts_toward_circuit": self.counts_toward_circuit,
                 "queue_wait_ms": round(self.queue_wait_seconds * 1000),
                 "attempts": self.attempts,
                 "retries_used": self.retries_used,
@@ -243,11 +249,21 @@ class LLMClient:
                         setattr(response, "_llm_stream_slot_owned", True)
                         setattr(response, "_llm_background_slot_owned", background_slot_owned)
                         setattr(response, "_llm_low_priority_slot_owned", low_priority_slot_owned)
+                        setattr(
+                            response, "_llm_stream_counts_toward_circuit",
+                            budget.counts_toward_circuit,
+                        )
                         release_slot = False
                         release_background_slot = False
                         release_low_priority_slot = False
-                    else:
+                    elif budget.counts_toward_circuit:
+                        # Optional quality stages share the transport but must
+                        # not alter the health signal that governs interactive
+                        # traffic. A successful Curator must not close a
+                        # circuit opened by failed chat requests.
                         self._circuit.record_success()
+                    else:
+                        self._circuit.release_probe()
                     if on_status:
                         on_status("🤖 模型响应中...")
                     return response
@@ -272,7 +288,7 @@ class LLMClient:
                         time.sleep(delay)
                 except requests.RequestException as exc:
                     # 4xx（除 429）通常是鉴权、参数或请求格式问题，重试没有意义。
-                    self._circuit.record_failure()
+                    self._record_or_release_circuit(budget, failed=True)
                     raise LLMRequestFailedError(self._format_request_error(exc)) from exc
                 except RequestCancelledError:
                     if response is not None:
@@ -284,14 +300,14 @@ class LLMClient:
                     if stream and not release_slot and response is not None:
                         self.finish_stream(response, success=False)
                     else:
-                        self._circuit.record_failure()
+                        self._record_or_release_circuit(budget, failed=True)
                     raise
 
             if last_error is None:
                 self._circuit.release_probe()
                 raise LLMRequestTimeoutError("模型请求在总截止时间内未完成")
 
-            self._circuit.record_failure()
+            self._record_or_release_circuit(budget, failed=True)
             if isinstance(last_error, (requests.Timeout, requests.ConnectionError)):
                 raise LLMRequestTimeoutError(
                     "模型服务连接或响应超时；未切换模型，请稍后点击重试"
@@ -329,6 +345,7 @@ class LLMClient:
             max_retries=max(0, int(retries)),
             purpose=policy.purpose,
             priority=policy.priority,
+            counts_toward_circuit=policy.counts_toward_circuit,
         )
 
     def prepare_stream_read(
@@ -384,12 +401,20 @@ class LLMClient:
             if getattr(response, "_llm_low_priority_slot_owned", False):
                 setattr(response, "_llm_low_priority_slot_owned", False)
                 self._low_priority_slots.release()
-        if success:
+        if success and getattr(response, "_llm_stream_counts_toward_circuit", True):
             self._circuit.record_success()
         elif cancelled:
             self._circuit.release_probe()
-        else:
+        elif getattr(response, "_llm_stream_counts_toward_circuit", True):
             self._circuit.record_failure()
+        else:
+            self._circuit.release_probe()
+
+    def _record_or_release_circuit(self, budget: RequestBudget, *, failed: bool) -> None:
+        if failed and budget.counts_toward_circuit:
+            self._circuit.record_failure()
+        else:
+            self._circuit.release_probe()
 
     def _acquire_slot(
         self,

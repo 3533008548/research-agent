@@ -21,6 +21,8 @@
 
 import os
 import re
+import threading
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -33,12 +35,15 @@ class ProfileManager:
 
     def __init__(self, path: str | None = None):
         self.path = Path(path) if path else get_runtime_paths().profile_path
+        self._lock = threading.RLock()
         self._ensure_exists()
 
     def _ensure_exists(self):
-        if not self.path.exists():
+        with self._lock:
+            if self.path.exists():
+                return
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
+            self._write(
                 "# 用户画像\n\n"
                 "## 研究方向\n\n"
                 "## 偏好设置\n"
@@ -51,10 +56,20 @@ class ProfileManager:
                 encoding="utf-8",
             )
 
+    def _write(self, text: str, *, encoding: str = "utf-8") -> None:
+        """Atomically replace the profile so concurrent readers never see a partial file."""
+        temp_path = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(text, encoding=encoding)
+            temp_path.replace(self.path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
     # ── 读取 ──
 
     def read(self) -> str:
-        return self.path.read_text(encoding="utf-8")
+        with self._lock:
+            return self.path.read_text(encoding="utf-8")
 
     def summary(self) -> str:
         """生成注入系统提示词的画像摘要"""
@@ -96,38 +111,39 @@ class ProfileManager:
 
     def _update_section(self, section: str, content: str, append: bool = True):
         """更新特定 ## 章节"""
-        text = self.read()
-        lines = text.split("\n")
-        new_lines = []
-        in_section = False
-        done = False
-        for line in lines:
-            if line.startswith(f"## {section}"):
-                in_section = True
-                new_lines.append(line)
-                if append:
-                    new_lines.append(content)
+        with self._lock:
+            text = self.read()
+            lines = text.split("\n")
+            new_lines = []
+            in_section = False
+            done = False
+            for line in lines:
+                if line.startswith(f"## {section}"):
+                    in_section = True
+                    new_lines.append(line)
+                    if append:
+                        new_lines.append(content)
+                    else:
+                        new_lines.append(content)
+                        done = True
+                elif in_section and line.startswith("##"):
+                    in_section = False
+                    if append and not done:
+                        new_lines.append(content)
+                        done = True
+                    new_lines.append(line)
+                elif in_section and (line.strip() == "" or not append):
+                    continue
                 else:
-                    new_lines.append(content)
-                    done = True
-            elif in_section and line.startswith("##"):
-                in_section = False
-                if append and not done:
-                    new_lines.append(content)
-                    done = True
-                new_lines.append(line)
-            elif in_section and (line.strip() == "" or not append):
-                continue
-            else:
-                new_lines.append(line)
-        if in_section and append and not done:
-            new_lines.append(content)
-        # 更新时间戳
-        text = "\n".join(new_lines)
-        text = re.sub(r'\*最后更新.*\*', f'*最后更新: {datetime.now().strftime("%Y-%m-%d %H:%M")}*', text)
-        if '*最后更新' not in text:
-            text += f"\n\n*最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M')}*"
-        self.path.write_text(text, encoding="utf-8")
+                    new_lines.append(line)
+            if in_section and append and not done:
+                new_lines.append(content)
+            # 更新时间戳
+            text = "\n".join(new_lines)
+            text = re.sub(r'\*最后更新.*\*', f'*最后更新: {datetime.now().strftime("%Y-%m-%d %H:%M")}*', text)
+            if '*最后更新' not in text:
+                text += f"\n\n*最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M')}*"
+            self._write(text)
 
     def add_research_direction(self, direction: str):
         self._update_section("研究方向", f"- {direction}")
@@ -140,23 +156,24 @@ class ProfileManager:
         self._update_section("已读论文", entry)
 
     def set_preference(self, key: str, value: str):
-        text = self.read()
-        lines = text.split("\n")
-        new_lines = []
-        found = False
-        for line in lines:
-            if line.strip().startswith(f"- {key}:"):
-                new_lines.append(f"- {key}: {value}")
-                found = True
-            else:
-                new_lines.append(line)
-        if not found:
-            # 插入到偏好设置节
-            for i, line in enumerate(new_lines):
-                if line.startswith("## 偏好设置"):
-                    new_lines.insert(i + 1, f"- {key}: {value}")
-                    break
-        self.path.write_text("\n".join(new_lines), encoding="utf-8")
+        with self._lock:
+            text = self.read()
+            lines = text.split("\n")
+            new_lines = []
+            found = False
+            for line in lines:
+                if line.strip().startswith(f"- {key}:"):
+                    new_lines.append(f"- {key}: {value}")
+                    found = True
+                else:
+                    new_lines.append(line)
+            if not found:
+                # 插入到偏好设置节
+                for i, line in enumerate(new_lines):
+                    if line.startswith("## 偏好设置"):
+                        new_lines.insert(i + 1, f"- {key}: {value}")
+                        break
+            self._write("\n".join(new_lines))
 
     def update_from_agent(self, action: str, content: str):
         """Agent 调用的统一更新接口"""

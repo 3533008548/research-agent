@@ -529,7 +529,12 @@ def build_graph(
         metadata = state.get("metadata") or {}
 
         def _complete_verification() -> dict:
-            """结束本轮验证时清除只对重试有效的状态。"""
+            """结束本轮验证时清除只对本轮有效的状态。"""
+            if token_usage:
+                # The final answer already contains any user-facing caveat, and
+                # the run timeline records a skipped/failed verification. Do not
+                # leave an old optional-stage warning in the next chat turn.
+                token_usage.pop("verify_status", None)
             cleaned = dict(metadata)
             for key in (
                 "verify_feedback", "verify_count", "verify_issues", "verify_history",
@@ -634,6 +639,7 @@ def build_graph(
             priority=RequestPriority.VERIFY,
             deadline_seconds=verify_timeout_seconds,
             max_retries=0,
+            counts_toward_circuit=False,
         )
 
         def _verify_status(message: str) -> None:

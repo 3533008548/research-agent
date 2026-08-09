@@ -352,8 +352,8 @@ class TestVerifyNode(unittest.TestCase):
         self.assertIn("session-b:TSN", prompt_texts[1])
         self.assertNotIn("session-a:TSN", prompt_texts[1])
 
-    def test_verify_uses_short_timeout_and_circuit_breaker(self):
-        """验证服务超时时快速降级，并打开熔断器避免下一轮继续等待。"""
+    def test_verify_uses_short_timeout_without_poisoning_main_circuit(self):
+        """验证超时只打开其局部熔断器，不能阻断主模型或 Curator。"""
         import requests
         from graph_builder import build_graph
         from llm_client import LLMClient
@@ -400,10 +400,12 @@ class TestVerifyNode(unittest.TestCase):
         self.assertGreater(read_timeout, 3.5)
         self.assertLessEqual(read_timeout, 4)
         self.assertFalse(guard.allow_request())
-        self.assertIn("验证跳过", usage["verify_status"])
+        self.assertEqual(client._circuit.state, "closed")
+        self.assertNotIn("verify_status", usage)
         verify_started = next(event for event in events if event["type"] == "verify_request_started")
         self.assertEqual(verify_started["purpose"], "verify")
         self.assertEqual(verify_started["priority"], "verify")
+        self.assertFalse(verify_started["counts_toward_circuit"])
 
     def test_stream_retries_same_model_before_first_token(self):
         """流式连接在尚未输出 token 时可以安全重放一次同模型请求。"""
@@ -601,8 +603,10 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
         class _LLM:
             def __init__(self):
                 self.calls = []
+                self.policies = []
 
             def new_request_budget(self, policy):
+                self.policies.append(policy)
                 return policy
 
             def post(self, payload, **_kwargs):
@@ -646,6 +650,7 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 self.assertEqual(result.status, "completed")
                 self.assertEqual(len(result.candidates), 2, "跨源同一 DOI 应合并")
                 self.assertEqual(len(llm.calls), 1, "Curator 必须按整次任务批处理")
+                self.assertFalse(llm.policies[0].counts_toward_circuit)
                 self.assertEqual(result.candidates[0]["curation"]["reason"], "高度相关")
                 saved = scheduler.get_daily_run(result.run_id)
                 self.assertEqual(saved["status"], "completed")
@@ -866,7 +871,13 @@ class TestSessionStore(unittest.TestCase):
                     )
                 self.assertEqual(
                     store.cleanup_orphaned_checkpoints(),
-                    {"checkpoints": 1, "writes": 1, "research_runs": 0},
+                    {
+                        "checkpoints": 1,
+                        "writes": 1,
+                        "research_runs": 0,
+                        "chat_runs": 0,
+                        "agent_run_events": 0,
+                    },
                 )
             finally:
                 store.close()
@@ -922,6 +933,62 @@ class TestSessionStore(unittest.TestCase):
                 self.assertIsNone(store.get_research_run(run["run_id"]))
             finally:
                 store.close()
+
+    def test_chat_run_events_are_safe_and_deleted_with_their_session(self):
+        """The operation log is session-scoped and keeps only approved metrics."""
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                first = store.create()
+                second = store.create()
+                run = store.create_chat_run(first["thread_id"], "deepseek-chat")
+                store.add_run_event(
+                    first["thread_id"], run["run_id"], "chat", "single_agent",
+                    "model", "completed", summary="模型请求已完成",
+                    metrics={"duration_ms": 12.34, "prompt": "must-not-persist"},
+                )
+                store.update_chat_run(
+                    run["run_id"], status="completed", duration_ms=13,
+                    metrics={"model_calls": 1, "raw_answer": "must-not-persist"},
+                )
+
+                saved = store.list_chat_runs(first["thread_id"])
+                self.assertEqual(saved[0]["status"], "completed")
+                self.assertEqual(saved[0]["metrics"], {"model_calls": 1})
+                events = store.get_run_events(run["run_id"], first["thread_id"])
+                self.assertEqual(events[0]["metrics"], {"duration_ms": 12.3})
+                self.assertEqual(store.get_run_events(run["run_id"], second["thread_id"]), [])
+
+                self.assertTrue(store.delete(first["thread_id"]))
+                self.assertIsNone(store.get_chat_run(run["run_id"]))
+                self.assertEqual(store.get_run_events(run["run_id"]), [])
+            finally:
+                store.close()
+
+    def test_daily_timeline_adapter_hides_daily_event_messages(self):
+        """Daily data stays in its own DB and raw keyword messages are never rendered."""
+        from run_timeline import RunTimelineService
+        from scheduler import Scheduler
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            scheduler = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                run = scheduler.create_daily_run("daily", ["PRIVATE_KEYWORD"])
+                scheduler.add_daily_agent_event(
+                    run["run_id"], "scouts", "running",
+                    "PRIVATE_KEYWORD and candidate title must not be rendered",
+                )
+                html = RunTimelineService(sessions, scheduler).render_daily_runs()
+                self.assertIn("多来源检索阶段", html)
+                self.assertNotIn("PRIVATE_KEYWORD", html)
+                self.assertNotIn("candidate title", html)
+            finally:
+                scheduler.close()
+                sessions.close()
 
 
 class TestResearchOrchestration(unittest.TestCase):
@@ -998,6 +1065,10 @@ class TestResearchOrchestration(unittest.TestCase):
                 self.assertEqual(saved["evidence"][0]["id"], "E1")
                 self.assertEqual(saved["critique"]["verdict"], "revise")
                 self.assertTrue(any(event["stage"] == "completed" for event in events))
+                persisted_events = store.get_run_events(result.run_id, session["thread_id"])
+                self.assertTrue(any(event["stage"] == "planner" for event in persisted_events))
+                self.assertTrue(any(event["stage"] == "completed" for event in persisted_events))
+                self.assertNotIn("TSN", " ".join(event["summary"] for event in persisted_events))
             finally:
                 store.close()
 
@@ -1638,6 +1709,95 @@ class TestResearchBenchmark(unittest.TestCase):
 class TestRequestTracing(unittest.TestCase):
     """真实调用前后都应产生脱敏的可评分追踪。"""
 
+    def test_agent_discards_persisted_transient_status_on_session_load(self):
+        from config import Config
+        from research_agent import ResearchAgent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+            try:
+                thread_id = agent.thread_id
+                agent.sessions.save_usage(thread_id, {
+                    "total": 7,
+                    "api_status": "⚠️ stale model warning",
+                    "verify_status": "⚠️ stale verify warning",
+                })
+                agent._usage_cache.pop(thread_id, None)
+
+                usage = agent.get_usage(thread_id)
+                self.assertEqual(usage["total"], 7)
+                self.assertNotIn("api_status", usage)
+                self.assertNotIn("verify_status", usage)
+                self.assertNotIn("api_status", agent.sessions.get_usage(thread_id))
+                self.assertNotIn("verify_status", agent.sessions.get_usage(thread_id))
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_interrupted_stream_releases_slot_and_can_be_retried(self):
+        """A partial SSE response must not block the next same-model request."""
+        import requests
+        from config import Config
+        from research_agent import ResearchAgent
+
+        class _StreamingResponse:
+            status_code = 200
+            text = ""
+            raw = None
+
+            def __init__(self, lines):
+                self.lines = lines
+                self.closed = False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=True):
+                for line in self.lines:
+                    if isinstance(line, BaseException):
+                        raise line
+                    yield line
+
+            def close(self):
+                self.closed = True
+
+        first = _StreamingResponse([
+            'data: {"choices":[{"delta":{"content":"已输出片段"}}]}',
+            requests.exceptions.ChunkedEncodingError("interrupted"),
+        ])
+        second = _StreamingResponse([
+            'data: {"choices":[{"delta":{"content":"重试完成"}}]}',
+            "data: [DONE]",
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+                api_max_concurrency=1, api_max_retries=0,
+            ))
+            try:
+                with patch("llm_client.requests.post", side_effect=[first, second]) as post:
+                    interrupted = agent.step("需要可靠重试的问题", on_token=lambda _token: None)
+                    retry = agent.get_retry_input(agent.thread_id)
+                    self.assertIn("输出中断", interrupted)
+                    self.assertEqual(retry["user_input"], "需要可靠重试的问题")
+                    self.assertTrue(
+                        agent.llm_client._slots.acquire(blocking=False),
+                        "中断流必须归还并发槽",
+                    )
+                    agent.llm_client._slots.release()
+
+                    retried = agent.step(
+                        retry["user_input"], context=retry["context"], topic=retry["topic"],
+                        on_token=lambda _token: None,
+                    )
+                    self.assertEqual(retried, "重试完成")
+                    self.assertEqual(post.call_count, 2)
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
     def test_agent_exposes_last_trace_without_prompt_or_tool_payload(self):
         from config import Config
         from research_agent import ResearchAgent
@@ -1664,7 +1824,13 @@ class TestRequestTracing(unittest.TestCase):
             self.assertEqual(trace["outcome"], "success")
             self.assertEqual(trace["tool_trace"][0]["tool"], "query_papers")
             self.assertNotIn("完整问题", str(trace))
+            saved_run = agent.sessions.list_chat_runs(agent.thread_id, limit=1)[0]
+            self.assertEqual(saved_run["status"], "completed")
+            saved_events = agent.sessions.get_run_events(saved_run["run_id"], agent.thread_id)
+            self.assertTrue(any(event["stage"] == "tool" for event in saved_events))
+            self.assertNotIn("完整问题", str(saved_events))
             agent.memory._conn.close()
+            agent.sessions.close()
 
 
 class TestRuntimeReplay(unittest.TestCase):
@@ -1701,6 +1867,196 @@ class TestWebRendering(unittest.TestCase):
         self.assertIn({"left": "$$", "right": "$$", "display": True}, CHAT_LATEX_DELIMITERS)
         self.assertIn({"left": "\\(", "right": "\\)", "display": False}, CHAT_LATEX_DELIMITERS)
         self.assertIn({"left": "\\[", "right": "\\]", "display": True}, CHAT_LATEX_DELIMITERS)
+
+
+class TestAuditRegressionFixes(unittest.TestCase):
+    """Regression coverage for correctness and boundary issues found in code audit."""
+
+    def test_rag_query_reorders_and_honors_top_k(self):
+        from paper_store import PaperStore
+
+        class _Collection:
+            def __init__(self):
+                self.requested = None
+
+            @staticmethod
+            def count():
+                return 4
+
+            def query(self, **kwargs):
+                self.requested = kwargs["n_results"]
+                return {
+                    "ids": [["intro", "method", "result", "other"]],
+                    "documents": [["intro", "method", "result", "other"]],
+                    "metadatas": [[
+                        {"title": "Paper", "section": "Introduction", "chunk_index": 0},
+                        {"title": "Paper", "section": "Method", "chunk_index": 1},
+                        {"title": "Paper", "section": "Results", "chunk_index": 2},
+                        {"title": "Paper", "section": "Related Work", "chunk_index": 3},
+                    ]],
+                    "distances": [[0.10, 0.14, 0.17, 0.30]],
+                }
+
+        store = PaperStore.__new__(PaperStore)
+        store._collection = _Collection()
+        results = store.query("method", top_k=2)
+
+        self.assertEqual(store._collection.requested, 4)
+        self.assertEqual([item["text"] for item in results], ["method", "result"])
+        self.assertEqual(len(results), 2)
+
+    def test_agent_sets_a_bounded_graph_recursion_limit(self):
+        from config import Config
+        from research_agent import MAX_AGENT_GRAPH_STEPS, ResearchAgent
+
+        class _FakeApp:
+            config = None
+
+            def invoke(self, state, config):
+                self.config = config
+                return {"messages": [{"role": "assistant", "content": "完成"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+            app = _FakeApp()
+            try:
+                with patch.object(agent, "_build_app", return_value=app):
+                    self.assertEqual(agent.step("请检索一个问题"), "完成")
+                self.assertEqual(app.config["recursion_limit"], MAX_AGENT_GRAPH_STEPS)
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_session_order_is_stable_for_fast_consecutive_creates(self):
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(str(Path(tmp) / "sessions.db"))
+            try:
+                sessions = [store.create(title=f"session-{index}") for index in range(5)]
+                self.assertEqual(store.list()[0]["thread_id"], sessions[-1]["thread_id"])
+                self.assertTrue(all("." in item["created_at"] for item in sessions))
+            finally:
+                store.close()
+
+    def test_note_store_serializes_concurrent_writes_and_rejects_blank_topic(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from notes import NoteStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = NoteStore(str(Path(tmp) / "notes.db"))
+            try:
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    list(executor.map(lambda index: store.add("并发话题", f"note-{index}"), range(32)))
+                self.assertEqual(len(store.list_notes("并发话题")), 32)
+                self.assertIsNone(store.get_topic(None))
+                with self.assertRaisesRegex(ValueError, "不能为空"):
+                    store.ensure_topic("  ")
+            finally:
+                store.close()
+
+    def test_profile_updates_are_atomic_under_concurrent_agent_calls(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from profile import ProfileManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ProfileManager(str(Path(tmp) / "profile.md"))
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(
+                    lambda index: profile.add_active_question(f"question-{index}"), range(16),
+                ))
+            content = profile.read()
+            self.assertTrue(all(f"question-{index}" in content for index in range(16)))
+
+    def test_optional_model_calls_do_not_clear_interactive_failure_signal(self):
+        from llm_client import LLMClient, RequestPolicy
+
+        class _Response:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def close():
+                return None
+
+        client = LLMClient(
+            "test-key", "https://example.test/chat", circuit_failure_threshold=2,
+        )
+        client._circuit.record_failure()
+        optional = RequestPolicy(purpose="curator", counts_toward_circuit=False)
+
+        with patch("llm_client.requests.post", return_value=_Response()):
+            response = client.post({"model": "test", "messages": []}, policy=optional)
+            response.close()
+        self.assertEqual(client._circuit._failures, 1)
+
+        with patch("llm_client.requests.post", return_value=_Response()):
+            stream = client.post(
+                {"model": "test", "messages": []}, stream=True, policy=optional,
+            )
+        client.finish_stream(stream, success=True)
+        self.assertEqual(client._circuit._failures, 1)
+
+    def test_pdf_tool_rejects_local_path_outside_runtime(self):
+        from runtime_paths import RuntimePaths
+        from tools.read_pdf import handle_read_pdf
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root / "runtime")
+            paths.ensure_initialized()
+            private_pdf = root / "private.pdf"
+            private_pdf.write_bytes(b"%PDF-private")
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(paths.root)}, clear=False):
+                result = handle_read_pdf({"url_or_path": str(private_pdf)})
+            self.assertIn("必须先上传", result)
+
+    def test_pdf_tool_rejects_loopback_before_network_request(self):
+        from tools.read_pdf import handle_read_pdf
+
+        with patch("tools.read_pdf.requests.get") as request_get:
+            result = handle_read_pdf({"url_or_path": "https://127.0.0.1/admin.pdf"})
+        self.assertIn("下载被拒绝", result)
+        self.assertFalse(request_get.called)
+
+    def test_pdf_download_enforces_size_limit_before_writing(self):
+        import socket
+        from tools.read_pdf import MAX_PDF_DOWNLOAD_BYTES, PDFDownloadError, _download_pdf
+
+        class _Response:
+            status_code = 200
+            headers = {
+                "Content-Length": str(MAX_PDF_DOWNLOAD_BYTES + 1),
+                "Content-Type": "application/pdf",
+            }
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def iter_content(chunk_size):
+                return iter([b"%PDF-ignored"])
+
+            @staticmethod
+            def close():
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "paper.pdf"
+            with patch(
+                "tools.read_pdf.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+            ), patch("tools.read_pdf.requests.get", return_value=_Response()):
+                with self.assertRaisesRegex(PDFDownloadError, "文件过大"):
+                    _download_pdf("https://example.com/paper.pdf", target)
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

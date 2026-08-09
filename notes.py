@@ -16,10 +16,21 @@
 
 import sqlite3
 import os
+import threading
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 
 from runtime_paths import get_runtime_paths
+
+
+def _synchronized(method):
+    """Serialize access to the shared SQLite connection (RLock allows nesting)."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 class NoteStore:
@@ -28,9 +39,12 @@ class NoteStore:
     def __init__(self, db_path: str | None = None):
         db_path = db_path or str(get_runtime_paths().notes_db)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_db()
 
     def _init_db(self):
@@ -57,6 +71,7 @@ class NoteStore:
 
     # ── 话题管理 ──
 
+    @_synchronized
     def list_topics(self) -> list[dict]:
         """列出所有话题"""
         rows = self._conn.execute(
@@ -66,26 +81,36 @@ class NoteStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_synchronized
     def get_topic(self, name_or_id) -> dict | None:
         """按名称或 ID 获取话题"""
-        if isinstance(name_or_id, int) or name_or_id.isdigit():
+        if isinstance(name_or_id, int) or (
+            isinstance(name_or_id, str) and name_or_id.isdigit()
+        ):
             row = self._conn.execute(
                 "SELECT * FROM topics WHERE id=?", (int(name_or_id),)
             ).fetchone()
         else:
+            name = str(name_or_id or "").strip()
+            if not name:
+                return None
             row = self._conn.execute(
-                "SELECT * FROM topics WHERE name=?", (name_or_id,)
+                "SELECT * FROM topics WHERE name=?", (name,)
             ).fetchone()
             if not row:
                 # 模糊匹配
                 row = self._conn.execute(
                     "SELECT * FROM topics WHERE name LIKE ? LIMIT 1",
-                    (f"%{name_or_id}%",)
+                    (f"%{name}%",)
                 ).fetchone()
         return dict(row) if row else None
 
+    @_synchronized
     def ensure_topic(self, name: str) -> dict:
         """获取或创建话题"""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("话题名称不能为空")
         row = self._conn.execute(
             "SELECT * FROM topics WHERE name=?", (name,)
         ).fetchone()
@@ -101,6 +126,7 @@ class NoteStore:
 
     # ── 笔记 CRUD ──
 
+    @_synchronized
     def add(self, topic_name: str, content: str) -> int:
         """添加一条笔记，返回笔记 ID"""
         topic = self.ensure_topic(topic_name)
@@ -112,6 +138,7 @@ class NoteStore:
         self._conn.commit()
         return cur.lastrowid
 
+    @_synchronized
     def list_notes(self, topic_name: str = None) -> list[dict]:
         """列出笔记（可选限定话题）"""
         if topic_name:
@@ -132,6 +159,7 @@ class NoteStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    @_synchronized
     def get(self, note_id: int) -> dict | None:
         row = self._conn.execute(
             "SELECT n.id, n.content, n.created_at, t.name AS topic "
@@ -140,11 +168,13 @@ class NoteStore:
         ).fetchone()
         return dict(row) if row else None
 
+    @_synchronized
     def delete(self, note_id: int) -> bool:
         cur = self._conn.execute("DELETE FROM notes WHERE id=?", (note_id,))
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def set_paper(self, note_id: int, paper_title: str) -> bool:
         """将笔记关联到一篇论文"""
         cur = self._conn.execute(
@@ -154,6 +184,7 @@ class NoteStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def delete_topic(self, topic_name: str) -> int:
         """删除话题及其所有笔记，返回删除的笔记数"""
         topic = self.get_topic(topic_name)
@@ -166,6 +197,7 @@ class NoteStore:
         self._conn.commit()
         return count
 
+    @_synchronized
     def search(self, query: str) -> list[dict]:
         rows = self._conn.execute(
             "SELECT n.id, n.content, n.created_at, t.name AS topic "
@@ -175,3 +207,7 @@ class NoteStore:
             (f"%{query}%", f"%{query}%"),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    @_synchronized
+    def close(self) -> None:
+        self._conn.close()

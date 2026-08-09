@@ -10,8 +10,11 @@ from pathlib import Path
 from runtime_paths import get_runtime_paths
 
 
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
 def handle_describe_image(args: dict, glm_api_key: str = "", memory_store=None, **kw) -> str:
-    image_path = args.get("image_path", "")
+    image_path = str(args.get("image_path", "") or "").strip()
     if not image_path:
         return "❌ 请提供图片路径。"
 
@@ -35,8 +38,12 @@ def handle_describe_image(args: dict, glm_api_key: str = "", memory_store=None, 
                 p = candidate
                 break
 
-    if p is None:
+    if p is None or not p.is_file():
         return f"❌ 图片不存在: {image_path}"
+    if p.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        return "❌ 仅支持 PNG、JPG 或 JPEG 图片。"
+    if p.stat().st_size > MAX_IMAGE_BYTES:
+        return "❌ 图片过大（上限 10MB），请先压缩后再分析。"
     if not glm_api_key:
         return "❌ GLM-4V API Key 未配置。请在 .env 中设置 GLM_API_KEY。"
 

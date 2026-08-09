@@ -103,12 +103,47 @@ class ResearchOrchestrator:
             plan = dict(run.get("plan") or self._fallback_plan(query))
             evidence = list(run.get("evidence") or [])
             self.sessions.update_research_run(run_id, status="running")
-            self._progress(on_progress, "resume", "running", "基于已找到的证据继续研究")
         else:
             run = self.sessions.create_research_run(thread_id, query)
             run_id = str(run["run_id"])
             plan: dict[str, Any] = {}
             evidence: list[dict[str, Any]] = []
+
+        # The UI callback may include useful detailed wording.  The persistent run
+        # timeline intentionally stores only a fixed, safe stage description so
+        # prompts, evidence text and tool output never leak into this lightweight
+        # operational log.
+        external_progress = on_progress
+
+        def _persisted_progress(event: dict[str, Any]) -> None:
+            stage = str(event.get("stage") or "research")
+            status = str(event.get("status") or "running")
+            labels = {
+                "resume": ("orchestrator", "基于已保存证据恢复运行"),
+                "planner": ("planner", "研究规划阶段"),
+                "researchers": ("researcher", "并行证据收集阶段"),
+                "synthesis": ("synthesis", "证据综合阶段"),
+                "critic": ("critic", "证据质检阶段"),
+                "revision": ("revision", "基于质检结果修订"),
+                "completed": ("orchestrator", "研究运行已完成"),
+                "cancelled": ("orchestrator", "研究运行已取消"),
+                "failed": ("orchestrator", "研究运行未完整完成"),
+            }
+            agent, summary = labels.get(stage, ("orchestrator", "研究运行状态已更新"))
+            self.sessions.add_run_event(
+                thread_id, run_id, "research", agent, stage, status,
+                summary=summary,
+            )
+            if external_progress:
+                external_progress(event)
+
+        on_progress = _persisted_progress
+        self.sessions.add_run_event(
+            thread_id, run_id, "research", "orchestrator", "run", "running",
+            summary="深度研究任务已创建" if not reuse_evidence else "深度研究任务正在恢复",
+        )
+        if reuse_evidence:
+            self._progress(on_progress, "resume", "running", "基于已找到的证据继续研究")
 
         started = time.perf_counter()
         usage = self._empty_usage()

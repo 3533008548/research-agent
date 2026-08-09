@@ -8,10 +8,21 @@ from search_api import search_arxiv, search_openalex, list_downloaded_papers
 from runtime_paths import get_runtime_paths
 
 
+def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    """Tool schemas are advisory; malformed model arguments must not abort a run."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
 def handle_search_papers(args: dict, **kw) -> str:
-    query = args.get("query", "")
-    source = args.get("source", "openalex")
-    limit = min(args.get("limit", 5), 10)
+    query = str(args.get("query", "") or "").strip()
+    if not query:
+        return "❌ 请提供论文检索关键词。"
+    source = str(args.get("source", "openalex") or "openalex").lower()
+    limit = _bounded_int(args.get("limit", 5), 5, 1, 10)
     if source == "arxiv":
         return search_arxiv(query, max_results=limit)
     return search_openalex(query, limit=limit)
@@ -20,9 +31,13 @@ def handle_search_papers(args: dict, **kw) -> str:
 def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     if not paper_store:
         return "❌ RAG 功能未启用。"
-    query = args.get("query", "")
-    top_k = min(args.get("top_k", 3), 5)
-    section = args.get("section", None)
+    query = str(args.get("query", "") or "").strip()
+    if not query:
+        return "❌ 请提供要在论文库中检索的问题。"
+    top_k = _bounded_int(args.get("top_k", 3), 3, 1, 5)
+    section_value = args.get("section")
+    section = str(section_value).strip() if section_value is not None else None
+    section = section or None
     results, pending = paper_store.query_with_timeout(
         query, top_k=top_k, section=section,
     )
@@ -64,7 +79,7 @@ def handle_list_indexed(args: dict, paper_store=None, **kw) -> str:
 def handle_delete_paper(args: dict, paper_store=None, **kw) -> str:
     if not paper_store:
         return "❌ RAG 功能未启用。"
-    pid_or_title = args.get("paper_id_or_title", "")
+    pid_or_title = str(args.get("paper_id_or_title", "") or "").strip()
     if not pid_or_title:
         return "❌ 请指定论文标题或 paper_id。"
     papers = paper_store.list_papers()

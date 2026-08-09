@@ -116,11 +116,21 @@ class Config:
             pass
 
         # ── 3. config.yaml 加载 ──
+        config_path = Path("config.yaml")
         try:
             import yaml
-            if Path("config.yaml").exists():
-                with open("config.yaml", encoding="utf-8") as f:
+        except ImportError as exc:
+            if config_path.exists():
+                raise RuntimeError(
+                    "检测到 config.yaml，但缺少 PyYAML；请安装 requirements.txt"
+                ) from exc
+            yaml = None
+        if yaml is not None and config_path.exists():
+            try:
+                with config_path.open(encoding="utf-8") as f:
                     yaml_cfg = yaml.safe_load(f) or {}
+                if not isinstance(yaml_cfg, dict):
+                    raise ValueError("config.yaml 的顶层必须是键值对象")
                 if "model" in yaml_cfg:
                     cfg["model"] = yaml_cfg["model"]
                 if "pdf" in yaml_cfg:
@@ -164,8 +174,8 @@ class Config:
                         config_key = f"api_{key}"
                         if key in settings:
                             cfg[config_key] = settings[key]
-        except Exception:
-            pass
+            except (OSError, ValueError, yaml.YAMLError, TypeError, AttributeError) as exc:
+                raise ValueError(f"无法读取 config.yaml：{exc}") from exc
 
         # ── 4. 运行时用户设置（UI 修改写入这里，不污染源码配置） ──
         cli_data_dir = (cli_overrides or {}).get("data_dir")

@@ -311,7 +311,9 @@ class PaperStore:
         返回: [{"text": "...", "section": "...", "title": "...",
                  "distance": 0.23}, ...]
         """
-        if self._collection.count() == 0:
+        top_k = max(1, min(int(top_k), 20))
+        collection_count = self._collection.count()
+        if collection_count == 0:
             return []
 
         # 构建过滤条件
@@ -332,7 +334,7 @@ class PaperStore:
         # 检索
         raw = self._collection.query(
             query_texts=[query_text],
-            n_results=top_k * 3,  # 多取一些用于章节加权
+            n_results=min(collection_count, top_k * 3),  # 多取一些用于章节加权
             where=where,
             include=["documents", "metadatas", "distances"],
         )
@@ -358,7 +360,12 @@ class PaperStore:
                     "distance": round(max(dist - weight_penalty, 0), 4),
                 })
 
-        return results
+        # A section bonus only takes effect after sorting. Returning the raw
+        # Chroma order also leaked up to ``top_k * 3`` chunks into the prompt.
+        return sorted(
+            results,
+            key=lambda item: (item["distance"], item["title"], item["chunk_index"]),
+        )[:top_k]
 
     def query_with_timeout(
         self,
