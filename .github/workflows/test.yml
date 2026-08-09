@@ -44,11 +44,8 @@ jobs:
       - name: Run offline unit tests
         run: python -m unittest tests.test_core -v
 
-      - name: Score versioned capability benchmark
-        run: python -m evals.benchmark --results evals/example_results.json --strict
-
-      - name: Replay runtime reliability scenarios
-        run: python -m evals.runtime_replay --strict
+      - name: Run offline release quality gate
+        run: python -m evals.release_gate --strict
 
   session-e2e:
     name: Browser session isolation

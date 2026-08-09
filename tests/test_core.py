@@ -1705,6 +1705,16 @@ class TestResearchBenchmark(unittest.TestCase):
         self.assertEqual(captured["source_stats"]["TSN"]["openalex"]["status"], "ok")
         self.assertNotIn("不应写入评测结果", str(captured))
 
+    def test_release_gate_combines_capability_and_runtime_suites(self):
+        from evals.release_gate import GATE_VERSION, run_release_gate
+
+        report = run_release_gate(seed=17)
+        self.assertTrue(report["passed"], report)
+        self.assertEqual(report["gate_version"], GATE_VERSION)
+        self.assertEqual((report["capability"]["passed"], report["capability"]["total"]), (15, 15))
+        self.assertEqual((report["runtime"]["passed"], report["runtime"]["total"]), (5, 5))
+        self.assertEqual(report["summary"]["success_rate"], 1.0)
+
 
 class TestRequestTracing(unittest.TestCase):
     """真实调用前后都应产生脱敏的可评分追踪。"""
@@ -1894,7 +1904,9 @@ class TestAuditRegressionFixes(unittest.TestCase):
                         {"title": "Paper", "section": "Results", "chunk_index": 2},
                         {"title": "Paper", "section": "Related Work", "chunk_index": 3},
                     ]],
-                    "distances": [[0.10, 0.14, 0.17, 0.30]],
+                    # Chroma order is intro → method → result. The section
+                    # bonus must reorder Method/Results ahead of Introduction.
+                    "distances": [[0.10, 0.12, 0.13, 0.30]],
                 }
 
         store = PaperStore.__new__(PaperStore)

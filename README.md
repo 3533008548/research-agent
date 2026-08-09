@@ -158,7 +158,7 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 
 ```bash
 python tests/test_core.py
-python -m evals.benchmark
+python -m evals.release_gate --strict
 ```
 
 核心回归测试覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订，以及取消令牌从浏览器到模型/工具节点的传播。
@@ -173,7 +173,7 @@ python -m unittest tests.test_session_e2e
 
 GitHub Actions 会分别运行核心回归和浏览器会话隔离测试。
 
-另提供 10 项版本化科研 Agent 评测任务，使用合成语料和模拟状态，不读取个人运行数据、不调用真实模型 API。任务、预期证据、工具轨迹、性能门槛和人工评分量表位于 [evals/README.md](evals/README.md)。真实运行可通过 `ResearchAgent.get_last_trace()` 自动采集脱敏链路数据，并保存带时间戳的评测报告，用于每次重构后的可复现对比与面试展示。
+另提供 15 项版本化科研 Agent 能力任务和 5 项离线可靠性回放，使用合成语料和模拟状态，不读取个人运行数据、不调用真实模型 API。`python -m evals.release_gate --strict` 会输出统一的发布质量门禁；任务、预期证据、工具轨迹、性能门槛和人工评分量表位于 [evals/README.md](evals/README.md)。真实运行可通过 `ResearchAgent.get_last_trace()` 自动采集脱敏链路数据，并保存带时间戳的评测报告，用于每次重构后的可复现对比与面试展示。
 
 ---
 

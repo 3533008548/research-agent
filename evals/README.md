@@ -4,6 +4,23 @@
 
 所有任务使用 `fixtures/synthetic_corpus.json` 的合成科研语料，或明确给出模拟状态；不会读取 `runtime/`、个人论文、API Key，也不会调用真实模型 API。因此它适合作为每次重构后的稳定回归基线。
 
+## 统一发布质量门禁
+
+日常开发与 CI 推荐只运行下面这一条命令。它会串联 15 项能力基准和 5 项真实编排可靠性回放，生成一个紧凑的通过/失败结论；报告不包含 prompt、论文正文、候选论文或密钥。
+
+```powershell
+docker compose exec -T research-agent python -m evals.release_gate --strict
+```
+
+需要留档或和上一版比较时：
+
+```powershell
+docker compose exec -T research-agent python -m evals.release_gate --write-report --strict
+docker compose exec -T research-agent python -m evals.release_gate --compare evals/reports/release-gate-previous.json --write-report --strict
+```
+
+门禁报告分别给出 `capability_success_rate`、`runtime_success_rate`、硬规则通过率和可靠性回放 P95 时延。每日来源的单点失败是已覆盖的恢复场景，不会被错误地判为整套门禁失败。
+
 ## 使用方式
 
 先验证任务清单：
