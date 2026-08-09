@@ -1,108 +1,107 @@
-# FastAPI service layer
+# FastAPI 服务说明
 
-The Gradio UI remains available at `http://localhost:7860/`; the OpenAPI
-document is at `http://localhost:7860/docs`.
+Gradio 页面仍可通过 `http://localhost:7860/` 访问；交互式 API 文档位于
+`http://localhost:7860/docs`。
 
-## Unified run boundary
+## 统一运行任务模型
 
-Chat, deep research, and daily paper discovery all use one durable run model
-and a separate `api-worker` process:
+对话、深度研究和每日论文检索都采用同一个可持久化的运行任务模型，并由独立的
+`api-worker` 进程执行：
 
 ```text
-API request -> SQLite run metadata (queued) -> Redis priority streams -> api-worker
-                                                                 |-> Redis SSE events
+API 请求 -> SQLite 运行记录（queued）-> Redis 优先级队列 -> api-worker
+                                                        |-> Redis SSE 事件
 ```
 
-- Queue entries hold request text only while a worker needs it; daily jobs
-  carry only their run ID because their plan is already persisted.
-- Redis event streams contain only the fixed `status`, `token`, `tool`,
-  `done`, and `error` events for 24 hours. Progress includes safe stage/status
-  metadata only; tool events include a tool identifier and lifecycle only.
-- Final answers, safe metrics and the audit timeline remain in SQLite, so
-  `GET /api/v1/runs/{run_id}` still works after event expiry.
-- Cancellation writes a Redis marker. The worker monitors it and supplies the
-  existing cooperative cancellation token to the agent.
-- A Redis consumer group keeps unacknowledged work pending after a worker
-  crash; the next worker claims it after two minutes.
+- 普通队列项仅在 worker 执行期间保存请求文本；每日任务只传递 `run_id`，检索计划已持久化。
+- SSE 事件固定为 `status`、`token`、`tool`、`done`、`error`，保留 24 小时。
+  进度事件只包含脱敏的阶段名与状态；工具事件只包含工具标识和生命周期状态。
+- 最终回答、安全聚合指标和审计时间线保存在 SQLite。因此 Redis 事件过期后，
+  `GET /api/v1/runs/{run_id}` 仍可查看任务结果。
+- 取消操作会写入 Redis 取消标记；worker 监测到标记后，将现有的协作式取消令牌传给 Agent。
+- Redis Consumer Group 会保留 worker 异常退出时未确认的任务；其他 worker 会在两分钟后认领。
 
-The Compose profile deliberately keeps one worker, because SQLite remains the
-primary user-data store. API replicas can scale safely because they only
-enqueue to the shared Redis streams. Inside the one worker process, dedicated
-chat and background consumers share one model client, so its existing
-interactive-reserved permits prevent a long background run from starving a
-chat request. Do not scale `api-worker` until SQLite is replaced by a
-multi-writer job/state store and a Redis distributed model semaphore is added.
+当前 Compose 配置故意只运行一个 `api-worker`，因为 SQLite 仍是主要用户数据存储。
+FastAPI API 实例可以横向扩展：它们只向共享 Redis 队列投递任务。单个 worker 进程中，
+聊天消费者和后台消费者共享同一个模型客户端，已有的交互保留并发槽可避免长时间后台任务
+挤占聊天请求。SQLite 尚未替换为多写入者的任务/状态存储前，请不要扩容 `api-worker`；
+届时还应增加 Redis 分布式模型信号量。
 
-## Authentication and network boundary
+## 鉴权与网络边界
 
-All `/api/v1/*` routes except `GET /api/v1/health` accept either:
+除 `GET /api/v1/health` 外，所有 `/api/v1/*` 路由均接受下列任一种鉴权方式：
 
 ```http
 X-API-Key: <API_AUTH_TOKEN>
 ```
 
-or:
+或：
 
 ```http
 Authorization: Bearer <API_AUTH_TOKEN>
 ```
 
-Set these in the untracked `.env` file before a public deployment:
+对外部署前，请在未纳入 Git 的 `.env` 文件中设置：
 
 ```env
 API_AUTH_TOKEN=use-a-long-random-secret
 API_AUTH_REQUIRED=1
 ```
 
-If a token is present it is enforced. `API_AUTH_REQUIRED=1` also makes startup
-fail fast when the token is absent. Compose binds port 7860 to `127.0.0.1` by
-default; use a TLS reverse proxy and keep authentication enabled before
-publishing it to a network.
+如果配置了令牌，系统会强制鉴权；若 `API_AUTH_REQUIRED=1` 但缺少令牌，启动会立即失败。
+Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TLS 反向代理后部署，
+并保持 API 鉴权开启。
 
-## Endpoints
+## 接口列表
 
-| Method | Route | Purpose |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/api/v1/health` | unauthenticated health check |
-| `GET`, `POST` | `/api/v1/sessions` | list or create a session |
-| `DELETE` | `/api/v1/sessions/{session_id}` | cancel active runs and delete a session |
-| `GET` | `/api/v1/sessions/{session_id}/runs` | list recent chat and research runs |
-| `POST` | `/api/v1/chat` | compatibility chat facade that creates a chat run |
-| `POST` | `/api/v1/runs` | create a `chat`, `research`, or `daily` run |
-| `GET` | `/api/v1/runs/{run_id}` | inspect status, safe metrics and final answer |
-| `GET` | `/api/v1/runs/{run_id}/events` | read SSE `status`, `token`, `tool`, `done`, `error` events |
-| `POST` | `/api/v1/runs/{run_id}/cancel` | request cross-process cooperative cancellation |
+| `GET` | `/api/v1/health` | 无需鉴权的健康检查 |
+| `GET`、`POST` | `/api/v1/sessions` | 列出或创建会话 |
+| `DELETE` | `/api/v1/sessions/{session_id}` | 取消会话中的活跃任务并删除会话 |
+| `GET` | `/api/v1/sessions/{session_id}/runs` | 列出该会话最近的聊天与深度研究任务 |
+| `POST` | `/api/v1/chat` | 兼容用聊天入口：创建一个聊天任务 |
+| `POST` | `/api/v1/runs` | 创建 `chat`、`research` 或 `daily` 任务 |
+| `GET` | `/api/v1/runs/{run_id}` | 查看状态、安全指标与最终结果 |
+| `GET` | `/api/v1/runs/{run_id}/events` | 读取 SSE 事件流 |
+| `POST` | `/api/v1/runs/{run_id}/cancel` | 请求跨进程协作式取消 |
 
-`POST /api/v1/sessions/{session_id}/chat-runs` remains a compatibility alias
-while clients migrate to the canonical endpoint.
-For daily work, `daily_kind` accepts `daily`, `retry`, `search`, or `resume`;
-`resume` requeues the latest recoverable daily run under its existing `run_id`.
+`POST /api/v1/sessions/{session_id}/chat-runs` 保留为兼容别名，客户端应逐步迁移到
+统一的 `/api/v1/runs` 接口。
 
-Example:
+每日任务的 `daily_kind` 支持 `daily`、`retry`、`search`、`resume`：其中 `resume`
+会使用原 `run_id` 重新排队最近一次可恢复的每日任务。
+
+## 调用示例
 
 ```bash
 TOKEN='your-long-random-secret'
 
+# 创建会话
 curl -X POST http://localhost:7860/api/v1/sessions \
   -H "X-API-Key: $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"title":"API session"}'
+  -d '{"title":"API 会话"}'
 
+# 创建聊天任务
 curl -X POST http://localhost:7860/api/v1/runs \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"kind":"chat","session_id":"<session_id>","message":"Explain the RAG cold-start fallback."}'
+  -d '{"kind":"chat","session_id":"<session_id>","message":"解释 RAG 冷启动时的降级策略。"}'
 
+# 创建深度研究任务
 curl -X POST http://localhost:7860/api/v1/runs \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"kind":"research","session_id":"<session_id>","query":"Compare RAG retrieval reranking methods."}'
+  -d '{"kind":"research","session_id":"<session_id>","query":"比较 RAG 检索重排序方法。"}'
 
+# 创建一次临时每日检索任务
 curl -X POST http://localhost:7860/api/v1/runs \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"kind":"daily","daily_kind":"search","keyword":"retrieval augmented generation"}'
+  -d '{"kind":"daily","daily_kind":"search","keyword":"检索增强生成"}'
 
+# 持续读取运行事件
 curl -N -H "X-API-Key: $TOKEN" \
   http://localhost:7860/api/v1/runs/<run_id>/events
 ```
