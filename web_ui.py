@@ -56,6 +56,57 @@ CHAT_LATEX_DELIMITERS = [
 ]
 
 
+# Gradio 6 applies these at launch time.  Keep them as module-level values so
+# the ASGI entrypoint can pass the exact same presentation settings to
+# ``mount_gradio_app``.
+UI_THEME = gr.themes.Soft()
+UI_CSS = """
+.gradio-container,
+.gradio-container button,
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select,
+.gradio-container .prose {
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif;
+}
+.main-header { text-align: center; padding: 0.5rem 0; }
+.main-header h1 { font-size: 1.3rem; font-weight: 600; }
+.status-bar { padding: 0.3rem 1rem; font-size: 0.75rem; color: #666; }
+footer { display: none !important; }
+.quit-btn { margin-top: -2px; min-width: 60px !important; max-width: 70px !important; }
+#drop-overlay { display: none !important; }
+#drop-overlay.show { display: flex !important; }
+.agent-run-list { display: grid; gap: 0.65rem; }
+.agent-run-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.7rem 0.85rem; background: #fff; }
+.agent-run-title { display: flex; align-items: center; gap: 0.5rem; }
+.agent-run-meta { color: #6b7280; font-size: 0.75rem; margin-top: 0.2rem; }
+.agent-run-badge { border-radius: 999px; padding: 0.08rem 0.45rem; font-size: 0.72rem; font-weight: 600; background: #e5e7eb; color: #374151; }
+.status-running, .status-waiting, .status-streaming { background: #dbeafe; color: #1d4ed8; }
+.status-completed { background: #dcfce7; color: #166534; }
+.status-failed, .status-cancelled, .status-partial_failed { background: #fee2e2; color: #b91c1c; }
+.status-partial, .status-skipped, .status-resumed { background: #fef3c7; color: #92400e; }
+.agent-run-events { list-style: none; margin: 0.55rem 0 0; padding: 0; display: grid; gap: 0.35rem; }
+.agent-run-event { display: grid; grid-template-columns: 0.55rem 1fr auto; gap: 0.4rem; align-items: center; font-size: 0.82rem; }
+.agent-run-event small { color: #6b7280; font-size: 0.7rem; }
+.agent-event-dot { display: inline-block; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #9ca3af; }
+.agent-event-dot.status-running, .agent-event-dot.status-waiting, .agent-event-dot.status-streaming { background: #2563eb; }
+.agent-event-dot.status-completed { background: #16a34a; }
+.agent-event-dot.status-failed, .agent-event-dot.status-cancelled, .agent-event-dot.status-partial_failed { background: #dc2626; }
+.agent-event-dot.status-partial, .agent-event-dot.status-skipped, .agent-event-dot.status-resumed { background: #d97706; }
+.agent-run-hint, .agent-run-empty { color: #6b7280; font-size: 0.8rem; margin-top: 0.6rem; }
+"""
+UI_JS = """
+function() {
+    var overlay = document.getElementById('drop-overlay');
+    var dragCount = 0;
+    document.addEventListener('dragenter', function(e) { e.preventDefault(); dragCount++; overlay.classList.add('show'); });
+    document.addEventListener('dragleave', function(e) { e.preventDefault(); dragCount--; if (dragCount <= 0) { dragCount = 0; overlay.classList.remove('show'); } });
+    document.addEventListener('dragover', function(e) { e.preventDefault(); });
+    document.addEventListener('drop', function(e) { e.preventDefault(); dragCount = 0; overlay.classList.remove('show'); });
+}
+"""
+
+
 def build_ui(*, cfg=None, agent=None, launch: bool = True):
     parser = argparse.ArgumentParser(description="科研助手 Web UI")
     parser.add_argument(
@@ -1032,10 +1083,8 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             status = gr.Markdown(refresh_status([], agent.thread_id), elem_classes=["status-bar"], scale=20)
             quit_btn = gr.Button("⏻ 退出", scale=1, size="sm", min_width=60, elem_classes=["quit-btn"])
         daily_panel = gr.Markdown(refresh_daily_panel())
-        daily_timer = gr.Timer(value=1.0)
-        # Read-only refreshes must never occupy Gradio's request queue.  Otherwise
-        # frequent timer ticks can make a user-initiated `/retry` appear stuck.
-        daily_timer.tick(
+        daily_refresh_btn = gr.Button("🔄 刷新每日任务", size="sm")
+        daily_refresh_btn.click(
             fn=refresh_daily_panel, outputs=[daily_panel], show_progress="hidden", queue=False,
         )
 
@@ -1098,8 +1147,8 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     current_run_panel = gr.HTML(
                         value=refresh_current_agent_run(agent.thread_id),
                     )
-                current_run_timer = gr.Timer(value=1.0)
-                current_run_timer.tick(
+                    refresh_current_run_btn = gr.Button("🔄 刷新本轮状态", size="sm")
+                refresh_current_run_btn.click(
                     fn=refresh_current_agent_run,
                     inputs=[session_state],
                     outputs=[current_run_panel],
@@ -1180,13 +1229,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     queue=False,
                 )
                 refresh_run_center_btn.click(
-                    fn=refresh_run_center,
-                    inputs=[run_center_scope, session_state],
-                    outputs=[run_center_panel],
-                    show_progress="hidden",
-                )
-                run_center_timer = gr.Timer(value=1.5)
-                run_center_timer.tick(
                     fn=refresh_run_center,
                     inputs=[run_center_scope, session_state],
                     outputs=[run_center_panel],
@@ -1296,44 +1338,9 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
         server_name=args.host if args else os.getenv("UI_HOST", "127.0.0.1"),
         server_port=args.port if args else int(os.getenv("UI_PORT", "7860")),
         share=False, show_error=True,
-        theme=gr.themes.Soft(),
-        css="""
-        .main-header { text-align: center; padding: 0.5rem 0; }
-        .main-header h1 { font-size: 1.3rem; font-weight: 600; }
-        .status-bar { padding: 0.3rem 1rem; font-size: 0.75rem; color: #666; }
-        footer { display: none !important; }
-        .quit-btn { margin-top: -2px; min-width: 60px !important; max-width: 70px !important; }
-        #drop-overlay { display: none !important; }
-        #drop-overlay.show { display: flex !important; }
-        .agent-run-list { display: grid; gap: 0.65rem; }
-        .agent-run-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.7rem 0.85rem; background: #fff; }
-        .agent-run-title { display: flex; align-items: center; gap: 0.5rem; }
-        .agent-run-meta { color: #6b7280; font-size: 0.75rem; margin-top: 0.2rem; }
-        .agent-run-badge { border-radius: 999px; padding: 0.08rem 0.45rem; font-size: 0.72rem; font-weight: 600; background: #e5e7eb; color: #374151; }
-        .status-running, .status-waiting, .status-streaming { background: #dbeafe; color: #1d4ed8; }
-        .status-completed { background: #dcfce7; color: #166534; }
-        .status-failed, .status-cancelled, .status-partial_failed { background: #fee2e2; color: #b91c1c; }
-        .status-partial, .status-skipped, .status-resumed { background: #fef3c7; color: #92400e; }
-        .agent-run-events { list-style: none; margin: 0.55rem 0 0; padding: 0; display: grid; gap: 0.35rem; }
-        .agent-run-event { display: grid; grid-template-columns: 0.55rem 1fr auto; gap: 0.4rem; align-items: center; font-size: 0.82rem; }
-        .agent-run-event small { color: #6b7280; font-size: 0.7rem; }
-        .agent-event-dot { display: inline-block; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #9ca3af; }
-        .agent-event-dot.status-running, .agent-event-dot.status-waiting, .agent-event-dot.status-streaming { background: #2563eb; }
-        .agent-event-dot.status-completed { background: #16a34a; }
-        .agent-event-dot.status-failed, .agent-event-dot.status-cancelled, .agent-event-dot.status-partial_failed { background: #dc2626; }
-        .agent-event-dot.status-partial, .agent-event-dot.status-skipped, .agent-event-dot.status-resumed { background: #d97706; }
-        .agent-run-hint, .agent-run-empty { color: #6b7280; font-size: 0.8rem; margin-top: 0.6rem; }
-        """,
-        js="""
-        function() {
-            var overlay = document.getElementById('drop-overlay');
-            var dragCount = 0;
-            document.addEventListener('dragenter', function(e) { e.preventDefault(); dragCount++; overlay.classList.add('show'); });
-            document.addEventListener('dragleave', function(e) { e.preventDefault(); dragCount--; if (dragCount <= 0) { dragCount = 0; overlay.classList.remove('show'); } });
-            document.addEventListener('dragover', function(e) { e.preventDefault(); });
-            document.addEventListener('drop', function(e) { e.preventDefault(); dragCount = 0; overlay.classList.remove('show'); });
-        }
-        """,
+        theme=UI_THEME,
+        css=UI_CSS,
+        js=UI_JS,
     )
     return demo
 

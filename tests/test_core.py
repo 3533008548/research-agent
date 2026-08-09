@@ -2025,6 +2025,17 @@ class TestWebRendering(unittest.TestCase):
         self.assertIn({"left": "\\(", "right": "\\)", "display": False}, CHAT_LATEX_DELIMITERS)
         self.assertIn({"left": "\\[", "right": "\\]", "display": True}, CHAT_LATEX_DELIMITERS)
 
+    def test_mounted_ui_keeps_theme_and_avoids_background_polling(self):
+        root = Path(__file__).resolve().parents[1]
+        source = root.joinpath("web_ui.py").read_text(encoding="utf-8")
+        server_source = root.joinpath("api_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("theme=UI_THEME", server_source)
+        self.assertIn("css=UI_CSS", server_source)
+        self.assertIn("js=UI_JS", server_source)
+        self.assertIn('font-family: "Microsoft YaHei UI"', source)
+        self.assertNotIn("gr.Timer(", source)
+
 
 class TestAuditRegressionFixes(unittest.TestCase):
     """Regression coverage for correctness and boundary issues found in code audit."""
