@@ -1672,7 +1672,7 @@ class TestResearchBenchmark(unittest.TestCase):
 
         manifest = load_manifest()
         expectations = {task["id"]: task["expected"] for task in manifest["tasks"]}
-        self.assertEqual(manifest["version"], "v1.2")
+        self.assertEqual(manifest["version"], "v1.3")
         self.assertNotIn("tool_trace_contains", expectations["T04"])
         self.assertNotIn("tool_trace_contains", expectations["T10"])
 
