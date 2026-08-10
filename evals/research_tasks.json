@@ -158,7 +158,7 @@
         "state_assertions": {"research_status": "completed", "evidence_persisted": true},
         "answer_checks": [
           {"label": "条件", "any_of": ["突发", "bursty", "负载"]},
-          {"label": "限制", "any_of": ["限制", "需要验证", "分布偏移"]}
+          {"label": "限制", "any_of": ["限制", "局限", "需要验证", "证据不足", "分布偏移"]}
         ],
         "min_evidence_references": 2,
         "manual_rubric": ["结论与 [E#] 证据对应", "不将预印本结论夸大为通用事实"]

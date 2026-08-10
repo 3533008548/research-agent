@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Annotated, TypedDict
+from typing import Annotated, Callable, TypedDict
 
 import requests
 from langgraph.graph import StateGraph, END
@@ -122,6 +122,8 @@ def build_graph(
     allowed_tool_names: set[str] | None = None,
     enable_verify: bool = True,
     request_policy: RequestPolicy | None = None,
+    max_tool_rounds: int | None = None,
+    tool_argument_normalizer: Callable[[str, dict], dict] | None = None,
 ):
     # A graph must use the process-wide client owned by ResearchAgent. Creating
     # one here would silently defeat shared admission control in multi-agent
@@ -137,6 +139,8 @@ def build_graph(
             schema for schema in tool_schemas
             if schema.get("function", {}).get("name") in allowed_tool_names
         ]
+    if max_tool_rounds is not None:
+        max_tool_rounds = max(1, int(max_tool_rounds))
 
     def emit(event_type: str, **details) -> None:
         """Best-effort trace hook; instrumentation must never interrupt inference."""
@@ -447,6 +451,25 @@ def build_graph(
             return "tools"
         return "verify" if enable_verify else END
 
+    def after_tools_router(state: AgentState) -> str:
+        """End bounded research workers after their final evidence tool round.
+
+        The normal chat graph remains unbounded apart from its outer recursion
+        limit. Research workers, however, do not need to ask the model for one
+        more prose turn after gathering evidence: the research synthesizer owns
+        that task. Ending here preserves collected tool messages rather than
+        losing them to a graph recursion error when a model keeps searching.
+        """
+        if max_tool_rounds is not None:
+            rounds = sum(
+                1 for message in state.get("messages", [])
+                if message.get("role") == "assistant" and message.get("tool_calls")
+            )
+            if rounds >= max_tool_rounds:
+                emit("tool_round_limit_reached", limit=max_tool_rounds)
+                return END
+        return "llm"
+
     # ═══ 工具节点 ═══
 
     def tool_node(state: AgentState) -> dict:
@@ -467,6 +490,12 @@ def build_graph(
                 args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
                 args = {}
+            if not isinstance(args, dict):
+                args = {}
+            if tool_argument_normalizer is not None:
+                normalized_args = tool_argument_normalizer(name, dict(args))
+                if isinstance(normalized_args, dict):
+                    args = normalized_args
             print(f"      🔧 {name}({json.dumps(args, ensure_ascii=False)})", file=sys.stderr)
             tool_started = time.perf_counter()
             emit("tool_started", tool=name)
@@ -810,7 +839,7 @@ def build_graph(
     graph.add_conditional_edges(
         "llm", router, {"tools": "tools", "verify": "verify", END: END},
     )
-    graph.add_edge("tools", "llm")
+    graph.add_conditional_edges("tools", after_tools_router, {"llm": "llm", END: END})
     graph.add_conditional_edges("verify", verify_router, {"llm": "llm", END: END})
 
     conn = sqlite3.connect(checkpoint_db, check_same_thread=False)

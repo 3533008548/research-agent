@@ -1394,6 +1394,76 @@ class TestResearchOrchestration(unittest.TestCase):
             verify_timeout_seconds=3,
         )
 
+    def test_research_worker_uses_bounded_tool_rounds(self):
+        from research_orchestrator import RESEARCH_WORKER_MAX_TOOL_ROUNDS, _WorkerSpec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            from session_store import SessionStore
+
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                orchestrator = self._orchestrator(store)
+
+                class _App:
+                    checkpointer = SimpleNamespace(conn=SimpleNamespace(close=lambda: None))
+
+                    @staticmethod
+                    def invoke(_state, config):
+                        return {"messages": [
+                            {"role": "assistant", "content": None, "tool_calls": [{
+                                "id": "evidence-1",
+                                "function": {"name": "search_papers", "arguments": "{}"},
+                            }]},
+                            {"role": "tool", "tool_call_id": "evidence-1", "content": "公开检索证据"},
+                        ]}
+
+                spec = _WorkerSpec(
+                    role="public", label="公开研究员", allowed_tools={"search_papers"}, instruction="收集证据",
+                )
+                with patch("research_orchestrator.build_graph", return_value=_App()) as build:
+                    worker = orchestrator._run_worker(spec, "研究问题", {"subtasks": []}, None)
+
+                self.assertEqual(RESEARCH_WORKER_MAX_TOOL_ROUNDS, 1)
+                self.assertEqual(build.call_args.kwargs["max_tool_rounds"], RESEARCH_WORKER_MAX_TOOL_ROUNDS)
+                self.assertEqual(worker["status"], "completed")
+                self.assertEqual(len(worker["evidence"]), 1)
+            finally:
+                store.close()
+
+    def test_network_tsn_question_keeps_networking_domain_constraint(self):
+        from research_orchestrator import ResearchOrchestrator, _WorkerSpec
+
+        prompt = ResearchOrchestrator._worker_input(
+            "评估 TSN 在突发流量负载下的调度条件",
+            {"subtasks": [{"id": "public", "focus": "公开证据"}]},
+            _WorkerSpec("public", "公开研究员", {"search_papers"}, "收集公开证据"),
+        )
+        self.assertIn("Time-Sensitive Networking", prompt)
+        self.assertIn("do not reinterpret", prompt)
+
+    def test_network_tsn_public_search_normalizer_rejects_video_terms(self):
+        from research_orchestrator import ResearchOrchestrator, _WorkerSpec
+
+        spec = _WorkerSpec("public", "公开研究员", {"search_papers"}, "收集公开证据")
+        normalize = ResearchOrchestrator._worker_tool_argument_normalizer(
+            "评估 TSN 在突发流量负载下的调度条件", spec,
+        )
+
+        self.assertIsNotNone(normalize)
+        normalized = normalize("search_papers", {
+            "query": "DiffTSN diffusion temporal segment network",
+            "source": "arxiv",
+        })
+        self.assertEqual(
+            normalized["query"],
+            "DiffTSN Time-Sensitive Networking scheduling bursty traffic",
+        )
+        self.assertEqual(normalized["source"], "arxiv")
+        self.assertEqual(
+            normalize("query_papers", {"query": "TSN"}),
+            {"query": "TSN"},
+        )
+
     def test_completed_research_runs_one_bounded_revision_and_persists_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             from session_store import SessionStore
@@ -1439,6 +1509,84 @@ class TestResearchOrchestration(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_critic_timeout_keeps_completed_evidence_report(self):
+        from llm_client import LLMRequestTimeoutError
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                session = store.create()
+                orchestrator = self._orchestrator(store)
+
+                def fake_model(*, stage, **_kwargs):
+                    if stage == "planner":
+                        return '{"objective":"TSN","subtasks":[{"id":"public","focus":"公开证据"}]}'
+                    if stage == "synthesis":
+                        return "基于证据的结论 [E1]，仍需验证局限。"
+                    if stage == "critic":
+                        raise LLMRequestTimeoutError("critic timeout")
+                    raise AssertionError(stage)
+
+                with patch.object(orchestrator, "_call_model", side_effect=fake_model), \
+                     patch.object(orchestrator, "_run_workers", return_value=[self._worker_result("public")]):
+                    result = orchestrator.run("研究 TSN", thread_id=session["thread_id"], scope="public")
+
+                self.assertEqual(result.status, "completed")
+                self.assertIn("自动质检已跳过：LLMRequestTimeoutError", result.answer)
+                self.assertTrue(any(
+                    stage.get("stage") == "critic" and stage.get("status") == "skipped"
+                    for stage in result.trace["stages"]
+                ))
+                saved = store.get_research_run(result.run_id)
+                self.assertEqual(saved["status"], "completed")
+                self.assertEqual(len(saved["evidence"]), 1)
+            finally:
+                store.close()
+
+
+    def test_synthesis_timeout_returns_completed_cited_evidence_fallback(self):
+        from llm_client import LLMRequestTimeoutError
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                session = store.create()
+                orchestrator = self._orchestrator(store)
+
+                def fake_model(*, stage, **_kwargs):
+                    if stage == "planner":
+                        return '{"objective":"TSN","subtasks":[{"id":"public","focus":"公开证据"}]}'
+                    if stage == "synthesis":
+                        raise LLMRequestTimeoutError("synthesis timeout")
+                    raise AssertionError(f"unexpected model stage: {stage}")
+
+                with patch.object(orchestrator, "_call_model", side_effect=fake_model), \
+                     patch.object(orchestrator, "_run_workers", return_value=[self._worker_result("public")]):
+                    result = orchestrator.run(
+                        "对 DiffTSN 在突发负载下的适用条件做一次深度研究",
+                        thread_id=session["thread_id"],
+                        scope="public",
+                    )
+
+                self.assertEqual(result.status, "completed")
+                self.assertIn("[E1]", result.answer)
+                self.assertIn("突发负载", result.answer)
+                self.assertIn("限制", result.answer)
+                self.assertTrue(any(
+                    stage.get("stage") == "synthesis" and stage.get("status") == "skipped"
+                    for stage in result.trace["stages"]
+                ))
+                self.assertTrue(any(
+                    stage.get("stage") == "critic" and stage.get("status") == "skipped"
+                    for stage in result.trace["stages"]
+                ))
+                saved = store.get_research_run(result.run_id)
+                self.assertEqual(saved["status"], "completed")
+                self.assertEqual(len(saved["evidence"]), 1)
+            finally:
+                store.close()
 
     def test_research_turn_is_visible_as_only_user_and_final_report(self):
         """研究员的内部工具消息不得污染普通会话历史。"""
@@ -1803,6 +1951,62 @@ class TestCancellationPropagation(unittest.TestCase):
 
         self.assertEqual(post.call_count, 1)
         self.assertEqual(result["messages"][-1]["content"], "已完成本地证据整理")
+
+    def test_bounded_research_worker_keeps_tool_evidence_without_recursion_error(self):
+        """研究员达到工具轮次上限时应保留最后一轮证据并正常结束。"""
+        from graph_builder import build_graph
+        from llm_client import LLMClient
+
+        class _Response:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "choices": [{"message": {
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "search-1", "type": "function",
+                            "function": {
+                                "name": "search_papers",
+                                "arguments": '{"query":"TSN"}',
+                            },
+                        }],
+                    }}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+
+        with patch("llm_client.requests.post", return_value=_Response()) as post, \
+             patch("graph_builder.execute_tool", return_value="搜索结果 **TSN 证据论文**") as execute:
+            app = build_graph(
+                api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
+                allowed_tool_names={"search_papers"}, max_tool_rounds=1,
+                tool_argument_normalizer=lambda _name, args: {
+                    **args, "query": "Time-Sensitive Networking scheduling",
+                },
+                llm_client=LLMClient("test-key", "https://example.test/chat", max_retries=0),
+            )
+            try:
+                result = app.invoke(
+                    {"messages": [{"role": "user", "content": "检索证据"}], "metadata": {}},
+                    config={"configurable": {"thread_id": "bounded-research"}, "recursion_limit": 8},
+                )
+            finally:
+                app.checkpointer.conn.close()
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(
+            execute.call_args.args[1]["query"],
+            "Time-Sensitive Networking scheduling",
+        )
+        self.assertEqual(result["messages"][-1]["role"], "tool")
+        self.assertIn("TSN 证据论文", result["messages"][-1]["content"])
 
     def test_graph_requires_shared_llm_client(self):
         from graph_builder import build_graph
