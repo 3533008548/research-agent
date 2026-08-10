@@ -2209,6 +2209,7 @@ class TestWebRendering(unittest.TestCase):
         self.assertIn("css=UI_CSS", server_source)
         self.assertIn("js=UI_JS", server_source)
         self.assertIn('font-family: "Microsoft YaHei UI"', source)
+        self.assertIn("API_RUN_CLIENT_ENABLED", source)
         self.assertNotIn("gr.Timer(", source)
 
 

@@ -175,7 +175,13 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
     # When mounted under FastAPI, Gradio is deliberately an HTTP client of the
     # same public run boundary.  Standalone ``python web_ui.py`` remains a
     # developer fallback and continues to use the in-process agent.
-    api_run_client_enabled = bool(not launch and os.getenv("REDIS_URL", "").strip())
+    api_run_client_enabled = bool(
+        not launch
+        and (
+            os.getenv("REDIS_URL", "").strip()
+            or os.getenv("API_RUN_CLIENT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+        )
+    )
     api_run_base = os.getenv("INTERNAL_API_URL", "http://127.0.0.1:7860").rstrip("/")
     api_run_token = os.getenv("API_AUTH_TOKEN", "").strip()
     _api_runs_by_browser: dict[str, str] = {}

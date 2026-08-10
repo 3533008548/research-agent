@@ -47,12 +47,23 @@ jobs:
       - name: Run offline release quality gate
         run: python -m evals.release_gate --strict
 
-  session-e2e:
-    name: Browser session isolation
+  browser-e2e:
+    name: Browser UI and FastAPI integration
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       APP_DATA_DIR: ${{ runner.temp }}/research-agent-runtime
       PYTHONUNBUFFERED: "1"
+      E2E_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v4
 
@@ -67,8 +78,8 @@ jobs:
           python -m pip install --requirement requirements-dev.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run session isolation browser regression
-        run: python -m unittest tests.test_session_e2e -v
+      - name: Run browser regressions
+        run: python -m unittest tests.test_session_e2e tests.test_mounted_api_e2e -v
 
   container-smoke:
     name: Docker build and health check
