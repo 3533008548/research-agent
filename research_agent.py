@@ -453,6 +453,7 @@ class ResearchAgent:
                 "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 "events": events,
                 "research_run_id": result.run_id,
+                "evidence_quality": result.trace.get("evidence_quality") or {},
                 "usage_delta": {
                     key: usage.get(key, 0) - usage_before.get(key, 0)
                     for key in ("prompt", "completion", "total", "calls")

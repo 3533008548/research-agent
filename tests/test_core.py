@@ -503,6 +503,79 @@ class TestQueryPapers(unittest.TestCase):
 
 
 class TestToolResponsiveness(unittest.TestCase):
+    def test_network_tsn_search_rejects_unrelated_provider_hit(self):
+        from search_api import search_openalex
+
+        class _Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"results": [
+                    {
+                        "id": "https://openalex.org/W1",
+                        "title": "Scheduling Time-Sensitive Networking for Bursty Traffic",
+                        "authorships": [],
+                        "publication_year": 2025,
+                        "cited_by_count": 7,
+                        "doi": "https://doi.org/10.1000/tsn",
+                        "primary_location": {"source": {"display_name": "TSN Journal"}},
+                        "abstract_inverted_index": {
+                            "Time-Sensitive": [0], "Networking": [1], "scheduling": [2],
+                            "for": [3], "bursty": [4], "traffic": [5],
+                        },
+                    },
+                    {
+                        "id": "https://openalex.org/W2",
+                        "title": "Routing in a delay tolerant network",
+                        "authorships": [],
+                        "publication_year": 2004,
+                        "cited_by_count": 1776,
+                        "doi": "https://doi.org/10.1000/dtn",
+                        "primary_location": {"source": {"display_name": "Unrelated Journal"}},
+                        "abstract_inverted_index": {"Routing": [0], "network": [1]},
+                    },
+                ]}
+
+        with patch("search_api.requests.get", return_value=_Response()) as get:
+            result = search_openalex(
+                "DiffTSN Time-Sensitive Networking scheduling bursty traffic",
+            )
+
+        self.assertEqual(
+            get.call_args.kwargs["params"]["search"],
+            '"Time-Sensitive Networking" AND (scheduling OR traffic OR bursty OR flow OR latency)',
+        )
+        self.assertIn("Scheduling Time-Sensitive Networking", result)
+        self.assertIn("相关性评分: 0.95-0.95", result)
+        self.assertIn("已拒绝 1 条", result)
+        self.assertNotIn("delay tolerant", result.casefold())
+
+    def test_time_sensitive_networking_full_name_enables_strict_filter(self):
+        from search_api import _filter_public_papers
+
+        accepted, quality = _filter_public_papers(
+            "Time-Sensitive Networking scheduling bursty traffic",
+            [{"title": "Routing in a delay tolerant network", "abstract": "Traffic routing."}],
+        )
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(quality["rejected"], 1)
+        self.assertIn("未命中 Time-Sensitive Networking 或 TSN", quality["rejection_reason"])
+
+    def test_network_tsn_search_requires_a_material_condition(self):
+        from search_api import _filter_public_papers
+
+        accepted, quality = _filter_public_papers(
+            "TSN scheduling under bursty traffic",
+            [{"title": "An Overview of Time-Sensitive Networking", "abstract": "TSN standards."}],
+        )
+
+        self.assertEqual(accepted, [])
+        self.assertIn("未命中调度、流量或 DiffTSN 条件", quality["rejection_reason"])
+
     def test_bounded_rag_query_returns_while_background_work_continues(self):
         import time
         import threading
@@ -1464,6 +1537,42 @@ class TestResearchOrchestration(unittest.TestCase):
             {"query": "TSN"},
         )
 
+    def test_public_evidence_persists_provider_relevance_metadata(self):
+        from research_orchestrator import ResearchOrchestrator
+
+        cards = ResearchOrchestrator._evidence_from_messages([
+            {"role": "assistant", "tool_calls": [{
+                "id": "search-1", "function": {"name": "search_papers", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "search-1", "content": (
+                "📚 **OpenAlex 搜索结果** — 查询: 「TSN scheduling」\n"
+                "📊 检索质量：保留 2/5 条 | 相关性评分: 0.80-0.95 | "
+                "已拒绝 3 条（未命中 Time-Sensitive Networking 或 TSN×3）\n"
+                "1. **TSN scheduling evidence**"
+            )},
+        ], "public")
+
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["relevance"], {
+            "accepted": 2,
+            "total": 5,
+            "score_min": 0.8,
+            "score_max": 0.95,
+            "rejected": 3,
+            "rejection_reason": "未命中 Time-Sensitive Networking 或 TSN×3",
+        })
+        context = ResearchOrchestrator._evidence_context([{**cards[0], "id": "E1"}])
+        self.assertIn("相关性评分 0.80-0.95；已筛除 3 条低相关候选", context)
+        self.assertEqual(
+            ResearchOrchestrator._evidence_quality_metrics([{**cards[0], "id": "E1"}]),
+            {
+                "public_evidence_cards": 1,
+                "scored_public_evidence_cards": 1,
+                "minimum_public_relevance": 0.8,
+                "rejected_public_candidates": 3,
+            },
+        )
+
     def test_completed_research_runs_one_bounded_revision_and_persists_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             from session_store import SessionStore
@@ -2269,6 +2378,22 @@ class TestResearchBenchmark(unittest.TestCase):
         self.assertEqual(captured["metrics"]["max_tool_duration_ms"], 8100)
         self.assertEqual(captured["metrics"]["model_calls"], 1)
         self.assertNotIn("arguments", str(captured))
+
+    def test_research_trace_capture_checks_public_evidence_quality_without_payloads(self):
+        from evals.capture import result_from_trace
+
+        captured = result_from_trace("T11", "带引用的研究报告 [E1]", {
+            "evidence_quality": {
+                "public_evidence_cards": 2,
+                "scored_public_evidence_cards": 2,
+                "minimum_public_relevance": 0.8,
+                "rejected_public_candidates": 6,
+            },
+        })
+
+        self.assertTrue(captured["state"]["public_evidence_relevance"])
+        self.assertTrue(captured["state"]["public_evidence_rejection_metadata"])
+        self.assertNotIn("rejection_reason", str(captured))
 
     def test_daily_capture_keeps_source_health_without_candidate_content(self):
         from evals.capture import result_from_daily_run

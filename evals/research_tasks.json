@@ -155,7 +155,12 @@
       "fixture": {"research_run": "synthetic-completed", "scope": "both"},
       "prompt": "对 DiffTSN 在突发负载下的适用条件做一次深度研究，用证据编号给出结论并说明限制。",
       "expected": {
-        "state_assertions": {"research_status": "completed", "evidence_persisted": true},
+        "state_assertions": {
+          "research_status": "completed",
+          "evidence_persisted": true,
+          "public_evidence_relevance": true,
+          "public_evidence_rejection_metadata": true
+        },
         "answer_checks": [
           {"label": "条件", "any_of": ["突发", "bursty", "负载"]},
           {"label": "限制", "any_of": ["限制", "局限", "需要验证", "证据不足", "分布偏移"]}

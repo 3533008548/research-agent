@@ -225,6 +225,7 @@ class ResearchOrchestrator:
                     )
 
                 evidence = self._renumber_evidence(evidence)
+                trace["evidence_quality"] = self._evidence_quality_metrics(evidence)
                 self.sessions.update_research_run(
                     run_id, evidence=evidence, trace=trace,
                 )
@@ -232,6 +233,7 @@ class ResearchOrchestrator:
                     raise RuntimeError("研究员未获得可用证据")
             else:
                 evidence = self._renumber_evidence(evidence)
+                trace["evidence_quality"] = self._evidence_quality_metrics(evidence)
                 self.sessions.update_research_run(run_id, evidence=evidence, trace=trace)
 
             self._ensure_active(cancel_event)
@@ -589,14 +591,18 @@ class ResearchOrchestrator:
             if not content or content.startswith(("❌", "📭", "⏳")):
                 continue
             tool = tool_names.get(str(message.get("tool_call_id", "")), "tool")
-            cards.append({
+            card = {
                 "id": "",
                 "researcher": role,
                 "source_type": tool,
                 "source": ResearchOrchestrator._source_label(content, tool),
                 "excerpt": content[:700],
                 "uncertainty": "来自工具检索结果，需结合原文核验。",
-            })
+            }
+            quality = ResearchOrchestrator._search_evidence_quality(content, tool)
+            if quality:
+                card["relevance"] = quality
+            cards.append(card)
         return cards[:6]
 
     @staticmethod
@@ -611,6 +617,40 @@ class ResearchOrchestrator:
         return {"search_papers": "公开论文检索", "query_papers": "本地 RAG 检索"}.get(tool, tool)
 
     @staticmethod
+    def _search_evidence_quality(content: str, tool: str) -> dict[str, Any] | None:
+        """Extract provider-side relevance metadata for durable evidence cards."""
+        if tool != "search_papers":
+            return None
+        match = re.search(
+            r"检索质量：保留 (\d+)/(\d+) 条 \| 相关性评分: ([0-9.]+)-([0-9.]+) \| "
+            r"已拒绝 (\d+) 条（([^）]*)）",
+            content,
+        )
+        if not match:
+            return None
+        return {
+            "accepted": int(match.group(1)),
+            "total": int(match.group(2)),
+            "score_min": float(match.group(3)),
+            "score_max": float(match.group(4)),
+            "rejected": int(match.group(5)),
+            "rejection_reason": match.group(6)[:300],
+        }
+
+    @staticmethod
+    def _relevance_summary(item: dict[str, Any], *, prefix: bool = True) -> str:
+        quality = item.get("relevance")
+        if not isinstance(quality, dict):
+            return "未提供来源相关性评分"
+        try:
+            score = f"{float(quality['score_min']):.2f}-{float(quality['score_max']):.2f}"
+            rejected = int(quality.get("rejected", 0))
+        except (KeyError, TypeError, ValueError):
+            return "来源相关性元数据不完整"
+        text = f"相关性评分 {score}；已筛除 {rejected} 条低相关候选"
+        return f"（{text}）" if prefix else text
+
+    @staticmethod
     def _renumber_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen: set[tuple[str, str]] = set()
         normalized: list[dict[str, Any]] = []
@@ -623,6 +663,27 @@ class ResearchOrchestrator:
             card["id"] = f"E{len(normalized) + 1}"
             normalized.append(card)
         return normalized[:10]
+
+    @staticmethod
+    def _evidence_quality_metrics(evidence: list[dict[str, Any]]) -> dict[str, int | float | None]:
+        """Return payload-free public-evidence quality metrics for traces and evals."""
+        public_cards = [item for item in evidence if item.get("source_type") == "search_papers"]
+        scored_cards = [item for item in public_cards if isinstance(item.get("relevance"), dict)]
+        minimum_scores = []
+        rejected_total = 0
+        for item in scored_cards:
+            quality = item["relevance"]
+            try:
+                minimum_scores.append(float(quality["score_min"]))
+                rejected_total += int(quality.get("rejected", 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return {
+            "public_evidence_cards": len(public_cards),
+            "scored_public_evidence_cards": len(scored_cards),
+            "minimum_public_relevance": min(minimum_scores) if minimum_scores else None,
+            "rejected_public_candidates": rejected_total,
+        }
 
     @staticmethod
     def _planner_input(query: str, context: str | None) -> str:
@@ -640,7 +701,10 @@ class ResearchOrchestrator:
             "网络", "调度", "流量", "负载",
             "network", "scheduling", "traffic", "flow",
         )
-        return "tsn" in normalized and any(marker in normalized for marker in network_markers)
+        tsn_markers = ("tsn", "time-sensitive networking", "time sensitive networking")
+        return any(marker in normalized for marker in tsn_markers) and any(
+            marker in normalized for marker in network_markers
+        )
 
     @classmethod
     def _worker_tool_argument_normalizer(
@@ -735,7 +799,9 @@ class ResearchOrchestrator:
     def _evidence_context(evidence: list[dict[str, Any]]) -> str:
         return "\n\n".join(
             f"[{item['id']}] source={item['source']} ({item['source_type']})\n"
-            f"excerpt={item['excerpt'][:700]}\nuncertainty={item['uncertainty']}"
+            f"excerpt={item['excerpt'][:700]}\n"
+            f"relevance={ResearchOrchestrator._relevance_summary(item, prefix=False)}\n"
+            f"uncertainty={item['uncertainty']}"
             for item in evidence
         )
 
@@ -767,6 +833,7 @@ class ResearchOrchestrator:
     ) -> str:
         index = "\n".join(
             f"- [{item['id']}] {item['source']}（{item['researcher']} / {item['source_type']}）"
+            f"{ResearchOrchestrator._relevance_summary(item)}"
             for item in evidence
         )
         issues = "；".join(critique.get("issues") or []) or "未发现需要修订的问题。"

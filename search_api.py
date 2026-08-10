@@ -7,14 +7,136 @@ Daily discovery has its own bounded adapters in ``daily_orchestrator.py``.
 from __future__ import annotations
 
 import os
+import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from typing import Any
 
 import requests
 
 
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
+_QUERY_STOPWORDS = {
+    "and", "for", "the", "with", "from", "under", "using", "about",
+    "paper", "research", "study", "model", "models", "condition", "conditions",
+}
+_UNRELATED_VIDEO_MARKERS = (
+    "temporal segment", "video action", "action recognition", "action detection",
+)
+
+
+def _is_network_tsn_query(query: str) -> bool:
+    normalized = query.casefold()
+    network_markers = (
+        "网络", "调度", "流量", "负载",
+        "network", "scheduling", "traffic", "flow",
+    )
+    tsn_markers = ("tsn", "time-sensitive networking", "time sensitive networking")
+    return any(marker in normalized for marker in tsn_markers) and any(
+        marker in normalized for marker in network_markers
+    )
+
+
+def _content_terms(query: str) -> set[str]:
+    return {
+        token for token in re.findall(r"[a-z0-9][a-z0-9-]{2,}", query.casefold())
+        if token not in _QUERY_STOPWORDS
+    }
+
+
+def _openalex_search_query(query: str) -> str:
+    """Use an exact TSN phrase before applying provider-side relevance ranking."""
+    if not _is_network_tsn_query(query):
+        return query
+    return '"Time-Sensitive Networking" AND (scheduling OR traffic OR bursty OR flow OR latency)'
+
+
+def _score_public_relevance(query: str, title: str, abstract: str) -> tuple[float, str]:
+    """Score a provider candidate without relying on another model call."""
+    text = f"{title}\n{abstract}".casefold()
+    if any(marker in text for marker in _UNRELATED_VIDEO_MARKERS):
+        return 0.0, "命中与网络研究无关的视频动作识别术语"
+
+    if _is_network_tsn_query(query):
+        has_tsn_domain = bool(re.search(r"time[- ]sensitive networks?|\btsn\b", text))
+        if not has_tsn_domain:
+            return 0.0, "未命中 Time-Sensitive Networking 或 TSN"
+
+        score = 0.55
+        reasons = ["命中 Time-Sensitive Networking/TSN"]
+        if any(marker in text for marker in ("schedul", "gate control", "time-aware")):
+            score += 0.20
+            reasons.append("命中调度条件")
+        if any(marker in text for marker in ("traffic", "flow", "burst", "arrival", "load")):
+            score += 0.20
+            reasons.append("命中流量或负载条件")
+        if "difftsn" in text:
+            score += 0.25
+            reasons.append("命中 DiffTSN")
+        score = min(round(score, 2), 1.0)
+        if score < 0.75:
+            return score, "仅命中 TSN 领域，未命中调度、流量或 DiffTSN 条件"
+        return score, "；".join(reasons)
+
+    terms = _content_terms(query)
+    if not terms:
+        return 0.5, "查询缺少可判定的英文术语，保留来源排序"
+    matched = sum(term in text for term in terms)
+    if not matched:
+        return 0.0, "标题和摘要均未命中查询术语"
+    score = round(matched / len(terms), 2)
+    return score, f"命中 {matched}/{len(terms)} 个查询术语"
+
+
+def _filter_public_papers(
+    query: str,
+    papers: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reject low-confidence provider hits before they enter research evidence."""
+    accepted: list[dict[str, Any]] = []
+    rejected_reasons: dict[str, int] = {}
+    strict_tsn = _is_network_tsn_query(query)
+    for paper in papers:
+        score, reason = _score_public_relevance(
+            query,
+            str(paper.get("title") or ""),
+            str(paper.get("abstract") or ""),
+        )
+        # For explicitly networking TSN questions, require the domain phrase
+        # plus a material scheduling/traffic/DiffTSN condition. For other
+        # questions, discard only zero-overlap candidates; semantic expansion
+        # remains the provider's responsibility.
+        keep = score >= 0.75 if strict_tsn else score > 0
+        if keep:
+            accepted.append({**paper, "relevance_score": score, "relevance_reason": reason})
+        else:
+            rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+
+    scores = [float(item["relevance_score"]) for item in accepted]
+    return accepted, {
+        "total": len(papers),
+        "accepted": len(accepted),
+        "rejected": len(papers) - len(accepted),
+        "score_min": min(scores) if scores else None,
+        "score_max": max(scores) if scores else None,
+        "rejection_reason": "；".join(
+            f"{reason}×{count}" for reason, count in sorted(rejected_reasons.items())
+        ) or "无",
+    }
+
+
+def _quality_line(quality: dict[str, Any]) -> str:
+    if not quality["accepted"]:
+        return (
+            "📭 未找到通过相关性校验的论文。"
+            f"已拒绝 {quality['rejected']}/{quality['total']} 条（{quality['rejection_reason']}）。"
+        )
+    return (
+        f"📊 检索质量：保留 {quality['accepted']}/{quality['total']} 条 | "
+        f"相关性评分: {quality['score_min']:.2f}-{quality['score_max']:.2f} | "
+        f"已拒绝 {quality['rejected']} 条（{quality['rejection_reason']}）"
+    )
 
 
 def search_arxiv(query: str, max_results: int = 5) -> str:
@@ -36,8 +158,8 @@ def search_arxiv(query: str, max_results: int = 5) -> str:
     if not entries:
         return "📭 arXiv 未找到相关论文。"
 
-    lines = [f"📚 **arXiv 搜索结果** — 查询: 「{query}」\n"]
-    for index, entry in enumerate(entries, 1):
+    papers = []
+    for entry in entries:
         title = _xml_text(entry, "atom:title") or "N/A"
         abstract = _xml_text(entry, "atom:summary")
         authors = [
@@ -47,12 +169,30 @@ def search_arxiv(query: str, max_results: int = 5) -> str:
         ]
         link = _xml_text(entry, "atom:id")
         published = _xml_text(entry, "atom:published")[:10]
-        short_abstract = abstract[:250] + "..." if len(abstract) > 250 else abstract
+        papers.append({
+            "title": title,
+            "abstract": abstract,
+            "authors": authors,
+            "link": link,
+            "published": published,
+        })
+
+    accepted, quality = _filter_public_papers(query, papers)
+    if not accepted:
+        return _quality_line(quality)
+
+    lines = [
+        f"📚 **arXiv 搜索结果** — 查询: 「{query}」",
+        _quality_line(quality),
+    ]
+    for index, paper in enumerate(accepted, 1):
+        short_abstract = paper["abstract"][:250] + "..." if len(paper["abstract"]) > 250 else paper["abstract"]
         lines.extend([
-            f"\n  {index}. **{title}**",
-            f"     作者: {', '.join(authors[:5])}{' et al.' if len(authors) > 5 else ''}",
-            f"     日期: {published}  |  arXiv: {link.rsplit('/', 1)[-1] if link else ''}",
-            f"     链接: {link}",
+            f"\n  {index}. **{paper['title']}**",
+            f"     作者: {', '.join(paper['authors'][:5])}{' et al.' if len(paper['authors']) > 5 else ''}",
+            f"     日期: {paper['published']}  |  arXiv: {paper['link'].rsplit('/', 1)[-1] if paper['link'] else ''}",
+            f"     相关性: {paper['relevance_score']:.2f} | 依据: {paper['relevance_reason']}",
+            f"     链接: {paper['link']}",
             f"     摘要: {short_abstract}",
         ])
     return "\n".join(lines)
@@ -65,8 +205,9 @@ def search_openalex(
     api_key: str | None = None,
 ) -> str:
     """Search OpenAlex; read the raw key from ``OPENALEX_API_KEY`` by default."""
+    provider_query = _openalex_search_query(query)
     params = {
-        "search": query,
+        "search": provider_query,
         "per-page": min(limit, 10),
         "sort": "relevance_score:desc",
         "select": (
@@ -87,8 +228,8 @@ def search_openalex(
     if not papers:
         return "📭 OpenAlex 未找到相关论文。"
 
-    lines = [f"📚 **OpenAlex 搜索结果** — 查询: 「{query}」\n"]
-    for index, paper in enumerate(papers, 1):
+    normalized_papers = []
+    for paper in papers:
         location = paper.get("primary_location") or {}
         authors = [
             item.get("author", {}).get("display_name", "")
@@ -96,14 +237,35 @@ def search_openalex(
             if item.get("author", {}).get("display_name")
         ]
         abstract = _openalex_abstract(paper.get("abstract_inverted_index")) or "无摘要"
-        short_abstract = abstract[:200] + "..." if len(abstract) > 200 else abstract
         venue = (location.get("source") or {}).get("display_name", "") or "N/A"
         link = location.get("landing_page_url") or paper.get("doi") or paper.get("id", "")
+        normalized_papers.append({
+            "title": paper.get("title") or "N/A",
+            "abstract": abstract,
+            "authors": authors,
+            "year": paper.get("publication_year") or "N/A",
+            "cited_by_count": paper.get("cited_by_count") or 0,
+            "venue": venue,
+            "link": link,
+        })
+
+    accepted, quality = _filter_public_papers(query, normalized_papers)
+    if not accepted:
+        return _quality_line(quality)
+
+    lines = [
+        f"📚 **OpenAlex 搜索结果** — 查询: 「{query}」",
+        f"🔎 OpenAlex 检索式: 「{provider_query}」",
+        _quality_line(quality),
+    ]
+    for index, paper in enumerate(accepted, 1):
+        short_abstract = paper["abstract"][:200] + "..." if len(paper["abstract"]) > 200 else paper["abstract"]
         lines.extend([
-            f"\n  {index}. **{paper.get('title') or 'N/A'}**",
-            f"     作者: {', '.join(authors)}",
-            f"     年份: {paper.get('publication_year') or 'N/A'}  |  引用: {paper.get('cited_by_count') or 0}  |  期刊: {venue}",
-            f"     链接: {link}",
+            f"\n  {index}. **{paper['title']}**",
+            f"     作者: {', '.join(paper['authors'])}",
+            f"     年份: {paper['year']}  |  引用: {paper['cited_by_count']}  |  期刊: {paper['venue']}",
+            f"     相关性: {paper['relevance_score']:.2f} | 依据: {paper['relevance_reason']}",
+            f"     链接: {paper['link']}",
             f"     摘要: {short_abstract}",
         ])
     return "\n".join(lines)

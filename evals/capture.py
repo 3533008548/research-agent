@@ -25,11 +25,23 @@ def result_from_trace(
         "max_tool_duration_ms": max(durations) if durations else 0,
         "model_calls": (trace.get("usage_delta") or {}).get("calls"),
     }
+    safe_state = dict(state or {})
+    quality = trace.get("evidence_quality") or {}
+    if isinstance(quality, dict) and quality.get("public_evidence_cards"):
+        minimum = quality.get("minimum_public_relevance")
+        safe_state.setdefault(
+            "public_evidence_relevance",
+            isinstance(minimum, (int, float)) and minimum >= 0.75,
+        )
+        safe_state.setdefault(
+            "public_evidence_rejection_metadata",
+            quality.get("scored_public_evidence_cards") == quality.get("public_evidence_cards"),
+        )
     return {
         "task_id": task_id,
         "answer": answer,
         "tool_trace": tool_trace,
-        "state": state or {},
+        "state": safe_state,
         "source_stats": source_stats or {},
         "metrics": {key: value for key, value in metrics.items() if value is not None},
     }
