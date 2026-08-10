@@ -385,6 +385,17 @@ class SessionStore:
         return [self._chat_row(row) for row in rows]
 
     @_synchronized
+    def run_status_counts(self) -> dict[str, dict[str, int]]:
+        """Return global, payload-free operational counts for API metrics."""
+        counts: dict[str, dict[str, int]] = {"chat": {}, "research": {}}
+        for kind, table in (("chat", "chat_runs"), ("research", "research_runs")):
+            rows = self._conn.execute(
+                f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
+            ).fetchall()
+            counts[kind] = {str(row["status"]): int(row["count"]) for row in rows}
+        return counts
+
+    @_synchronized
     def update_chat_run(
         self,
         run_id: str,

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from api.auth import require_api_key
+from api.observability import render_prometheus_metrics
 from api.redis_runs import QueueUnavailableError
 from api.schemas import (
     CancelRunResponse,
@@ -116,6 +117,15 @@ def _run_payload(request: Request, run: dict, events: list[dict] | None = None) 
 @router.get("/health")
 def health(request: Request) -> dict[str, str]:
     return {"status": "ok", "model": str(request.app.state.agent.model)}
+
+
+@router.get("/metrics", include_in_schema=False, dependencies=[Depends(require_api_key)])
+def prometheus_metrics(request: Request) -> PlainTextResponse:
+    """Expose aggregate operational metrics without any user or model payload."""
+    return PlainTextResponse(
+        render_prometheus_metrics(request.app),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @router.get("/sessions", response_model=list[SessionResponse], dependencies=[Depends(require_api_key)])

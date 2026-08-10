@@ -251,6 +251,60 @@ class TestFastAPIService(unittest.TestCase):
             200,
         )
 
+    def test_metrics_are_authenticated_and_expose_only_aggregate_state(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        client = TestClient(create_app(
+            agent=self.agent, api_key="metrics-secret", require_api_key=True,
+        ))
+        session_id = client.post(
+            "/api/v1/sessions", headers={"X-API-Key": "metrics-secret"},
+            json={"title": "Metrics"},
+        ).json()["thread_id"]
+        client.post(
+            "/api/v1/runs", headers={"X-API-Key": "metrics-secret"},
+            json={"kind": "chat", "session_id": session_id, "message": "private prompt"},
+        )
+
+        self.assertEqual(client.get("/api/v1/metrics").status_code, 401)
+        response = client.get("/api/v1/metrics", headers={"X-API-Key": "metrics-secret"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/plain"))
+        self.assertIn("research_agent_api_up 1", response.text)
+        self.assertIn('research_agent_run_records{kind="chat",status="completed"} 1', response.text)
+        self.assertIn('research_agent_queue_configured{kind="chat"} 0', response.text)
+        self.assertNotIn("private prompt", response.text)
+
+    def test_redis_broker_reports_queue_depth_and_worker_heartbeat(self):
+        from fnmatch import fnmatch
+        from api.redis_runs import RedisChatRunBroker
+
+        class _MetricsRedis:
+            def __init__(self, test_case):
+                self.test_case = test_case
+                self.stream_lengths = {}
+                self.keys = set()
+
+            def xlen(self, key):
+                return self.stream_lengths.get(key, 0)
+
+            def set(self, key, _value, ex):
+                self.test_case.assertGreaterEqual(ex, 5)
+                self.keys.add(key)
+
+            def scan_iter(self, *, match, count):
+                self.test_case.assertEqual(count, 100)
+                return iter(key for key in self.keys if fnmatch(key, match))
+
+        client = _MetricsRedis(self)
+        broker = RedisChatRunBroker("redis://unused", client=client)
+        client.stream_lengths[broker.queue_key] = 3
+        broker.heartbeat("metrics-worker", ttl_seconds=5)
+
+        self.assertEqual(broker.queue_depth(), 3)
+        self.assertEqual(broker.live_worker_count(), 1)
+
     def test_durable_worker_executes_and_cancels_queued_chat_runs(self):
         from api.redis_runs import RedisChatRunManager, RedisChatRunWorker
 

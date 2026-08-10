@@ -20,6 +20,8 @@ API 请求 -> SQLite 运行记录（queued）-> Redis 优先级队列 -> api-wor
   `GET /api/v1/runs/{run_id}` 仍可查看任务结果。
 - 取消操作会写入 Redis 取消标记；worker 监测到标记后，将现有的协作式取消令牌传给 Agent。
 - Redis Consumer Group 会保留 worker 异常退出时未确认的任务；其他 worker 会在两分钟后认领。
+- `GET /api/v1/metrics` 输出 Prometheus 文本指标：Redis 队列积压、worker 心跳、
+  各类运行任务的状态计数和 API 进程运行时长。它不输出用户输入、模型回答、论文信息或工具参数。
 
 当前 Compose 配置故意只运行一个 `api-worker`，因为 SQLite 仍是主要用户数据存储。
 FastAPI API 实例可以横向扩展：它们只向共享 Redis 队列投递任务。单个 worker 进程中，
@@ -57,6 +59,7 @@ Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TL
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/api/v1/health` | 无需鉴权的健康检查 |
+| `GET` | `/api/v1/metrics` | Prometheus 聚合运行指标，需鉴权 |
 | `GET`、`POST` | `/api/v1/sessions` | 列出或创建会话 |
 | `DELETE` | `/api/v1/sessions/{session_id}` | 取消会话中的活跃任务并删除会话 |
 | `GET` | `/api/v1/sessions/{session_id}/runs` | 列出该会话最近的聊天与深度研究任务 |
@@ -104,4 +107,7 @@ curl -X POST http://localhost:7860/api/v1/runs \
 # 持续读取运行事件
 curl -N -H "X-API-Key: $TOKEN" \
   http://localhost:7860/api/v1/runs/<run_id>/events
+
+# 抓取脱敏的运行指标
+curl -H "X-API-Key: $TOKEN" http://localhost:7860/api/v1/metrics
 ```

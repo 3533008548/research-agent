@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import FastAPI
 
 from api.auth import APIKeyAuthenticator
@@ -22,6 +24,7 @@ def create_app(
     """Create an ASGI app around an already configured shared agent instance."""
     app = FastAPI(title=title, version="v1")
     app.state.agent = agent
+    app.state.api_started_at = time.monotonic()
     app.state.chat_run_manager = chat_run_manager or ChatRunManager(agent)
     # ``None`` means that this deployment has not configured the durable Redis
     # worker boundary; the canonical route then returns a clear 503 for the

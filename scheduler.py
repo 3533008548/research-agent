@@ -175,6 +175,13 @@ class Scheduler:
         ).fetchall()
         return [self._run_row(row) for row in rows]
 
+    def daily_run_status_counts(self) -> dict[str, int]:
+        """Return only global status aggregates for the Prometheus endpoint."""
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) AS count FROM daily_runs GROUP BY status"
+        ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
     def get_latest_resumable_run(self, kind: str | None = None) -> dict | None:
         where = "WHERE status IN ('running', 'partial_failed', 'failed', 'cancelled')"
         values: list[str] = []

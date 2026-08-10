@@ -223,6 +223,32 @@ class RedisChatRunBroker:
             # change the worker's final result.
             return
 
+    def _worker_heartbeat_key(self, consumer: str) -> str:
+        return f"{self.queue_key}:worker:{consumer}"
+
+    def heartbeat(self, consumer: str, *, ttl_seconds: int = 15) -> None:
+        """Advertise a worker without retaining requests or worker internals."""
+        try:
+            self._redis.set(
+                self._worker_heartbeat_key(consumer), "1", ex=max(5, int(ttl_seconds)),
+            )
+        except Exception as exc:
+            raise QueueUnavailableError("could not record worker heartbeat") from exc
+
+    def queue_depth(self) -> int:
+        """Return unacknowledged stream entries; request payloads stay unread."""
+        try:
+            return int(self._redis.xlen(self.queue_key))
+        except Exception as exc:
+            raise QueueUnavailableError("could not read queue depth") from exc
+
+    def live_worker_count(self) -> int:
+        """Count only short-lived heartbeat keys for this run-kind queue."""
+        try:
+            return sum(1 for _ in self._redis.scan_iter(match=f"{self.queue_key}:worker:*", count=100))
+        except Exception as exc:
+            raise QueueUnavailableError("could not read worker heartbeats") from exc
+
 
 @dataclass(frozen=True)
 class QueuedResearchRun:
@@ -406,6 +432,7 @@ class RedisChatRunWorker:
 
     def run_forever(self) -> None:
         while True:
+            self.broker.heartbeat(self.consumer)
             self.run_once(block_ms=5_000)
 
     def _process(self, job: QueuedChatRun) -> None:
@@ -621,6 +648,7 @@ class RedisResearchRunWorker:
 
     def run_forever(self) -> None:
         while True:
+            self.broker.heartbeat(self.consumer)
             self.run_once(block_ms=5_000)
 
     def _process(self, job: QueuedResearchRun) -> None:
@@ -771,6 +799,7 @@ class RedisDailyRunWorker:
 
     def run_forever(self) -> None:
         while True:
+            self.broker.heartbeat(self.consumer)
             self.run_once(block_ms=5_000)
 
     def _process(self, job: QueuedDailyRun) -> None:
