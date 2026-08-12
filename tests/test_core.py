@@ -28,6 +28,29 @@ from unittest.mock import patch, MagicMock
 
 
 RUN_CHROMA_INTEGRATION = os.getenv("SKIP_CHROMA_INTEGRATION") != "1"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _pdf_test_sample() -> Path | None:
+    """Find an opt-in real PDF without making CI depend on user data."""
+    configured = os.getenv("PDF_TEST_SAMPLE")
+    if configured:
+        candidate = Path(configured).expanduser()
+        return candidate if candidate.is_file() and candidate.suffix.lower() == ".pdf" else None
+
+    # Local developers normally keep papers in the project runtime directory.
+    # CI sets APP_DATA_DIR to a new temporary directory, so it still skips when
+    # no fixture has been explicitly provided.
+    candidates = [
+        PROJECT_ROOT / "runtime" / "primary" / "papers",
+        Path(os.environ["APP_DATA_DIR"]) / "primary" / "papers",
+    ] if os.getenv("APP_DATA_DIR") else [PROJECT_ROOT / "runtime" / "primary" / "papers"]
+    for directory in candidates:
+        if directory.is_dir():
+            sample = next(directory.glob("*.pdf"), None)
+            if sample:
+                return sample
+    return None
 
 
 class TestFastAPIService(unittest.TestCase):
@@ -424,13 +447,13 @@ class TestReadPDFFlow(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_extract_text_from_pdf(self):
-        """pdfplumber 能否从真实 PDF 提取文本"""
+        """pdfplumber 能否从显式样本或本地运行时论文提取文本。"""
         from pdf_reader import PaperReader
-        pdfs = list(Path(os.environ.get("APP_DATA_DIR", "runtime")).joinpath("primary", "papers").glob("*.pdf"))
-        if not pdfs:
-            self.skipTest("运行时论文目录中没有 PDF 文件")
+        sample = _pdf_test_sample()
+        if sample is None:
+            self.skipTest("未设置 PDF_TEST_SAMPLE，且本地运行时论文目录没有 PDF 文件")
         reader = PaperReader(max_pages=2, max_chars=2000)
-        result = reader.read(str(pdfs[0]))
+        result = reader.read(str(sample))
         self.assertIn("📄", result)
         self.assertGreater(len(result), 100, "提取文本不应为空")
 

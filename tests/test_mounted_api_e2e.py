@@ -26,6 +26,8 @@ import unittest
 from pathlib import Path
 from urllib.request import urlopen
 
+from tests.browser import launch_chromium
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -56,7 +58,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         )
         self._wait_until_ready("/api/v1/health")
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=True)
+        self.browser = launch_chromium(self.playwright)
         self.page = self.browser.new_page()
         self.page.goto(f"{self.base_url}/", wait_until="domcontentloaded")
         self.expected_redis = bool(os.getenv("E2E_REDIS_URL", "").strip())

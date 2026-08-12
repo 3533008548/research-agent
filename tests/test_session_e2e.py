@@ -23,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import urlopen
 
+from tests.browser import launch_chromium
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -91,7 +93,7 @@ class TestSessionIsolationE2E(unittest.TestCase):
         )
         self._wait_until_ready()
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=True)
+        self.browser = launch_chromium(self.playwright)
         self.page = self.browser.new_page()
         self.page.goto(f"http://127.0.0.1:{self.ui_port}/", wait_until="domcontentloaded")
 
