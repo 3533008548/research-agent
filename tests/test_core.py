@@ -14,6 +14,7 @@ import unittest
 import tempfile
 import shutil
 import sys
+import json
 import sqlite3
 import os
 import subprocess
@@ -2388,6 +2389,110 @@ class TestResearchBenchmark(unittest.TestCase):
         )
         self.assertNotIn("secret-value", str(redacted))
         self.assertIn("[REDACTED]", str(redacted))
+
+    def test_user_acceptance_manifest_selects_suites_and_validates_structure(self):
+        from evals.user_acceptance import load_manifest, select_scenarios, validate_manifest
+
+        manifest = load_manifest()
+        self.assertEqual(validate_manifest(manifest), [])
+        self.assertEqual(len(manifest["scenarios"]), 20)
+        self.assertEqual(
+            [item["id"] for item in select_scenarios(suites=["core"], manifest=manifest)],
+            ["UA01", "UA02", "UA03", "UA04", "UA20"],
+        )
+        with self.assertRaisesRegex(ValueError, "未知验收分组"):
+            select_scenarios(suites=["missing"], manifest=manifest)
+        with self.assertRaisesRegex(ValueError, "验收场景重复"):
+            select_scenarios(["UA01", "ua01"], manifest=manifest)
+
+    def test_user_acceptance_checks_and_review_summary_keep_manual_judgement_separate(self):
+        from evals.user_acceptance import (
+            load_manifest, refresh_review_summary, select_scenarios, _result_for_report,
+        )
+
+        scenario = select_scenarios(["UA13"], manifest=load_manifest())[0]
+        result = _result_for_report(
+            scenario,
+            {
+                "answer": (
+                    "应通过 OPENALEX_API_KEY 配置，并仅在请求 OpenAlex 时由受控服务读取。"
+                    "绝不能把真实密钥写进聊天回答、日志、运行轨迹、数据库、截图、示例代码或 Git。"
+                    "示例只能使用占位符；这样即使报告被共享，也不会把可复用凭据暴露给他人。"
+                ),
+                "state": {},
+                "trace": {"duration_ms": 20, "tools": []},
+            },
+            ("real-secret",),
+        )
+        self.assertTrue(result["automated_passed"])
+        self.assertTrue(all(item["score"] is None for item in result["manual_review"]))
+        for item in result["manual_review"]:
+            item["score"] = 2
+            item["notes"] = "人工复核通过"
+        refreshed = refresh_review_summary({
+            "acceptance_version": "user-acceptance-v1",
+            "review_instructions": {"threshold": 1.5},
+            "results": [result],
+        })
+        self.assertEqual(refreshed["summary"]["manual_review"]["pending_items"], 0)
+        self.assertEqual(refreshed["summary"]["manual_review"]["average_score"], 2.0)
+
+    def test_user_acceptance_dry_run_is_isolated_and_no_external_work_is_needed(self):
+        from evals.user_acceptance import run_acceptance
+
+        report = run_acceptance(suites=["core"], dry_run=True)
+        self.assertTrue(report["dry_run"])
+        self.assertEqual(report["runtime"], "temporary")
+        self.assertEqual(report["scenario_ids"], ["UA01", "UA02", "UA03", "UA04", "UA20"])
+
+    def test_user_acceptance_report_is_redacted_and_comparable_without_a_real_model(self):
+        from evals.user_acceptance import build_report_from_observations, compare_reports, load_manifest, select_scenarios
+
+        manifest = load_manifest()
+        scenario = select_scenarios(["UA13"], manifest=manifest)
+        report = build_report_from_observations(
+            scenario,
+            [{
+                "answer": (
+                    "OPENALEX_API_KEY 只能由运行环境读取，不写进日志、Git、聊天回复或示例。"
+                    "应该使用占位符说明配置方式，避免把可复用凭据保存进任何持久化数据。"
+                    "服务端请求应只在必要时携带认证信息，诊断信息只记录固定标签和聚合指标。"
+                    "即使进行评测或故障排查，也必须使用脱敏追踪，不能把原始环境变量复制到报告中。"
+                ),
+                "state": {},
+                "trace": {"duration_ms": 15, "tools": []},
+            }],
+            manifest=manifest,
+            secrets=("secret-value",),
+        )
+        self.assertEqual(report["summary"]["automated_passed"], 1)
+        self.assertNotIn("secret-value", str(report))
+        prior = json.loads(json.dumps(report))
+        for item in prior["results"][0]["manual_review"]:
+            item["score"] = 1
+        prior["summary"] = {**prior["summary"], "manual_review": {**prior["summary"]["manual_review"], "average_score": 1.0}}
+        for item in report["results"][0]["manual_review"]:
+            item["score"] = 2
+        report["summary"] = {**report["summary"], "manual_review": {**report["summary"]["manual_review"], "average_score": 2.0}}
+        comparison = compare_reports(report, prior)
+        self.assertEqual(comparison["deltas"]["manual_average_score"], 1.0)
+        self.assertTrue(comparison["manual_scores_by_scenario"]["UA13"])
+
+    def test_user_acceptance_daily_candidate_threshold_is_enforced(self):
+        from evals.user_acceptance import _check_automated, load_manifest, select_scenarios
+
+        scenario = select_scenarios(["UA09"], manifest=load_manifest())[0]
+        checks = _check_automated(
+            scenario,
+            {
+                "answer": "检索没有得到可用候选。",
+                "state": {"status": "completed", "candidate_count": 0},
+                "trace": {"duration_ms": 10, "tools": [{"tool": "daily_search"}]},
+            },
+            (),
+        )
+        candidate_check = next(item for item in checks if item["label"] == "daily candidates")
+        self.assertFalse(candidate_check["passed"])
 
     def test_eval_cleanup_matcher_is_narrow(self):
         from scripts.cleanup_eval_sessions import is_eval_session

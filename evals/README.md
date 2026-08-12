@@ -115,6 +115,60 @@ python -m evals.benchmark --results results.json --compare evals/reports/benchma
 
 输出中的 `manual_rubric` 仍需人工按 0–2 分评估事实正确性、引用充分性和表达质量；这样不会把关键词命中误当成高质量回答。面试展示时，应保留每次运行的 JSON 报告，并说明通过数、失败任务和修复动作。
 
+## 真实用户验收集（推荐作为下一阶段基线）
+
+能力基准验证预先定义的系统能力；真实用户验收集则以接近实际使用的研究旅程检查：
+研究问题收敛、公开文献研究、趋势梳理、鲁棒性实验设计、研究计划、多轮上下文、会话隔离、笔记、每日发现、证据约束问答、密钥边界、韧性、RAG 降级、取消语义、会话删除和复现产物整理。
+
+场景定义在 `user_acceptance_tasks.json`，当前共 20 个，分为：
+
+- `core`：首次可感知的科研问答与研究结论质量；
+- `research`：深度研究、证据、实验设计与多轮上下文；
+- `workflow`：笔记、每日发现、会话和研究产物；
+- `safety`：密钥、超时、RAG 降级和取消边界。
+
+它会调用真实模型与公开来源，因此**不进入 CI，也不能替代离线发布门禁**。每次执行都使用临时隔离运行时、默认关闭 RAG；报告仅保留回答、脱敏轨迹、状态摘要和人工评分模板，不保存原始 prompt、运行数据库、候选论文或密钥。
+
+先用核心场景建立第一份基线：
+
+```powershell
+python scripts/run_user_acceptance.py --suite core
+```
+
+先核对场景选择和隔离策略、不会调用模型或外部来源：
+
+```powershell
+python scripts/run_user_acceptance.py --suite core --dry-run
+```
+
+深度研究场景使用公开来源；每日发现场景会访问公开论文源，建议拆分运行并记录外部失败：
+
+```powershell
+python scripts/run_user_acceptance.py --scenario UA02 --scenario UA11 --research-scope public
+python scripts/run_user_acceptance.py --suite workflow
+```
+
+运行结束后，在输出报告的每个 `manual_review` 条目中填写 `score`（只能为 `0`、`1`、`2`）和简短的 `notes`：
+
+- 0：不满足，存在明显错误、遗漏、误导或不可接受风险；
+- 1：部分满足，基本可用但有可修正缺口；
+- 2：满足，准确、可追溯并符合任务边界。
+
+填写后生成带人工汇总的新报告：
+
+```powershell
+python scripts/summarize_user_acceptance.py evals/reports/user-acceptance-20260812T000000Z.json
+```
+
+与上一份相同版本、已完成评分的报告比较：
+
+```powershell
+python scripts/run_user_acceptance.py --suite core --compare evals/reports/user-acceptance-baseline.json
+python scripts/summarize_user_acceptance.py evals/reports/user-acceptance-current.json --compare evals/reports/user-acceptance-baseline-reviewed.json
+```
+
+自动检查适合发现超时、工具轨迹缺失、证据数量不足、会话边界和配置密钥泄露；人工评分才用于判断事实准确性、引用是否真正支撑结论、相关性和表达质量。优化时优先处理：关键人工项低于 1.5 分、自动检查失败，或相对基线退化的场景。
+
 ## 清理历史误入的评测会话
 
 历史版本可能已把 `真实评测 T*` 或编码损坏的 `???? T11 ????` 写入主会话列表。清理脚本
