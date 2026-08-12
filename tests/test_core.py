@@ -2364,6 +2364,78 @@ class TestResearchBenchmark(unittest.TestCase):
         self.assertNotIn("tool_trace_contains", expectations["T04"])
         self.assertNotIn("tool_trace_contains", expectations["T10"])
 
+    def test_real_eval_selection_and_runtime_protection(self):
+        from evals.real_eval import PROJECT_ROOT, resolve_runtime, select_tasks
+
+        self.assertEqual([task["id"] for task in select_tasks(["t04", "T13"])], ["T04", "T13"])
+        with self.assertRaisesRegex(ValueError, "任务重复"):
+            select_tasks(["T04", "t04"])
+        with self.assertRaisesRegex(ValueError, "主 runtime"):
+            resolve_runtime(str(PROJECT_ROOT / "runtime"), keep_runtime=True, allow_production_runtime=False)
+        with self.assertRaisesRegex(ValueError, "必须同时传入 --keep-runtime"):
+            resolve_runtime("temporary-eval-root", keep_runtime=False, allow_production_runtime=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            root, owns_runtime = resolve_runtime(tmp, keep_runtime=True, allow_production_runtime=False)
+            self.assertEqual(root, Path(tmp).resolve())
+            self.assertFalse(owns_runtime)
+
+    def test_real_eval_redacts_known_secrets(self):
+        from evals.real_eval import redact_known_secrets
+
+        redacted = redact_known_secrets(
+            {"answer": "key=secret-value", "nested": ["secret-value"]},
+            ("secret-value",),
+        )
+        self.assertNotIn("secret-value", str(redacted))
+        self.assertIn("[REDACTED]", str(redacted))
+
+    def test_eval_cleanup_matcher_is_narrow(self):
+        from scripts.cleanup_eval_sessions import is_eval_session
+
+        self.assertTrue(is_eval_session({"title": "真实评测 T13"}))
+        self.assertTrue(is_eval_session({"title": "???? T11 ????"}))
+        self.assertFalse(is_eval_session({"title": "普通 T11 讨论"}))
+
+    def test_eval_cleanup_script_previews_then_deletes_session_data(self):
+        from runtime_paths import RuntimePaths
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root / "runtime")
+            paths.ensure_initialized()
+            store = SessionStore(str(paths.checkpoint_db))
+            eval_session = store.create("真实评测 T13")
+            regular_session = store.create("正常研究")
+            store.create_chat_run(eval_session["thread_id"], "test-model")
+            store.create_chat_run(regular_session["thread_id"], "test-model")
+            store.close()
+
+            base_cmd = [
+                sys.executable, "scripts/cleanup_eval_sessions.py",
+                "--data-dir", str(paths.root), "--backup-dir", str(root / "backups"),
+            ]
+            preview = subprocess.run(
+                base_cmd, check=True, capture_output=True, text=True,
+                encoding="utf-8", cwd=Path(__file__).parent.parent,
+            )
+            self.assertIn(eval_session["thread_id"], preview.stdout)
+            preview_store = SessionStore(str(paths.checkpoint_db))
+            try:
+                self.assertTrue(preview_store.get(eval_session["thread_id"]))
+            finally:
+                preview_store.close()
+
+            subprocess.run(base_cmd + ["--apply"], check=True, cwd=Path(__file__).parent.parent)
+            verified = SessionStore(str(paths.checkpoint_db))
+            try:
+                self.assertIsNone(verified.get(eval_session["thread_id"]))
+                self.assertIsNotNone(verified.get(regular_session["thread_id"]))
+                self.assertEqual(verified.list_chat_runs(eval_session["thread_id"]), [])
+            finally:
+                verified.close()
+            self.assertEqual(len(list((root / "backups").glob("checkpoint-before-eval-cleanup-*.db"))), 1)
+
     def test_scorer_checks_answer_and_tool_trace(self):
         from evals.benchmark import load_manifest, score_task
 

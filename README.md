@@ -177,7 +177,7 @@ FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文
 监控 Redis 队列积压、各类 worker 心跳和运行状态计数。指标只包含固定标签与聚合数字，
 不包含用户输入、模型回答、论文信息或工具参数。
 
-另提供 15 项版本化科研 Agent 能力任务和 5 项离线可靠性回放，使用合成语料和模拟状态，不读取个人运行数据、不调用真实模型 API。`python -m evals.release_gate --strict` 会输出统一的发布质量门禁；任务、预期证据、工具轨迹、性能门槛和人工评分量表位于 [evals/README.md](evals/README.md)。真实运行可通过 `ResearchAgent.get_last_trace()` 自动采集脱敏链路数据，并保存带时间戳的评测报告，用于每次重构后的可复现对比与面试展示。
+另提供 15 项版本化科研 Agent 能力任务和 5 项离线可靠性回放，使用合成语料和模拟状态，不读取个人运行数据、不调用真实模型 API。`python -m evals.release_gate --strict` 会输出统一的发布质量门禁；任务、预期证据、工具轨迹、性能门槛和人工评分量表位于 [evals/README.md](evals/README.md)。小样本真实模型评测必须通过 `python scripts/run_real_eval.py --task T04 ...` 执行：它使用临时隔离运行时并仅保存脱敏报告，避免评测会话出现在网页列表。
 
 ---
 

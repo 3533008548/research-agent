@@ -54,14 +54,40 @@ python -m evals.benchmark --results evals/example_results.json
 
 T04（鲁棒性评估设计）与 T10（RAG 初始化降级）是工程/方法解释题：若用户没有要求论文、引用或具体实验数据，Agent 可以直接说明项目约束，不必为制造引用调用工具。工具轨迹在这两题是可选证据；其他明确要求取证的任务仍保留强制工具断言。
 
-真实执行一项任务时，可直接转换为评分输入：
+## 小样本真实模型评测（隔离运行时）
 
-```python
-from evals.capture import result_from_trace
+不要在 Python 交互环境中直接对主 Agent 调用 `create_session()` 再执行评测任务。那会把
+`真实评测 T*` 会话、checkpoint 和运行记录写入网页正在使用的 `runtime/`，造成会话列表污染。
 
-answer = agent.step(task["prompt"], session_id=session_id)
-result = result_from_trace(task["id"], answer, agent.get_last_trace(session_id))
+必须使用统一入口；它默认创建系统临时运行时、默认关闭 RAG，并在结束后删除运行数据库。
+只有脱敏后的报告会保存到被 Git 忽略的 `evals/reports/`：
+
+```powershell
+python scripts/run_real_eval.py --task T04 --task T10 --task T13
 ```
+
+先只校验任务和隔离策略、不会调用模型：
+
+```powershell
+python scripts/run_real_eval.py --task T04 --task T13 --dry-run
+```
+
+T11 会实际执行深度研究；默认仅使用公开来源，避免依赖或修改个人论文库：
+
+```powershell
+python scripts/run_real_eval.py --task T11 --research-scope public
+```
+
+如需保留某次评测现场复盘，显式指定项目外的目录并保留它：
+
+```powershell
+python scripts/run_real_eval.py --task T04 --data-dir D:\temp\research-agent-eval --keep-runtime
+```
+
+脚本拒绝使用项目主 `runtime/` 或容器 `/app/runtime`。只有同时传入
+`--keep-runtime --allow-production-runtime` 才能绕过此保护；这会污染网页会话，通常不应使用。
+脚本只自动记录实际执行可观察到的状态，不会为复杂夹具任务伪造通过状态；仍需人工完成
+报告中的 `manual_rubric`。
 
 每日任务完成后可直接保留来源健康指标，而不保存候选论文详情：
 
@@ -88,6 +114,28 @@ python -m evals.benchmark --results results.json --compare evals/reports/benchma
 输出的 `comparison.deltas` 直接给出成功率、延迟、模型调用和来源失败率的变化，便于每次重构后确认收益与回归。
 
 输出中的 `manual_rubric` 仍需人工按 0–2 分评估事实正确性、引用充分性和表达质量；这样不会把关键词命中误当成高质量回答。面试展示时，应保留每次运行的 JSON 报告，并说明通过数、失败任务和修复动作。
+
+## 清理历史误入的评测会话
+
+历史版本可能已把 `真实评测 T*` 或编码损坏的 `???? T11 ????` 写入主会话列表。清理脚本
+默认只预览匹配对象和关联运行数，不会删除任何数据：
+
+```powershell
+python scripts/cleanup_eval_sessions.py
+```
+
+确认预览无误后才执行删除。脚本会先对 `checkpoint.db` 做 SQLite 在线备份，再使用项目的
+`SessionStore.delete()` 语义清理会话、运行、事件和 checkpoint，并清理对应会话摘要：
+
+```powershell
+python scripts/cleanup_eval_sessions.py --apply
+```
+
+如需额外指定某条会话，使用精确 ID；不要直接删除 SQLite 表行：
+
+```powershell
+python scripts/cleanup_eval_sessions.py --session-id session-xxxxxxxxxxxx --apply
+```
 
 ## 运行时真实回放（离线）
 
