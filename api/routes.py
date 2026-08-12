@@ -35,22 +35,50 @@ def _session_payload(session: dict) -> dict:
     }
 
 
-def _chat_payload(run: dict, events: list[dict] | None = None) -> dict:
+def _run_response(
+    run: dict,
+    *,
+    kind: str,
+    session_id: str | None,
+    model: str = "",
+    answer: str = "",
+    duration_ms: int | float | None = None,
+    metrics: dict | None = None,
+    error_type: str = "",
+    events: list[dict] | None = None,
+    completed_at: str | None = None,
+) -> dict:
+    """Build the stable public representation shared by every run kind."""
     return {
         "run_id": run["run_id"],
-        "session_id": run["thread_id"],
-        "kind": "chat",
+        "session_id": session_id,
+        "kind": kind,
         "status": run["status"],
-        "model": run.get("model", ""),
-        "answer": run.get("answer", ""),
-        "duration_ms": run.get("duration_ms"),
-        "metrics": run.get("metrics", {}),
-        "error_type": run.get("error_type", ""),
+        "model": model,
+        "answer": answer,
+        "duration_ms": duration_ms,
+        "metrics": metrics or {},
+        "error_type": error_type,
         "created_at": run["created_at"],
         "updated_at": run["updated_at"],
-        "completed_at": run.get("completed_at"),
+        "completed_at": completed_at,
         "events": events or [],
     }
+
+
+def _chat_payload(run: dict, events: list[dict] | None = None) -> dict:
+    return _run_response(
+        run,
+        kind="chat",
+        session_id=run["thread_id"],
+        model=run.get("model", ""),
+        answer=run.get("answer", ""),
+        duration_ms=run.get("duration_ms"),
+        metrics=run.get("metrics", {}),
+        error_type=run.get("error_type", ""),
+        events=events,
+        completed_at=run.get("completed_at"),
+    )
 
 
 def _research_payload(run: dict, events: list[dict] | None = None) -> dict:
@@ -62,15 +90,16 @@ def _research_payload(run: dict, events: list[dict] | None = None) -> dict:
         and isinstance(value, (int, float)) and not isinstance(value, bool)
     }
     duration = trace.get("duration_ms") if isinstance(trace, dict) else None
-    return {
-        "run_id": run["run_id"], "session_id": run["thread_id"], "kind": "research",
-        "status": run["status"], "model": "", "answer": run.get("final_answer", ""),
-        "duration_ms": duration if isinstance(duration, (int, float)) else None,
-        "metrics": safe_metrics, "error_type": str(trace.get("error_type") or "")[:120]
-        if isinstance(trace, dict) else "",
-        "created_at": run["created_at"], "updated_at": run["updated_at"],
-        "completed_at": None, "events": events or [],
-    }
+    return _run_response(
+        run,
+        kind="research",
+        session_id=run["thread_id"],
+        answer=run.get("final_answer", ""),
+        duration_ms=duration if isinstance(duration, (int, float)) else None,
+        metrics=safe_metrics,
+        error_type=str(trace.get("error_type") or "")[:120] if isinstance(trace, dict) else "",
+        events=events,
+    )
 
 
 def _daily_payload(run: dict) -> dict:
@@ -78,17 +107,16 @@ def _daily_payload(run: dict) -> dict:
     selected = result.get("selected") if isinstance(result, dict) else []
     candidates = run.get("candidates") or []
     error_text = str(run.get("error_text") or "")
-    return {
-        "run_id": run["run_id"], "session_id": None, "kind": "daily",
-        "status": run["status"], "model": "", "answer": "", "duration_ms": None,
-        "metrics": {
+    return _run_response(
+        run,
+        kind="daily",
+        session_id=None,
+        metrics={
             "candidate_count": len(candidates) if isinstance(candidates, list) else 0,
             "selected_count": len(selected) if isinstance(selected, list) else 0,
         },
-        "error_type": error_text.split(":", 1)[0][:120] if error_text else "",
-        "created_at": run["created_at"], "updated_at": run["updated_at"],
-        "completed_at": None, "events": [],
-    }
+        error_type=error_text.split(":", 1)[0][:120] if error_text else "",
+    )
 
 
 def _manager(request: Request):

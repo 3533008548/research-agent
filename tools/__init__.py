@@ -9,6 +9,34 @@ from tools.profile_tool import handle_update_profile
 from cancellation import raise_if_cancelled
 
 
+_TOOL_HANDLERS = {
+    "search_papers": handle_search_papers,
+    "read_pdf": handle_read_pdf,
+    "describe_image": handle_describe_image,
+    "query_papers": handle_query_papers,
+    "list_papers": handle_list_papers,
+    "list_indexed_papers": handle_list_indexed,
+    "delete_paper": handle_delete_paper,
+    "update_profile": handle_update_profile,
+}
+
+
+def _search_memory(args: dict, memory_store) -> str:
+    """Return a compact rendering of local memory triples."""
+    if not memory_store:
+        return "❌ 记忆模块未启用。"
+    query = str(args.get("query", "") or "").strip()
+    triples = memory_store.search_triples(query, limit=5)
+    if not triples:
+        return "📭 未找到相关记忆。"
+    lines = [f"📚 记忆搜索结果 — 「{query}」:\n"]
+    lines.extend(
+        f"  • {item['paper_title']} → {item['relation']}: {item['value']}"
+        for item in triples
+    )
+    return "\n".join(lines)
+
+
 def execute_tool(
     name: str,
     args: dict,
@@ -20,31 +48,11 @@ def execute_tool(
 ) -> str:
     """工具分发入口"""
     raise_if_cancelled(cancel_event, "工具调用已取消")
-    handlers = {
-        "search_papers": handle_search_papers,
-        "read_pdf": handle_read_pdf,
-        "describe_image": handle_describe_image,
-        "query_papers": handle_query_papers,
-        "list_papers": handle_list_papers,
-        "list_indexed_papers": handle_list_indexed,
-        "delete_paper": handle_delete_paper,
-        "update_profile": handle_update_profile,
-    }
-    # memory_search 内联
     if name == "memory_search":
-        if not memory_store:
-            return "❌ 记忆模块未启用。"
-        q = args.get("query", "")
-        triples = memory_store.search_triples(q, limit=5)
-        if not triples:
-            return "📭 未找到相关记忆。"
-        lines = [f"📚 记忆搜索结果 — 「{q}」:\n"]
-        for t in triples:
-            lines.append(f"  • {t['paper_title']} → {t['relation']}: {t['value']}")
-        result = "\n".join(lines)
+        result = _search_memory(args, memory_store)
         raise_if_cancelled(cancel_event, "工具调用已取消")
         return result
-    handler = handlers.get(name)
+    handler = _TOOL_HANDLERS.get(name)
     if handler:
         result = handler(
             args, paper_store=paper_store, glm_api_key=glm_api_key,

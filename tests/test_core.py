@@ -196,6 +196,18 @@ class TestFastAPIService(unittest.TestCase):
         detail = client.get(f"/api/v1/runs/{started.json()['run_id']}")
         self.assertEqual(detail.json()["kind"], "chat")
 
+    def test_sse_formatter_restricts_the_public_event_vocabulary(self):
+        from api.sse import format_sse
+
+        self.assertEqual(
+            format_sse({"type": "token", "text": "中文 token"}),
+            'event: token\ndata: {"type":"token","text":"中文 token"}\n\n',
+        )
+        self.assertEqual(
+            format_sse({"type": "internal", "payload": "must not leak"}),
+            'event: status\ndata: {"type":"status","status":"running"}\n\n',
+        )
+
     def test_cannot_claim_cross_process_cancellation(self):
         from fastapi.testclient import TestClient
         from api.app import create_app

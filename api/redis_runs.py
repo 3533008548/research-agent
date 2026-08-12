@@ -15,6 +15,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterator
 
+from api.sse import format_sse
+
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial_failed"}
 
@@ -379,43 +381,30 @@ class RedisChatRunManager:
         run = self.get(run_id)
         if not run:
             raise KeyError(run_id)
-        yield self._sse({"type": "status", "status": run["status"], "run_id": run_id})
+        yield format_sse({"type": "status", "status": run["status"], "run_id": run_id})
         cursor = "0-0"
         while True:
             events, cursor = self.broker.events(run_id, cursor)
             for event in events:
-                yield self._sse(event)
+                yield format_sse(event)
                 if event.get("type") == "done":
                     return
             run = self.get(run_id)
             if not run:
                 return
             if run.get("status") in _TERMINAL_STATUSES:
-                yield self._sse({
+                yield format_sse({
                     "type": "done", "status": run["status"], "answer": run.get("answer", ""),
                 })
                 return
             yield ": keep-alive\n\n"
 
-    @staticmethod
-    def _sse(event: dict[str, Any]) -> str:
-        return _sse(event)
+class _RedisRunWorker:
+    """Shared Redis Streams polling and cooperative-cancellation plumbing."""
 
-
-class RedisChatRunWorker:
-    """The single durable worker that executes queued chat runs against the agent."""
-
-    def __init__(
-        self,
-        agent,
-        broker: RedisChatRunBroker,
-        *,
-        consumer: str | None = None,
-        claim_idle_ms: int = 120_000,
-    ) -> None:
-        self.agent = agent
+    def __init__(self, broker: RedisChatRunBroker, *, consumer: str, claim_idle_ms: int) -> None:
         self.broker = broker
-        self.consumer = consumer or f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.consumer = consumer
         self.claim_idle_ms = max(1_000, int(claim_idle_ms))
 
     def run_once(self, *, block_ms: int = 1_000) -> bool:
@@ -435,6 +424,43 @@ class RedisChatRunWorker:
             self.broker.heartbeat(self.consumer)
             self.run_once(block_ms=5_000)
 
+    def _cancel_monitor(self, run_id: str) -> tuple[threading.Event, threading.Event, threading.Thread]:
+        cancel_event = threading.Event()
+        stop_monitor = threading.Event()
+
+        def monitor_cancel() -> None:
+            while not stop_monitor.wait(0.1):
+                if self.broker.cancel_requested(run_id):
+                    cancel_event.set()
+                    return
+
+        monitor = threading.Thread(
+            target=monitor_cancel,
+            name=f"api-cancel-{run_id[-8:]}",
+            daemon=True,
+        )
+        monitor.start()
+        return cancel_event, stop_monitor, monitor
+
+
+class RedisChatRunWorker(_RedisRunWorker):
+    """The durable worker that executes queued chat runs against the agent."""
+
+    def __init__(
+        self,
+        agent,
+        broker: RedisChatRunBroker,
+        *,
+        consumer: str | None = None,
+        claim_idle_ms: int = 120_000,
+    ) -> None:
+        self.agent = agent
+        super().__init__(
+            broker,
+            consumer=consumer or f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+            claim_idle_ms=claim_idle_ms,
+        )
+
     def _process(self, job: QueuedChatRun) -> None:
         run = self.agent.sessions.get_chat_run(job.run_id)
         if not run or run.get("thread_id") != job.session_id:
@@ -452,17 +478,7 @@ class RedisChatRunWorker:
             summary="Durable API worker started chat run",
         )
 
-        cancel_event = threading.Event()
-        stop_monitor = threading.Event()
-
-        def monitor_cancel() -> None:
-            while not stop_monitor.wait(0.1):
-                if self.broker.cancel_requested(job.run_id):
-                    cancel_event.set()
-                    return
-
-        monitor = threading.Thread(target=monitor_cancel, name=f"api-cancel-{job.run_id[-8:]}", daemon=True)
-        monitor.start()
+        cancel_event, stop_monitor, monitor = self._cancel_monitor(job.run_id)
 
         def on_token(token: str) -> None:
             if token and not cancel_event.is_set():
@@ -519,16 +535,6 @@ class RedisChatRunWorker:
         self.broker.clear_cancel(job.run_id)
 
 
-def _sse(event: dict[str, Any]) -> str:
-    """Render one event from the fixed public SSE vocabulary."""
-    event_type = str(event.get("type") or "status")
-    if event_type not in {"status", "token", "tool", "done", "error"}:
-        event_type = "status"
-        event = {"type": "status", "status": "running"}
-    data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-    return f"event: {event_type}\\ndata: {data}\\n\\n"
-
-
 def _safe_status_event(event: dict[str, Any]) -> dict[str, str]:
     """Keep only de-identified stage/status fields from existing progress traces."""
     return {
@@ -547,12 +553,12 @@ class _RedisRunStream:
         run = self.get(run_id)
         if not run:
             raise KeyError(run_id)
-        yield _sse({"type": "status", "status": run["status"], "run_id": run_id})
+        yield format_sse({"type": "status", "status": run["status"], "run_id": run_id})
         cursor = "0-0"
         while True:
             events, cursor = self.broker.events(run_id, cursor)
             for event in events:
-                yield _sse(event)
+                yield format_sse(event)
                 if event.get("type") == "done":
                     return
             run = self.get(run_id)
@@ -562,7 +568,7 @@ class _RedisRunStream:
                 done = {"type": "done", "status": run["status"]}
                 if answer_key and run.get(answer_key):
                     done["answer"] = run[answer_key]
-                yield _sse(done)
+                yield format_sse(done)
                 return
             yield ": keep-alive\\n\\n"
 
@@ -622,7 +628,7 @@ class RedisResearchRunManager(_RedisRunStream):
         return self._stream(run_id, answer_key="final_answer")
 
 
-class RedisResearchRunWorker:
+class RedisResearchRunWorker(_RedisRunWorker):
     """Durably execute one persisted deep-research run at a time."""
 
     def __init__(
@@ -630,26 +636,11 @@ class RedisResearchRunWorker:
         claim_idle_ms: int = 120_000,
     ) -> None:
         self.agent = agent
-        self.broker = broker
-        self.consumer = consumer or f"research-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self.claim_idle_ms = max(1_000, int(claim_idle_ms))
-
-    def run_once(self, *, block_ms: int = 1_000) -> bool:
-        job = self.broker.claim_stale(self.consumer, min_idle_ms=self.claim_idle_ms)
-        if job is None:
-            job = self.broker.reserve(self.consumer, block_ms=block_ms)
-        if job is None:
-            return False
-        try:
-            self._process(job)
-        finally:
-            self.broker.acknowledge(job.message_id)
-        return True
-
-    def run_forever(self) -> None:
-        while True:
-            self.broker.heartbeat(self.consumer)
-            self.run_once(block_ms=5_000)
+        super().__init__(
+            broker,
+            consumer=consumer or f"research-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+            claim_idle_ms=claim_idle_ms,
+        )
 
     def _process(self, job: QueuedResearchRun) -> None:
         run = self.agent.sessions.get_research_run(job.run_id)
@@ -684,20 +675,6 @@ class RedisResearchRunWorker:
             stop_monitor.set()
             monitor.join(timeout=0.2)
             self.broker.clear_cancel(job.run_id)
-
-    def _cancel_monitor(self, run_id: str) -> tuple[threading.Event, threading.Event, threading.Thread]:
-        cancel_event = threading.Event()
-        stop_monitor = threading.Event()
-
-        def monitor_cancel() -> None:
-            while not stop_monitor.wait(0.1):
-                if self.broker.cancel_requested(run_id):
-                    cancel_event.set()
-                    return
-
-        monitor = threading.Thread(target=monitor_cancel, name=f"api-cancel-{run_id[-8:]}", daemon=True)
-        monitor.start()
-        return cancel_event, stop_monitor, monitor
 
     def _finish_cancelled(self, job: QueuedResearchRun) -> None:
         self.agent.sessions.update_research_run(job.run_id, status="cancelled", final_answer="")
@@ -771,7 +748,7 @@ class RedisDailyRunManager(_RedisRunStream):
         return self._stream(run_id, answer_key="")
 
 
-class RedisDailyRunWorker:
+class RedisDailyRunWorker(_RedisRunWorker):
     """Execute daily discovery work from the shared low-priority Redis stream."""
 
     def __init__(
@@ -780,27 +757,12 @@ class RedisDailyRunWorker:
     ) -> None:
         self.orchestrator = orchestrator
         self.scheduler = scheduler
-        self.broker = broker
-        self.consumer = consumer or f"daily-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self.claim_idle_ms = max(1_000, int(claim_idle_ms))
         self.paper_store = paper_store
-
-    def run_once(self, *, block_ms: int = 1_000) -> bool:
-        job = self.broker.claim_stale(self.consumer, min_idle_ms=self.claim_idle_ms)
-        if job is None:
-            job = self.broker.reserve(self.consumer, block_ms=block_ms)
-        if job is None:
-            return False
-        try:
-            self._process(job)
-        finally:
-            self.broker.acknowledge(job.message_id)
-        return True
-
-    def run_forever(self) -> None:
-        while True:
-            self.broker.heartbeat(self.consumer)
-            self.run_once(block_ms=5_000)
+        super().__init__(
+            broker,
+            consumer=consumer or f"daily-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+            claim_idle_ms=claim_idle_ms,
+        )
 
     def _process(self, job: QueuedDailyRun) -> None:
         run = self.scheduler.get_daily_run(job.run_id)
@@ -811,17 +773,7 @@ class RedisDailyRunWorker:
             return
         self.scheduler.update_daily_run(job.run_id, status="running")
         self.broker.publish(job.run_id, {"type": "status", "status": "running", "run_id": job.run_id})
-        cancel_event = threading.Event()
-        stop_monitor = threading.Event()
-
-        def monitor_cancel() -> None:
-            while not stop_monitor.wait(0.1):
-                if self.broker.cancel_requested(job.run_id):
-                    cancel_event.set()
-                    return
-
-        monitor = threading.Thread(target=monitor_cancel, name=f"api-cancel-{job.run_id[-8:]}", daemon=True)
-        monitor.start()
+        cancel_event, stop_monitor, monitor = self._cancel_monitor(job.run_id)
         try:
             result = self.orchestrator.run(
                 job.kind, run_id=job.run_id, paper_store=self.paper_store, cancel_event=cancel_event,

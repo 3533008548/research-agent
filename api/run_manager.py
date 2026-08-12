@@ -9,10 +9,11 @@ deployment step, not something FastAPI BackgroundTasks can provide.
 
 from __future__ import annotations
 
-import json
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterator
+
+from api.sse import format_sse
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -148,31 +149,22 @@ class ChatRunManager:
         run = self.get(run_id)
         if not run:
             raise KeyError(run_id)
-        yield self._sse({"type": "status", "status": run["status"], "run_id": run_id})
+        yield format_sse({"type": "status", "status": run["status"], "run_id": run_id})
 
         with self._lock:
             active = self._active.get(run_id)
         if active is None:
-            yield self._sse({"type": "done", "status": run["status"], "answer": run.get("answer", "")})
+            yield format_sse({"type": "done", "status": run["status"], "answer": run.get("answer", "")})
             return
 
         cursor = 0
         while True:
             events, cursor = active.after(cursor)
             for event in events:
-                yield self._sse(event)
+                yield format_sse(event)
             if active.done_event.wait(timeout=0.25):
                 events, cursor = active.after(cursor)
                 for event in events:
-                    yield self._sse(event)
+                    yield format_sse(event)
                 return
             yield ": keep-alive\n\n"
-
-    @staticmethod
-    def _sse(event: dict[str, Any]) -> str:
-        event_type = str(event.get("type") or "status")
-        if event_type not in {"status", "token", "tool", "done", "error"}:
-            event_type = "status"
-            event = {"type": "status", "status": "running"}
-        data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-        return f"event: {event_type}\ndata: {data}\n\n"
