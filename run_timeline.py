@@ -169,7 +169,8 @@ class RunTimelineService:
             f'<span class="agent-run-badge status-{escape(status)}">'
             f'{escape(_STATUS_LABELS.get(status, status))}</span>'
             '</div>'
-            f'<div class="agent-run-meta">{escape(metadata)}</div>'
+            f'<div class="agent-run-meta">{escape(metadata)} · 运行 ID：'
+            f'<code>{escape(str(run.get("run_id") or ""))}</code></div>'
         )
         events = list(run.get("events") or [])[-max_events:]
         event_html = "".join(self._render_event(event) for event in events)

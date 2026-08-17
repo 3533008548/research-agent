@@ -22,6 +22,13 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
+from run_contract import (
+    RUN_EVENT_SCHEMA_VERSION,
+    daily_event_summary,
+    infer_persisted_event_type,
+    safe_metadata,
+    safe_metrics,
+)
 from runtime_paths import get_runtime_paths
 
 
@@ -97,9 +104,12 @@ class Scheduler:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
                 agent TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT 'status',
                 status TEXT NOT NULL,
                 message TEXT NOT NULL,
                 details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                schema_version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(run_id) REFERENCES daily_runs(run_id) ON DELETE CASCADE
             );
@@ -112,6 +122,19 @@ class Scheduler:
         if "search_status" not in cols:
             self._conn.execute("ALTER TABLE keywords ADD COLUMN search_status TEXT DEFAULT 'idle'")
             self._conn.commit()
+        daily_event_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(daily_agent_events)")
+        }
+        for column, definition in (
+            ("event_type", "TEXT NOT NULL DEFAULT 'status'"),
+            ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if column not in daily_event_columns:
+                self._conn.execute(
+                    f"ALTER TABLE daily_agent_events ADD COLUMN {column} {definition}"
+                )
+        self._conn.commit()
 
     # ── 多 Agent 每日运行记录 ──
 
@@ -258,30 +281,56 @@ class Scheduler:
         return candidates
 
     def add_daily_agent_event(
-        self, run_id: str, agent: str, status: str, message: str, details: dict | None = None,
+        self,
+        run_id: str,
+        agent: str,
+        status: str,
+        message: str,
+        details: dict | None = None,
+        *,
+        event_type: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
+        """Append one bounded operational event without retaining task content.
+
+        ``message`` and ``details`` remain parameters for the live UI callback
+        compatibility path, but persistence intentionally stores only a fixed
+        stage label, aggregate metrics and a small execution fingerprint.
+        """
+        safe_event_type = infer_persisted_event_type(
+            status=str(status or "running"),
+            stage=str(agent or "orchestrator"),
+            event_type=event_type,
+        )
         with self._conn:
             self._conn.execute(
-                "INSERT INTO daily_agent_events (run_id, agent, status, message, details_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO daily_agent_events "
+                "(run_id, agent, event_type, status, message, details_json, payload_json, schema_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    run_id, agent, status, message,
-                    json.dumps(details or {}, ensure_ascii=False), datetime.now().isoformat(),
+                    run_id, str(agent or "orchestrator")[:80], safe_event_type, str(status or "running")[:40],
+                    daily_event_summary(str(agent), str(status)),
+                    json.dumps(safe_metrics(details), ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(safe_metadata(metadata), ensure_ascii=False, separators=(",", ":")),
+                    RUN_EVENT_SCHEMA_VERSION, datetime.now().isoformat(),
                 ),
             )
 
     def get_daily_agent_events(self, run_id: str) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT agent, status, message, details_json, created_at FROM daily_agent_events "
-            "WHERE run_id=? ORDER BY id", (run_id,),
+            "SELECT id, agent, event_type, status, message, details_json, payload_json, schema_version, created_at "
+            "FROM daily_agent_events WHERE run_id=? ORDER BY id", (run_id,),
         ).fetchall()
-        return [
-            {
-                **dict(row),
-                "details": self._decode_json(row["details_json"], {}),
-            }
-            for row in rows
-        ]
+        events = []
+        for row in rows:
+            item = dict(row)
+            # Older local databases may contain unsanitized legacy values.  Do
+            # not re-expose them through this read boundary after migration.
+            item["message"] = daily_event_summary(item["agent"], item["status"])
+            item["details"] = safe_metrics(self._decode_json(item.pop("details_json", "{}"), {}))
+            item["metadata"] = safe_metadata(self._decode_json(item.pop("payload_json", "{}"), {}))
+            events.append(item)
+        return events
 
     # ── 关键词管理 ──
 

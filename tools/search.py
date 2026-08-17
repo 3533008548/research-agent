@@ -46,16 +46,21 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     if not results:
         prefix = f"⏳ {pending}\n\n" if pending else ""
         return prefix + "📭 未找到相关内容。请先阅读并索引论文（read_pdf 会自动索引）。"
-    is_keyword_result = results[0].get("retrieval") == "keyword"
+    retrieval_mode = results[0].get("retrieval", "semantic")
     prefix = f"⏳ {pending}\n\n" if pending else ""
-    heading = "关键词候选" if is_keyword_result else "检索结果"
+    heading = {
+        "keyword": "关键词候选",
+        "hybrid": "混合检索结果",
+    }.get(retrieval_mode, "语义检索结果")
     lines = [f"{prefix}📚 {heading} — 「{query}」（共 {len(results)} 条）\n"]
     for i, r in enumerate(results, 1):
         sec = r.get("section", "未标注")
-        metric = (
-            f"关键词分: {r['keyword_score']}"
-            if is_keyword_result else f"距离: {r['distance']}"
-        )
+        if r.get("retrieval") == "keyword":
+            metric = f"关键词分: {r['keyword_score']}"
+        elif r.get("retrieval") == "hybrid":
+            metric = f"混合分: {r['hybrid_score']}"
+        else:
+            metric = f"距离: {r['distance']}"
         lines.append(f"  {i}. [{r['title']} · {sec}章节]  {metric}\n     {r['text']}")
     return "\n".join(lines)
 

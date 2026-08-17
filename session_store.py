@@ -16,6 +16,13 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from run_contract import (
+    RUN_EVENT_SCHEMA_VERSION,
+    infer_persisted_event_type,
+    safe_metadata,
+    safe_metrics,
+)
+
 
 LEGACY_THREAD_ID = "research-main"
 
@@ -107,11 +114,14 @@ class SessionStore:
                 run_id TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
                 run_kind TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT 'status',
                 agent TEXT NOT NULL,
                 stage TEXT NOT NULL,
                 status TEXT NOT NULL,
                 summary TEXT NOT NULL DEFAULT '',
                 metrics_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                schema_version INTEGER NOT NULL DEFAULT 1,
                 error_type TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
@@ -129,6 +139,13 @@ class SessionStore:
             self._conn.execute(
                 "ALTER TABLE chat_runs ADD COLUMN answer_text TEXT NOT NULL DEFAULT ''"
             )
+        for column, definition in (
+            ("event_type", "TEXT NOT NULL DEFAULT 'status'"),
+            ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if not self._table_has_column("agent_run_events", column):
+                self._conn.execute(f"ALTER TABLE agent_run_events ADD COLUMN {column} {definition}")
         self._conn.commit()
 
     @staticmethod
@@ -302,17 +319,7 @@ class SessionStore:
     @staticmethod
     def _safe_event_metrics(metrics: dict[str, Any] | None) -> dict[str, int | float]:
         """Keep only bounded aggregate metrics; traces must never contain payloads."""
-        allowed = {
-            "at_ms", "duration_ms", "queue_wait_ms", "attempt", "model_calls",
-            "tool_count", "candidate_count", "source_failures", "event_count",
-        }
-        safe: dict[str, int | float] = {}
-        for key, value in (metrics or {}).items():
-            if key not in allowed or isinstance(value, bool):
-                continue
-            if isinstance(value, (int, float)):
-                safe[key] = round(value, 1) if isinstance(value, float) else value
-        return safe
+        return safe_metrics(metrics)
 
     @_synchronized
     def create_research_run(
@@ -467,30 +474,41 @@ class SessionStore:
         summary: str = "",
         metrics: dict[str, Any] | None = None,
         error_type: str = "",
+        event_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if not self.get(thread_id):
             return
         if run_kind not in {"chat", "research"}:
             raise ValueError(f"未知运行类型: {run_kind}")
         compact_summary = " ".join(str(summary or "").split())[:240]
+        safe_event_type = infer_persisted_event_type(
+            status=str(status or "running"),
+            stage=str(stage or "run"),
+            error_type=str(error_type or ""),
+            event_type=event_type,
+        )
         with self._conn:
             self._conn.execute(
                 "INSERT INTO agent_run_events "
-                "(run_id, thread_id, run_kind, agent, stage, status, summary, metrics_json, error_type, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(run_id, thread_id, run_kind, event_type, agent, stage, status, summary, metrics_json, "
+                "payload_json, schema_version, error_type, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    run_id, thread_id, run_kind,
+                    run_id, thread_id, run_kind, safe_event_type,
                     str(agent or "agent")[:80], str(stage or "run")[:80], str(status or "running")[:40],
                     compact_summary,
                     json.dumps(self._safe_event_metrics(metrics), ensure_ascii=False, separators=(",", ":")),
-                    str(error_type or "")[:120], self._now(),
+                    json.dumps(safe_metadata(metadata), ensure_ascii=False, separators=(",", ":")),
+                    RUN_EVENT_SCHEMA_VERSION, str(error_type or "")[:120], self._now(),
                 ),
             )
 
     @_synchronized
     def get_run_events(self, run_id: str, thread_id: str | None = None) -> list[dict[str, Any]]:
         query = (
-            "SELECT run_kind, agent, stage, status, summary, metrics_json, error_type, created_at "
+            "SELECT id, run_kind, event_type, agent, stage, status, summary, metrics_json, payload_json, "
+            "schema_version, error_type, created_at "
             "FROM agent_run_events WHERE run_id=?"
         )
         values: list[str] = [run_id]
@@ -503,6 +521,9 @@ class SessionStore:
         for row in rows:
             item = dict(row)
             item["metrics"] = self._decode_json(item.pop("metrics_json", "{}"), {})
+            item["metadata"] = safe_metadata(
+                self._decode_json(item.pop("payload_json", "{}"), {})
+            )
             events.append(item)
         return events
 

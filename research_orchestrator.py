@@ -20,6 +20,8 @@ from llm_client import (
     RequestPolicy,
     RequestPriority,
 )
+from run_contract import execution_metadata
+from tool_runtime import ToolExecutionContext
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -166,6 +168,13 @@ class ResearchOrchestrator:
         self.sessions.add_run_event(
             thread_id, run_id, "research", "orchestrator", "run", "running",
             summary="深度研究任务已创建" if not reuse_evidence else "深度研究任务正在恢复",
+            metadata=execution_metadata(
+                "research",
+                runner="orchestrator",
+                model=self.model,
+                scope=scope,
+                toolset="research-bounded",
+            ),
         )
         if reuse_evidence:
             self._progress(on_progress, "resume", "running", "基于已找到的证据继续研究")
@@ -211,6 +220,7 @@ class ResearchOrchestrator:
                 )
                 worker_results = self._run_workers(
                     worker_specs, query, plan, cancel_event, on_progress,
+                    run_id=run_id,
                 )
                 completed = 0
                 for result in worker_results:
@@ -374,11 +384,13 @@ class ResearchOrchestrator:
         plan: dict[str, Any],
         cancel_event: threading.Event | None,
         on_progress: ProgressCallback | None,
+        *,
+        run_id: str = "",
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=min(2, len(specs)), thread_name_prefix="research-worker") as pool:
             futures = {
-                pool.submit(self._run_worker, spec, query, plan, cancel_event): spec
+                pool.submit(self._run_worker, spec, query, plan, cancel_event, run_id): spec
                 for spec in specs
             }
             for future in as_completed(futures):
@@ -403,6 +415,7 @@ class ResearchOrchestrator:
         query: str,
         plan: dict[str, Any],
         cancel_event: threading.Event | None,
+        run_id: str = "",
     ) -> dict[str, Any]:
         self._ensure_active(cancel_event)
         usage = self._empty_usage()
@@ -430,6 +443,14 @@ class ResearchOrchestrator:
             allowed_tool_names=spec.allowed_tools,
             max_tool_rounds=RESEARCH_WORKER_MAX_TOOL_ROUNDS,
             tool_argument_normalizer=self._worker_tool_argument_normalizer(query, spec),
+            tool_context=ToolExecutionContext(
+                run_kind="research",
+                run_id=run_id,
+                session_id=worker_id,
+                research_scope=spec.role,
+                allowed_tool_names=frozenset(spec.allowed_tools),
+                cancel_event=cancel_event,
+            ),
             request_policy=RequestPolicy(
                 purpose=f"research_{spec.role}", priority=RequestPriority.RESEARCH,
             ),

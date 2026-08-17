@@ -52,8 +52,11 @@ from llm_client import LLMClient, LLMClientError
 from profile import ProfileManager
 from research_orchestrator import ResearchOrchestrator
 from resilience import CircuitBreaker
+from run_contract import execution_metadata
 from search_api import list_downloaded_papers
 from session_store import SessionStore
+from tool_catalog import get_tool_definition
+from tool_runtime import ToolExecutionContext
 
 
 # Keep a normal chat turn bounded even when the model repeatedly requests tools.
@@ -242,6 +245,9 @@ class ResearchAgent:
             self.sessions.add_run_event(
                 thread_id, chat_run_id, "chat", "single_agent", "queue", "running",
                 summary="请求已进入交互队列",
+                metadata=execution_metadata(
+                    "chat", runner="agent", model=self.model, toolset="chat-default",
+                ),
             )
             trace_events: list[dict] = []
             first_token_ms: float | None = None
@@ -277,12 +283,13 @@ class ResearchAgent:
                     # to accept a no-op policy argument.
                     app = self._build_app(
                         usage, _on_token if on_token else None, _record_event,
-                        cancel_event=cancel_event,
+                        cancel_event=cancel_event, run_id=chat_run_id, session_id=thread_id,
                     )
                 else:
                     app = self._build_app(
                         usage, _on_token if on_token else None, _record_event,
                         cancel_event=cancel_event, allowed_tool_names=allowed_tool_names,
+                        run_id=chat_run_id, session_id=thread_id,
                     )
                 result = app.invoke(
                     state,
@@ -361,6 +368,7 @@ class ResearchAgent:
                     summary=terminal_summaries[run_status],
                     metrics={"duration_ms": duration_ms},
                     error_type="" if run_status == "completed" else outcome,
+                    event_type="done",
                 )
                 self._last_traces[thread_id] = {
                     "chat_run_id": chat_run_id,
@@ -710,14 +718,8 @@ class ResearchAgent:
         }
         if event_type in {"tool_started", "tool_finished", "tool_failed"}:
             tool_name = str(event.get("tool") or "")
-            tool_labels = {
-                "query_papers": "论文检索",
-                "search_papers": "论文搜索",
-                "read_pdf": "论文阅读",
-                "describe_image": "图像分析",
-                "memory_search": "记忆检索",
-            }
-            label = tool_labels.get(tool_name, "工具调用")
+            tool_definition = get_tool_definition(tool_name)
+            label = tool_definition.label if tool_definition else "工具调用"
             status = {
                 "tool_started": "running",
                 "tool_finished": "completed",
@@ -739,11 +741,18 @@ class ResearchAgent:
             summary=summary,
             metrics=metrics,
             error_type=str(event.get("error_type") or "")[:120],
+            event_type=(
+                "tool" if event_type in {"tool_started", "tool_finished", "tool_failed"}
+                else "error" if event_type in {"llm_request_failed", "verify_request_failed"}
+                else None
+            ),
         )
 
     def _build_app(
         self, usage: dict, on_token=None, event_callback=None, cancel_event=None,
         allowed_tool_names: set[str] | None = None,
+        run_id: str = "",
+        session_id: str = "",
     ):
         return build_graph(
             api_key=self.api_key,
@@ -761,6 +770,15 @@ class ResearchAgent:
             verify_guard=self.verify_guard,
             llm_client=self.llm_client,
             allowed_tool_names=allowed_tool_names,
+            tool_context=ToolExecutionContext(
+                run_kind="chat",
+                run_id=run_id,
+                session_id=session_id,
+                allowed_tool_names=(
+                    frozenset(allowed_tool_names) if allowed_tool_names is not None else None
+                ),
+                cancel_event=cancel_event,
+            ),
         )
 
     @staticmethod

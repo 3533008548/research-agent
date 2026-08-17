@@ -34,6 +34,13 @@ except ImportError:
     embedding_functions = None
 
 
+# The local paper corpus is normally modest.  For unusually large collections,
+# do not turn an interactive RAG request into an unbounded full-corpus scan.
+HYBRID_LEXICAL_MAX_CHUNKS = 5_000
+HYBRID_CANDIDATE_LIMIT = 20
+RRF_K = 60
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Chunk 分块策略
 # ═══════════════════════════════════════════════════════════════
@@ -383,7 +390,7 @@ class PaperStore:
                     "嵌入模型仍在后台初始化，以下为本地关键词候选结果。"
                 )
             future = self._query_executor.submit(
-                self.query, query_text, top_k, paper_ids, section,
+                self.query_hybrid, query_text, top_k, paper_ids, section,
             )
             self._active_query = future
 
@@ -415,6 +422,82 @@ class PaperStore:
         cjk_terms = [cjk[i:i + 2] for i in range(max(len(cjk) - 1, 0))]
         return list(dict.fromkeys(latin_terms + cjk_terms))
 
+    @staticmethod
+    def _result_key(result: dict) -> tuple[str, str, int]:
+        """Return a stable key for merging semantic and lexical candidates."""
+        return (
+            str(result.get("paper_id") or result.get("title") or ""),
+            str(result.get("title") or ""),
+            int(result.get("chunk_index") or 0),
+        )
+
+    def query_hybrid(
+        self,
+        query_text: str,
+        top_k: int = 3,
+        paper_ids: Optional[list[str]] = None,
+        section: Optional[str] = None,
+    ) -> list[dict]:
+        """Fuse semantic and lexical candidates with reciprocal-rank fusion.
+
+        The two retrieval scores are not comparable: Chroma returns distances,
+        while lexical retrieval returns term counts.  RRF therefore merges only
+        their ranks, keeps ties deterministic, and needs no extra dependency or
+        persisted index.  On a large local corpus we retain semantic retrieval
+        rather than scanning every chunk on the request path.
+        """
+        top_k = max(1, min(int(top_k), 20))
+        candidate_k = min(HYBRID_CANDIDATE_LIMIT, top_k * 4)
+        semantic = self.query(query_text, candidate_k, paper_ids, section)
+        collection_count = self._collection.count()
+        if collection_count > HYBRID_LEXICAL_MAX_CHUNKS:
+            return [
+                {**item, "retrieval": "semantic"}
+                for item in semantic[:top_k]
+            ]
+
+        try:
+            lexical = self.query_lexical(query_text, candidate_k, paper_ids, section)
+        except Exception:
+            # A working vector result is more useful than failing the complete
+            # request because a best-effort local keyword scan is unavailable.
+            return [
+                {**item, "retrieval": "semantic"}
+                for item in semantic[:top_k]
+            ]
+
+        if not semantic:
+            return lexical[:top_k]
+        if not lexical:
+            return [
+                {**item, "retrieval": "semantic"}
+                for item in semantic[:top_k]
+            ]
+
+        fused: dict[tuple[str, str, int], dict] = {}
+        for source, candidates in (("semantic", semantic), ("keyword", lexical)):
+            for rank, candidate in enumerate(candidates, start=1):
+                key = self._result_key(candidate)
+                item = fused.setdefault(key, dict(candidate))
+                item[f"{source}_rank"] = rank
+                item["hybrid_score"] = round(
+                    float(item.get("hybrid_score", 0.0)) + 1.0 / (RRF_K + rank), 6,
+                )
+
+        results = []
+        for item in fused.values():
+            item["retrieval"] = "hybrid"
+            results.append(item)
+        return sorted(
+            results,
+            key=lambda item: (
+                -item["hybrid_score"],
+                min(item.get("semantic_rank", 99_999), item.get("keyword_rank", 99_999)),
+                item.get("title", ""),
+                item.get("chunk_index", 0),
+            ),
+        )[:top_k]
+
     def query_lexical(
         self,
         query_text: str,
@@ -431,16 +514,23 @@ class PaperStore:
 
         raw = self._collection.get(include=["documents", "metadatas"])
         candidates = []
+        phrase = query_text.strip().lower()
         for doc, meta in zip(raw.get("documents") or [], raw.get("metadatas") or []):
             meta = meta or {}
             if paper_ids and meta.get("paper_id") not in paper_ids:
                 continue
             if section and meta.get("section") != section:
                 continue
-            searchable = "\n".join((
-                str(meta.get("title", "")), str(meta.get("section", "")), doc or "",
-            )).lower()
-            score = sum(searchable.count(term.lower()) for term in terms)
+            title = str(meta.get("title", "")).lower()
+            section_name = str(meta.get("section", "")).lower()
+            body = (doc or "").lower()
+            score = sum(
+                title.count(term) * 3 + section_name.count(term) * 2 + body.count(term)
+                for term in terms
+            )
+            if len(phrase) >= 3:
+                score += title.count(phrase) * 8 + section_name.count(phrase) * 5
+                score += body.count(phrase) * 3
             if score <= 0:
                 continue
             candidates.append({
@@ -532,6 +622,7 @@ class PaperStore:
 class NoOpStore:
     """空操作存储 — ChromaDB 离线时保持 Agent 可用"""
     def query(self, *a, **kw): return []
+    def query_hybrid(self, *a, **kw): return []
     def query_with_timeout(self, *a, **kw): return [], None
     def index_paper(self, *a, **kw): return ""
     def list_papers(self): return []

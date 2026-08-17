@@ -87,6 +87,11 @@ class RuntimePaths:
         return self.database_dir / "daily.db"
 
     @property
+    def badcases_db(self) -> Path:
+        """本地 Badcase 候选池；仅保存脱敏运行快照与人工分类。"""
+        return self.database_dir / "badcases.db"
+
+    @property
     def profile_path(self) -> Path:
         return self.primary_dir / "profile.md"
 

@@ -16,8 +16,11 @@ API 请求 -> SQLite 运行记录（queued）-> Redis 优先级队列 -> api-wor
 - 普通队列项仅在 worker 执行期间保存请求文本；每日任务只传递 `run_id`，检索计划已持久化。
 - SSE 事件固定为 `status`、`token`、`tool`、`done`、`error`，保留 24 小时。
   进度事件只包含脱敏的阶段名与状态；工具事件只包含工具标识和生命周期状态。
-- 最终回答、安全聚合指标和审计时间线保存在 SQLite。因此 Redis 事件过期后，
-  `GET /api/v1/runs/{run_id}` 仍可查看任务结果。
+- SQLite 会持久化低频审计事件 `status`、`tool`、`done`、`error`，以及模型、运行器、
+  工具集和研究范围组成的执行指纹；`token` 只保留在 Redis，避免把完整回答流复制进数据库。
+  审计事件只包含固定阶段说明、聚合耗时/计数和错误类型，不包含提示词、回答、关键词、
+  论文内容、工具参数或工具原始结果。因此 Redis 事件过期后，
+  `GET /api/v1/runs/{run_id}` 仍可查看任务结果与安全时间线。
 - 取消操作会写入 Redis 取消标记；worker 监测到标记后，将现有的协作式取消令牌传给 Agent。
 - Redis Consumer Group 会保留 worker 异常退出时未确认的任务；其他 worker 会在两分钟后认领。
 - `GET /api/v1/metrics` 输出 Prometheus 文本指标：Redis 队列积压、worker 心跳、
@@ -68,12 +71,27 @@ Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TL
 | `GET` | `/api/v1/runs/{run_id}` | 查看状态、安全指标与最终结果 |
 | `GET` | `/api/v1/runs/{run_id}/events` | 读取 SSE 事件流 |
 | `POST` | `/api/v1/runs/{run_id}/cancel` | 请求跨进程协作式取消 |
+| `POST` | `/api/v1/runs/{run_id}/badcases` | 标记为本地 Badcase 审核候选 |
 
 `POST /api/v1/sessions/{session_id}/chat-runs` 保留为兼容别名，客户端应逐步迁移到
 统一的 `/api/v1/runs` 接口。
 
 每日任务的 `daily_kind` 支持 `daily`、`retry`、`search`、`resume`：其中 `resume`
 会使用原 `run_id` 重新排队最近一次可恢复的每日任务。
+
+### 持久运行事件
+
+`GET /api/v1/runs/{run_id}` 返回的 `events` 是低频审计时间线。每条事件包含数据库
+排序 id、`event_type`、`stage`、`status`、聚合 `metrics` 和可选 `metadata`。其中
+`metadata` 只允许 `protocol`、`run_kind`、`model`、`runner`、`scope`、`toolset`，可用于
+比较执行环境；其他字段会在写入前丢弃。客户端若需要逐 token 展示，仍应连接 SSE，不能
+依赖该数组复原模型输出。
+
+### Badcase 候选
+
+`POST /api/v1/runs/{run_id}/badcases` 接受受限的 `category` 和至多 500 字的人工脱敏备注。它从既有运行记录投影出内容安全的快照：运行类型、状态、模型标识、耗时、聚合指标和安全事件字段；不会存储或返回 prompt、回答、PDF、论文候选、工具参数或工具原始结果。响应只含候选 ID、分类、来源、状态、去重指纹和出现次数，候选实际保存在本地 `badcases.db`。
+
+相同 `run_id + category` 重复提交不会创建新候选，而是增加 `occurrence_count`。删除所属会话时会同时删除其候选；如需把问题沉淀为 Git 内的回归测试，应使用导出脚本生成空的合成夹具草稿，再人工填写公开、可复现的数据。
 
 ## 调用示例
 
@@ -107,6 +125,12 @@ curl -X POST http://localhost:7860/api/v1/runs \
 # 持续读取运行事件
 curl -N -H "X-API-Key: $TOKEN" \
   http://localhost:7860/api/v1/runs/<run_id>/events
+
+# 标记一个已完成或失败的任务；备注必须由调用方自行脱敏
+curl -X POST http://localhost:7860/api/v1/runs/<run_id>/badcases \
+  -H "X-API-Key: $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"category":"citation_quality","note":"已脱敏：引用未覆盖结论"}'
 
 # 抓取脱敏的运行指标
 curl -H "X-API-Key: $TOKEN" http://localhost:7860/api/v1/metrics

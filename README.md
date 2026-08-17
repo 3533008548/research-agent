@@ -21,7 +21,7 @@
 | 🔍 **论文搜索** | OpenAlex 通用检索 + arXiv 临时/深度研究预印本检索；结果统一去重 |
 | 📄 **PDF 阅读** | pdfplumber 表格/双栏/章节 + 图注感知图片提取（保留子图关系） |
 | 💬 **多会话管理** | 新建、切换、加载和永久删除会话；历史、摘要、Token 统计互相隔离 |
-| 🧠 **RAG 检索** | 章节感知分层切块 + 章节加权 + 章节过滤 + 公式保护 |
+| 🧠 **RAG 检索** | 章节感知分层切块 + 语义/关键词混合检索 + 章节加权与过滤 + 公式保护 |
 | 🖼 **多模态看图** | GLM-4V 描述 + 图注附带 + 描述缓存（省 token） |
 | 📰 **每日速递** | OpenAlex + OpenAIRE + DBLP 并行限时的后台推送；临时检索改用 OpenAlex + arXiv，支持重试和待读清单管理 |
 | 📝 **科研笔记** | SQLite 按话题分组，关联论文 |
@@ -29,6 +29,7 @@
 | ✅ **自动验证** | verify 分级（严重重生成/轻微提示）+ 跳过门控 + 8 秒限时熔断降级 |
 | 📊 **Token 管理** | 按工具差异化截断 + 缓存命中统计 + 预算预警 + 费用估算 |
 | 🛡️ **请求韧性** | 同模型重试、429 排队、端到端截止时间、半开熔断、流式中断恢复与用户主动取消；不自动降级模型 |
+| 🔐 **工具运行时** | 统一授权范围、协作式取消、结果限长与脱敏工具事件；普通对话和深度研究共用同一执行边界 |
 
 ---
 
@@ -78,7 +79,7 @@ APP_DATA_DIR=/path/to/research-agent-data python web_ui.py
 python web_ui.py --data-dir ./runtime
 ```
 
-`runtime/primary/` 保存 SQLite、论文 PDF、用户画像与设置；`runtime/derived/` 保存可由原始数据重建的 Chroma 索引和 PDF 图片。旧版根目录数据不会自动移动，可先预览再迁移：
+`runtime/primary/` 保存 SQLite、论文 PDF、用户画像与设置；`runtime/derived/` 保存可由原始数据重建的 Chroma 索引和 PDF 图片。`runtime/primary/db/badcases.db` 是本地 Badcase 候选池，只保存脱敏运行快照和人工分类。旧版根目录数据不会自动移动，可先预览再迁移：
 
 ```bash
 python scripts/migrate_runtime.py
@@ -135,6 +136,18 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 
 深度研究使用受限的工具集：本地研究员只能读取当前论文库，公开研究员只能检索公开论文；若需要新上传文件，请先在普通对话中完成上传和索引，再发起研究。
 
+### 标记 Badcase，形成可维护的回归样例
+
+在 **Agent 运行中心 → 标记问题（Badcase 候选）** 中选择问题类型；默认关联当前会话最新任务，也可粘贴运行卡片中的 `run_id`。候选只记录运行类型、状态、耗时、受限指标和脱敏事件时间线，绝不会自动复制问题、模型回答、论文正文或工具参数/结果。可选备注由你手动填写，因此也不能粘贴原始内容或密钥。
+
+候选先保存在本机的 `badcases.db`，不会自动进入 Git 或评测集。审核后导出一个空的合成夹具草稿，再手工填写可公开、可复现的输入和断言：
+
+```powershell
+python scripts/export_badcase_template.py --candidate-id bc-xxxxxxxxxxxx
+```
+
+删除会话时，关联的 Badcase 候选也会一并删除；如需长期保留某个问题，应先将其转写为合成评测样例。
+
 常用 Web UI 命令：
 
 | 命令 | 说明 |
@@ -161,7 +174,7 @@ python tests/test_core.py
 python -m evals.release_gate --strict
 ```
 
-核心回归测试覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订，以及取消令牌从浏览器到模型/工具节点的传播。
+核心回归测试覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订、Badcase 脱敏快照/会话删除，以及取消令牌从浏览器到模型/工具节点的传播。
 
 浏览器回归测试覆盖两类场景：会话隔离测试会启动本地 SSE 模拟服务，复现“旧会话流式输出中，新建会话并发送第一条命令”的竞态；挂载 API 测试会启动临时 FastAPI + Gradio 服务，确认 Gradio 通过 HTTP 创建运行任务、消费 SSE，并在切换会话时取消旧任务。两者都不读取用户 `runtime/`，也不访问真实模型。首次运行需安装 Chromium：
 
@@ -201,7 +214,7 @@ LangGraph ReAct 循环 (graph_builder.py)
 Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过或达到重试上限后自动清理，避免影响后续对话。
 
 运行时数据层（APP_DATA_DIR，默认 ./runtime）:
-  primary/db/          → checkpoint、notes、memory、daily SQLite 数据
+  primary/db/          → checkpoint、notes、memory、daily、badcases SQLite 数据
   primary/papers/      → 原始论文 PDF
   primary/profile.md   → 用户画像
   primary/settings.json→ Web UI 用户设置
@@ -217,6 +230,8 @@ Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过�
 research_agent/
 ├── prompts.py            # 系统提示词 + 少样本范例
 ├── tool_schemas.py       # 9 个工具 JSON Schema
+├── tool_catalog.py       # 工具声明目录：名称、Schema、展示名与结果限长
+├── tool_runtime.py       # 工具授权/取消/限长/脱敏事件的统一执行边界
 ├── graph_builder.py      # LangGraph 图定义 + verify 分级
 ├── pdf_reader.py         # PDF 增强提取 (表格/双栏/章节/图注图片)
 ├── paper_store.py        # ChromaDB RAG (章节感知切块) + NoOpStore
@@ -229,6 +244,8 @@ research_agent/
 ├── llm_client.py         # 主模型并发/重试/端到端预算/取消（不做模型降级）
 ├── cancellation.py       # 浏览器请求的协作式取消原语
 ├── resilience.py         # 通用三态熔断器（closed/open/half_open）
+├── run_contract.py       # 对话、研究、每日任务共用的脱敏运行事件契约
+├── badcase_store.py      # 本地 Badcase 候选池与合成夹具草稿导出
 ├── runtime_paths.py       # 运行时数据边界、版本与用户设置
 ├── config.py / config.yaml  # 统一配置
 ├── logger.py             # 结构化日志
@@ -243,7 +260,7 @@ research_agent/
 ├── research_orchestrator.py # 有边界的 Planner / Researcher / Critic 闭环
 ├── session_store.py       # 会话目录、研究运行记录、Token 统计与 checkpoint 联动删除
 ├── web_ui.py             # Web UI：受控 Chatbot 状态，深度研究进度/停止/继续
-├── scripts/              # 旧数据迁移与运行时备份
+├── scripts/              # 旧数据迁移、运行时备份和 Badcase 合成夹具导出
 ├── tests/                # 核心回归 + Playwright 浏览器会话隔离测试
 ├── .github/workflows/    # CI 自动测试
 │

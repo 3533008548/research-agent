@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from api.sse import format_sse
+from run_contract import execution_metadata
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial_failed"}
@@ -349,6 +350,10 @@ class RedisChatRunManager:
         self.agent.sessions.add_run_event(
             session_id, run_id, "chat", "api", "queue", "queued",
             summary="API chat run queued for a durable worker",
+            event_type="status",
+            metadata=execution_metadata(
+                "chat", runner="redis-worker", model=str(self.agent.model), toolset="chat-default",
+            ),
         )
         return self.get(run_id) or run
 
@@ -476,6 +481,7 @@ class RedisChatRunWorker(_RedisRunWorker):
         self.agent.sessions.add_run_event(
             job.session_id, job.run_id, "chat", "api_worker", "run", "running",
             summary="Durable API worker started chat run",
+            event_type="status",
         )
 
         cancel_event, stop_monitor, monitor = self._cancel_monitor(job.run_id)
@@ -499,8 +505,15 @@ class RedisChatRunWorker(_RedisRunWorker):
             for tool_event in trace.get("tool_trace", []):
                 tool_name = str(tool_event.get("tool") or "")[:80]
                 if tool_name:
+                    duration_ms = tool_event.get("duration_ms")
+                    metrics = {"duration_ms": duration_ms} if isinstance(duration_ms, (int, float)) else None
+                    self.agent.sessions.add_run_event(
+                        job.session_id, job.run_id, "chat", "single_agent", "tool", "completed",
+                        summary="工具调用已完成", metrics=metrics, event_type="tool",
+                    )
                     self.broker.publish(job.run_id, {
                         "type": "tool", "tool": tool_name, "status": "completed",
+                        **({"duration_ms": round(float(duration_ms), 1)} if isinstance(duration_ms, (int, float)) else {}),
                     })
             current = self.agent.sessions.get_chat_run(job.run_id) or run
             outcome = trace.get("outcome")
@@ -516,7 +529,11 @@ class RedisChatRunWorker(_RedisRunWorker):
             )
             self.agent.sessions.add_run_event(
                 job.session_id, job.run_id, "chat", "api_worker", "run", "failed",
-                summary="Durable API worker failed", error_type=type(exc).__name__,
+                summary="Durable API worker failed", error_type=type(exc).__name__, event_type="error",
+            )
+            self.agent.sessions.add_run_event(
+                job.session_id, job.run_id, "chat", "api_worker", "run", "failed",
+                summary="聊天运行已结束", event_type="done",
             )
             self.broker.publish(job.run_id, {"type": "error", "error_type": type(exc).__name__})
             self.broker.publish(job.run_id, {"type": "done", "status": "failed", "answer": ""})
@@ -529,7 +546,7 @@ class RedisChatRunWorker(_RedisRunWorker):
         self.agent.sessions.update_chat_run(job.run_id, status="cancelled", answer="")
         self.agent.sessions.add_run_event(
             job.session_id, job.run_id, "chat", "api_worker", "run", "cancelled",
-            summary="Queued API chat run was cancelled before execution",
+            summary="Queued API chat run was cancelled before execution", event_type="done",
         )
         self.broker.publish(job.run_id, {"type": "done", "status": "cancelled", "answer": ""})
         self.broker.clear_cancel(job.run_id)
@@ -596,6 +613,14 @@ class RedisResearchRunManager(_RedisRunStream):
         self.agent.sessions.add_run_event(
             session_id, run_id, "research", "api", "queue", "queued",
             summary="API research run queued for a durable worker",
+            event_type="status",
+            metadata=execution_metadata(
+                "research",
+                runner="redis-worker",
+                model=str(self.agent.model),
+                scope=scope,
+                toolset="research-bounded",
+            ),
         )
         return self.get(run_id) or run
 
@@ -651,6 +676,10 @@ class RedisResearchRunWorker(_RedisRunWorker):
             return
         self.agent.sessions.update_research_run(job.run_id, status="running")
         self.broker.publish(job.run_id, {"type": "status", "status": "running", "run_id": job.run_id})
+        self.agent.sessions.add_run_event(
+            job.session_id, job.run_id, "research", "api_worker", "run", "running",
+            summary="Durable API worker started research run", event_type="status",
+        )
         cancel_event, stop_monitor, monitor = self._cancel_monitor(job.run_id)
         try:
             self.agent.research(
@@ -669,6 +698,14 @@ class RedisResearchRunWorker(_RedisRunWorker):
             })
         except Exception as exc:
             self.agent.sessions.update_research_run(job.run_id, status="failed")
+            self.agent.sessions.add_run_event(
+                job.session_id, job.run_id, "research", "api_worker", "run", "failed",
+                summary="Durable API worker failed", error_type=type(exc).__name__, event_type="error",
+            )
+            self.agent.sessions.add_run_event(
+                job.session_id, job.run_id, "research", "api_worker", "run", "failed",
+                summary="深度研究运行已结束", event_type="done",
+            )
             self.broker.publish(job.run_id, {"type": "error", "error_type": type(exc).__name__})
             self.broker.publish(job.run_id, {"type": "done", "status": "failed"})
         finally:
@@ -680,7 +717,7 @@ class RedisResearchRunWorker(_RedisRunWorker):
         self.agent.sessions.update_research_run(job.run_id, status="cancelled", final_answer="")
         self.agent.sessions.add_run_event(
             job.session_id, job.run_id, "research", "api_worker", "run", "cancelled",
-            summary="Queued API research run was cancelled before execution",
+            summary="Queued API research run was cancelled before execution", event_type="done",
         )
         self.broker.publish(job.run_id, {"type": "done", "status": "cancelled"})
         self.broker.clear_cancel(job.run_id)
@@ -710,6 +747,13 @@ class RedisDailyRunManager(_RedisRunStream):
             except QueueUnavailableError:
                 self.scheduler.update_daily_run(run_id, status="failed", error_text="QueueUnavailableError")
                 raise
+            self.scheduler.add_daily_agent_event(
+                run_id, "orchestrator", "queued", "",
+                event_type="status",
+                metadata=execution_metadata(
+                    "daily", runner="redis-worker", toolset="daily-curated",
+                ),
+            )
             return run
         if kind == "search":
             error = self.scheduler.validate_keyword(keyword or "")
@@ -726,6 +770,13 @@ class RedisDailyRunManager(_RedisRunStream):
         except QueueUnavailableError:
             self.scheduler.update_daily_run(run_id, status="failed", error_text="QueueUnavailableError")
             raise
+        self.scheduler.add_daily_agent_event(
+            run_id, "orchestrator", "queued", "",
+            event_type="status",
+            metadata=execution_metadata(
+                "daily", runner="redis-worker", toolset="daily-curated",
+            ),
+        )
         return self.get(run_id) or run
 
     def get(self, run_id: str) -> dict[str, Any] | None:
@@ -742,6 +793,9 @@ class RedisDailyRunManager(_RedisRunStream):
         updated = self.scheduler.update_daily_run(run_id, status="cancelling")
         if updated:
             self.broker.publish(run_id, {"type": "status", "status": "cancelling", "run_id": run_id})
+            self.scheduler.add_daily_agent_event(
+                run_id, "orchestrator", "cancelling", "", event_type="status",
+            )
         return updated
 
     def stream(self, run_id: str) -> Iterator[str]:
@@ -773,6 +827,9 @@ class RedisDailyRunWorker(_RedisRunWorker):
             return
         self.scheduler.update_daily_run(job.run_id, status="running")
         self.broker.publish(job.run_id, {"type": "status", "status": "running", "run_id": job.run_id})
+        self.scheduler.add_daily_agent_event(
+            job.run_id, "orchestrator", "running", "", event_type="status",
+        )
         cancel_event, stop_monitor, monitor = self._cancel_monitor(job.run_id)
         try:
             result = self.orchestrator.run(
@@ -782,6 +839,13 @@ class RedisDailyRunWorker(_RedisRunWorker):
             self.broker.publish(job.run_id, {"type": "done", "status": result.status})
         except Exception as exc:
             self.scheduler.update_daily_run(job.run_id, status="failed", error_text=type(exc).__name__)
+            self.scheduler.add_daily_agent_event(
+                job.run_id, "orchestrator", "failed", "",
+                event_type="error", metadata=None,
+            )
+            self.scheduler.add_daily_agent_event(
+                job.run_id, "orchestrator", "failed", "", event_type="done",
+            )
             self.broker.publish(job.run_id, {"type": "error", "error_type": type(exc).__name__})
             self.broker.publish(job.run_id, {"type": "done", "status": "failed"})
         finally:
@@ -791,5 +855,8 @@ class RedisDailyRunWorker(_RedisRunWorker):
 
     def _finish_cancelled(self, job: QueuedDailyRun) -> None:
         self.scheduler.update_daily_run(job.run_id, status="cancelled")
+        self.scheduler.add_daily_agent_event(
+            job.run_id, "orchestrator", "cancelled", "", event_type="done",
+        )
         self.broker.publish(job.run_id, {"type": "done", "status": "cancelled"})
         self.broker.clear_cancel(job.run_id)

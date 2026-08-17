@@ -92,6 +92,7 @@ def main() -> int:
         ("memory.db", lambda: _copy_sqlite(source / "memory.db", paths.memory_db, args.apply, args.overwrite)),
         ("notes.db", lambda: _copy_sqlite(source / "notes.db", paths.notes_db, args.apply, args.overwrite)),
         ("daily.db", lambda: _copy_sqlite(source / "daily.db", paths.daily_db, args.apply, args.overwrite)),
+        ("badcases.db", lambda: _copy_sqlite(source / "badcases.db", paths.badcases_db, args.apply, args.overwrite)),
         ("profile.md", lambda: _copy_file(source / "profile.md", paths.profile_path, args.apply, args.overwrite)),
         ("chroma_data", lambda: _copy_tree(source / "chroma_data", paths.chroma_dir, args.apply, args.overwrite)),
         ("data/papers", lambda: _copy_tree(

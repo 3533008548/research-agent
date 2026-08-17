@@ -9,6 +9,8 @@ from api.auth import require_api_key
 from api.observability import render_prometheus_metrics
 from api.redis_runs import QueueUnavailableError
 from api.schemas import (
+    BadcaseCandidateResponse,
+    BadcaseCreateRequest,
     CancelRunResponse,
     ChatCreateRequest,
     ChatRunCreateRequest,
@@ -183,6 +185,7 @@ def delete_session(session_id: str, request: Request) -> Response:
         research_manager.cancel_for_session(session_id)
     if not request.app.state.agent.delete_session(session_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found")
+    request.app.state.badcase_store.delete_for_session(session_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -295,6 +298,47 @@ def get_run(run_id: str, request: Request) -> dict:
     if run_id.startswith(("chat-", "research-")):
         events = request.app.state.agent.sessions.get_run_events(run_id, run["thread_id"])
     return _run_payload(request, run, events)
+
+
+def _badcase_payload(candidate: dict) -> dict:
+    """Return feedback metadata only; the content-free snapshot remains local."""
+    return {
+        key: candidate.get(key)
+        for key in (
+            "candidate_id", "run_id", "category", "source", "status", "fingerprint",
+            "occurrence_count", "created_at", "updated_at",
+        )
+    }
+
+
+@router.post(
+    "/runs/{run_id}/badcases",
+    response_model=BadcaseCandidateResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def create_badcase(
+    run_id: str,
+    payload: BadcaseCreateRequest,
+    request: Request,
+    response: Response,
+) -> dict:
+    """Mark an existing run for review without copying its input or answer."""
+    manager = _manager_for_run(request, run_id)
+    if manager is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
+    run = manager.get(run_id)
+    if not run:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
+    events = []
+    if run_id.startswith(("chat-", "research-")):
+        events = request.app.state.agent.sessions.get_run_events(run_id, run["thread_id"])
+    candidate, created = request.app.state.badcase_store.create_candidate(
+        _run_payload(request, run, events),
+        category=payload.category,
+        note=payload.note,
+    )
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    return _badcase_payload(candidate)
 
 
 @router.get("/runs/{run_id}/events", dependencies=[Depends(require_api_key)])

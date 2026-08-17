@@ -7,6 +7,7 @@ from tools.read_pdf import handle_read_pdf
 from tools.describe import handle_describe_image
 from tools.profile_tool import handle_update_profile
 from cancellation import raise_if_cancelled
+from tool_catalog import TOOL_NAMES
 
 
 _TOOL_HANDLERS = {
@@ -19,6 +20,10 @@ _TOOL_HANDLERS = {
     "delete_paper": handle_delete_paper,
     "update_profile": handle_update_profile,
 }
+
+_EXECUTABLE_TOOL_NAMES = frozenset({*_TOOL_HANDLERS, "memory_search"})
+if TOOL_NAMES != _EXECUTABLE_TOOL_NAMES:
+    raise RuntimeError("工具目录与执行分发器不一致")
 
 
 def _search_memory(args: dict, memory_store) -> str:

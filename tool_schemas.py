@@ -3,8 +3,8 @@
 """
 
 
-def get_tool_schemas() -> list[dict]:
-    """返回所有工具的 JSON Schema 定义"""
+def _raw_tool_schemas() -> list[dict]:
+    """Return the static schemas used to construct the public tool catalog."""
     return [
         {
             "type": "function",
@@ -130,3 +130,10 @@ def get_tool_schemas() -> list[dict]:
             },
         },
     ]
+
+
+def get_tool_schemas() -> list[dict]:
+    """兼容入口：返回工具目录生成的独立 schema 副本。"""
+    from tool_catalog import get_tool_schemas as _get_tool_schemas
+
+    return _get_tool_schemas()

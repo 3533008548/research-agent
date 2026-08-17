@@ -41,6 +41,7 @@ for env_path in [".env", "../cli-chatbot/.env", str(Path.home() / ".env")]:
 load_dotenv()
 
 from research_agent import ResearchAgent
+from badcase_store import BadcaseStore
 from notes import NoteStore
 from run_timeline import RunTimelineService
 from ui_request_guard import BrowserRunGuard
@@ -141,6 +142,7 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
     print(f"🤖 模型: {cfg.model}")
     agent = agent or ResearchAgent(cfg=cfg)
     notes = NoteStore(cfg.notes_db)
+    badcases = BadcaseStore(str(cfg.runtime_paths.badcases_db))
     pending_conflicts = {}
     from scheduler import Scheduler
     scheduler = Scheduler(
@@ -1159,6 +1161,104 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             return timeline.render_daily_runs()
         return timeline.render_session_runs(session_id or agent.thread_id)
 
+    def _latest_session_run_id(session_id: str | None) -> str:
+        """Choose the newest user-visible run without reading its content."""
+        if not session_id:
+            return ""
+        runs = [
+            *agent.sessions.list_chat_runs(session_id, limit=1),
+            *agent.sessions.list_research_runs(session_id, limit=1),
+        ]
+        if not runs:
+            return ""
+        latest = max(
+            runs,
+            key=lambda item: (str(item.get("updated_at") or ""), str(item.get("created_at") or "")),
+        )
+        return str(latest.get("run_id") or "")
+
+    def _local_badcase_run(run_id: str) -> dict | None:
+        if run_id.startswith("chat-"):
+            run = agent.sessions.get_chat_run(run_id)
+            kind = "chat"
+            if run:
+                return {
+                    "run_id": run_id, "kind": kind, "session_id": run["thread_id"],
+                    "status": run["status"], "model": run.get("model", ""),
+                    "duration_ms": run.get("duration_ms"), "metrics": run.get("metrics", {}),
+                    "error_type": run.get("error_type", ""),
+                    "events": agent.sessions.get_run_events(run_id, run["thread_id"]),
+                }
+        if run_id.startswith("research-"):
+            run = agent.sessions.get_research_run(run_id)
+            if run:
+                trace = run.get("trace") if isinstance(run.get("trace"), dict) else {}
+                usage = trace.get("usage") if isinstance(trace.get("usage"), dict) else {}
+                return {
+                    "run_id": run_id, "kind": "research", "session_id": run["thread_id"],
+                    "status": run["status"], "model": agent.model,
+                    "duration_ms": trace.get("duration_ms"), "metrics": usage,
+                    "error_type": trace.get("error_type", ""),
+                    "events": agent.sessions.get_run_events(run_id, run["thread_id"]),
+                }
+        if run_id.startswith("daily-"):
+            run = scheduler.get_daily_run(run_id)
+            if run:
+                result = run.get("result") if isinstance(run.get("result"), dict) else {}
+                candidates = run.get("candidates") if isinstance(run.get("candidates"), list) else []
+                selected = result.get("selected") if isinstance(result.get("selected"), list) else []
+                events = [
+                    {
+                        "event_type": event.get("event_type"),
+                        "stage": event.get("agent"),
+                        "status": event.get("status"),
+                        "metrics": event.get("details"),
+                        "metadata": event.get("metadata"),
+                    }
+                    for event in scheduler.get_daily_agent_events(run_id)
+                ]
+                return {
+                    "run_id": run_id, "kind": "daily", "session_id": "",
+                    "status": run["status"], "model": "",
+                    "metrics": {
+                        "candidate_count": len(candidates), "selected_count": len(selected),
+                    },
+                    "error_type": str(run.get("error_text") or "").split(":", 1)[0],
+                    "events": events,
+                }
+        return None
+
+    def report_badcase(
+        session_id: str | None, run_id: str, category: str, note: str,
+    ) -> str:
+        selected_run_id = (run_id or "").strip() or _latest_session_run_id(session_id)
+        if not selected_run_id:
+            return "⚠️ 当前会话没有可标记的运行任务。"
+        try:
+            if api_run_client_enabled:
+                import requests
+
+                response = requests.post(
+                    f"{api_run_base}/api/v1/runs/{selected_run_id}/badcases",
+                    headers=_api_headers(), json={"category": category, "note": note},
+                    timeout=(3, 10),
+                )
+                response.raise_for_status()
+                candidate = response.json()
+            else:
+                run = _local_badcase_run(selected_run_id)
+                if not run:
+                    return "⚠️ 未找到该运行任务。"
+                candidate, _created = badcases.create_candidate(
+                    run, category=category, note=note,
+                )
+        except Exception as exc:
+            return f"⚠️ 标记问题失败：{type(exc).__name__}"
+        return (
+            f"✅ 已加入本地 Badcase 候选池：`{candidate['candidate_id']}`。"
+            "仅保存脱敏运行快照；请在人工审核后再转成合成回归样例。"
+        )
+
     def _session_choices():
         return [
             (f"{session['title']} · {session['updated_at'][:16]}", session["thread_id"])
@@ -1209,6 +1309,7 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             )
         _invalidate_browser_request(request)
         agent.delete_session(session_id)
+        badcases.delete_for_session(session_id)
         _forget_topic(session_id)
         for key in [key for key in pending_conflicts if key[0] == session_id]:
             pending_conflicts.pop(key, None)
@@ -1458,6 +1559,40 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     outputs=[run_center_panel],
                     show_progress="hidden",
                 )
+                with gr.Accordion("标记问题（Badcase 候选）", open=False):
+                    gr.Markdown(
+                        "将当前会话最新运行（或指定运行 ID）加入本地候选池。"
+                        "不会自动复制问题、回答、PDF 或工具原始结果。"
+                    )
+                    badcase_run_id = gr.Textbox(
+                        label="运行 ID（留空表示当前会话最新任务）", max_lines=1,
+                    )
+                    with gr.Row():
+                        badcase_category = gr.Dropdown(
+                            label="问题类型",
+                            choices=[
+                                ("检索遗漏", "retrieval_miss"),
+                                ("引用质量", "citation_quality"),
+                                ("回答质量", "answer_quality"),
+                                ("工具失败", "tool_failure"),
+                                ("性能问题", "performance"),
+                                ("安全问题", "safety"),
+                                ("其他", "other"),
+                            ],
+                            value="answer_quality", scale=2,
+                        )
+                        report_badcase_btn = gr.Button("标记问题", variant="secondary", scale=1)
+                    badcase_note = gr.Textbox(
+                        label="脱敏备注（可选）", max_lines=3,
+                        placeholder="请勿粘贴原始问题、回答、论文正文或密钥。",
+                    )
+                    badcase_status = gr.Markdown()
+                    report_badcase_btn.click(
+                        fn=report_badcase,
+                        inputs=[session_state, badcase_run_id, badcase_category, badcase_note],
+                        outputs=[badcase_status],
+                        show_progress="hidden",
+                    )
 
             # ── Tab 3: 论文库 ──
             with gr.Tab("📚 论文库"):

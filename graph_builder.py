@@ -34,7 +34,8 @@ from llm_client import (
     RequestPriority,
 )
 from prompts import SYSTEM_PROMPT
-from tool_schemas import get_tool_schemas
+from tool_catalog import get_tool_schemas
+from tool_runtime import ToolExecutionContext, ToolRuntime
 from tools import execute_tool
 
 
@@ -124,6 +125,7 @@ def build_graph(
     request_policy: RequestPolicy | None = None,
     max_tool_rounds: int | None = None,
     tool_argument_normalizer: Callable[[str, dict], dict] | None = None,
+    tool_context: ToolExecutionContext | None = None,
 ):
     # A graph must use the process-wide client owned by ResearchAgent. Creating
     # one here would silently defeat shared admission control in multi-agent
@@ -133,12 +135,7 @@ def build_graph(
     if checkpoint_db is None:
         from runtime_paths import get_runtime_paths
         checkpoint_db = str(get_runtime_paths().checkpoint_db)
-    tool_schemas = get_tool_schemas()
-    if allowed_tool_names is not None:
-        tool_schemas = [
-            schema for schema in tool_schemas
-            if schema.get("function", {}).get("name") in allowed_tool_names
-        ]
+    tool_schemas = get_tool_schemas(allowed_tool_names)
     if max_tool_rounds is not None:
         max_tool_rounds = max(1, int(max_tool_rounds))
 
@@ -156,6 +153,19 @@ def build_graph(
         if cancel_event is not None and cancel_event.is_set():
             emit("request_cancelled", stage=stage)
         raise_if_cancelled(cancel_event, f"请求已在 {stage} 取消")
+
+    runtime_context = tool_context or ToolExecutionContext(
+        run_kind="research" if allowed_tool_names is not None else "chat",
+        allowed_tool_names=(
+            frozenset(allowed_tool_names) if allowed_tool_names is not None else None
+        ),
+        cancel_event=cancel_event,
+    )
+    # Keep the dispatcher injectable at this seam: it preserves lightweight
+    # graph tests while the runtime owns all cross-cutting policy.
+    tool_runtime = ToolRuntime(
+        runtime_context, event_callback=emit, executor=execute_tool,
+    )
 
     def watch_stream_cancellation(response):
         """取消时关闭已建立的 SSE 连接，打断 ``iter_lines`` 的阻塞读取。"""
@@ -480,12 +490,6 @@ def build_graph(
         for tc in tool_calls:
             ensure_active("before_tool")
             name = tc["function"]["name"]
-            if allowed_tool_names is not None and name not in allowed_tool_names:
-                tool_msgs.append({
-                    "role": "tool", "tool_call_id": tc["id"],
-                    "content": f"Tool is not available in this research role: {name}",
-                })
-                continue
             try:
                 args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
@@ -496,40 +500,12 @@ def build_graph(
                 normalized_args = tool_argument_normalizer(name, dict(args))
                 if isinstance(normalized_args, dict):
                     args = normalized_args
-            print(f"      🔧 {name}({json.dumps(args, ensure_ascii=False)})", file=sys.stderr)
-            tool_started = time.perf_counter()
-            emit("tool_started", tool=name)
-            try:
-                result = execute_tool(
-                    name, args, paper_store=paper_store, glm_api_key=glm_api_key,
-                    profile_manager=profile_manager, memory_store=memory_store,
-                    cancel_event=cancel_event,
-                )
-            except Exception as exc:
-                emit(
-                    "tool_failed", tool=name,
-                    duration_ms=round((time.perf_counter() - tool_started) * 1000, 1),
-                    error_type=type(exc).__name__,
-                )
-                raise
-            ensure_active("after_tool")
-            if isinstance(result, str):
-                # ── 按工具类型差异化截断 ──
-                limits = {
-                    "query_papers": 5000,
-                    "search_papers": 3000,
-                    "read_pdf": 12000,
-                    "describe_image": 2000,
-                    "memory_search": 1500,
-                }
-                limit = limits.get(name, 3000)
-                if len(result) > limit:
-                    result = result[:limit] + f"\n\n...（截断至 {limit} 字符）"
-            emit(
-                "tool_finished", tool=name,
-                duration_ms=round((time.perf_counter() - tool_started) * 1000, 1),
-                rag_keyword_fallback=name == "query_papers" and "关键词候选" in str(result),
+            print(f"      🔧 {name}", file=sys.stderr)
+            result = tool_runtime.execute(
+                name, args, paper_store=paper_store, glm_api_key=glm_api_key,
+                profile_manager=profile_manager, memory_store=memory_store,
             )
+            ensure_active("after_tool")
             tool_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         return {"messages": tool_msgs}
 

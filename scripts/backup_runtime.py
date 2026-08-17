@@ -56,6 +56,7 @@ def main() -> int:
             (paths.memory_db, "primary/db/memory.db"),
             (paths.notes_db, "primary/db/notes.db"),
             (paths.daily_db, "primary/db/daily.db"),
+            (paths.badcases_db, "primary/db/badcases.db"),
         ):
             _backup_sqlite(source, staging / relative)
         for source, relative in (

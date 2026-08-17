@@ -88,3 +88,25 @@ class RunResponse(BaseModel):
 class CancelRunResponse(BaseModel):
     run_id: str
     status: str
+
+
+class BadcaseCreateRequest(BaseModel):
+    """User feedback without copying the associated prompt or answer."""
+
+    category: Literal[
+        "retrieval_miss", "citation_quality", "answer_quality", "tool_failure",
+        "performance", "safety", "other",
+    ]
+    note: str = Field(default="", max_length=500)
+
+
+class BadcaseCandidateResponse(BaseModel):
+    candidate_id: str
+    run_id: str
+    category: str
+    source: str
+    status: str
+    fingerprint: str
+    occurrence_count: int
+    created_at: str
+    updated_at: str

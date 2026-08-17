@@ -220,6 +220,46 @@ class TestFastAPIService(unittest.TestCase):
         detail = client.get(f"/api/v1/runs/{started.json()['run_id']}")
         self.assertEqual(detail.json()["kind"], "chat")
 
+    def test_badcase_feedback_keeps_only_a_safe_run_snapshot_and_follows_session_delete(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        app = create_app(agent=self.agent)
+        try:
+            client = TestClient(app)
+            session_id = client.post("/api/v1/sessions", json={"title": "Badcase"}).json()["thread_id"]
+            started = client.post("/api/v1/runs", json={
+                "kind": "chat", "session_id": session_id,
+                "message": "PRIVATE_PROMPT_MUST_NOT_BE_SAVED",
+            })
+            run_id = started.json()["run_id"]
+
+            created = client.post(
+                f"/api/v1/runs/{run_id}/badcases",
+                json={"category": "answer_quality", "note": "已人工脱敏的备注"},
+            )
+            self.assertEqual(created.status_code, 201)
+            self.assertNotIn("note", created.json())
+            candidate_id = created.json()["candidate_id"]
+            candidate = app.state.badcase_store.get(candidate_id)
+            self.assertEqual(candidate["note"], "已人工脱敏的备注")
+            persisted = json.dumps(candidate["snapshot"], ensure_ascii=False)
+            self.assertNotIn("PRIVATE_PROMPT_MUST_NOT_BE_SAVED", persisted)
+            self.assertNotIn("已收到", persisted)
+
+            duplicate = client.post(
+                f"/api/v1/runs/{run_id}/badcases",
+                json={"category": "answer_quality"},
+            )
+            self.assertEqual(duplicate.status_code, 200)
+            self.assertEqual(duplicate.json()["candidate_id"], candidate_id)
+            self.assertEqual(duplicate.json()["occurrence_count"], 2)
+
+            self.assertEqual(client.delete(f"/api/v1/sessions/{session_id}").status_code, 204)
+            self.assertIsNone(app.state.badcase_store.get(candidate_id))
+        finally:
+            app.state.badcase_store.close()
+
     def test_sse_formatter_restricts_the_public_event_vocabulary(self):
         from api.sse import format_sse
 
@@ -231,6 +271,14 @@ class TestFastAPIService(unittest.TestCase):
             format_sse({"type": "internal", "payload": "must not leak"}),
             'event: status\ndata: {"type":"status","status":"running"}\n\n',
         )
+        tool_event = format_sse({
+            "type": "tool", "tool": "read_pdf", "status": "completed",
+            "arguments": {"path": "private-paper.pdf"}, "result": "must not leak",
+        })
+        self.assertIn('event: tool', tool_event)
+        self.assertIn('"tool":"read_pdf"', tool_event)
+        self.assertNotIn("private-paper.pdf", tool_event)
+        self.assertNotIn("must not leak", tool_event)
 
     def test_cannot_claim_cross_process_cancellation(self):
         from fastapi.testclient import TestClient
@@ -349,6 +397,15 @@ class TestFastAPIService(unittest.TestCase):
         session_id = self.agent.create_session("Durable API 测试")["thread_id"]
         started = manager.start(session_id, "队列执行")
         self.assertEqual(started["status"], "queued")
+        queued_events = self.store.get_run_events(started["run_id"], session_id)
+        self.assertEqual(queued_events[0]["event_type"], "status")
+        self.assertEqual(queued_events[0]["metadata"], {
+            "protocol": "run-event/v1",
+            "run_kind": "chat",
+            "runner": "redis-worker",
+            "model": "fake-model",
+            "toolset": "chat-default",
+        })
         worker = RedisChatRunWorker(self.agent, broker, consumer="test-worker")
         self.assertTrue(worker.run_once(block_ms=1))
         completed = manager.get(started["run_id"])
@@ -655,6 +712,95 @@ class TestToolResponsiveness(unittest.TestCase):
         )
         self.assertIn("后台初始化", result)
         self.assertEqual(store.query, "TSN scheduling")
+
+    def test_hybrid_query_promotes_exact_term_and_renders_its_mode(self):
+        from paper_store import PaperStore
+        from tools.search import handle_query_papers
+
+        class _Collection:
+            @staticmethod
+            def count():
+                return 3
+
+            @staticmethod
+            def query(**_kwargs):
+                return {
+                    "ids": [["semantic", "exact", "overview"]],
+                    "documents": [[
+                        "A learned scheduler for deterministic networks.",
+                        "TSN scheduling under bursty traffic is evaluated here.",
+                        "An overview of TSN architecture.",
+                    ]],
+                    "metadatas": [[
+                        {"paper_id": "a", "title": "Learned Scheduler", "section": "Method", "chunk_index": 0},
+                        {"paper_id": "b", "title": "Exact TSN Scheduling", "section": "Related Work", "chunk_index": 1},
+                        {"paper_id": "c", "title": "TSN Overview", "section": "Introduction", "chunk_index": 2},
+                    ]],
+                    "distances": [[0.06, 0.10, 0.30]],
+                }
+
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "documents": [
+                        "A learned scheduler for deterministic networks.",
+                        "TSN scheduling under bursty traffic is evaluated here.",
+                        "An overview of TSN architecture.",
+                    ],
+                    "metadatas": [
+                        {"paper_id": "a", "title": "Learned Scheduler", "section": "Method", "chunk_index": 0},
+                        {"paper_id": "b", "title": "Exact TSN Scheduling", "section": "Related Work", "chunk_index": 1},
+                        {"paper_id": "c", "title": "TSN Overview", "section": "Introduction", "chunk_index": 2},
+                    ],
+                }
+
+        store = PaperStore.__new__(PaperStore)
+        store._collection = _Collection()
+        results = store.query_hybrid("TSN scheduling", top_k=2)
+
+        self.assertEqual(results[0]["title"], "Exact TSN Scheduling")
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item["retrieval"] == "hybrid" for item in results))
+        self.assertTrue(all("hybrid_score" in item for item in results))
+
+        class _HybridStore:
+            @staticmethod
+            def query_with_timeout(*_args, **_kwargs):
+                return results, None
+
+        rendering = handle_query_papers({"query": "TSN scheduling"}, paper_store=_HybridStore())
+        self.assertIn("混合检索结果", rendering)
+        self.assertIn("混合分:", rendering)
+
+    def test_hybrid_query_keeps_large_collections_on_semantic_path(self):
+        from paper_store import HYBRID_LEXICAL_MAX_CHUNKS, PaperStore
+
+        class _Collection:
+            get_called = False
+
+            @staticmethod
+            def count():
+                return HYBRID_LEXICAL_MAX_CHUNKS + 1
+
+            @staticmethod
+            def query(**_kwargs):
+                return {
+                    "ids": [["semantic"]],
+                    "documents": [["Semantic candidate"]],
+                    "metadatas": [[{"paper_id": "a", "title": "Paper", "section": "Method", "chunk_index": 0}]],
+                    "distances": [[0.1]],
+                }
+
+            def get(self, **_kwargs):
+                self.get_called = True
+                raise AssertionError("large corpus must not run lexical scan")
+
+        store = PaperStore.__new__(PaperStore)
+        store._collection = _Collection()
+        results = store.query_hybrid("semantic query", top_k=1)
+
+        self.assertEqual(results[0]["retrieval"], "semantic")
+        self.assertFalse(store._collection.get_called)
 
 
 class TestVerifyNode(unittest.TestCase):
@@ -1424,10 +1570,19 @@ class TestSessionStore(unittest.TestCase):
                     first["thread_id"], run["run_id"], "chat", "single_agent",
                     "model", "completed", summary="模型请求已完成",
                     metrics={"duration_ms": 12.34, "prompt": "must-not-persist"},
+                    metadata={"model": "deepseek-chat", "prompt": "must-not-persist"},
                 )
                 store.update_chat_run(
                     run["run_id"], status="completed", duration_ms=13,
                     metrics={"model_calls": 1, "raw_answer": "must-not-persist"},
+                )
+                store.add_run_event(
+                    first["thread_id"], run["run_id"], "chat", "single_agent",
+                    "tool", "completed", summary="工具调用已完成",
+                )
+                store.add_run_event(
+                    first["thread_id"], run["run_id"], "chat", "single_agent",
+                    "run", "completed", summary="本轮对话已完成",
                 )
 
                 saved = store.list_chat_runs(first["thread_id"])
@@ -1435,6 +1590,11 @@ class TestSessionStore(unittest.TestCase):
                 self.assertEqual(saved[0]["metrics"], {"model_calls": 1})
                 events = store.get_run_events(run["run_id"], first["thread_id"])
                 self.assertEqual(events[0]["metrics"], {"duration_ms": 12.3})
+                self.assertEqual(events[0]["event_type"], "status")
+                self.assertEqual(events[0]["schema_version"], 1)
+                self.assertEqual(events[0]["metadata"], {"model": "deepseek-chat"})
+                self.assertNotIn("must-not-persist", json.dumps(events[0], ensure_ascii=False))
+                self.assertEqual([event["event_type"] for event in events], ["status", "tool", "done"])
                 self.assertEqual(store.get_run_events(run["run_id"], second["thread_id"]), [])
 
                 self.assertTrue(store.delete(first["thread_id"]))
@@ -1457,11 +1617,80 @@ class TestSessionStore(unittest.TestCase):
                 scheduler.add_daily_agent_event(
                     run["run_id"], "scouts", "running",
                     "PRIVATE_KEYWORD and candidate title must not be rendered",
+                    {"candidate_count": 3, "keyword": "PRIVATE_KEYWORD"},
                 )
+                events = scheduler.get_daily_agent_events(run["run_id"])
+                self.assertEqual(events[0]["event_type"], "status")
+                self.assertEqual(events[0]["details"], {"candidate_count": 3})
+                self.assertNotIn("PRIVATE_KEYWORD", json.dumps(events[0], ensure_ascii=False))
                 html = RunTimelineService(sessions, scheduler).render_daily_runs()
                 self.assertIn("多来源检索阶段", html)
                 self.assertNotIn("PRIVATE_KEYWORD", html)
                 self.assertNotIn("candidate title", html)
+            finally:
+                scheduler.close()
+                sessions.close()
+
+    def test_event_schema_migrates_existing_databases_and_hides_legacy_payloads(self):
+        """Adding the shared contract must not require users to rebuild local SQLite files."""
+        from scheduler import Scheduler
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_db = Path(tmp) / "checkpoint.db"
+            conn = sqlite3.connect(checkpoint_db)
+            conn.execute("""
+                CREATE TABLE agent_run_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL, thread_id TEXT NOT NULL, run_kind TEXT NOT NULL,
+                    agent TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '', metrics_json TEXT NOT NULL DEFAULT '{}',
+                    error_type TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+            conn.close()
+
+            daily_db = Path(tmp) / "daily.db"
+            conn = sqlite3.connect(daily_db)
+            conn.execute("""
+                CREATE TABLE daily_agent_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+                    agent TEXT NOT NULL, status TEXT NOT NULL, message TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+            conn.close()
+
+            sessions = SessionStore(str(checkpoint_db))
+            scheduler = Scheduler(str(daily_db))
+            try:
+                session_columns = {
+                    row[1] for row in sessions._conn.execute("PRAGMA table_info(agent_run_events)")
+                }
+                daily_columns = {
+                    row[1] for row in scheduler._conn.execute("PRAGMA table_info(daily_agent_events)")
+                }
+                self.assertTrue({"event_type", "payload_json", "schema_version"} <= session_columns)
+                self.assertTrue({"event_type", "payload_json", "schema_version"} <= daily_columns)
+
+                run = scheduler.create_daily_run("daily", ["legacy keyword"])
+                with scheduler._conn:
+                    scheduler._conn.execute(
+                        "INSERT INTO daily_agent_events "
+                        "(run_id, agent, event_type, status, message, details_json, payload_json, schema_version, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            run["run_id"], "scouts", "status", "running", "legacy keyword",
+                            '{"candidate_count":2,"keyword":"legacy keyword"}',
+                            '{"model":"safe-model","prompt":"legacy keyword"}', 1, "now",
+                        ),
+                    )
+                saved = scheduler.get_daily_agent_events(run["run_id"])[0]
+                self.assertEqual(saved["details"], {"candidate_count": 2})
+                self.assertEqual(saved["metadata"], {"model": "safe-model"})
+                self.assertNotIn("legacy keyword", json.dumps(saved, ensure_ascii=False))
             finally:
                 scheduler.close()
                 sessions.close()
@@ -1530,10 +1759,17 @@ class TestResearchOrchestration(unittest.TestCase):
                     role="public", label="公开研究员", allowed_tools={"search_papers"}, instruction="收集证据",
                 )
                 with patch("research_orchestrator.build_graph", return_value=_App()) as build:
-                    worker = orchestrator._run_worker(spec, "研究问题", {"subtasks": []}, None)
+                    worker = orchestrator._run_worker(
+                        spec, "研究问题", {"subtasks": []}, None, run_id="research-run-1",
+                    )
 
                 self.assertEqual(RESEARCH_WORKER_MAX_TOOL_ROUNDS, 1)
                 self.assertEqual(build.call_args.kwargs["max_tool_rounds"], RESEARCH_WORKER_MAX_TOOL_ROUNDS)
+                context = build.call_args.kwargs["tool_context"]
+                self.assertEqual(context.run_kind, "research")
+                self.assertEqual(context.run_id, "research-run-1")
+                self.assertEqual(context.research_scope, "public")
+                self.assertEqual(context.allowed_tool_names, frozenset({"search_papers"}))
                 self.assertEqual(worker["status"], "completed")
                 self.assertEqual(len(worker["evidence"]), 1)
             finally:
@@ -2194,7 +2430,7 @@ class TestCancellationPropagation(unittest.TestCase):
             cancel_event = threading.Event()
             result = []
 
-            def fake_build(_usage, on_token=None, event_callback=None, cancel_event=None):
+            def fake_build(_usage, on_token=None, event_callback=None, cancel_event=None, **_kwargs):
                 return _SlowApp(cancel_event)
 
             worker = threading.Thread(
@@ -2209,6 +2445,90 @@ class TestCancellationPropagation(unittest.TestCase):
             self.assertEqual(result, ["⏹️ 请求已取消。"])
             agent.memory.close()
             agent.sessions.close()
+
+
+class TestToolCatalog(unittest.TestCase):
+    """工具声明必须在 Schema、运行时和分发器之间保持同源。"""
+
+    def test_catalog_filters_capabilities_and_returns_independent_schemas(self):
+        from tool_catalog import TOOL_NAMES, get_tool_schemas
+        from tools import TOOL_NAMES as executable_names
+
+        self.assertEqual(TOOL_NAMES, executable_names)
+        all_schemas = get_tool_schemas()
+        self.assertEqual(
+            {schema["function"]["name"] for schema in all_schemas}, TOOL_NAMES,
+        )
+        all_schemas[0]["function"]["description"] = "mutated by caller"
+        self.assertNotEqual(
+            get_tool_schemas()[0]["function"]["description"], "mutated by caller",
+        )
+        self.assertEqual(
+            [schema["function"]["name"] for schema in get_tool_schemas({"read_pdf"})],
+            ["read_pdf"],
+        )
+
+
+class TestToolRuntime(unittest.TestCase):
+    """工具策略在现有分发器之前生效，且追踪中不保留参数或结果。"""
+
+    def test_disallowed_tool_does_not_reach_dispatcher_or_expose_arguments(self):
+        from tool_runtime import ToolExecutionContext, ToolRuntime
+
+        events = []
+        dispatcher = MagicMock(return_value="不应执行")
+        runtime = ToolRuntime(
+            ToolExecutionContext(
+                run_kind="research",
+                allowed_tool_names=frozenset({"query_papers"}),
+            ),
+            event_callback=lambda event_type, **details: events.append({
+                "type": event_type, **details,
+            }),
+            executor=dispatcher,
+        )
+
+        result = runtime.execute("search_papers", {"query": "不可泄露的检索词"})
+
+        self.assertIn("not available", result)
+        dispatcher.assert_not_called()
+        self.assertEqual(events, [{
+            "type": "tool_failed", "tool": "search_papers",
+            "error_type": "ToolAccessDenied",
+        }])
+        self.assertNotIn("不可泄露", json.dumps(events, ensure_ascii=False))
+
+    def test_runtime_bounds_output_and_stops_before_cancelled_dispatch(self):
+        import threading
+        from cancellation import RequestCancelledError
+        from tool_runtime import ToolExecutionContext, ToolRuntime
+
+        events = []
+        dispatcher = MagicMock(return_value="x" * 3_200)
+        runtime = ToolRuntime(
+            ToolExecutionContext(allowed_tool_names=frozenset({"search_papers"})),
+            event_callback=lambda event_type, **details: events.append({
+                "type": event_type, **details,
+            }),
+            executor=dispatcher,
+        )
+        result = runtime.execute("search_papers", {"query": "TSN"})
+        self.assertIn("截断至 3000 字符", result)
+        self.assertLessEqual(len(result), 3_100)
+        self.assertEqual([event["type"] for event in events], [
+            "tool_started", "tool_finished",
+        ])
+        self.assertNotIn("TSN", json.dumps(events, ensure_ascii=False))
+
+        cancelled = threading.Event()
+        cancelled.set()
+        blocked_dispatcher = MagicMock()
+        cancelled_runtime = ToolRuntime(
+            ToolExecutionContext(cancel_event=cancelled), executor=blocked_dispatcher,
+        )
+        with self.assertRaises(RequestCancelledError):
+            cancelled_runtime.execute("read_pdf", {"source": "paper.pdf"})
+        blocked_dispatcher.assert_not_called()
 
 
 class TestCircuitBreaker(unittest.TestCase):
@@ -2230,6 +2550,65 @@ class TestCircuitBreaker(unittest.TestCase):
         breaker.record_failure()
         self.assertEqual(breaker.state, "open")
         self.assertFalse(breaker.allow_request())
+
+
+class TestBadcaseStore(unittest.TestCase):
+    """Badcase 候选只保存可审计的机器元数据，不保留真实内容。"""
+
+    def test_candidate_and_export_template_strip_run_content(self):
+        from badcase_store import BadcaseStore, promotion_template
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "runtime"
+            store = BadcaseStore(str(data_dir / "primary" / "db" / "badcases.db"))
+            try:
+                candidate, created = store.create_candidate(
+                    {
+                        "run_id": "chat-private-run",
+                        "kind": "chat",
+                        "session_id": "session-private",
+                        "status": "completed",
+                        "model": "safe-model",
+                        "duration_ms": 12.5,
+                        "answer": "PRIVATE_ANSWER_MUST_NOT_BE_SAVED",
+                        "metrics": {"model_calls": 1, "raw": "PRIVATE_METRIC"},
+                        "events": [{
+                            "event_type": "tool", "stage": "tool", "status": "completed",
+                            "message": "PRIVATE_EVENT_MESSAGE", "result": "PRIVATE_TOOL_RESULT",
+                            "metrics": {"calls": 1, "raw": "PRIVATE_EVENT_METRIC"},
+                            "metadata": {"model": "safe-model", "prompt": "PRIVATE_METADATA"},
+                        }],
+                    },
+                    category="tool_failure",
+                    note="人工确认，未包含原始内容",
+                )
+                self.assertTrue(created)
+                serialized = json.dumps(candidate["snapshot"], ensure_ascii=False)
+                for marker in (
+                    "PRIVATE_ANSWER_MUST_NOT_BE_SAVED", "PRIVATE_METRIC",
+                    "PRIVATE_EVENT_MESSAGE", "PRIVATE_TOOL_RESULT", "PRIVATE_EVENT_METRIC",
+                    "PRIVATE_METADATA",
+                ):
+                    self.assertNotIn(marker, serialized)
+                self.assertEqual(candidate["snapshot"]["timeline"][0]["metrics"], {"calls": 1})
+                self.assertEqual(candidate["snapshot"]["timeline"][0]["metadata"], {"model": "safe-model"})
+
+                draft = promotion_template(candidate)
+                self.assertEqual(draft["schema"], "badcase-fixture-draft/v1")
+                self.assertEqual(draft["to_fill_manually"]["redacted_input"], "")
+                self.assertNotIn("PRIVATE_ANSWER_MUST_NOT_BE_SAVED", json.dumps(draft, ensure_ascii=False))
+
+                result = subprocess.run(
+                    [
+                        sys.executable, "scripts/export_badcase_template.py",
+                        "--data-dir", str(data_dir), "--candidate-id", candidate["candidate_id"],
+                    ],
+                    check=True, cwd=PROJECT_ROOT, text=True, encoding="utf-8", capture_output=True,
+                )
+                self.assertIn('"schema": "badcase-fixture-draft/v1"', result.stdout)
+                self.assertNotIn("PRIVATE_ANSWER_MUST_NOT_BE_SAVED", result.stdout)
+            finally:
+                store.close()
 
 
 class TestRuntimePaths(unittest.TestCase):
@@ -2262,6 +2641,7 @@ class TestRuntimePaths(unittest.TestCase):
                 self.assertEqual(Path(cfg.memory_db), paths.memory_db)
                 self.assertEqual(Path(cfg.notes_db), paths.notes_db)
                 self.assertEqual(Path(cfg.daily_db), paths.daily_db)
+                self.assertEqual(paths.badcases_db, paths.database_dir / "badcases.db")
                 self.assertEqual(Path(cfg.chroma_dir), paths.chroma_dir)
                 self.assertEqual(Path(cfg.papers_dir), paths.papers_dir)
                 self.assertEqual(Path(cfg.images_dir), paths.images_dir)
@@ -2314,6 +2694,7 @@ class TestRuntimePaths(unittest.TestCase):
                 copied.close()
 
     def test_backup_script_exports_primary_data_as_zip(self):
+        from badcase_store import BadcaseStore
         from runtime_paths import RuntimePaths
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2325,6 +2706,14 @@ class TestRuntimePaths(unittest.TestCase):
             conn.execute("INSERT INTO marker VALUES ('backup-ok')")
             conn.commit()
             conn.close()
+            badcases = BadcaseStore(str(paths.badcases_db))
+            try:
+                badcases.create_candidate(
+                    {"run_id": "chat-backup", "kind": "chat", "session_id": "session-backup"},
+                    category="other",
+                )
+            finally:
+                badcases.close()
             paths.profile_path.write_text("# 用户画像\n", encoding="utf-8")
             (paths.papers_dir / "paper.pdf").write_bytes(b"%PDF-test")
             output = root / "backups"
@@ -2341,6 +2730,7 @@ class TestRuntimePaths(unittest.TestCase):
             self.assertEqual(len(archives), 1)
             with zipfile.ZipFile(archives[0]) as archive:
                 self.assertIn("runtime/primary/db/notes.db", archive.namelist())
+                self.assertIn("runtime/primary/db/badcases.db", archive.namelist())
                 self.assertIn("runtime/primary/profile.md", archive.namelist())
                 self.assertIn("runtime/primary/papers/paper.pdf", archive.namelist())
 
@@ -2738,7 +3128,7 @@ class TestRequestTracing(unittest.TestCase):
                 deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
             ))
 
-            def fake_build(usage, on_token=None, event_callback=None, cancel_event=None):
+            def fake_build(usage, on_token=None, event_callback=None, cancel_event=None, **_kwargs):
                 event_callback({
                     "type": "tool_finished", "tool": "query_papers",
                     "duration_ms": 12.5, "rag_keyword_fallback": False,
