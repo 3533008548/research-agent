@@ -18,6 +18,8 @@ from runtime_paths import get_runtime_paths
 class MemoryStore:
     """轻量记忆存储 — 三元组 + 话题摘要"""
 
+    MAX_SUMMARIES_PER_THREAD = 3
+
     def __init__(self, db_path: str | None = None):
         db_path = db_path or str(get_runtime_paths().memory_db)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +74,10 @@ class MemoryStore:
 
     def search_triples(self, query: str, limit: int = 10) -> list[dict]:
         """模糊搜索三元组"""
+        query = str(query or "").strip()
+        if not query:
+            return []
+        limit = max(1, min(int(limit), 50))
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM triples WHERE paper_title LIKE ? OR relation LIKE ? OR value LIKE ? "
@@ -98,8 +104,8 @@ class MemoryStore:
                 (thread_id, topic, summary, now),
             )
             rows = self._conn.execute(
-                "SELECT id FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 3",
-                (thread_id,),
+                "SELECT id FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT -1 OFFSET ?",
+                (thread_id, self.MAX_SUMMARIES_PER_THREAD),
             ).fetchall()
             for r in rows:
                 self._conn.execute("DELETE FROM summaries WHERE id=?", (r["id"],))
@@ -143,6 +149,33 @@ class MemoryStore:
                     "SELECT * FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT 3",
                     (thread_id,),
                 ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_summaries(
+        self,
+        query: str,
+        thread_id: str,
+        limit: int = 3,
+    ) -> list[dict]:
+        """Search only the current session's summaries.
+
+        Conversation summaries are session-scoped by design.  Requiring a
+        ``thread_id`` here prevents a model-facing memory search from leaking
+        another conversation's context into the active session.
+        """
+        query = str(query or "").strip()
+        thread_id = str(thread_id or "").strip()
+        if not query or not thread_id:
+            return []
+        limit = max(1, min(int(limit), self.MAX_SUMMARIES_PER_THREAD))
+        pattern = f"%{query}%"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM summaries "
+                "WHERE thread_id=? AND (topic LIKE ? OR summary LIKE ?) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (thread_id, pattern, pattern, limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def delete_summaries(self, thread_id: str) -> int:

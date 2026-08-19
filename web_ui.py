@@ -63,23 +63,100 @@ CHAT_LATEX_DELIMITERS = [
 # ``mount_gradio_app``.
 UI_THEME = gr.themes.Soft()
 UI_CSS = """
+/* A quiet workbench: conversation in the centre, context on the left, run
+   inspection on the right.  Avoid broad colour overrides so Gradio keeps the
+   established primary/stop button semantics. */
+:root { color-scheme: light; }
 .gradio-container,
 .gradio-container button,
 .gradio-container input,
 .gradio-container textarea,
 .gradio-container select,
 .gradio-container .prose {
-    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Noto Sans SC", Arial, sans-serif;
 }
-.main-header { text-align: center; padding: 0.5rem 0; }
-.main-header h1 { font-size: 1.3rem; font-weight: 600; }
-.status-bar { padding: 0.3rem 1rem; font-size: 0.75rem; color: #666; }
+.gradio-container {
+    max-width: none !important;
+    min-height: 100vh;
+    padding: 0 !important;
+    background: #f7f8fb;
+    color: #182230;
+}
+.gradio-container .main { max-width: 1560px !important; padding: 1rem 1.25rem 1.5rem !important; }
+.workbench-header {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    padding: 0.5rem 0 1rem;
+}
+.workbench-mark {
+    display: grid;
+    width: 2.35rem;
+    height: 2.35rem;
+    place-items: center;
+    border-radius: 0.8rem;
+    background: #e7efff;
+    font-size: 1.2rem;
+}
+.workbench-title { margin: 0; font-size: 1.06rem; font-weight: 680; letter-spacing: -0.01em; }
+.workbench-subtitle { margin: 0.1rem 0 0; color: #687386; font-size: 0.78rem; }
+.status-bar { align-self: center; margin-left: auto; padding: 0.3rem 0.65rem; font-size: 0.72rem; color: #687386; text-align: right; }
+.status-bar p { margin: 0; }
 footer { display: none !important; }
-.quit-btn { margin-top: -2px; min-width: 60px !important; max-width: 70px !important; }
-#drop-overlay { display: none !important; }
-#drop-overlay.show { display: flex !important; }
-.agent-run-list { display: grid; gap: 0.65rem; }
-.agent-run-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.7rem 0.85rem; background: #fff; }
+.quit-btn { align-self: center; min-width: 3.7rem !important; max-width: 4.5rem !important; }
+.app-shell { gap: 1rem !important; align-items: flex-start !important; }
+.workspace-sidebar, .workspace-inspector {
+    gap: 0.75rem !important;
+    border: 1px solid #e7eaf0;
+    border-radius: 0.9rem;
+    padding: 0.8rem !important;
+    background: rgba(255, 255, 255, 0.88);
+    box-shadow: 0 1px 2px rgba(24, 34, 48, 0.025);
+}
+.workspace-sidebar { order: -1; }
+.workspace-main { min-width: 0 !important; gap: 0.75rem !important; }
+.workspace-eyebrow { margin: 0.15rem 0 -0.25rem; color: #687386; font-size: 0.76rem; }
+.workspace-heading { margin: 0; font-size: 1.05rem; font-weight: 650; }
+.sidebar-label, .inspector-label { margin: 0.15rem 0 -0.2rem; font-size: 0.76rem; font-weight: 650; color: #49566b; }
+.session-actions, .composer-actions, .research-actions { gap: 0.5rem !important; }
+.session-actions button { min-width: 0 !important; }
+.composer-shell {
+    gap: 0.45rem !important;
+    border: 1px solid #e0e5ee;
+    border-radius: 1rem;
+    padding: 0.55rem !important;
+    background: #ffffff;
+    box-shadow: 0 10px 24px rgba(24, 34, 48, 0.055);
+}
+.composer-shell textarea { min-height: 3rem !important; }
+.research-tools, .utility-panel, .inspector-panel {
+    border: 1px solid #e7eaf0 !important;
+    border-radius: 0.7rem !important;
+    background: #fff !important;
+}
+.research-tools { margin-top: 0.15rem; }
+.utility-panel, .inspector-panel { margin: 0 !important; }
+.utility-panel > button, .inspector-panel > button, .research-tools > button {
+    padding: 0.65rem 0.7rem !important;
+    font-size: 0.82rem !important;
+}
+.utility-panel > .wrap, .inspector-panel > .wrap, .research-tools > .wrap { padding-top: 0.1rem !important; }
+#research-chat {
+    height: clamp(360px, 54vh, 540px) !important;
+    min-height: 360px !important;
+    border: 1px solid #e3e8f1;
+    border-radius: 1rem;
+    background: #fff;
+    overflow: hidden;
+    box-shadow: 0 1px 2px rgba(24, 34, 48, 0.02);
+}
+#research-chat .wrap { padding: 0.3rem; }
+.daily-panel { max-height: 15rem; overflow: auto; font-size: 0.82rem; }
+.paper-list { max-height: 19rem; overflow: auto; }
+.note-list { max-height: 16rem; overflow: auto; }
+.settings-stack { gap: 0.5rem !important; }
+.agent-run-list { display: grid; gap: 0.55rem; }
+.agent-run-card { border: 1px solid #e5e7eb; border-radius: 0.7rem; padding: 0.65rem 0.75rem; background: #fff; }
 .agent-run-title { display: flex; align-items: center; gap: 0.5rem; }
 .agent-run-meta { color: #6b7280; font-size: 0.75rem; margin-top: 0.2rem; }
 .agent-run-badge { border-radius: 999px; padding: 0.08rem 0.45rem; font-size: 0.72rem; font-weight: 600; background: #e5e7eb; color: #374151; }
@@ -96,17 +173,25 @@ footer { display: none !important; }
 .agent-event-dot.status-failed, .agent-event-dot.status-cancelled, .agent-event-dot.status-partial_failed { background: #dc2626; }
 .agent-event-dot.status-partial, .agent-event-dot.status-skipped, .agent-event-dot.status-resumed { background: #d97706; }
 .agent-run-hint, .agent-run-empty { color: #6b7280; font-size: 0.8rem; margin-top: 0.6rem; }
-"""
-UI_JS = """
-function() {
-    var overlay = document.getElementById('drop-overlay');
-    var dragCount = 0;
-    document.addEventListener('dragenter', function(e) { e.preventDefault(); dragCount++; overlay.classList.add('show'); });
-    document.addEventListener('dragleave', function(e) { e.preventDefault(); dragCount--; if (dragCount <= 0) { dragCount = 0; overlay.classList.remove('show'); } });
-    document.addEventListener('dragover', function(e) { e.preventDefault(); });
-    document.addEventListener('drop', function(e) { e.preventDefault(); dragCount = 0; overlay.classList.remove('show'); });
+@media (max-width: 1120px) {
+    .gradio-container .main { padding: 0.8rem !important; }
+    .app-shell { flex-wrap: wrap !important; }
+    .workspace-main { order: -2; flex-basis: 100% !important; }
+    .workspace-sidebar, .workspace-inspector { order: initial; flex: 1 1 19rem !important; }
+    .status-bar { display: none; }
+}
+@media (max-width: 720px) {
+    .gradio-container .main { padding: 0.55rem !important; }
+    .workspace-sidebar, .workspace-inspector { flex-basis: 100% !important; }
+    .workbench-header { padding-bottom: 0.65rem; }
+    #research-chat { height: 48vh !important; min-height: 360px !important; }
+    .composer-actions, .research-actions { flex-wrap: wrap !important; }
 }
 """
+# The native MultimodalTextbox owns drag/drop.  Do not install a document-wide
+# handler here: it would compete with Gradio's uploader and make the main
+# composer feel less direct.
+UI_JS = ""
 
 
 def build_ui(*, cfg=None, agent=None, launch: bool = True):
@@ -1120,28 +1205,14 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
         limit = tu.get("context_limit", 131072)
         limit_k = f"{limit//1000000}M" if limit >= 1000000 else f"{limit//1000}K"
         pct = min(round(last / limit * 100), 99) if last else 0
-        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
         vs = tu.get("verify_status", "")
-        vs_str = f"**{vs}** | " if vs else ""
         api = tu.get("api_status", "")
-        api_str = f"**{api}** | " if api else ""
-        daily = agent.runtime_status.get("daily_progress", "")
-        daily_str = f"**{daily}** | " if daily else ""
-        ready = agent.runtime_status.get("daily_ready", False)
-        ready_str = "**📰 结果就绪** | " if ready else ""
         bw = tu.get("budget_warning", "")
-        bw_str = f"**{bw}** | " if bw else ""
+        signals = [value for value in (api, vs, bw) if value]
+        signal_text = f" · **{signals[-1]}**" if signals else ""
         return (
-            f"**模型**: {agent.model} | "
-            f"**上下文**: `{bar}` {pct}% ({last:,}/{limit_k}) | "
-            f"{api_str}"
-            f"{vs_str}"
-            f"{daily_str}"
-            f"{ready_str}"
-            f"{bw_str}"
-            f"**Tokens**: {tu['total']:,} | "
-            f"**话题**: {_topic_for(session_id)} | "
-            f"**RAG**: {rag}"
+            f"模型：**{agent.model}** · 上下文：{pct}% ({last:,}/{limit_k}) · "
+            f"Tokens：{tu['total']:,} · RAG：{rag}{signal_text}"
         )
 
     def refresh_daily_panel() -> str:
@@ -1394,49 +1465,28 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
 
     # ═══ 构建界面 ═══
 
-    with gr.Blocks(title="🔬 Research Assistant") as demo:
+    with gr.Blocks(title="🔬 Research Assistant", elem_classes=["research-app"]) as demo:
         # gr.State 是浏览器请求级状态，避免两个标签页切换到彼此的会话。
         session_state = gr.State(value=agent.thread_id)
+        with gr.Row(elem_classes=["workbench-header"]):
+            gr.HTML(
+                '<div class="workbench-mark">🔬</div>'
+                '<div><p class="workbench-title">Research Assistant</p>'
+                '<p class="workbench-subtitle">论文证据、研究推理与可追溯运行</p></div>',
+            )
+            status = gr.Markdown(
+                refresh_status([], agent.thread_id), elem_classes=["status-bar"], scale=12,
+            )
+            quit_btn = gr.Button("退出", size="sm", elem_classes=["quit-btn"])
 
-        gr.HTML(
-            '<div class="main-header">'
-            '<h1>🔬 Research Assistant</h1>'
-            '</div>'
-        )
-
-        with gr.Row():
-            status = gr.Markdown(refresh_status([], agent.thread_id), elem_classes=["status-bar"], scale=20)
-            quit_btn = gr.Button("⏻ 退出", scale=1, size="sm", min_width=60, elem_classes=["quit-btn"])
-        daily_panel = gr.Markdown(refresh_daily_panel())
-        daily_refresh_btn = gr.Button("🔄 刷新每日任务", size="sm")
-        daily_refresh_btn.click(
-            fn=refresh_daily_panel, outputs=[daily_panel], show_progress="hidden", queue=False,
-        )
-
-        with gr.Tabs():
-            # ── Tab 1: 对话 ──
-            with gr.Tab("💬 对话"):
-                with gr.Row():
-                    session_picker = gr.Dropdown(
-                        label="会话", choices=_session_choices(), value=agent.thread_id,
-                        scale=5, interactive=True,
-                    )
-                    new_session_btn = gr.Button("＋ 新建会话", variant="primary", scale=1)
-                    delete_confirm = gr.Checkbox(
-                        label="确认永久删除当前会话", value=False, scale=2,
-                    )
-                    delete_session_btn = gr.Button("删除会话", variant="stop", scale=1)
-                # 拖拽覆盖层（拖文件时显示）
-                gr.HTML("""
-                <div id="drop-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;
-                background:rgba(0,0,0,0.5);z-index:9999;align-items:center;justify-content:center;">
-                <div style="background:#fff;padding:40px 80px;border-radius:16px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.2);">
-                <p style="font-size:1.8rem;margin:0;">📥 释放文件以上传</p><p style="color:#999;margin-top:8px;">PDF、PNG、JPG</p></div></div>
-                """)
-                # 隐藏的文件上传组件（拖拽释放后接收文件）
-                file_upload = gr.File(
-                    label="", file_types=[".pdf", ".png", ".jpg", ".jpeg"],
-                    visible=False, elem_id="drop-file-input",
+        # The main column is declared first so the chat composer remains the
+        # first textarea in the DOM for keyboard and browser-test ergonomics.
+        # CSS places the workspace column visually on the left.
+        with gr.Row(elem_classes=["app-shell"]):
+            with gr.Column(scale=8, min_width=520, elem_classes=["workspace-main"]):
+                gr.HTML(
+                    '<p class="workspace-eyebrow">研究工作台</p>'
+                    '<h2 class="workspace-heading">开始一项研究任务</h2>',
                 )
                 # 受控聊天状态：不使用 ChatInterface 的私有 chatbot_state，
                 # 会话切换后的可见历史与请求历史只有同一个 browser State。
@@ -1444,42 +1494,36 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                 chat_history_state = gr.State(value=initial_history)
                 chatbot = gr.Chatbot(
                     value=initial_history,
-                    height=420,
+                    height=520,
+                    show_label=False,
+                    placeholder="从一个研究问题、论文或假设开始。",
                     render_markdown=True,
                     latex_delimiters=CHAT_LATEX_DELIMITERS,
+                    elem_id="research-chat",
                 )
-                with gr.Row():
-                    chat_input = gr.MultimodalTextbox(
-                        placeholder="输入问题或命令... 可拖拽/粘贴文件",
-                        container=False, scale=7,
-                        file_types=[".pdf", ".png", ".jpg", ".jpeg"],
-                        submit_btn="发送", stop_btn=False,
-                    )
-                    stop_reply_btn = gr.Button("停止", variant="stop", scale=1)
-                with gr.Row():
-                    research_scope = gr.Dropdown(
-                        label="深度研究来源",
-                        choices=[
-                            ("本地论文 + 公开文献", "both"),
-                            ("仅本地论文", "local"),
-                            ("仅公开文献", "public"),
-                        ],
-                        value="both", scale=3,
-                    )
-                    deep_research_btn = gr.Button("🧭 深度研究", variant="secondary", scale=2)
-                    continue_research_btn = gr.Button("继续上次研究", scale=2)
-                with gr.Accordion("本轮 Agent 执行状态", open=False):
-                    current_run_panel = gr.HTML(
-                        value=refresh_current_agent_run(agent.thread_id),
-                    )
-                    refresh_current_run_btn = gr.Button("🔄 刷新本轮状态", size="sm")
-                refresh_current_run_btn.click(
-                    fn=refresh_current_agent_run,
-                    inputs=[session_state],
-                    outputs=[current_run_panel],
-                    show_progress="hidden",
-                    queue=False,
-                )
+                with gr.Column(elem_classes=["composer-shell"]):
+                    with gr.Row(elem_classes=["composer-actions"]):
+                        chat_input = gr.MultimodalTextbox(
+                            placeholder="提问、输入命令，或拖入 PDF / 图片…",
+                            container=False, scale=9,
+                            file_types=[".pdf", ".png", ".jpg", ".jpeg"],
+                            submit_btn="发送", stop_btn=False,
+                        )
+                        stop_reply_btn = gr.Button("停止", variant="stop", scale=1)
+                    with gr.Accordion("深度研究", open=False, elem_classes=["research-tools"]):
+                        gr.Markdown("规划并并行收集本地与公开证据；长任务可在右侧检查器查看进度。")
+                        with gr.Row(elem_classes=["research-actions"]):
+                            research_scope = gr.Dropdown(
+                                label="来源范围",
+                                choices=[
+                                    ("本地论文 + 公开文献", "both"),
+                                    ("仅本地论文", "local"),
+                                    ("仅公开文献", "public"),
+                                ],
+                                value="both", scale=3,
+                            )
+                            deep_research_btn = gr.Button("开始深度研究", variant="secondary", scale=2)
+                            continue_research_btn = gr.Button("继续上次", scale=2)
                 pending_message = gr.State(value=None)
 
                 submit_event = chat_input.submit(
@@ -1531,21 +1575,110 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     fn=refresh_chat_status, inputs=[chat_history_state, session_state],
                     outputs=[status],
                 )
-            # ── Tab 2: Agent 运行中心 ──
-            with gr.Tab("📊 Agent 运行中心"):
-                gr.Markdown(
-                    "查看当前会话的单 Agent / 深度研究阶段，或每日检索的多 Agent 阶段。"
-                    "这里仅展示脱敏的状态、耗时和错误类别。"
+
+            with gr.Column(scale=3, min_width=270, elem_classes=["workspace-sidebar"]):
+                gr.HTML('<p class="sidebar-label">当前工作区</p>')
+                session_picker = gr.Dropdown(
+                    label="会话", choices=_session_choices(), value=agent.thread_id, interactive=True,
                 )
-                run_center_scope = gr.Radio(
-                    label="运行范围",
-                    choices=[("当前会话", "session"), ("每日检索", "daily")],
-                    value="session",
+                with gr.Row(elem_classes=["session-actions"]):
+                    new_session_btn = gr.Button("＋ 新建会话", variant="primary", scale=1)
+                with gr.Accordion("会话管理", open=False, elem_classes=["utility-panel"]):
+                    gr.Markdown("删除会同时清除该会话的历史、运行记录和关联 Badcase 候选。")
+                    delete_confirm = gr.Checkbox(label="确认永久删除当前会话", value=False)
+                    delete_session_btn = gr.Button("删除当前会话", variant="stop")
+
+                with gr.Accordion("论文库", open=False, elem_classes=["utility-panel"]):
+                    paper_list = gr.HTML(value=paper_cards_html(), elem_classes=["paper-list"])
+                    refresh_papers_btn = gr.Button("刷新论文库", size="sm")
+                refresh_papers_btn.click(fn=paper_cards_html, outputs=[paper_list], queue=False)
+
+                with gr.Accordion("研究笔记", open=False, elem_classes=["utility-panel"]):
+                    topic_dd = gr.Dropdown(
+                        label="话题", allow_custom_value=True,
+                        choices=[t["name"] for t in notes.list_topics()],
+                        value=_topic_for(agent.thread_id),
+                    )
+                    note_input = gr.Textbox(
+                        label="新笔记", placeholder="记录一个可复用的观察…", lines=3,
+                    )
+                    note_save_btn = gr.Button("保存笔记", variant="primary", size="sm")
+                    note_display = gr.HTML(
+                        value=note_list_html(session_id=agent.thread_id), elem_classes=["note-list"],
+                    )
+                note_save_btn.click(
+                    fn=note_save, inputs=[topic_dd, note_input, session_state],
+                    outputs=[note_input, note_display],
                 )
-                run_center_panel = gr.HTML(
-                    value=refresh_run_center("session", agent.thread_id),
+                topic_dd.change(
+                    fn=note_topic_change, inputs=[topic_dd, session_state], outputs=[note_display],
                 )
-                refresh_run_center_btn = gr.Button("🔄 刷新运行记录", size="sm")
+
+                with gr.Accordion("每日检索关键词", open=False, elem_classes=["utility-panel"]):
+                    kw_list = [k["keyword"] for k in scheduler.list_keywords()] if scheduler.list_keywords() else []
+                    kw_dd = gr.Dropdown(
+                        label="已有关键词", choices=kw_list,
+                        value=kw_list[0] if kw_list else None, interactive=True,
+                    )
+                    kw_input = gr.Textbox(label="新关键词", placeholder="例如：TSN scheduling reinforcement learning")
+                    with gr.Row(elem_classes=["session-actions"]):
+                        kw_add_btn = gr.Button("添加", scale=1)
+                        kw_del_btn = gr.Button("删除", variant="secondary", scale=1)
+                    kw_msg = gr.Markdown("")
+
+                    def _add_kw(kw):
+                        msg = scheduler.add_keyword(kw)
+                        kws = [k["keyword"] for k in scheduler.list_keywords()]
+                        return gr.update(choices=kws, value=kws[0] if kws else None), "", msg
+
+                    def _del_kw(kw):
+                        scheduler.remove_keyword(kw)
+                        kws = [k["keyword"] for k in scheduler.list_keywords()]
+                        return gr.update(choices=kws, value=kws[0] if kws else None), f"🗑 已删除: {kw}"
+
+                kw_add_btn.click(fn=_add_kw, inputs=[kw_input], outputs=[kw_dd, kw_input, kw_msg])
+                kw_del_btn.click(fn=_del_kw, inputs=[kw_dd], outputs=[kw_dd, kw_msg])
+
+                with gr.Accordion("设置", open=False, elem_classes=["utility-panel"]):
+                    with gr.Column(elem_classes=["settings-stack"]):
+                        model_dd = gr.Dropdown(
+                            label="模型", value=cfg.model,
+                            choices=["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
+                            allow_custom_value=True,
+                        )
+                        rag_toggle = gr.Checkbox(label="启用 RAG 论文库", value=cfg.rag_enabled)
+                        max_pages_slider = gr.Slider(
+                            label="PDF 最大页数", minimum=5, maximum=100, step=5, value=cfg.pdf_max_pages,
+                        )
+                        daily_enabled = gr.Checkbox(label="启用每日自动检索", value=cfg.daily_search_enabled)
+                        save_cfg_btn = gr.Button("保存设置", variant="primary", size="sm")
+                        cfg_msg = gr.Markdown("")
+                save_cfg_btn.click(
+                    fn=save_config,
+                    inputs=[model_dd, rag_toggle, max_pages_slider, daily_enabled],
+                    outputs=[cfg_msg],
+                )
+
+            with gr.Column(scale=3, min_width=285, elem_classes=["workspace-inspector"]):
+                gr.HTML('<p class="inspector-label">运行检查器</p>')
+                with gr.Accordion("本轮 Agent 状态", open=True, elem_classes=["inspector-panel"]):
+                    current_run_panel = gr.HTML(value=refresh_current_agent_run(agent.thread_id))
+                    refresh_current_run_btn = gr.Button("刷新本轮状态", size="sm")
+                refresh_current_run_btn.click(
+                    fn=refresh_current_agent_run,
+                    inputs=[session_state],
+                    outputs=[current_run_panel],
+                    show_progress="hidden",
+                    queue=False,
+                )
+
+                with gr.Accordion("全部运行任务", open=False, elem_classes=["inspector-panel"]):
+                    gr.Markdown("只展示脱敏的状态、耗时与错误类别。")
+                    run_center_scope = gr.Radio(
+                        label="范围", choices=[("当前会话", "session"), ("每日检索", "daily")], value="session",
+                    )
+                    run_center_panel = gr.HTML(value=refresh_run_center("session", agent.thread_id))
+                    refresh_run_center_btn = gr.Button("刷新运行记录", size="sm")
                 run_center_scope.change(
                     fn=refresh_run_center,
                     inputs=[run_center_scope, session_state],
@@ -1559,137 +1692,70 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     outputs=[run_center_panel],
                     show_progress="hidden",
                 )
-                with gr.Accordion("标记问题（Badcase 候选）", open=False):
+
+                with gr.Accordion("每日检索", open=False, elem_classes=["inspector-panel"]):
+                    daily_panel = gr.Markdown(refresh_daily_panel(), elem_classes=["daily-panel"])
+                    daily_refresh_btn = gr.Button("刷新每日任务", size="sm")
+                daily_refresh_btn.click(
+                    fn=refresh_daily_panel, outputs=[daily_panel], show_progress="hidden", queue=False,
+                )
+
+                with gr.Accordion("标记问题（Badcase）", open=False, elem_classes=["inspector-panel"]):
                     gr.Markdown(
-                        "将当前会话最新运行（或指定运行 ID）加入本地候选池。"
+                        "留空时标记当前会话最新任务；也可填入聊天、研究或每日任务的运行 ID。"
                         "不会自动复制问题、回答、PDF 或工具原始结果。"
                     )
-                    badcase_run_id = gr.Textbox(
-                        label="运行 ID（留空表示当前会话最新任务）", max_lines=1,
+                    badcase_run_id = gr.Textbox(label="运行 ID（可选）", max_lines=1)
+                    badcase_category = gr.Dropdown(
+                        label="问题类型",
+                        choices=[
+                            ("检索遗漏", "retrieval_miss"),
+                            ("引用质量", "citation_quality"),
+                            ("回答质量", "answer_quality"),
+                            ("工具失败", "tool_failure"),
+                            ("性能问题", "performance"),
+                            ("安全问题", "safety"),
+                            ("其他", "other"),
+                        ],
+                        value="answer_quality",
                     )
-                    with gr.Row():
-                        badcase_category = gr.Dropdown(
-                            label="问题类型",
-                            choices=[
-                                ("检索遗漏", "retrieval_miss"),
-                                ("引用质量", "citation_quality"),
-                                ("回答质量", "answer_quality"),
-                                ("工具失败", "tool_failure"),
-                                ("性能问题", "performance"),
-                                ("安全问题", "safety"),
-                                ("其他", "other"),
-                            ],
-                            value="answer_quality", scale=2,
-                        )
-                        report_badcase_btn = gr.Button("标记问题", variant="secondary", scale=1)
                     badcase_note = gr.Textbox(
                         label="脱敏备注（可选）", max_lines=3,
                         placeholder="请勿粘贴原始问题、回答、论文正文或密钥。",
                     )
+                    report_badcase_btn = gr.Button("标记问题", variant="secondary")
                     badcase_status = gr.Markdown()
-                    report_badcase_btn.click(
-                        fn=report_badcase,
-                        inputs=[session_state, badcase_run_id, badcase_category, badcase_note],
-                        outputs=[badcase_status],
-                        show_progress="hidden",
-                    )
-
-            # ── Tab 3: 论文库 ──
-            with gr.Tab("📚 论文库"):
-                gr.Markdown("### 已索引论文")
-                paper_list = gr.HTML(value=paper_cards_html())
-                with gr.Row():
-                    refresh_papers_btn = gr.Button("🔄 刷新", scale=1)
-                refresh_papers_btn.click(
-                    fn=lambda: paper_cards_html(), outputs=[paper_list],
+                report_badcase_btn.click(
+                    fn=report_badcase,
+                    inputs=[session_state, badcase_run_id, badcase_category, badcase_note],
+                    outputs=[badcase_status],
+                    show_progress="hidden",
                 )
 
-            # ── Tab 4: 笔记 ──
-            with gr.Tab("📝 笔记"):
-                with gr.Row():
-                    topic_dd = gr.Dropdown(
-                        label="话题", scale=2, allow_custom_value=True,
-                        choices=[t["name"] for t in notes.list_topics()],
-                        value=_topic_for(agent.thread_id),
-                    )
-                    note_input = gr.Textbox(
-                        label="新笔记", placeholder="输入笔记内容...",
-                        lines=2, scale=5,
-                    )
-                    note_save_btn = gr.Button("保存", scale=1, variant="primary")
-                note_display = gr.HTML(value=note_list_html(session_id=agent.thread_id))
-                note_save_btn.click(
-                    fn=note_save, inputs=[topic_dd, note_input, session_state],
-                    outputs=[note_input, note_display],
-                )
-                topic_dd.change(
-                    fn=note_topic_change, inputs=[topic_dd, session_state],
-                    outputs=[note_display],
-                )
-                demo.load(fn=note_topic_list, inputs=[session_state], outputs=[topic_dd])
-
-                # These callbacks also update the per-session note view. They
-                # are registered after Tab 4 so both components exist.
-                session_picker.change(
-                    fn=switch_session, inputs=[session_picker],
-                    outputs=[
-                        chatbot, chat_history_state, session_state, status,
-                        topic_dd, note_display,
-                    ],
-                    queue=False,
-                )
-                new_session_btn.click(
-                    fn=new_session,
-                    outputs=[
-                        session_picker, chatbot, chat_history_state,
-                        session_state, status, delete_confirm, topic_dd, note_display,
-                    ],
-                    queue=False,
-                )
-                delete_session_btn.click(
-                    fn=delete_current_session,
-                    inputs=[session_state, delete_confirm],
-                    outputs=[
-                        session_picker, chatbot, chat_history_state,
-                        session_state, delete_confirm, status, topic_dd, note_display,
-                    ],
-                    queue=False,
-                )
-
-            # ── Tab 5: 设置 ──
-            with gr.Tab("⚙ 设置"):
-                gr.Markdown("### 基础设置")
-                model_dd = gr.Dropdown(
-                    label="模型", value=cfg.model,
-                    choices=["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
-                    allow_custom_value=True,
-                )
-                rag_toggle = gr.Checkbox(label="启用 RAG 论文库", value=cfg.rag_enabled)
-                max_pages_slider = gr.Slider(label="PDF 最大页数", minimum=5, maximum=100, step=5, value=cfg.pdf_max_pages)
-                daily_enabled = gr.Checkbox(label="启用每日自动检索", value=cfg.daily_search_enabled)
-                save_cfg_btn = gr.Button("💾 保存配置", variant="primary")
-                cfg_msg = gr.Markdown("")
-                save_cfg_btn.click(fn=save_config, inputs=[model_dd, rag_toggle, max_pages_slider, daily_enabled], outputs=[cfg_msg])
-
-                gr.Markdown("### 📰 每日论文检索")
-                kw_list = [k["keyword"] for k in scheduler.list_keywords()] if scheduler.list_keywords() else []
-                kw_dd = gr.Dropdown(label="已有关键词", choices=kw_list, value=kw_list[0] if kw_list else None, interactive=True)
-                kw_input = gr.Textbox(label="新关键词", placeholder="例如: TSN scheduling reinforcement learning")
-                kw_add_btn = gr.Button("➕ 添加关键词", scale=1)
-                kw_del_btn = gr.Button("🗑 删除选中", scale=1)
-                kw_msg = gr.Markdown("")
-
-                def _add_kw(kw):
-                    msg = scheduler.add_keyword(kw)
-                    kws = [k["keyword"] for k in scheduler.list_keywords()]
-                    return gr.update(choices=kws, value=kws[0] if kws else None), "", msg
-                def _del_kw(kw):
-                    scheduler.remove_keyword(kw)
-                    kws = [k["keyword"] for k in scheduler.list_keywords()]
-                    return gr.update(choices=kws, value=kws[0] if kws else None), f"🗑 已删除: {kw}"
-                kw_add_btn.click(fn=_add_kw, inputs=[kw_input], outputs=[kw_dd, kw_input, kw_msg])
-                kw_del_btn.click(fn=_del_kw, inputs=[kw_dd], outputs=[kw_dd, kw_msg])
-
+        demo.load(fn=note_topic_list, inputs=[session_state], outputs=[topic_dd])
+        # These callbacks also update the workspace controls after a session change.
+        session_picker.change(
+            fn=switch_session, inputs=[session_picker],
+            outputs=[chatbot, chat_history_state, session_state, status, topic_dd, note_display],
+            queue=False,
+        )
+        new_session_btn.click(
+            fn=new_session,
+            outputs=[
+                session_picker, chatbot, chat_history_state,
+                session_state, status, delete_confirm, topic_dd, note_display,
+            ],
+            queue=False,
+        )
+        delete_session_btn.click(
+            fn=delete_current_session,
+            inputs=[session_state, delete_confirm],
+            outputs=[
+                session_picker, chatbot, chat_history_state,
+                session_state, delete_confirm, status, topic_dd, note_display,
+            ],
+            queue=False,
+        )
         quit_btn.click(fn=lambda: (demo.close(), os._exit(0)), outputs=[])
 
     launch_fn = demo.launch if launch else (lambda **_kwargs: demo)

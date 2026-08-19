@@ -111,6 +111,7 @@ class ToolRuntime:
                 glm_api_key=glm_api_key,
                 profile_manager=profile_manager,
                 memory_store=memory_store,
+                session_id=self.context.session_id,
                 cancel_event=self.context.cancel_event,
             )
             self._ensure_active("after_tool")

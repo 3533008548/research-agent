@@ -26,6 +26,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from cancellation import RequestCancelledError, raise_if_cancelled
+from conversation_memory import context_usage_ratio, maybe_store_conversation_summary
 from llm_client import (
     LLMCircuitOpenError,
     LLMQueueFullError,
@@ -703,51 +704,19 @@ def build_graph(
         if not result or result.upper().startswith("OK"):
             if token_usage:
                 token_usage.pop("verify_status", None)
-            # ── 对话摘要：上下文 > 50% 或 > 10 轮对话时生成 ──
+            # Successful evidence-backed turns may compact their recent history.
             if memory_store:
-                user_msg_count = sum(1 for m in messages if m.get("role") == "user")
-                pct_ctx = (token_usage.get("last_prompt", 0) / token_usage.get("context_limit", 131072)) if token_usage else 0
-                thread_id = metadata.get("session_id", "research-main")
-                # ── 摘要频率控制：10 分钟内不重复摘要 ──
-                from datetime import datetime as _dt, timedelta as _td
-                last_sum = memory_store.get_last_summary_time(thread_id)
-                recent_sum = False
-                if last_sum:
-                    try:
-                        recent_sum = (_dt.fromisoformat(last_sum) + _td(minutes=10)) > _dt.now()
-                    except Exception:
-                        recent_sum = False
-                if (user_msg_count > 10 or pct_ctx > 0.5) and not recent_sum:
-                    try:
-                        recent_msgs = []
-                        for m in messages[-20:]:
-                            c = m.get("content", "") or ""
-                            recent_msgs.append(f"[{m.get('role','')}] {c[:300]}")
-                        raw = "\n".join(recent_msgs)
-                        sum_prompt = f"Summarize this research conversation in 150 chars Chinese:\n{raw[:3000]}"
-                        summary_budget = llm_client.new_request_budget(
-                            RequestPolicy(
-                                purpose="summary",
-                                priority=RequestPriority.SUMMARY,
-                                deadline_seconds=verify_timeout_seconds,
-                                max_retries=0,
-                            ),
-                        )
-                        sr = llm_client.post(
-                            {"model": model, "messages": [{"role": "user", "content": sum_prompt}],
-                             "stream": False, "temperature": 0.2},
-                            stream=False,
-                            budget=summary_budget,
-                            cancel_event=cancel_event,
-                        )
-                        if sr.status_code == 200:
-                            summary = sr.json()["choices"][0]["message"]["content"].strip()[:300]
-                            topic = state.get("metadata", {}).get("topic", "")
-                            memory_store.add_summary(thread_id, topic, summary)
-                    except RequestCancelledError:
-                        raise
-                    except Exception:
-                        pass
+                pct_ctx = context_usage_ratio(token_usage)
+                maybe_store_conversation_summary(
+                    messages=messages,
+                    metadata=metadata,
+                    context_ratio=pct_ctx,
+                    memory_store=memory_store,
+                    llm_client=llm_client,
+                    model=model,
+                    timeout_seconds=verify_timeout_seconds,
+                    cancel_event=cancel_event,
+                )
                 # ── 预算预警前置：> 60% 提示（> 90% 强警告）──
                 if pct_ctx > 0.9 and token_usage:
                     token_usage["budget_warning"] = "⚠️ 上下文 90%+，建议 /new"

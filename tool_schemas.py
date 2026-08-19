@@ -119,7 +119,7 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "memory_search",
-                "description": "搜索记忆库中的论文关系三元组（论文→方法/结果）和对话摘要。",
+                "description": "搜索当前会话摘要和全局论文关系三元组（论文→方法/结果）。",
                 "parameters": {
                     "type": "object",
                     "properties": {

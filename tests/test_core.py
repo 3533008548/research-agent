@@ -1393,6 +1393,97 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 scheduler.close()
 
 
+class TestConversationMemory(unittest.TestCase):
+    """长期辅助记忆保持会话隔离，并在达到阈值后有界压缩。"""
+
+    def test_memory_search_combines_current_session_summary_and_paper_facts(self):
+        from memory import MemoryStore
+        from tools import execute_tool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = MemoryStore(str(Path(tmp) / "memory.db"))
+            try:
+                memory.add_summary("session-a", "TSN", "TSN 动态负载实验需要报告截止期违例")
+                memory.add_summary("session-b", "TSN", "TSN 另一个会话的私有摘要")
+                memory.add_triple("DiffTSN", "uses_method", "TSN scheduling under bursty traffic")
+
+                result = execute_tool(
+                    "memory_search",
+                    {"query": "TSN"},
+                    memory_store=memory,
+                    session_id="session-a",
+                )
+            finally:
+                memory.close()
+
+        self.assertIn("当前会话摘要", result)
+        self.assertIn("截止期违例", result)
+        self.assertNotIn("另一个会话", result)
+        self.assertIn("论文事实", result)
+        self.assertIn("DiffTSN", result)
+
+    def test_summary_policy_skips_short_history_and_compacts_long_history(self):
+        from conversation_memory import maybe_store_conversation_summary
+
+        class _Memory:
+            stored = []
+
+            @staticmethod
+            def get_last_summary_time(_thread_id):
+                return None
+
+            def add_summary(self, thread_id, topic, summary):
+                self.stored.append((thread_id, topic, summary))
+
+        class _Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"choices": [{"message": {"content": "压缩后的项目上下文"}}]}
+
+        class _LLM:
+            def __init__(self):
+                self.calls = 0
+
+            @staticmethod
+            def new_request_budget(policy):
+                return policy
+
+            def post(self, *_args, **_kwargs):
+                self.calls += 1
+                return _Response()
+
+        memory = _Memory()
+        llm = _LLM()
+        metadata = {"session_id": "session-a", "topic": "TSN"}
+        short_history = [{"role": "user", "content": f"问题 {i}"} for i in range(10)]
+        self.assertFalse(maybe_store_conversation_summary(
+            messages=short_history,
+            metadata=metadata,
+            context_ratio=0.1,
+            memory_store=memory,
+            llm_client=llm,
+            model="test-model",
+            timeout_seconds=2,
+        ))
+        self.assertEqual(llm.calls, 0)
+
+        long_history = short_history + [{"role": "user", "content": "第十一个问题"}]
+        self.assertTrue(maybe_store_conversation_summary(
+            messages=long_history,
+            metadata=metadata,
+            context_ratio=0.1,
+            memory_store=memory,
+            llm_client=llm,
+            model="test-model",
+            timeout_seconds=2,
+        ))
+        self.assertEqual(memory.stored, [
+            ("session-a", "TSN", "压缩后的项目上下文"),
+        ])
+
+
 class TestSessionStore(unittest.TestCase):
     """多会话注册、旧历史迁移与硬删除边界。"""
 
@@ -2530,6 +2621,18 @@ class TestToolRuntime(unittest.TestCase):
             cancelled_runtime.execute("read_pdf", {"source": "paper.pdf"})
         blocked_dispatcher.assert_not_called()
 
+    def test_runtime_passes_non_content_session_scope_to_memory_tool(self):
+        from tool_runtime import ToolExecutionContext, ToolRuntime
+
+        dispatcher = MagicMock(return_value="记忆结果")
+        runtime = ToolRuntime(
+            ToolExecutionContext(session_id="session-a"),
+            executor=dispatcher,
+        )
+
+        self.assertEqual(runtime.execute("memory_search", {"query": "TSN"}), "记忆结果")
+        self.assertEqual(dispatcher.call_args.kwargs["session_id"], "session-a")
+
 
 class TestCircuitBreaker(unittest.TestCase):
     def test_half_open_admits_a_single_probe_and_reopens_on_failure(self):
@@ -3196,6 +3299,15 @@ class TestWebRendering(unittest.TestCase):
         self.assertIn('font-family: "Microsoft YaHei UI"', source)
         self.assertIn("API_RUN_CLIENT_ENABLED", source)
         self.assertNotIn("gr.Timer(", source)
+
+    def test_workbench_layout_keeps_conversation_primary(self):
+        source = Path(__file__).resolve().parents[1].joinpath("web_ui.py").read_text(encoding="utf-8")
+
+        self.assertIn('elem_classes=["app-shell"]', source)
+        self.assertIn('elem_classes=["workspace-sidebar"]', source)
+        self.assertIn('elem_classes=["workspace-inspector"]', source)
+        self.assertIn("show_label=False", source)
+        self.assertNotIn("with gr.Tabs():", source)
 
 
 class TestAuditRegressionFixes(unittest.TestCase):

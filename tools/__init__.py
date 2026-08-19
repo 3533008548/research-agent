@@ -26,19 +26,30 @@ if TOOL_NAMES != _EXECUTABLE_TOOL_NAMES:
     raise RuntimeError("工具目录与执行分发器不一致")
 
 
-def _search_memory(args: dict, memory_store) -> str:
-    """Return a compact rendering of local memory triples."""
+def _search_memory(args: dict, memory_store, session_id: str = "") -> str:
+    """Render current-session summaries and global paper facts compactly."""
     if not memory_store:
         return "❌ 记忆模块未启用。"
     query = str(args.get("query", "") or "").strip()
+    if not query:
+        return "❌ 请提供记忆搜索词。"
+    summaries = memory_store.search_summaries(query, session_id, limit=3)
     triples = memory_store.search_triples(query, limit=5)
-    if not triples:
+    if not summaries and not triples:
         return "📭 未找到相关记忆。"
-    lines = [f"📚 记忆搜索结果 — 「{query}」:\n"]
-    lines.extend(
-        f"  • {item['paper_title']} → {item['relation']}: {item['value']}"
-        for item in triples
-    )
+    lines = [f"📚 记忆搜索结果 — 「{query}」:"]
+    if summaries:
+        lines.append("\n**当前会话摘要**")
+        lines.extend(
+            f"  • {item['topic'] or '未分类'}：{item['summary']}"
+            for item in summaries
+        )
+    if triples:
+        lines.append("\n**论文事实**")
+        lines.extend(
+            f"  • {item['paper_title']} → {item['relation']}: {item['value']}"
+            for item in triples
+        )
     return "\n".join(lines)
 
 
@@ -49,12 +60,13 @@ def execute_tool(
     glm_api_key: str = "",
     profile_manager=None,
     memory_store=None,
+    session_id: str = "",
     cancel_event=None,
 ) -> str:
     """工具分发入口"""
     raise_if_cancelled(cancel_event, "工具调用已取消")
     if name == "memory_search":
-        result = _search_memory(args, memory_store)
+        result = _search_memory(args, memory_store, session_id)
         raise_if_cancelled(cancel_event, "工具调用已取消")
         return result
     handler = _TOOL_HANDLERS.get(name)
