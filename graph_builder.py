@@ -204,7 +204,7 @@ def build_graph(
                     messages[i] = dict(m)
                     del messages[i]["tool_calls"]
 
-        # 话题/笔记上下文也会以 system message 传入，不能因此跳过核心约束提示词。
+        # 对话上下文不会替代核心约束提示词。
         profile_text = profile_manager.summary() if profile_manager else ""
         prompt = system_prompt or SYSTEM_PROMPT
         if profile_text:
@@ -217,9 +217,8 @@ def build_graph(
 
         if memory_store:
             metadata = state.get("metadata", {})
-            topic = metadata.get("topic", "")
             thread_id = metadata.get("session_id", "research-main")
-            recent = memory_store.get_recent_summary(thread_id, topic)
+            recent = memory_store.get_recent_summary(thread_id)
             if recent:
                 messages.append({"role": "system", "content": f"[对话摘要] {recent}"})
 
@@ -505,6 +504,7 @@ def build_graph(
             result = tool_runtime.execute(
                 name, args, paper_store=paper_store, glm_api_key=glm_api_key,
                 profile_manager=profile_manager, memory_store=memory_store,
+                llm_client=llm_client, model=model,
             )
             ensure_active("after_tool")
             tool_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})

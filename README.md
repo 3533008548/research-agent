@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![tests](https://github.com/3533008548/research-agent/actions/workflows/test.yml/badge.svg)](https://github.com/3533008548/research-agent/actions/workflows/test.yml)
 
-**搜索论文 · 阅读 PDF · RAG 检索 · 多模态看图 · 每日速递 · 科研笔记 · 用户画像**
+**搜索论文 · 阅读 PDF · RAG 检索 · 多模态看图 · 每日速递 · 用户画像**
 
 </div>
 
@@ -19,12 +19,12 @@
 | 功能 | 说明 |
 |------|------|
 | 🔍 **论文搜索** | OpenAlex 通用检索 + arXiv 临时/深度研究预印本检索；结果统一去重 |
-| 📄 **PDF 阅读** | pdfplumber 表格/双栏/章节 + 图注感知图片提取（保留子图关系） |
+| 📄 **PDF 阅读** | PyMuPDF 文本块双栏重排 + pdfplumber 表格 + 图注感知图片提取 |
 | 💬 **多会话管理** | 新建、切换、加载和永久删除会话；历史、摘要、Token 统计互相隔离 |
-| 🧠 **RAG 检索** | 章节感知分层切块 + 语义/关键词混合检索 + 章节加权与过滤 + 公式保护 |
+| 🧠 **RAG 检索** | 章节感知切块 + 语义/BM25 RRF + 可选本地重排 + 公式保护 |
 | 🖼 **多模态看图** | GLM-4V 描述 + 图注附带 + 描述缓存（省 token） |
 | 📰 **每日速递** | OpenAlex + OpenAIRE + DBLP 并行限时的后台推送；临时检索改用 OpenAlex + arXiv，支持重试和待读清单管理 |
-| 📝 **科研笔记** | SQLite 按话题分组，关联论文 |
+| 📁 **研究档案** | 将研究方案、假设或决策记录保存为可检索 Markdown 与可下载 Word 文档；按需读取，不注入会话摘要或用户画像 |
 | 👤 **用户画像** | Markdown 自动维护，Agent 从对话中学习偏好 |
 | 🧩 **辅助记忆** | 当前会话摘要自动压缩注入；论文方法/结果以全局三元组按需检索，会话之间严格隔离 |
 | ✅ **自动验证** | verify 分级（严重重生成/轻微提示）+ 跳过门控 + 8 秒限时熔断降级 |
@@ -88,6 +88,18 @@ python scripts/migrate_runtime.py --apply
 python scripts/backup_runtime.py --output backups/
 ```
 
+PDF 阅读器或分块规则升级后，重建本地索引：
+
+```powershell
+python scripts/reindex_local_papers.py --data-dir runtime --max-pages 20
+```
+
+可选的中文/英文本地重排器首次下载和自检后，才在 `config.yaml` 中开启 `rag.reranker.enabled`：
+
+```powershell
+python scripts/warm_reranker.py
+```
+
 ### Docker Compose 部署
 
 Docker Desktop 启动后，先根据示例创建本地密钥文件，再构建并启动服务：
@@ -109,6 +121,13 @@ docker compose down             # 仅停止并删除容器，不删除 runtime �
 docker compose up -d --build    # 代码更新后重建并启动
 ```
 
+本版本默认启用本地 RAG 重排器。镜像重建后先在容器内预热一次；模型缓存保存在挂载的 `runtime/derived/cache/`，后续重启不会重复下载：
+
+```powershell
+docker compose exec research-agent python scripts/warm_reranker.py
+docker compose restart research-agent api-worker
+```
+
 若需改宿主机端口，在 `.env` 设置 `UI_PORT=8080`，随后访问 `http://localhost:8080`。`.env` 不会被复制到镜像或提交到 Git。
 
 若构建阶段无法访问 Docker Hub（如 `auth.docker.io:443` 超时），这属于网络或 Docker Desktop 代理问题，而非项目依赖问题。优先在 Docker Desktop 的 **Settings → Resources → Proxies** 配置当前网络可用的 HTTP/HTTPS 代理；也可以在 `.env` 设置可访问镜像仓库中的 Python 3.11-slim 地址，例如：
@@ -126,6 +145,7 @@ PYTHON_IMAGE=<你的镜像仓库>/library/python:3.11-slim
 ```
 >>> 搜索 diffusion model 在网络调度中的最新论文
 >>> 精读第1篇                      ← 自动下载+索引+图片提取+摘要卡片
+>>> 为第1篇生成论文证据卡          ← 保存带页码/来源块锚点的精读 Markdown
 >>> 这篇的损失函数是什么？          ← RAG 章节感知检索
 >>> 描述 Figure 3                  ← GLM-4V 看图（带图注）
 >>> 对比已读论文的技术路线          ← 跨论文分析
@@ -136,6 +156,10 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 需要对一个问题做有边界的深度研究时，在对话框输入问题后点击 **🧭 深度研究**（可选择“本地论文 + 公开文献 / 仅本地论文 / 仅公开文献”）。它会先规划问题，再由最多两名研究员并行收集证据，最后完成综合、质检和最多一次修订；最终报告附带 `[E1]` 等证据编号与来源索引。研究只保存用户问题和最终报告，不会把内部工具消息写进会话历史。中途点击“停止”会保留已经收集的证据；在同一会话点击“继续上次研究”或输入 `/research continue` 可从这些证据继续。
 
 深度研究使用受限的工具集：本地研究员只能读取当前论文库，公开研究员只能检索公开论文；若需要新上传文件，请先在普通对话中完成上传和索引，再发起研究。
+
+普通对话中可以明确要求“为这篇论文生成证据卡”。它会读取已索引的本地 PDF，生成 `paper-card.md` 与 `source_map.json`；卡片中的论文事实以 `【论文 p.N · Sxxx】` 定位到提取块，模型推断会标记为 `【分析】`。PDF 文本不足或模型暂不可用时，系统会保留可追溯的证据草稿，而不会补写未提取到的实验或页码。
+
+需要把暂定研究方案留在对话之外时，直接说“把这份方案保存为研究文档”。Agent 会生成自包含的 Markdown 原稿和同版本 `.docx`，放入 `runtime/primary/research_documents/`；页面左侧的“研究档案”面板可预览原稿并下载 Word 文档。之后说“查一下之前保存的 TSN 方案”即可按关键词检索，只有选中的文档会被读取，不会自动塞入会话摘要或用户画像。文档保存的是工作草稿，不能替代论文证据或引用。
 
 ### 标记 Badcase，形成可维护的回归样例
 
@@ -156,7 +180,6 @@ python scripts/export_badcase_template.py --candidate-id bc-xxxxxxxxxxxx
 | `/model` `/tokens` `/profile` | 查看模型、当前会话用量和用户画像 |
 | `/retry` | 重发当前进程中最后一个模型请求；流式中断后可用 |
 | `/indexed` | 查看已索引论文 |
-| `/note ...` | 管理按话题归档的科研笔记 |
 | `/daily add <关键词>` | 添加每日检索关键词 |
 | `/daily search <关键词>` | 立即执行一次不落库的 OpenAlex + arXiv 临时检索 |
 | `/daily retry` | 清除当日检索记录后重新检索已启用关键词 |
@@ -191,7 +214,7 @@ FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文
 监控 Redis 队列积压、各类 worker 心跳和运行状态计数。指标只包含固定标签与聚合数字，
 不包含用户输入、模型回答、论文信息或工具参数。
 
-另提供 15 项版本化科研 Agent 能力任务和 5 项离线可靠性回放，使用合成语料和模拟状态，不读取个人运行数据、不调用真实模型 API。`python -m evals.release_gate --strict` 会输出统一的发布质量门禁；任务、预期证据、工具轨迹、性能门槛和人工评分量表位于 [evals/README.md](evals/README.md)。小样本真实模型评测必须通过 `python scripts/run_real_eval.py --task T04 ...` 执行：它使用临时隔离运行时并仅保存脱敏报告，避免评测会话出现在网页列表。面向真实用户的 20 项研究旅程验收集使用 `python scripts/run_user_acceptance.py --suite core` 建立可人工复核、可前后比较的模型效果基线。
+另提供 14 项版本化科研 Agent 能力任务和 5 项离线可靠性回放，使用合成语料和模拟状态，不读取个人运行数据、不调用真实模型 API。`python -m evals.release_gate --strict` 会输出统一的发布质量门禁；任务、预期证据、工具轨迹、性能门槛和人工评分量表位于 [evals/README.md](evals/README.md)。小样本真实模型评测必须通过 `python scripts/run_real_eval.py --task T04 ...` 执行：它使用临时隔离运行时并仅保存脱敏报告，避免评测会话出现在网页列表。面向真实用户的 19 项研究旅程验收集使用 `python scripts/run_user_acceptance.py --suite core` 建立可人工复核、可前后比较的模型效果基线。
 
 ---
 
@@ -210,17 +233,19 @@ LangGraph ReAct 循环 (graph_builder.py)
   Rule Planner → OpenAlex Scout ∥ OpenAIRE Scout ∥ DBLP Scout
   → Normalizer/Deduper → Quality Gate → Curator(整次任务一次) → Conditional Critic → Delivery
 
-每日运行记录保存在 daily.db；来源请求按域名限流，任务停止或失败时可从保存的候选恢复。Curator 使用共享 LLMClient 的低优先级请求，模型暂不可用时只保留可解释的规则排序，不切换模型。
+每日运行记录保存在 daily.db；来源请求按域名限流，任务停止或失败时可从保存的候选恢复。Curator 使用共享 LLMClient 的低优先级请求，模型暂不可用时只保留可解释的规则排序，不切换模型。公开论文检索默认合并 OpenAlex 与 arXiv，按 DOI、arXiv ID、标题相似度去重，并保留每条记录的来源、相关性依据和部分来源失败信息。
 
 Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过或达到重试上限后自动清理，避免影响后续对话。
 
 运行时数据层（APP_DATA_DIR，默认 ./runtime）:
-  primary/db/          → checkpoint、notes、memory、daily、badcases SQLite 数据
+  primary/db/          → checkpoint、memory、daily、badcases SQLite 数据
   primary/papers/      → 原始论文 PDF
+  primary/research_documents/ → 用户研究档案：Markdown 原稿与 Word 导出
   primary/profile.md   → 用户画像
   primary/settings.json→ Web UI 用户设置
   derived/chroma/      → 论文向量库（可重建）
   derived/images/      → PDF 提取图片与图注（可重建）
+  derived/paper_artifacts/ → 论文来源映射、证据卡与审计结果（可重建）
 ```
 
 ---
@@ -230,17 +255,19 @@ Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过�
 ```
 research_agent/
 ├── prompts.py            # 系统提示词 + 少样本范例
-├── tool_schemas.py       # 9 个工具 JSON Schema
+├── tool_schemas.py       # 12 个工具 JSON Schema
 ├── tool_catalog.py       # 工具声明目录：名称、Schema、展示名与结果限长
 ├── tool_runtime.py       # 工具授权/取消/限长/脱敏事件的统一执行边界
 ├── graph_builder.py      # LangGraph 图定义 + verify 分级
-├── pdf_reader.py         # PDF 增强提取 (表格/双栏/章节/图注图片)
-├── paper_store.py        # ChromaDB RAG (章节感知切块) + NoOpStore
+├── pdf_reader.py         # PDF 增强提取 (文本块双栏重排/表格/章节/图注图片)
+├── paper_store.py        # ChromaDB RAG (语义 + BM25 RRF + 可选重排) + NoOpStore
+├── paper_artifacts.py    # 本地 PDF 来源映射、证据卡与锚点审计
+├── research_documents.py # 用户研究档案：可检索 Markdown + Word 导出
+├── paper_records.py      # 公开检索/每日检索共用的论文规范化与去重
 ├── search_api.py         # OpenAlex / arXiv 交互式与深度研究检索 API
 ├── scheduler.py          # 每日论文检索调度器（自动/临时/重试）
 ├── daily_orchestrator.py # 每日多 Agent 编排、候选质量门控与恢复
-├── notes.py              # 科研笔记 (SQLite)
-├── profile.py            # 用户画像 (Markdown)
+├── user_profile.py       # 用户画像 (Markdown)
 ├── memory.py             # 记忆模块 (三元组+摘要+图片缓存)
 ├── conversation_memory.py # 对话摘要门控、生成与持久化策略
 ├── llm_client.py         # 主模型并发/重试/端到端预算/取消（不做模型降级）
@@ -255,6 +282,7 @@ research_agent/
 ├── tools/                # 工具实现
 │   ├── search.py         # 搜索/查询/列表/删除
 │   ├── read_pdf.py       # 下载+提取+图片+索引+摘要
+│   ├── research_documents.py # 保存/检索/读取研究档案
 │   ├── describe.py       # GLM-4V 看图 (缓存+图注)
 │   └── profile_tool.py   # 画像更新
 │
@@ -262,7 +290,7 @@ research_agent/
 ├── research_orchestrator.py # 有边界的 Planner / Researcher / Critic 闭环
 ├── session_store.py       # 会话目录、研究运行记录、Token 统计与 checkpoint 联动删除
 ├── web_ui.py             # Web UI：受控 Chatbot 状态，深度研究进度/停止/继续
-├── scripts/              # 旧数据迁移、运行时备份和 Badcase 合成夹具导出
+├── scripts/              # 数据迁移、索引重建、重排器预热、备份和 Badcase 夹具导出
 ├── tests/                # 核心回归 + Playwright 浏览器会话隔离测试
 ├── .github/workflows/    # CI 自动测试
 │

@@ -225,14 +225,13 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
                     paper_store.delete_paper(paper["paper_id"])
                     print(f"      🗑️ 已删除旧索引: {title}", file=sys.stderr)
                     break
-            paper_store.index_paper(result, title=title)
+            paper_id = paper_store.index_paper(result, title=title)
             print("      📎 已索引到论文库", file=sys.stderr)
             result += (
                 "\n\n---\n"
-                "🧵 **请对这篇论文生成一个结构化摘要卡片**，覆盖以下维度（控制在 10 行以内）：\n"
-                "1. **核心问题**\n2. **方法一句话**\n3. **关键公式**\n"
-                "4. **实验结论**\n5. **局限性**\n6. **与已读论文的关系**\n\n"
-                "论文全文已索引到本地库；后续细节请使用 query_papers 检索。"
+                f"📌 已索引论文 ID：`{paper_id}`。后续细节可使用 query_papers 检索。\n"
+                "如需完整的可追溯精读，请明确要求“生成论文证据卡”；"
+                "系统会把结论保存为带页码和来源块锚点的本地 Markdown 文件。"
             )
         except Exception as exc:
             print(f"      ⚠️ RAG 索引失败: {exc}", file=sys.stderr)

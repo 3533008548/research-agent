@@ -17,6 +17,7 @@
 import os
 import sys
 import re
+import math
 import uuid
 import json
 import threading
@@ -39,6 +40,17 @@ except ImportError:
 HYBRID_LEXICAL_MAX_CHUNKS = 5_000
 HYBRID_CANDIDATE_LIMIT = 20
 RRF_K = 60
+DEFAULT_RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+_PDF_READER_PREAMBLE = "📄 **PDF 解析完成**"
+
+
+def clean_index_text(text: str) -> str:
+    """Remove reader status text that is useful to people but not retrieval."""
+    normalized = str(text or "").strip()
+    if not normalized.startswith(_PDF_READER_PREAMBLE):
+        return normalized
+    _header, separator, body = normalized.partition("\n\n")
+    return body.strip() if separator else normalized
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -212,7 +224,14 @@ class PaperStore:
 
     COLLECTION_NAME = "papers"
 
-    def __init__(self, persist_dir: str | None = None):
+    def __init__(
+        self,
+        persist_dir: str | None = None,
+        *,
+        reranker_enabled: bool = False,
+        reranker_model: str = DEFAULT_RERANKER_MODEL,
+        reranker_candidate_limit: int = HYBRID_CANDIDATE_LIMIT,
+    ):
         if chromadb is None or embedding_functions is None:
             raise ImportError(
                 "需要安装 chromadb:\n   pip install chromadb"
@@ -251,6 +270,14 @@ class PaperStore:
         )
         self._query_lock = threading.RLock()
         self._active_query: Future | None = None
+        self._reranker_enabled = reranker_enabled
+        self._reranker_model_name = reranker_model
+        self._reranker_candidate_limit = max(
+            1, min(int(reranker_candidate_limit), HYBRID_CANDIDATE_LIMIT),
+        )
+        self._reranker = None
+        self._reranker_load_attempted = False
+        self._reranker_lock = threading.Lock()
 
     # ── 公开接口 ──
 
@@ -265,7 +292,8 @@ class PaperStore:
 
         返回: paper_id (若未传入则自动生成)
         """
-        if not text or not text.strip():
+        text = clean_index_text(text)
+        if not text:
             return ""
 
         paper_id = paper_id or f"paper_{uuid.uuid4().hex[:12]}"
@@ -415,12 +443,16 @@ class PaperStore:
             )
 
     @staticmethod
-    def _query_terms(query_text: str) -> list[str]:
-        """提取适合中英文论文文本的轻量关键词。"""
-        latin_terms = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{1,}", query_text.lower())
-        cjk = "".join(re.findall(r"[\u4e00-\u9fff]", query_text))
-        cjk_terms = [cjk[i:i + 2] for i in range(max(len(cjk) - 1, 0))]
-        return list(dict.fromkeys(latin_terms + cjk_terms))
+    def _lexical_tokens(text: str) -> list[str]:
+        """Tokenize text for the small local BM25 index."""
+        latin_terms = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{1,}", text.lower())
+        cjk = "".join(re.findall(r"[\u4e00-\u9fff]", text))
+        return latin_terms + [cjk[i:i + 2] for i in range(max(len(cjk) - 1, 0))]
+
+    @classmethod
+    def _query_terms(cls, query_text: str) -> list[str]:
+        """提取适合中英文论文文本的去重检索词。"""
+        return list(dict.fromkeys(cls._lexical_tokens(query_text)))
 
     @staticmethod
     def _result_key(result: dict) -> tuple[str, str, int]:
@@ -429,6 +461,66 @@ class PaperStore:
             str(result.get("paper_id") or result.get("title") or ""),
             str(result.get("title") or ""),
             int(result.get("chunk_index") or 0),
+        )
+
+    def _get_reranker(self):
+        """Load the optional local cross-encoder only when a query needs it."""
+        if not getattr(self, "_reranker_enabled", False):
+            return None
+        if self._reranker is not None or self._reranker_load_attempted:
+            return self._reranker
+        with self._reranker_lock:
+            if self._reranker is not None or self._reranker_load_attempted:
+                return self._reranker
+            self._reranker_load_attempted = True
+            try:
+                from sentence_transformers import CrossEncoder
+
+                self._reranker = CrossEncoder(
+                    self._reranker_model_name,
+                    max_length=512,
+                    local_files_only=True,
+                )
+            except Exception as exc:
+                print(
+                    f"      ⚠️ RAG 重排器未启用（{type(exc).__name__}: {exc}）",
+                    file=sys.stderr,
+                )
+        return self._reranker
+
+    def _rerank(self, query_text: str, candidates: list[dict]) -> list[dict]:
+        """Use a cross-encoder to reorder only the already retrieved candidates."""
+        reranker = self._get_reranker()
+        if reranker is None or not candidates:
+            return candidates
+        try:
+            scores = reranker.predict(
+                [(query_text, item["text"]) for item in candidates],
+                batch_size=8,
+                show_progress_bar=False,
+            )
+        except Exception as exc:
+            print(
+                f"      ⚠️ RAG 重排失败，保留 RRF 结果（{type(exc).__name__}: {exc}）",
+                file=sys.stderr,
+            )
+            return candidates
+
+        ranked = []
+        for item, score in zip(candidates, scores):
+            ranked.append({
+                **item,
+                "reranked": True,
+                "reranker_score": round(float(score), 6),
+            })
+        return sorted(
+            ranked,
+            key=lambda item: (
+                -item["reranker_score"],
+                -item.get("hybrid_score", 0.0),
+                item.get("title", ""),
+                item.get("chunk_index", 0),
+            ),
         )
 
     def query_hybrid(
@@ -447,7 +539,14 @@ class PaperStore:
         rather than scanning every chunk on the request path.
         """
         top_k = max(1, min(int(top_k), 20))
-        candidate_k = min(HYBRID_CANDIDATE_LIMIT, top_k * 4)
+        candidate_k = min(
+            HYBRID_CANDIDATE_LIMIT,
+            max(
+                top_k * 4,
+                getattr(self, "_reranker_candidate_limit", 0)
+                if getattr(self, "_reranker_enabled", False) else 0,
+            ),
+        )
         semantic = self.query(query_text, candidate_k, paper_ids, section)
         collection_count = self._collection.count()
         if collection_count > HYBRID_LEXICAL_MAX_CHUNKS:
@@ -488,7 +587,7 @@ class PaperStore:
         for item in fused.values():
             item["retrieval"] = "hybrid"
             results.append(item)
-        return sorted(
+        ranked = sorted(
             results,
             key=lambda item: (
                 -item["hybrid_score"],
@@ -496,7 +595,13 @@ class PaperStore:
                 item.get("title", ""),
                 item.get("chunk_index", 0),
             ),
-        )[:top_k]
+        )
+        rerank_limit = (
+            getattr(self, "_reranker_candidate_limit", 0)
+            if getattr(self, "_reranker_enabled", False) else 0
+        )
+        reranked = self._rerank(query_text, ranked[:rerank_limit]) if rerank_limit else ranked
+        return reranked[:top_k]
 
     def query_lexical(
         self,
@@ -505,7 +610,7 @@ class PaperStore:
         paper_ids: Optional[list[str]] = None,
         section: Optional[str] = None,
     ) -> list[dict]:
-        """不依赖 embedding 的本地关键词检索，用于模型首次下载期间。"""
+        """基于 BM25 的本地正文检索，用于混合召回和嵌入模型初始化期间。"""
         if self._collection.count() == 0:
             return []
         terms = self._query_terms(query_text)
@@ -514,24 +619,11 @@ class PaperStore:
 
         raw = self._collection.get(include=["documents", "metadatas"])
         candidates = []
-        phrase = query_text.strip().lower()
         for doc, meta in zip(raw.get("documents") or [], raw.get("metadatas") or []):
             meta = meta or {}
             if paper_ids and meta.get("paper_id") not in paper_ids:
                 continue
             if section and meta.get("section") != section:
-                continue
-            title = str(meta.get("title", "")).lower()
-            section_name = str(meta.get("section", "")).lower()
-            body = (doc or "").lower()
-            score = sum(
-                title.count(term) * 3 + section_name.count(term) * 2 + body.count(term)
-                for term in terms
-            )
-            if len(phrase) >= 3:
-                score += title.count(phrase) * 8 + section_name.count(phrase) * 5
-                score += body.count(phrase) * 3
-            if score <= 0:
                 continue
             candidates.append({
                 "text": doc or "",
@@ -541,9 +633,33 @@ class PaperStore:
                 "chunk_index": meta.get("chunk_index", 0),
                 "char_start": meta.get("char_start", 0),
                 "char_end": meta.get("char_end", 0),
-                "keyword_score": score,
                 "retrieval": "keyword",
             })
+
+        if not candidates:
+            return []
+
+        tokenized = [self._lexical_tokens(item["text"]) for item in candidates]
+        document_count = len(tokenized)
+        average_length = sum(len(tokens) for tokens in tokenized) / document_count
+        document_frequency = {
+            term: sum(term in set(tokens) for tokens in tokenized)
+            for term in terms
+        }
+        for item, tokens in zip(candidates, tokenized):
+            length = len(tokens)
+            score = 0.0
+            for term in terms:
+                frequency = tokens.count(term)
+                if not frequency:
+                    continue
+                idf = math.log(1 + (document_count - document_frequency[term] + 0.5) /
+                               (document_frequency[term] + 0.5))
+                denominator = frequency + 1.5 * (1 - 0.75 + 0.75 * length / average_length)
+                score += idf * frequency * 2.5 / denominator
+            item["keyword_score"] = round(score, 6)
+
+        candidates = [item for item in candidates if item["keyword_score"] > 0]
         return sorted(
             candidates,
             key=lambda item: (-item["keyword_score"], item["title"], item["chunk_index"]),

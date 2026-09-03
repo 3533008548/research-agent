@@ -1,5 +1,5 @@
 {
-  "version": "v1.3",
+  "version": "v1.4",
   "corpus": "synthetic-research-corpus-v1",
   "tasks": [
     {
@@ -63,19 +63,6 @@
           {"label": "设置", "any_of": ["分布偏移", "动态负载", "bursty"]}
         ],
         "manual_rubric": ["区分训练负载与测试负载", "包含风险或可行性维度"]
-      }
-    },
-    {
-      "id": "T05",
-      "capability": "科研笔记",
-      "title": "保存可追溯的实验假设",
-      "fixture": {"topic": "TSN-diffusion"},
-      "prompt": "把“条件扩散可能在突发负载下减少截止期违例，需在 20/50/100 flows 上对比 PPO”保存为 TSN-diffusion 话题下的笔记。",
-      "expected": {
-        "tool_trace_contains": ["note_add"],
-        "state_assertions": {"topic": "TSN-diffusion", "note_contains": "20/50/100"},
-        "answer_checks": [{"label": "保存确认", "any_of": ["已保存", "笔记", "TSN-diffusion"]}],
-        "manual_rubric": ["保留可检验假设", "不改写数值条件"]
       }
     },
     {

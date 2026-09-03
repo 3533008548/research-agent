@@ -1,6 +1,6 @@
 # 科研 Agent 评测集
 
-`research_tasks.json` 定义 15 个版本化任务，覆盖论文精读、RAG 检索、跨论文对比、证据约束、科研笔记、每日速递、会话隔离/删除、同模型请求韧性、RAG 初始化降级，以及深度研究证据闭环、每日来源故障恢复、OpenAlex 鉴权边界、交互优先级和长任务取消。
+`research_tasks.json` 定义 14 个版本化任务，覆盖论文精读、RAG 检索、跨论文对比、证据约束、每日速递、会话隔离/删除、同模型请求韧性、RAG 初始化降级，以及深度研究证据闭环、每日来源故障恢复、OpenAlex 鉴权边界、交互优先级和长任务取消。
 
 所有任务使用 `fixtures/synthetic_corpus.json` 的合成科研语料，或明确给出模拟状态；不会读取 `runtime/`、个人论文、API Key，也不会调用真实模型 API。因此它适合作为每次重构后的稳定回归基线。
 
@@ -16,7 +16,7 @@ python scripts/export_badcase_template.py --candidate-id bc-xxxxxxxxxxxx
 
 ## 统一发布质量门禁
 
-日常开发与 CI 推荐只运行下面这一条命令。它会串联 15 项能力基准和 5 项真实编排可靠性回放，生成一个紧凑的通过/失败结论；报告不包含 prompt、论文正文、候选论文或密钥。
+日常开发与 CI 推荐只运行下面这一条命令。它会串联 14 项能力基准和 5 项真实编排可靠性回放，生成一个紧凑的通过/失败结论；报告不包含 prompt、论文正文、候选论文或密钥。
 
 ```powershell
 docker compose exec -T research-agent python -m evals.release_gate --strict
@@ -32,6 +32,36 @@ docker compose exec -T research-agent python -m evals.release_gate --compare eva
 门禁报告分别给出 `capability_success_rate`、`runtime_success_rate`、硬规则通过率和可靠性回放 P95 时延。每日来源的单点失败是已覆盖的恢复场景，不会被错误地判为整套门禁失败。
 
 ## 使用方式
+
+## 本地 RAG 召回评测（人工金标）
+
+现有能力基准只验证 RAG 工具是否被正确调用、是否可降级；它**不**衡量“正确证据段是否被召回”。如需评估本地论文库，请单独使用段落级召回评测：
+
+```powershell
+python scripts/run_rag_retrieval_eval.py `
+  --cases runtime/derived/rag_eval/current_local_cases.json `
+  --mode timed_hybrid
+```
+
+它不会调用模型、下载论文或修改向量库，只读取当前 Chroma 索引。默认报告写入被 Git 忽略的 `evals/reports/rag-retrieval-*.json`。报告分开给出：
+
+- `paper_recall_at_k`：前 k 条中是否出现正确论文，用于定位跨论文选择错误；
+- `passage_recall_at_k`：前 k 条中是否出现人工核验的正确块，才是 RAG 证据召回的主指标；
+- `MRR`：首个正确证据块的平均倒数排名；
+- `latency_ms` 与 `fallback_case_count`：检索体验和降级情况。
+
+金标文件必须包含论文标题、块序号及原文锚点 `text_contains`；只标论文标题会被拒绝。标注应先阅读原始 PDF 或已解析原文，再查看检索结果，避免用当前排序反向制造“正确答案”。真实本地论文的金标文件只放在 `runtime/derived/rag_eval/`，不得提交 Git。
+
+可额外运行关键词对照，以确认混合检索的收益是否真实存在：
+
+```powershell
+python scripts/run_rag_retrieval_eval.py `
+  --cases runtime/derived/rag_eval/current_local_cases.json `
+  --mode keyword `
+  --output evals/reports/rag-retrieval-keyword-baseline.json
+```
+
+## 能力基准评分
 
 先验证任务清单：
 
@@ -58,7 +88,7 @@ python -m evals.benchmark
 python -m evals.benchmark --results evals/example_results.json
 ```
 
-`example_results.json` 是评分器的合成格式样例，预期得到 15/15；它不代表真实模型表现。真实评测应保存一次实际 Agent 运行产生的回答、工具轨迹和状态快照，再使用同一命令评分。
+`example_results.json` 是评分器的合成格式样例，预期得到 14/14；它不代表真实模型表现。真实评测应保存一次实际 Agent 运行产生的回答、工具轨迹和状态快照，再使用同一命令评分。
 
 `ResearchAgent.get_last_trace()` 可取得一轮脱敏追踪：模型名、总耗时、首 token 时间、工具名/耗时、RAG 是否走关键词候选、错误类型和 token 增量。它不包含 API Key、完整 prompt 或工具原文。`result_from_trace()` 会自动携带模型调用次数；每日任务可额外传入 `source_stats`。对带性能门槛的任务，评分器会校验 `metrics`；例如 T10 在走 RAG 工具时要求其在 8.5 秒内返回关键词候选或语义结果。
 
@@ -128,13 +158,13 @@ python -m evals.benchmark --results results.json --compare evals/reports/benchma
 ## 真实用户验收集（推荐作为下一阶段基线）
 
 能力基准验证预先定义的系统能力；真实用户验收集则以接近实际使用的研究旅程检查：
-研究问题收敛、公开文献研究、趋势梳理、鲁棒性实验设计、研究计划、多轮上下文、会话隔离、笔记、每日发现、证据约束问答、密钥边界、韧性、RAG 降级、取消语义、会话删除和复现产物整理。
+研究问题收敛、公开文献研究、趋势梳理、鲁棒性实验设计、研究计划、多轮上下文、会话隔离、每日发现、证据约束问答、密钥边界、韧性、RAG 降级、取消语义、会话删除和复现产物整理。
 
-场景定义在 `user_acceptance_tasks.json`，当前共 20 个，分为：
+场景定义在 `user_acceptance_tasks.json`，当前共 19 个，分为：
 
 - `core`：首次可感知的科研问答与研究结论质量；
 - `research`：深度研究、证据、实验设计与多轮上下文；
-- `workflow`：笔记、每日发现、会话和研究产物；
+- `workflow`：每日发现、会话和研究产物；
 - `safety`：密钥、超时、RAG 降级和取消边界。
 
 它会调用真实模型与公开来源，因此**不进入 CI，也不能替代离线发布门禁**。每次执行都使用临时隔离运行时、默认关闭 RAG；报告仅保留回答、脱敏轨迹、状态摘要和人工评分模板，不保存原始 prompt、运行数据库、候选论文或密钥。
@@ -221,3 +251,14 @@ docker compose exec research-agent python -m evals.runtime_replay --case R04 --s
 docker compose exec research-agent python -m evals.runtime_replay --write-report --strict
 docker compose exec research-agent python -m evals.runtime_replay --compare evals/reports/runtime-replay-previous.json --write-report
 ```
+### 评测可选重排器
+
+默认评测只测当前的向量 + BM25 RRF。首次下载由单独命令完成，避免普通查询因网络不可用而卡住；之后可与基线使用相同金标比较：
+
+```powershell
+pip install -r requirements.txt
+python scripts/warm_reranker.py
+python scripts/run_rag_retrieval_eval.py --cases runtime/derived/rag_eval/current_local_cases.json --mode timed_hybrid --ks 1,3,5,10,20 --reranker
+```
+
+`--reranker` 只重排混合召回的前 20 条候选，不扩大给模型的上下文；运行时只从本地缓存加载 `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`。确认指标有收益后，再将 `config.yaml` 的 `rag.reranker.enabled` 改为 `true`。

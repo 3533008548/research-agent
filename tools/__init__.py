@@ -4,6 +4,12 @@
 
 from tools.search import handle_search_papers, handle_query_papers, handle_list_papers, handle_list_indexed, handle_delete_paper
 from tools.read_pdf import handle_read_pdf
+from tools.paper_card import handle_generate_paper_card
+from tools.research_documents import (
+    handle_read_research_document,
+    handle_save_research_document,
+    handle_search_research_documents,
+)
 from tools.describe import handle_describe_image
 from tools.profile_tool import handle_update_profile
 from cancellation import raise_if_cancelled
@@ -13,6 +19,10 @@ from tool_catalog import TOOL_NAMES
 _TOOL_HANDLERS = {
     "search_papers": handle_search_papers,
     "read_pdf": handle_read_pdf,
+    "generate_paper_card": handle_generate_paper_card,
+    "save_research_document": handle_save_research_document,
+    "search_research_documents": handle_search_research_documents,
+    "read_research_document": handle_read_research_document,
     "describe_image": handle_describe_image,
     "query_papers": handle_query_papers,
     "list_papers": handle_list_papers,
@@ -41,7 +51,7 @@ def _search_memory(args: dict, memory_store, session_id: str = "") -> str:
     if summaries:
         lines.append("\n**当前会话摘要**")
         lines.extend(
-            f"  • {item['topic'] or '未分类'}：{item['summary']}"
+            f"  • {item['summary']}"
             for item in summaries
         )
     if triples:
@@ -61,6 +71,8 @@ def execute_tool(
     profile_manager=None,
     memory_store=None,
     session_id: str = "",
+    llm_client=None,
+    model: str = "",
     cancel_event=None,
 ) -> str:
     """工具分发入口"""
@@ -74,6 +86,7 @@ def execute_tool(
         result = handler(
             args, paper_store=paper_store, glm_api_key=glm_api_key,
             profile_manager=profile_manager, memory_store=memory_store,
+            llm_client=llm_client, model=model,
             cancel_event=cancel_event,
         )
         raise_if_cancelled(cancel_event, "工具调用已取消")

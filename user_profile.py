@@ -1,37 +1,16 @@
-"""
-👤 用户画像 — Markdown 持久化偏好与研究方向
+"""用户画像的 Markdown 持久化管理器。"""
 
-文件: APP_DATA_DIR/primary/profile.md（人 + Agent 共维护）
-
-结构:
-  # 用户画像
-  ## 研究方向
-  ## 偏好设置
-  ## 活跃问题
-  ## 已读论文
-
-用法:
-  pm = ProfileManager()
-  pm.add_research_direction("TSN调度中的强化学习")
-  pm.set_preference("模型", "deepseek-v4-flash")
-  pm.add_active_question("L_total 是否考虑延迟约束？")
-  pm.add_paper("Attention Is All You Need", "Transformer, 注意力机制")
-  summary = pm.summary()  # 注入系统提示词的摘要
-"""
-
-import os
 import re
 import threading
 import uuid
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
 
 from runtime_paths import get_runtime_paths
 
 
 class ProfileManager:
-    """用户画像管理器 — 读写 profile.md"""
+    """读写 ``APP_DATA_DIR/primary/profile.md``。"""
 
     def __init__(self, path: str | None = None):
         self.path = Path(path) if path else get_runtime_paths().profile_path
@@ -57,7 +36,6 @@ class ProfileManager:
             )
 
     def _write(self, text: str, *, encoding: str = "utf-8") -> None:
-        """Atomically replace the profile so concurrent readers never see a partial file."""
         temp_path = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         try:
             temp_path.write_text(text, encoding=encoding)
@@ -65,20 +43,15 @@ class ProfileManager:
         finally:
             temp_path.unlink(missing_ok=True)
 
-    # ── 读取 ──
-
     def read(self) -> str:
         with self._lock:
             return self.path.read_text(encoding="utf-8")
 
     def summary(self) -> str:
-        """生成注入系统提示词的画像摘要"""
-        text = self.read()
-        lines = text.split("\n")
-        # 提取 ## 研究方向和 ## 偏好设置之间的关键行
+        """生成注入系统提示词的画像摘要。"""
         sections = {"研究方向": [], "偏好设置": [], "活跃问题": []}
         current = None
-        for line in lines:
+        for line in self.read().split("\n"):
             if line.startswith("## 研究方向"):
                 current = "研究方向"
             elif line.startswith("## 偏好设置"):
@@ -96,35 +69,23 @@ class ProfileManager:
         if sections["偏好设置"]:
             parts.append(f"偏好: {'; '.join(sections['偏好设置'])}")
         if sections["活跃问题"]:
-            parts.append(f"活跃问题: {'; '.join(sections['活跃问题'][:3])}")
+            parts.append(f"活跃问题: {', '.join(sections['活跃问题'][:3])}")
         return " | ".join(parts) if parts else ""
 
     def to_context(self) -> str:
-        """生成注入对话上下文的完整画像文本"""
-        return (
-            "[用户画像 — 以下信息用于个性化回答]\n"
-            + self.read()
-            + "\n[画像结束]"
-        )
-
-    # ── 写入 ──
+        return "[用户画像 — 以下信息用于个性化回答]\n" + self.read() + "\n[画像结束]"
 
     def _update_section(self, section: str, content: str, append: bool = True):
-        """更新特定 ## 章节"""
         with self._lock:
-            text = self.read()
-            lines = text.split("\n")
+            lines = self.read().split("\n")
             new_lines = []
             in_section = False
             done = False
             for line in lines:
                 if line.startswith(f"## {section}"):
                     in_section = True
-                    new_lines.append(line)
-                    if append:
-                        new_lines.append(content)
-                    else:
-                        new_lines.append(content)
+                    new_lines.extend((line, content))
+                    if not append:
                         done = True
                 elif in_section and line.startswith("##"):
                     in_section = False
@@ -138,10 +99,9 @@ class ProfileManager:
                     new_lines.append(line)
             if in_section and append and not done:
                 new_lines.append(content)
-            # 更新时间戳
             text = "\n".join(new_lines)
             text = re.sub(r'\*最后更新.*\*', f'*最后更新: {datetime.now().strftime("%Y-%m-%d %H:%M")}*', text)
-            if '*最后更新' not in text:
+            if "*最后更新" not in text:
                 text += f"\n\n*最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M')}*"
             self._write(text)
 
@@ -152,13 +112,11 @@ class ProfileManager:
         self._update_section("活跃问题", f"- {question}")
 
     def add_paper(self, title: str, summary: str):
-        entry = f"- {title}: {summary}"
-        self._update_section("已读论文", entry)
+        self._update_section("已读论文", f"- {title}: {summary}")
 
     def set_preference(self, key: str, value: str):
         with self._lock:
-            text = self.read()
-            lines = text.split("\n")
+            lines = self.read().split("\n")
             new_lines = []
             found = False
             for line in lines:
@@ -168,15 +126,14 @@ class ProfileManager:
                 else:
                     new_lines.append(line)
             if not found:
-                # 插入到偏好设置节
-                for i, line in enumerate(new_lines):
+                for index, line in enumerate(new_lines):
                     if line.startswith("## 偏好设置"):
-                        new_lines.insert(i + 1, f"- {key}: {value}")
+                        new_lines.insert(index + 1, f"- {key}: {value}")
                         break
             self._write("\n".join(new_lines))
 
     def update_from_agent(self, action: str, content: str):
-        """Agent 调用的统一更新接口"""
+        """Agent 调用的统一更新接口。"""
         if action == "add_direction":
             self.add_research_direction(content)
         elif action == "add_question":
@@ -187,5 +144,3 @@ class ProfileManager:
         elif action == "set_preference":
             key, _, value = content.partition(": ")
             self.set_preference(key.strip(), value.strip())
-        elif action == "summary":
-            pass  # read-only

@@ -1,6 +1,6 @@
 """The small declarative catalog for model-facing tools.
 
-This is deliberately not a dynamic plugin system.  It gives the nine bundled
+This is deliberately not a dynamic plugin system.  It gives the bundled
 tools one public definition for their name, function-calling schema, user-safe
 label and model-visible result limit.  New tools remain ordinary Python
 handlers, but adding one now fails early if its execution and declaration
@@ -29,6 +29,10 @@ class ToolDefinition:
 _PRESENTATION = {
     "search_papers": ("论文搜索", 3_000),
     "read_pdf": ("论文阅读", 12_000),
+    "generate_paper_card": ("论文证据卡", 3_000),
+    "save_research_document": ("研究档案保存", 1_500),
+    "search_research_documents": ("研究档案检索", 4_000),
+    "read_research_document": ("研究档案阅读", 12_000),
     "describe_image": ("图像分析", 2_000),
     "query_papers": ("论文检索", 5_000),
     "list_papers": ("本地论文列表", 3_000),

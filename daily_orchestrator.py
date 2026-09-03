@@ -22,6 +22,13 @@ import requests
 
 from cancellation import RequestCancelledError, raise_if_cancelled
 from llm_client import RequestPolicy, RequestPriority
+from paper_records import (
+    deduplicate_paper_records,
+    merge_paper_records,
+    normalize_doi,
+    same_paper,
+    title_similarity,
+)
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -491,7 +498,7 @@ class DailyResearchOrchestrator:
         title = " ".join(str(values.get("title") or "").split())
         abstract = " ".join(str(values.get("abstract") or "").split())
         source = str(values.get("source") or "")
-        doi = str(values.get("doi") or "").removeprefix("https://doi.org/").lower()
+        doi = normalize_doi(values.get("doi"))
         identifier = doi or str(values.get("source_id") or "") or title.lower()
         candidate_id = hashlib.sha256(identifier.encode("utf-8", "ignore")).hexdigest()[:16]
         return {
@@ -511,48 +518,26 @@ class DailyResearchOrchestrator:
         }
 
     def _deduplicate(self, candidates: list[dict[str, Any]], paper_store=None) -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
         local_titles: list[str] = []
         if paper_store:
             try:
                 local_titles = [str(paper.get("title") or "") for paper in paper_store.list_papers()]
             except Exception:
                 local_titles = []
-        for candidate in candidates:
-            if not candidate.get("title"):
-                continue
-            existing = next((item for item in merged if self._same_paper(item, candidate)), None)
-            if existing is None:
-                candidate = dict(candidate)
-                candidate["already_indexed"] = any(
-                    self._title_similarity(candidate["title"], title) >= 0.88 for title in local_titles
-                )
-                merged.append(candidate)
-                continue
-            self._merge_candidate(existing, candidate)
+        merged = deduplicate_paper_records(candidates)
+        for candidate in merged:
+            candidate["already_indexed"] = any(
+                title_similarity(candidate["title"], title) >= 0.88 for title in local_titles
+            )
         return merged
 
     @staticmethod
     def _same_paper(left: dict[str, Any], right: dict[str, Any]) -> bool:
-        if left.get("doi") and left.get("doi") == right.get("doi"):
-            return True
-        for source, source_id in (right.get("source_ids") or {}).items():
-            if source_id and (left.get("source_ids") or {}).get(source) == source_id:
-                return True
-        return DailyResearchOrchestrator._title_similarity(left.get("title", ""), right.get("title", "")) >= 0.9
+        return same_paper(left, right)
 
     @staticmethod
     def _merge_candidate(target: dict[str, Any], source: dict[str, Any]) -> None:
-        target["sources"] = sorted(set(target.get("sources", [])) | set(source.get("sources", [])))
-        target["keywords"] = sorted(set(target.get("keywords", [])) | set(source.get("keywords", [])))
-        target["source_ids"].update(source.get("source_ids") or {})
-        for key in ("abstract", "authors", "published_at", "venue", "doi", "url", "year"):
-            if not target.get(key) and source.get(key):
-                target[key] = source[key]
-        if len(str(source.get("abstract") or "")) > len(str(target.get("abstract") or "")):
-            target["abstract"] = source["abstract"]
-        target["citation_count"] = max(int(target.get("citation_count") or 0), int(source.get("citation_count") or 0))
-        target["already_indexed"] = bool(target.get("already_indexed") or source.get("already_indexed"))
+        merge_paper_records(target, source)
 
     def _apply_quality_gate(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         current_year = date.today().year
@@ -798,11 +783,7 @@ class DailyResearchOrchestrator:
 
     @staticmethod
     def _title_similarity(left: str, right: str) -> float:
-        normalize = lambda value: re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", value.lower()).split()
-        left_words, right_words = set(normalize(left)), set(normalize(right))
-        if not left_words or not right_words:
-            return 0.0
-        return len(left_words & right_words) / max(len(left_words), len(right_words))
+        return title_similarity(left, right)
 
     @staticmethod
     def _xml_text(entry, path: str, namespace: dict[str, str]) -> str:

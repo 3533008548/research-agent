@@ -89,6 +89,8 @@ class ToolRuntime:
         glm_api_key: str = "",
         profile_manager=None,
         memory_store=None,
+        llm_client=None,
+        model: str = "",
     ) -> str:
         """Run one existing tool without exposing its arguments or result to traces."""
         name = str(name or "")[:80]
@@ -111,6 +113,8 @@ class ToolRuntime:
                 glm_api_key=glm_api_key,
                 profile_manager=profile_manager,
                 memory_store=memory_store,
+                llm_client=llm_client,
+                model=model,
                 session_id=self.context.session_id,
                 cancel_event=self.context.cancel_event,
             )

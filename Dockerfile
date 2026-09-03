@@ -19,7 +19,11 @@ RUN apt-get update \
     && adduser --system --uid 10001 --ingroup app app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# The default Linux wheel on PyPI pulls CUDA libraries. This service runs on CPU,
+# so install the matching CPU wheel first; sentence-transformers then reuses it.
+ARG TORCH_VERSION=2.13.0+cpu
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}" \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY . ./
 RUN mkdir -p /app/runtime/derived/home/.cache /app/runtime/derived/cache \

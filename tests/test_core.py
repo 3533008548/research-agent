@@ -27,6 +27,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from unittest.mock import patch, MagicMock
 
+from evals.rag_retrieval import (
+    PassageLabel,
+    RetrievalCase,
+    RetrievalResponse,
+    RagEvalError,
+    evaluate_cases,
+    load_cases,
+)
+
 
 RUN_CHROMA_INTEGRATION = os.getenv("SKIP_CHROMA_INTEGRATION") != "1"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -489,6 +498,45 @@ class TestRetrievalAdmissionPolicy(unittest.TestCase):
         ))
 
 
+class TestPdfReaderLayout(unittest.TestCase):
+    """PDF 文本块的阅读顺序不应被双栏布局打乱。"""
+
+    def test_reader_reads_the_left_column_before_the_right_column(self):
+        import pymupdf
+        from pdf_reader import PaperReader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "two-columns.pdf"
+            document = pymupdf.open()
+            page = document.new_page(width=600, height=800)
+            page.insert_text((200, 50), "Paper title")
+            for y, text in ((140, "left evidence one"), (180, "left evidence two"), (220, "left evidence three")):
+                page.insert_text((50, y), text)
+            for y, text in ((140, "right evidence one"), (180, "right evidence two"), (220, "right evidence three")):
+                page.insert_text((330, y), text)
+            document.save(pdf_path)
+            document.close()
+
+            text = PaperReader(max_pages=1).read(str(pdf_path))
+
+        self.assertLess(text.index("left evidence three"), text.index("right evidence one"))
+        self.assertNotIn("─── 右栏 ───", text)
+
+    def test_index_cleaning_drops_the_reader_status_preamble(self):
+        from paper_store import clean_index_text, chunk_text
+
+        reader_text = (
+            "📄 **PDF 解析完成**\n文件名: sample.pdf | 总页数: 1 | 已读: 1 | 提取: 42 字符\n\n"
+            "━━━ 第 1 页 ━━━\n## Abstract\nVerified evidence."
+        )
+        cleaned = clean_index_text(reader_text)
+
+        self.assertNotIn("PDF 解析完成", cleaned)
+        chunks = chunk_text(cleaned)
+        self.assertTrue(all("PDF 解析完成" not in chunk["text"] for chunk in chunks))
+        self.assertTrue(any(chunk["section"] == "Abstract" for chunk in chunks))
+
+
 @unittest.skipUnless(
     RUN_CHROMA_INTEGRATION,
     "CI offline quality gate skips Chroma/ONNX integration; run it in the scheduled integration job.",
@@ -802,6 +850,57 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertEqual(results[0]["retrieval"], "semantic")
         self.assertFalse(store._collection.get_called)
 
+    def test_reranker_only_reorders_existing_candidates(self):
+        from paper_store import PaperStore
+
+        class _Reranker:
+            def predict(self, pairs, **_kwargs):
+                self.pairs = pairs
+                return [0.1, 0.9]
+
+        store = PaperStore.__new__(PaperStore)
+        store._reranker_enabled = True
+        store._reranker = _Reranker()
+        store._reranker_load_attempted = True
+        candidates = [
+            {"text": "first candidate", "title": "A", "chunk_index": 0, "hybrid_score": 0.2},
+            {"text": "second candidate", "title": "B", "chunk_index": 1, "hybrid_score": 0.1},
+        ]
+
+        results = store._rerank("which evidence", candidates)
+
+        self.assertEqual([item["title"] for item in results], ["B", "A"])
+        self.assertTrue(all(item["reranked"] for item in results))
+        self.assertEqual(store._reranker.pairs[0], ("which evidence", "first candidate"))
+
+    def test_bm25_scores_the_chunk_body_not_repeated_paper_title(self):
+        from paper_store import PaperStore
+
+        class _Collection:
+            @staticmethod
+            def count():
+                return 2
+
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "documents": [
+                        "The introduction describes a generic network problem.",
+                        "Branch-and-Bound is the exact optimization algorithm for MILP.",
+                    ],
+                    "metadatas": [
+                        {"paper_id": "p", "title": "Branch-and-Bound Scheduling", "chunk_index": 0},
+                        {"paper_id": "p", "title": "Branch-and-Bound Scheduling", "chunk_index": 1},
+                    ],
+                }
+
+        store = PaperStore.__new__(PaperStore)
+        store._collection = _Collection()
+        results = store.query_lexical("Which exact optimization algorithm is used?", top_k=2)
+
+        self.assertEqual(results[0]["chunk_index"], 1)
+        self.assertGreater(results[0]["keyword_score"], 0)
+
 
 class TestVerifyNode(unittest.TestCase):
     """测试3: verify 节点边界不崩溃"""
@@ -943,8 +1042,8 @@ class TestVerifyNode(unittest.TestCase):
         from graph_builder import build_graph
 
         class _Memory:
-            def get_recent_summary(self, thread_id, topic):
-                return f"{thread_id}:{topic}"
+            def get_recent_summary(self, thread_id):
+                return thread_id
 
         responses = [self._FakeResponse({"content": "收到"}) for _ in range(2)]
         from llm_client import LLMClient
@@ -958,7 +1057,7 @@ class TestVerifyNode(unittest.TestCase):
                     app.invoke(
                         {
                             "messages": [{"role": "user", "content": "测试"}],
-                            "metadata": {"session_id": thread_id, "topic": "TSN"},
+                            "metadata": {"session_id": thread_id},
                         },
                         config={"configurable": {"thread_id": thread_id}},
                     )
@@ -969,10 +1068,10 @@ class TestVerifyNode(unittest.TestCase):
             "\n".join(message["content"] or "" for message in call.kwargs["json"]["messages"])
             for call in post.call_args_list
         ]
-        self.assertIn("session-a:TSN", prompt_texts[0])
-        self.assertNotIn("session-b:TSN", prompt_texts[0])
-        self.assertIn("session-b:TSN", prompt_texts[1])
-        self.assertNotIn("session-a:TSN", prompt_texts[1])
+        self.assertIn("session-a", prompt_texts[0])
+        self.assertNotIn("session-b", prompt_texts[0])
+        self.assertIn("session-b", prompt_texts[1])
+        self.assertNotIn("session-a", prompt_texts[1])
 
     def test_verify_uses_short_timeout_without_poisoning_main_circuit(self):
         """验证超时只打开其局部熔断器，不能阻断主模型或 Curator。"""
@@ -1121,8 +1220,7 @@ class TestVerifyNode(unittest.TestCase):
         from search_api import search_arxiv, search_openalex, list_downloaded_papers
         from pdf_reader import read_pdf_enhanced, extract_images
         from paper_store import PaperStore, chunk_text
-        from notes import NoteStore
-        from profile import ProfileManager
+        from user_profile import ProfileManager
         self.assertTrue(callable(search_arxiv))
         self.assertTrue(callable(search_openalex))
         self.assertTrue(callable(read_pdf_enhanced))
@@ -1186,6 +1284,232 @@ class TestScheduler(unittest.TestCase):
                 )
             finally:
                 scheduler.close()
+
+
+class TestPaperArtifacts(unittest.TestCase):
+    """Evidence cards remain local, source-bounded and independently auditable."""
+
+    def test_source_map_keeps_page_and_section_anchors(self):
+        from paper_artifacts import build_source_map_from_reader_text
+
+        reader_text = (
+            "📄 **PDF 解析完成**\n文件名: sample.pdf | 总页数: 2 | 已读: 2 | 提取: 90 字符\n\n"
+            "━━━ 第 1 页 ━━━\n## Abstract\nThe paper proposes a scheduler.\n\n"
+            "━━━ 第 2 页 ━━━\n## Experiments\nIt reports lower latency."
+        )
+        source_map = build_source_map_from_reader_text(
+            reader_text, paper_id="paper-1", title="Sample", source_file="sample.pdf",
+        )
+
+        self.assertEqual(source_map["coverage"]["locator_mode"], "page-grounded")
+        self.assertEqual([item["id"] for item in source_map["blocks"]], ["S001", "S002"])
+        self.assertEqual(source_map["blocks"][1]["page"], 2)
+        self.assertEqual(source_map["blocks"][1]["section"], "Experiments")
+
+    def test_evidence_card_writes_only_under_runtime_and_rejects_bad_anchor(self):
+        from paper_artifacts import CARD_HEADINGS, audit_paper_card, write_paper_artifact
+        from runtime_paths import RuntimePaths
+
+        source_map = {
+            "paper_id": "paper-1",
+            "blocks": [{"id": "S001", "page": 1, "text": "verified evidence"}],
+        }
+        card = "\n".join(
+            ["# Sample"]
+            + [f"## {index}. {heading}\n内容【论文 p.1 · S001】" for index, heading in enumerate(CARD_HEADINGS, 1)]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RuntimePaths.from_root(Path(tmp) / "runtime")
+            paths.ensure_initialized()
+            card_path, map_path, audit = write_paper_artifact(
+                paths, paper_id="paper-1", source_map=source_map, card=card,
+            )
+            self.assertTrue(card_path.is_file())
+            self.assertTrue(map_path.is_file())
+            self.assertTrue(audit["valid"])
+            self.assertTrue(str(card_path).startswith(str(paths.paper_artifacts_dir)))
+
+        invalid = audit_paper_card(card.replace("S001", "S999"), source_map)
+        self.assertFalse(invalid["valid"])
+        self.assertIn("未知块 ID: S999", invalid["invalid_anchors"])
+
+    def test_paper_card_tool_generates_an_offline_evidence_draft(self):
+        from tools.paper_card import handle_generate_paper_card
+
+        class _Store:
+            @staticmethod
+            def list_papers():
+                return [{"paper_id": "paper-1", "title": "Sample Paper"}]
+
+        source_map = {
+            "paper_id": "paper-1", "title": "Sample Paper",
+            "coverage": {"processed_pages": 1, "total_pages": 1, "locator_mode": "page-grounded"},
+            "blocks": [{"id": "S001", "page": 1, "section": "Abstract", "text": "A verified claim."}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            papers = runtime / "primary" / "papers"
+            papers.mkdir(parents=True)
+            (papers / "Sample_Paper.pdf").write_bytes(b"%PDF-placeholder")
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False), patch(
+                "tools.paper_card.create_source_map", return_value=source_map,
+            ):
+                result = handle_generate_paper_card(
+                    {"paper_id_or_title": "paper-1"}, paper_store=_Store(),
+                )
+            self.assertIn("已生成证据草稿", result)
+            self.assertTrue((runtime / "derived" / "paper_artifacts" / "paper-1" / "paper-card.md").is_file())
+
+    def test_paper_card_tool_uses_shared_client_with_a_low_priority_policy(self):
+        from paper_artifacts import CARD_HEADINGS
+        from tools.paper_card import handle_generate_paper_card
+
+        class _Store:
+            @staticmethod
+            def list_papers():
+                return [{"paper_id": "paper-1", "title": "Sample Paper"}]
+
+        class _Response:
+            @staticmethod
+            def json():
+                card = "\n".join(
+                    ["# Sample"]
+                    + [f"## {index}. {heading}\n结论【论文 p.1 · S001】" for index, heading in enumerate(CARD_HEADINGS, 1)]
+                )
+                return {"choices": [{"message": {"content": card}}]}
+
+            @staticmethod
+            def close():
+                return None
+
+        class _LLM:
+            calls = []
+
+            def post(self, payload, **kwargs):
+                self.calls.append((payload, kwargs))
+                return _Response()
+
+        source_map = {
+            "paper_id": "paper-1", "title": "Sample Paper",
+            "coverage": {"processed_pages": 1, "total_pages": 1, "locator_mode": "page-grounded"},
+            "blocks": [{"id": "S001", "page": 1, "section": "Abstract", "text": "A verified claim."}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            papers = runtime / "primary" / "papers"
+            papers.mkdir(parents=True)
+            (papers / "Sample_Paper.pdf").write_bytes(b"%PDF-placeholder")
+            client = _LLM()
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False), patch(
+                "tools.paper_card.create_source_map", return_value=source_map,
+            ):
+                result = handle_generate_paper_card(
+                    {"paper_id_or_title": "paper-1"}, paper_store=_Store(),
+                    llm_client=client, model="test-model",
+                )
+        self.assertIn("模型已完成", result)
+        self.assertEqual(client.calls[0][0]["model"], "test-model")
+        self.assertEqual(client.calls[0][1]["policy"].priority.name, "SUMMARY")
+        self.assertFalse(client.calls[0][1]["policy"].counts_toward_circuit)
+
+
+class TestResearchDocuments(unittest.TestCase):
+    """Research plans are durable artifacts, not hidden conversation memory."""
+
+    def test_store_updates_and_searches_markdown_with_word_export(self):
+        from docx import Document
+        from research_documents import ResearchDocumentStore
+        from runtime_paths import RuntimePaths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RuntimePaths.from_root(Path(tmp) / "runtime")
+            store = ResearchDocumentStore(paths)
+            created = store.save(
+                "TSN 扩散调度验证方案",
+                "# TSN 扩散调度验证方案\n\n## 假设\n- 在突发流量下减少截止期违例。\n\n## 计划\n1. 在 20、50、100 flows 上与 PPO 对比。",
+            )
+
+            self.assertEqual(created["revision"], 1)
+            self.assertTrue(Path(created["markdown_path"]).is_file())
+            self.assertTrue(Path(created["docx_path"]).is_file())
+            self.assertEqual(Document(created["docx_path"]).core_properties.title, "TSN 扩散调度验证方案")
+            self.assertEqual(store.search("PPO")[0]["document_id"], created["document_id"])
+
+            updated = store.save(
+                "TSN 扩散调度验证方案",
+                "## 更新后的计划\n增加分布偏移和消融实验。",
+                document_id=created["document_id"],
+            )
+            loaded = store.read(created["document_id"])
+            self.assertEqual(updated["revision"], 2)
+            self.assertIn("分布偏移", loaded["content"])
+            self.assertTrue(str(Path(loaded["markdown_path"])).startswith(str(paths.research_documents_dir)))
+
+    def test_tool_handlers_keep_research_documents_outside_profile_and_memory(self):
+        import re
+        from tools import execute_tool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
+                saved = execute_tool("save_research_document", {
+                    "title": "临时实验方案",
+                    "content": "## 目标\n验证 bursty traffic 下的时延和截止期违例。",
+                })
+                document_id = re.search(r"`(research-doc-[a-f0-9]{12})`", saved).group(1)
+                searched = execute_tool("search_research_documents", {"query": "bursty"})
+                loaded = execute_tool("read_research_document", {"document_id": document_id})
+
+            self.assertIn(document_id, searched)
+            self.assertIn("截止期违例", loaded)
+            self.assertTrue((runtime / "primary" / "research_documents" / document_id / "document.docx").is_file())
+            self.assertFalse((runtime / "primary" / "profile.md").exists())
+
+
+class TestPaperRecordNormalization(unittest.TestCase):
+    def test_deduplication_prefers_doi_and_merges_provider_metadata(self):
+        from paper_records import deduplicate_paper_records
+
+        records = [
+            {
+                "title": "A Scheduling Method", "doi": "https://doi.org/10.1/ABC.",
+                "abstract": "short", "sources": ["openalex"], "source_ids": {"openalex": "W1"},
+                "citation_count": 2,
+            },
+            {
+                "title": "A scheduling method", "doi": "10.1/abc",
+                "abstract": "longer abstract", "sources": ["arxiv"], "source_ids": {"arxiv": "2501.00001"},
+                "citation_count": 5,
+            },
+        ]
+        merged = deduplicate_paper_records(records)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["sources"], ["arxiv", "openalex"])
+        self.assertEqual(merged[0]["citation_count"], 5)
+        self.assertEqual(merged[0]["abstract"], "longer abstract")
+
+    def test_merged_public_search_keeps_source_labels_and_partial_failure(self):
+        from search_api import search_public_papers
+
+        openalex = [{
+            "title": "Shared Paper", "abstract": "TSN scheduling under bursty traffic.",
+            "doi": "10.1/shared", "year": 2025, "citation_count": 8,
+            "sources": ["openalex"], "source_ids": {"openalex": "W1"},
+        }]
+        arxiv = [{
+            "title": "Shared Paper", "abstract": "TSN scheduling under bursty traffic.",
+            "doi": "10.1/shared", "year": 2025, "citation_count": 0,
+            "sources": ["arxiv"], "source_ids": {"arxiv": "2501.00001"},
+        }]
+        with patch("search_api._fetch_openalex_records", return_value=(openalex, None, "TSN")), patch(
+            "search_api._fetch_arxiv_records", return_value=(arxiv, "arXiv API 请求失败: timeout"),
+        ):
+            result = search_public_papers("TSN scheduling under bursty traffic", limit=5)
+
+        self.assertIn("Shared Paper", result)
+        self.assertIn("[openalex]", result)
+        self.assertIn("未完成来源", result)
 
 
 class TestDailyMultiAgentOrchestration(unittest.TestCase):
@@ -1403,8 +1727,8 @@ class TestConversationMemory(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             memory = MemoryStore(str(Path(tmp) / "memory.db"))
             try:
-                memory.add_summary("session-a", "TSN", "TSN 动态负载实验需要报告截止期违例")
-                memory.add_summary("session-b", "TSN", "TSN 另一个会话的私有摘要")
+                memory.add_summary("session-a", "TSN 动态负载实验需要报告截止期违例")
+                memory.add_summary("session-b", "TSN 另一个会话的私有摘要")
                 memory.add_triple("DiffTSN", "uses_method", "TSN scheduling under bursty traffic")
 
                 result = execute_tool(
@@ -1432,8 +1756,8 @@ class TestConversationMemory(unittest.TestCase):
             def get_last_summary_time(_thread_id):
                 return None
 
-            def add_summary(self, thread_id, topic, summary):
-                self.stored.append((thread_id, topic, summary))
+            def add_summary(self, thread_id, summary):
+                self.stored.append((thread_id, summary))
 
         class _Response:
             status_code = 200
@@ -1456,7 +1780,7 @@ class TestConversationMemory(unittest.TestCase):
 
         memory = _Memory()
         llm = _LLM()
-        metadata = {"session_id": "session-a", "topic": "TSN"}
+        metadata = {"session_id": "session-a"}
         short_history = [{"role": "user", "content": f"问题 {i}"} for i in range(10)]
         self.assertFalse(maybe_store_conversation_summary(
             messages=short_history,
@@ -1480,7 +1804,7 @@ class TestConversationMemory(unittest.TestCase):
             timeout_seconds=2,
         ))
         self.assertEqual(memory.stored, [
-            ("session-a", "TSN", "压缩后的项目上下文"),
+            ("session-a", "压缩后的项目上下文"),
         ])
 
 
@@ -1529,8 +1853,8 @@ class TestSessionStore(unittest.TestCase):
                     raw.execute(f"INSERT INTO {table} VALUES (?, 'other')", (second["thread_id"],))
                 raw.commit()
                 raw.close()
-                memory.add_summary(first["thread_id"], "", "会话一摘要")
-                memory.add_summary(second["thread_id"], "", "会话二摘要")
+                memory.add_summary(first["thread_id"], "会话一摘要")
+                memory.add_summary(second["thread_id"], "会话二摘要")
 
                 self.assertTrue(store.delete(first["thread_id"]))
                 self.assertEqual(memory.delete_summaries(first["thread_id"]), 1)
@@ -2735,6 +3059,7 @@ class TestRuntimePaths(unittest.TestCase):
                 self.assertTrue(paths.state_file.exists())
                 self.assertTrue(paths.database_dir.is_dir())
                 self.assertTrue(paths.papers_dir.is_dir())
+                self.assertTrue(paths.research_documents_dir.is_dir())
                 self.assertTrue(paths.chroma_dir.is_dir())
                 self.assertTrue(paths.images_dir.is_dir())
                 self.assertEqual(paths.safe_child(paths.papers_dir, "../escape.pdf").parent, paths.papers_dir)
@@ -2742,7 +3067,6 @@ class TestRuntimePaths(unittest.TestCase):
                 cfg = Config.load({"data_dir": tmp})
                 self.assertEqual(Path(cfg.checkpoint_db), paths.checkpoint_db)
                 self.assertEqual(Path(cfg.memory_db), paths.memory_db)
-                self.assertEqual(Path(cfg.notes_db), paths.notes_db)
                 self.assertEqual(Path(cfg.daily_db), paths.daily_db)
                 self.assertEqual(paths.badcases_db, paths.database_dir / "badcases.db")
                 self.assertEqual(Path(cfg.chroma_dir), paths.chroma_dir)
@@ -2804,7 +3128,8 @@ class TestRuntimePaths(unittest.TestCase):
             root = Path(tmp)
             paths = RuntimePaths.from_root(root / "runtime")
             paths.ensure_initialized()
-            conn = sqlite3.connect(paths.notes_db)
+            legacy_notes = paths.database_dir / "notes.db"
+            conn = sqlite3.connect(legacy_notes)
             conn.execute("CREATE TABLE marker (value TEXT)")
             conn.execute("INSERT INTO marker VALUES ('backup-ok')")
             conn.commit()
@@ -2819,6 +3144,10 @@ class TestRuntimePaths(unittest.TestCase):
                 badcases.close()
             paths.profile_path.write_text("# 用户画像\n", encoding="utf-8")
             (paths.papers_dir / "paper.pdf").write_bytes(b"%PDF-test")
+            (paths.research_documents_dir / "research-doc-backup").mkdir()
+            (paths.research_documents_dir / "research-doc-backup" / "document.md").write_text(
+                "# 备份验证\n", encoding="utf-8",
+            )
             output = root / "backups"
 
             subprocess.run(
@@ -2836,25 +3165,26 @@ class TestRuntimePaths(unittest.TestCase):
                 self.assertIn("runtime/primary/db/badcases.db", archive.namelist())
                 self.assertIn("runtime/primary/profile.md", archive.namelist())
                 self.assertIn("runtime/primary/papers/paper.pdf", archive.namelist())
+                self.assertIn("runtime/primary/research_documents/research-doc-backup/document.md", archive.namelist())
 
 
 class TestResearchBenchmark(unittest.TestCase):
     """版本化评测集不读取用户数据，并能稳定检查结果结构。"""
 
-    def test_manifest_defines_fifteen_distinct_research_tasks(self):
+    def test_manifest_defines_fourteen_distinct_research_tasks(self):
         from evals.benchmark import load_manifest, validate_manifest
 
         manifest = load_manifest()
         self.assertEqual(validate_manifest(manifest), [])
-        self.assertEqual(len(manifest["tasks"]), 15)
-        self.assertEqual(len({task["id"] for task in manifest["tasks"]}), 15)
+        self.assertEqual(len(manifest["tasks"]), 14)
+        self.assertEqual(len({task["id"] for task in manifest["tasks"]}), 14)
 
     def test_engineering_explanation_tasks_do_not_require_a_tool_trace(self):
         from evals.benchmark import load_manifest
 
         manifest = load_manifest()
         expectations = {task["id"]: task["expected"] for task in manifest["tasks"]}
-        self.assertEqual(manifest["version"], "v1.3")
+        self.assertEqual(manifest["version"], "v1.4")
         self.assertNotIn("tool_trace_contains", expectations["T04"])
         self.assertNotIn("tool_trace_contains", expectations["T10"])
 
@@ -2888,7 +3218,7 @@ class TestResearchBenchmark(unittest.TestCase):
 
         manifest = load_manifest()
         self.assertEqual(validate_manifest(manifest), [])
-        self.assertEqual(len(manifest["scenarios"]), 20)
+        self.assertEqual(len(manifest["scenarios"]), 19)
         self.assertEqual(
             [item["id"] for item in select_scenarios(suites=["core"], manifest=manifest)],
             ["UA01", "UA02", "UA03", "UA04", "UA20"],
@@ -3045,13 +3375,13 @@ class TestResearchBenchmark(unittest.TestCase):
         })
         self.assertTrue(score["passed"])
 
-    def test_example_results_exercise_all_fifteen_tasks_and_emit_metrics(self):
+    def test_example_results_exercise_all_fourteen_tasks_and_emit_metrics(self):
         import json
         from evals.benchmark import ROOT, load_manifest, score_submission
 
         results = json.loads((ROOT / "example_results.json").read_text(encoding="utf-8"))
         report = score_submission(load_manifest(), results)
-        self.assertEqual((report["passed"], report["total"]), (15, 15))
+        self.assertEqual((report["passed"], report["total"]), (14, 14))
         self.assertEqual(report["summary"]["citation_traceability_rate"], 1.0)
         self.assertEqual(report["summary"]["source_failures"], 1)
 
@@ -3121,7 +3451,7 @@ class TestResearchBenchmark(unittest.TestCase):
         report = run_release_gate(seed=17)
         self.assertTrue(report["passed"], report)
         self.assertEqual(report["gate_version"], GATE_VERSION)
-        self.assertEqual((report["capability"]["passed"], report["capability"]["total"]), (15, 15))
+        self.assertEqual((report["capability"]["passed"], report["capability"]["total"]), (14, 14))
         self.assertEqual((report["runtime"]["passed"], report["runtime"]["total"]), (5, 5))
         self.assertEqual(report["summary"]["success_rate"], 1.0)
 
@@ -3208,10 +3538,7 @@ class TestRequestTracing(unittest.TestCase):
                     )
                     agent.llm_client._slots.release()
 
-                    retried = agent.step(
-                        retry["user_input"], context=retry["context"], topic=retry["topic"],
-                        on_token=lambda _token: None,
-                    )
+                    retried = agent.step(retry["user_input"], on_token=lambda _token: None)
                     self.assertEqual(retried, "重试完成")
                     self.assertEqual(post.call_count, 2)
             finally:
@@ -3384,25 +3711,9 @@ class TestAuditRegressionFixes(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_note_store_serializes_concurrent_writes_and_rejects_blank_topic(self):
-        from concurrent.futures import ThreadPoolExecutor
-        from notes import NoteStore
-
-        with tempfile.TemporaryDirectory() as tmp:
-            store = NoteStore(str(Path(tmp) / "notes.db"))
-            try:
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    list(executor.map(lambda index: store.add("并发话题", f"note-{index}"), range(32)))
-                self.assertEqual(len(store.list_notes("并发话题")), 32)
-                self.assertIsNone(store.get_topic(None))
-                with self.assertRaisesRegex(ValueError, "不能为空"):
-                    store.ensure_topic("  ")
-            finally:
-                store.close()
-
     def test_profile_updates_are_atomic_under_concurrent_agent_calls(self):
         from concurrent.futures import ThreadPoolExecutor
-        from profile import ProfileManager
+        from user_profile import ProfileManager
 
         with tempfile.TemporaryDirectory() as tmp:
             profile = ProfileManager(str(Path(tmp) / "profile.md"))
@@ -3500,6 +3811,55 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 with self.assertRaisesRegex(PDFDownloadError, "文件过大"):
                     _download_pdf("https://example.com/paper.pdf", target)
             self.assertFalse(target.exists())
+
+
+class TestRagRetrievalEvaluation(unittest.TestCase):
+    """The recall scorer must stay independent from Chroma and model calls."""
+
+    def test_reports_document_and_strict_passage_metrics_separately(self):
+        alpha = PassageLabel("Paper Alpha", 2, "gold alpha evidence")
+        beta = PassageLabel("Paper Beta", 8, "gold beta evidence")
+        cases = [
+            RetrievalCase("RAG-01", "alpha question", (alpha,)),
+            RetrievalCase("RAG-02", "beta question", (beta,)),
+        ]
+
+        def _retrieve(query, _top_k):
+            if query == "alpha question":
+                return [
+                    {"title": "Paper Other", "chunk_index": 1, "text": "unrelated"},
+                    {"title": "Paper Alpha", "chunk_index": 2, "text": "gold alpha evidence"},
+                ]
+            return RetrievalResponse(
+                [
+                    {"title": "Paper Beta", "chunk_index": 7, "text": "near but not the source"},
+                    {"title": "Paper Beta", "chunk_index": 8, "text": "gold beta evidence"},
+                ],
+                fallback_note="lexical fallback",
+            )
+
+        report = evaluate_cases(cases, _retrieve, ks=(1, 2))
+        metrics = report["metrics"]
+        self.assertEqual(metrics["paper_recall_at_k"], {"1": 0.5, "2": 1.0})
+        self.assertEqual(metrics["passage_recall_at_k"], {"1": 0.0, "2": 1.0})
+        self.assertEqual(metrics["mrr"], 0.5)
+        self.assertEqual(metrics["fallback_case_count"], 1)
+        self.assertEqual(report["cases"][1]["first_paper_rank"], 1)
+        self.assertEqual(report["cases"][1]["first_passage_rank"], 2)
+
+    def test_manifest_requires_a_human_passage_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "cases.json"
+            manifest.write_text(json.dumps({
+                "schema_version": 1,
+                "cases": [{
+                    "id": "RAG-01",
+                    "query": "question",
+                    "labels": [{"paper_title": "Paper", "chunk_index": 1}],
+                }],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(RagEvalError, "text_contains"):
+                load_cases(manifest)
 
 
 if __name__ == "__main__":

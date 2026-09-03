@@ -49,7 +49,7 @@ except ImportError:
 from cancellation import RequestCancelledError, raise_if_cancelled
 from graph_builder import build_graph
 from llm_client import LLMClient, LLMClientError
-from profile import ProfileManager
+from user_profile import ProfileManager
 from research_orchestrator import ResearchOrchestrator
 from resilience import CircuitBreaker
 from run_contract import execution_metadata
@@ -156,7 +156,12 @@ class ResearchAgent:
             try:
                 from paper_store import PaperStore
                 print("      📚 初始化论文向量库...", file=sys.stderr, flush=True)
-                self._paper_store = PaperStore(persist_dir=cfg.chroma_dir)
+                self._paper_store = PaperStore(
+                    persist_dir=cfg.chroma_dir,
+                    reranker_enabled=cfg.rag_reranker_enabled,
+                    reranker_model=cfg.rag_reranker_model,
+                    reranker_candidate_limit=cfg.rag_reranker_candidate_limit,
+                )
                 print(
                     f"      ✅ 已加载 {self._paper_store.paper_count} 篇论文, "
                     f"{self._paper_store.chunk_count} 个块",
@@ -196,25 +201,21 @@ class ResearchAgent:
     def step(
         self,
         user_input: str,
-        context: str | None = None,
         on_token=None,
         session_id: str | None = None,
-        topic: str | None = None,
         cancel_event: threading.Event | None = None,
         run_id: str | None = None,
     ) -> str:
-        """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文。
-           ``session_id`` 省略时使用当前 CLI 会话；Web 请求必须显式传入。"""
+        """单轮推理：输入用户消息，返回 Agent 回复文本。
+
+        ``session_id`` 省略时使用当前 CLI 会话；Web 请求必须显式传入。
+        """
         try:
             raise_if_cancelled(cancel_event, "请求已取消")
         except RequestCancelledError:
             return "⏹️ 请求已取消。"
         thread_id = session_id or self._thread_id
         state = {"messages": [], "metadata": {"session_id": thread_id}}
-        if topic:
-            state["metadata"]["topic"] = topic
-        if context:
-            state["messages"].append({"role": "system", "content": context})
         state["messages"].append({"role": "user", "content": user_input})
 
         # 同一会话的对话和删除互斥；不同会话仍可并行执行。等待锁时也响应取消。
@@ -227,9 +228,7 @@ class ResearchAgent:
         try:
             if not self.sessions.get(thread_id):
                 return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
-            self._retry_inputs[thread_id] = {
-                "user_input": user_input, "context": context, "topic": topic,
-            }
+            self._retry_inputs[thread_id] = {"user_input": user_input}
             usage = self.get_usage(thread_id)
             usage_before = dict(usage)
             started_at = time.perf_counter()
@@ -840,7 +839,7 @@ def print_help():
 📦 **数据存储**
   runtime/primary/papers/  PDF 缓存
   runtime/derived/chroma/  RAG 向量库（可重建）
-  runtime/primary/db/      对话、笔记、记忆和每日检索数据
+  runtime/primary/db/      对话、记忆和每日检索数据
 """
     print(msg)
 

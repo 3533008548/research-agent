@@ -3,7 +3,6 @@
   {"task_id": "T02", "answer": "在 BurstTSN 的 bursty traffic 下，DiffTSN 相对 PPO 将 deadline violations 降低 18%。", "tool_trace": ["query_papers"], "state": {}},
   {"task_id": "T03", "answer": "Diffusion 通过迭代去噪生成调度；图注意力 actor-critic 直接选择动作，面对训练分布之外的分布偏移需要额外验证。", "tool_trace": ["query_papers"], "state": {}},
   {"task_id": "T04", "answer": "动态负载的鲁棒性应报告 deadline violations、latency 和 schedule feasibility，并在分布偏移条件下评估。", "tool_trace": ["query_papers"], "state": {}},
-  {"task_id": "T05", "answer": "已保存到 TSN-diffusion 笔记。", "tool_trace": ["note_add"], "state": {"topic": "TSN-diffusion", "note_contains": "20/50/100"}},
   {"task_id": "T06", "answer": "新增 Diffusion Models for Network Scheduling 与 Multi-Agent TSN under Bursty Traffic 两篇待读论文。", "tool_trace": ["daily_search"], "state": {"keyword": "diffusion TSN", "new_count": 2, "unread_count": 2, "source_stats": {"diffusion TSN": {"openalex": {"status": "ok", "count": 2}, "openaire": {"status": "ok", "count": 1}, "dblp": {"status": "ok", "count": 1}}}}},
   {"task_id": "T07", "answer": "当前会话讨论的是 DiffTSN 的扩散调度。", "tool_trace": [], "state": {"session_id": "eval-b", "history_isolated": true}},
   {"task_id": "T08", "answer": "已删除 eval-delete；eval-keep 和全局论文库仍保留。", "tool_trace": [], "state": {"deleted_session": "eval-delete", "remaining_session": "eval-keep", "paper_store_preserved": true}},

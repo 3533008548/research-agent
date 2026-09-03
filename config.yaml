@@ -25,6 +25,11 @@ pdf:
   max_pages: 20
 rag:
   enabled: true
+  reranker:
+    # 首次使用先运行 scripts/warm_reranker.py；运行时只从本地缓存加载。
+    enabled: true
+    model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+    candidate_limit: 20
 ui:
   port: 7860
   theme: soft

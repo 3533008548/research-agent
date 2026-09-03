@@ -3,10 +3,9 @@
 
 基于 Gradio Blocks + 受控 Chatbot 状态，支持：
   - 斜杠命令: /model /tokens /indexed /new /help
-  - 笔记命令: /note topics /note add /note list /note del
   - ChromaDB RAG 论文检索
   - 公式实时 MathJax 渲染
-  - 状态栏实时更新 + 弹出笔记面板
+  - 状态栏实时更新 + 工作区面板
 
 启动:
   python web_ui.py
@@ -14,6 +13,7 @@
 """
 
 import argparse
+import html
 import os
 import re
 import sys
@@ -42,7 +42,7 @@ load_dotenv()
 
 from research_agent import ResearchAgent
 from badcase_store import BadcaseStore
-from notes import NoteStore
+from research_documents import ResearchDocumentStore
 from run_timeline import RunTimelineService
 from ui_request_guard import BrowserRunGuard
 
@@ -153,7 +153,6 @@ footer { display: none !important; }
 #research-chat .wrap { padding: 0.3rem; }
 .daily-panel { max-height: 15rem; overflow: auto; font-size: 0.82rem; }
 .paper-list { max-height: 19rem; overflow: auto; }
-.note-list { max-height: 16rem; overflow: auto; }
 .settings-stack { gap: 0.5rem !important; }
 .agent-run-list { display: grid; gap: 0.55rem; }
 .agent-run-card { border: 1px solid #e5e7eb; border-radius: 0.7rem; padding: 0.65rem 0.75rem; background: #fff; }
@@ -226,8 +225,8 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
 
     print(f"🤖 模型: {cfg.model}")
     agent = agent or ResearchAgent(cfg=cfg)
-    notes = NoteStore(cfg.notes_db)
     badcases = BadcaseStore(str(cfg.runtime_paths.badcases_db))
+    research_documents = ResearchDocumentStore(cfg.runtime_paths)
     pending_conflicts = {}
     from scheduler import Scheduler
     scheduler = Scheduler(
@@ -235,26 +234,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
     )
     timeline = RunTimelineService(agent.sessions, scheduler)
     import threading
-
-    # A topic is user/session context, not process-global UI state. Keeping one
-    # shared value made one browser tab silently change another tab's prompt.
-    _session_topics: dict[str, str] = {}
-    _session_topics_lock = threading.RLock()
-
-    def _topic_for(session_id: str | None) -> str:
-        with _session_topics_lock:
-            return _session_topics.get(session_id or "", "默认")
-
-    def _set_topic(session_id: str | None, topic: str | None) -> str:
-        normalized = (topic or "").strip() or "默认"
-        with _session_topics_lock:
-            if session_id:
-                _session_topics[session_id] = normalized
-        return normalized
-
-    def _forget_topic(session_id: str | None) -> None:
-        with _session_topics_lock:
-            _session_topics.pop(session_id or "", None)
 
     daily_lock = threading.Lock()
     daily_task = {"thread": None, "cancel_event": None, "api_run_id": None}
@@ -470,16 +449,15 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
 | `/retry` | 重新发送本次运行中最后一个模型请求 |
 | `/profile` | 查看用户画像 |
 
-**📚 论文 / 笔记**
+**📁 研究档案**
+
+明确说“把这份研究方案保存为文档”即可生成可下载 Word 文档和可检索 Markdown；
+之后可说“查一下之前保存的方案”，Agent 会按需检索，不会将档案自动塞进对话上下文。
+
+**📚 论文**
 | 命令 | 说明 |
 |------|------|
 | `/indexed` | 已索引论文列表 |
-| `/note topics` | 列出笔记话题 |
-| `/note topic <名>` | 切换话题 |
-| `/note add <内容>` | 添加笔记 |
-| `/note list` | 当前话题笔记 |
-| `/note del <编号>` | 删除笔记 |
-| `/note link <id> <论文>` | 笔记关联论文 |
 
 **📰 每日检索**
 | 命令 | 说明 |
@@ -646,9 +624,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
 
         if msg == "/profile":
             yield agent.profile.read(); return
-
-        if msg.startswith("/note"):
-            yield _handle_note_cmd(msg, session_id); return
 
         if msg == "/daily":
             today = scheduler.get_today_results()
@@ -867,7 +842,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     result = agent.research(
                         "" if resume_research else research_query,
                         scope=research_scope,
-                        context=_build_context(session_id),
                         session_id=session_id,
                         resume=resume_research,
                         cancel_event=cancel_event,
@@ -991,8 +965,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
         def can_update_chat() -> bool:
             return browser_run_guard.is_current(browser_id, request_generation)
 
-        ctx = retry_request["context"] if retry_request else _build_context(session_id)
-        request_topic = retry_request["topic"] if retry_request else _topic_for(session_id)
         import queue, threading
         q = queue.Queue()
         final = []
@@ -1000,9 +972,9 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
         def _run():
             try:
                 r = agent.step(
-                    msg, context=ctx if ctx else None,
+                    msg,
                     on_token=lambda token: q.put(("token", token)),
-                    session_id=session_id, topic=request_topic,
+                    session_id=session_id,
                     cancel_event=cancel_event,
                 )
             except BaseException as exc:
@@ -1103,99 +1075,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
     def stop_active_reply(request: gr.Request | None = None):
         """停止当前浏览器的流式输出，并向 Agent 传播取消令牌。"""
         _invalidate_browser_request(request)
-
-    def _handle_note_cmd(msg: str, session_id: str) -> str:
-        parts = msg[5:].strip()  # 去掉 "/note"
-        if not parts:
-            return "用法:\n- `/note topics` 查看话题\n- `/note topic <名>` 切换话题\n- `/note add <内容>` 添加笔记\n- `/note list` 列出笔记\n- `/note del <编号>` 删除笔记"
-
-        if parts == "topics":
-            topics = notes.list_topics()
-            if not topics:
-                return "📭 还没有笔记话题。"
-            lines = [f"**笔记话题** ({len(topics)})\n"]
-            for t in topics:
-                lines.append(f"- {t['name']}（{t['count']} 条笔记）")
-            return "\n".join(lines)
-
-        if parts.startswith("topic "):
-            name = parts[6:].strip()
-            if not name:
-                return "用法: `/note topic <名>`"
-            name = _set_topic(session_id, name)
-            notes.ensure_topic(name)
-            return f"✅ 当前笔记话题: **{name}**"
-
-        if parts.startswith("add "):
-            content = parts[4:].strip()
-            if not content:
-                return "用法: `/note add <笔记内容>`"
-            topic = _topic_for(session_id)
-            tid = notes.add(topic, content)
-            return f"✅ 笔记 #{tid} 已保存到话题「{topic}」"
-
-        if parts == "list":
-            topic = _topic_for(session_id)
-            all_notes = notes.list_notes(topic)
-            if not all_notes:
-                return f"📭 话题「{topic}」还没有笔记。"
-            lines = [f"**{topic}** 的笔记：\n"]
-            for n in all_notes:
-                preview = n['content'].replace('\n', ' ')[:80]
-                lines.append(f"#{n['id']}  {preview}")
-            return "\n".join(lines)
-
-        if parts.startswith("del "):
-            nid = parts[4:].strip()
-            if not nid.isdigit():
-                return "用法: `/note del <编号>`"
-            note = notes.get(int(nid))
-            if not note or note["topic"] != _topic_for(session_id):
-                return f"❌ 当前话题中未找到笔记 #{nid}"
-            ok = notes.delete(int(nid))
-            return f"🗑️ 笔记 #{nid} 已删除。" if ok else f"❌ 未找到笔记 #{nid}"
-
-        if parts.startswith("link "):
-            args_link = parts[5:].strip().split(" ", 1)
-            if len(args_link) < 2 or not args_link[0].isdigit():
-                return "用法: `/note link <笔记编号> <论文标题>`"
-            nid = int(args_link[0])
-            paper = args_link[1].strip()
-            note = notes.get(nid)
-            if not note or note["topic"] != _topic_for(session_id):
-                return f"❌ 当前话题中未找到笔记 #{nid}"
-            notes.set_paper(nid, paper)
-            return f"✅ 笔记 #{nid} 已关联论文「{paper}」"
-
-        return f"❌ 未知命令: /note {parts}\n输入 `/note` 查看用法。"
-
-    # ═══ 上下文构建（打通三库关联） ═══
-
-    def _build_context(session_id: str) -> str | None:
-        """构建当前话题的上下文，注入 Agent"""
-        topic = _topic_for(session_id)
-        if topic == "默认":
-            return None
-
-        parts = [f"[当前研究话题: {topic}]\n"]
-
-        # 关联论文
-        if agent.paper_store:
-            papers = agent.paper_store.list_papers()
-            if papers:
-                names = [p["title"] for p in papers[:5]]
-                parts.append(f"已索引论文 ({len(papers)} 篇): " + ", ".join(names))
-
-        # 关联笔记
-        topic_notes = notes.list_notes(topic)
-        if topic_notes:
-            recent = topic_notes[-3:]  # 最近 3 条
-            parts.append("\n最近笔记:")
-            for n in recent:
-                preview = n["content"].replace("\n", " ")[:100]
-                parts.append(f"  - {preview}")
-
-        return "\n".join(parts)
 
     def refresh_status(history, session_id: str | None = None):
         session_id = session_id or agent.thread_id
@@ -1343,7 +1222,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
     def new_session(request: gr.Request | None = None):
         _invalidate_browser_request(request)
         session = agent.create_session()
-        _set_topic(session["thread_id"], "默认")
         return (
             gr.update(choices=_session_choices(), value=session["thread_id"]),
             [],
@@ -1351,8 +1229,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             session["thread_id"],
             refresh_status([], session["thread_id"]),
             gr.update(value=False),
-            note_topic_list(session["thread_id"]),
-            note_list_html(session_id=session["thread_id"]),
         )
 
     def switch_session(session_id: str, request: gr.Request | None = None):
@@ -1360,12 +1236,10 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
         if not agent.sessions.get(session_id):
             return (
                 [], [], agent.thread_id, refresh_status([], agent.thread_id),
-                note_topic_list(agent.thread_id), note_list_html(session_id=agent.thread_id),
             )
         history = agent.get_history(session_id)
         return (
             history, history, session_id, refresh_status(history, session_id),
-            note_topic_list(session_id), note_list_html(session_id=session_id),
         )
 
     def delete_current_session(
@@ -1376,12 +1250,10 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                 gr.update(), gr.update(), gr.update(), gr.update(),
                 gr.update(value=False),
                 "⚠️ 请先勾选“确认永久删除当前会话”。",
-                gr.update(), gr.update(),
             )
         _invalidate_browser_request(request)
         agent.delete_session(session_id)
         badcases.delete_for_session(session_id)
-        _forget_topic(session_id)
         for key in [key for key in pending_conflicts if key[0] == session_id]:
             pending_conflicts.pop(key, None)
         remaining = agent.list_sessions()
@@ -1394,45 +1266,52 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             next_session_id,
             gr.update(value=False),
             refresh_status(history, next_session_id),
-            note_topic_list(next_session_id),
-            note_list_html(session_id=next_session_id),
         )
 
-    # ═══ 笔记面板函数 ═══
-
-    def note_topic_list(session_id: str | None = None):
-        topics = notes.list_topics()
-        return gr.update(choices=[t["name"] for t in topics], value=_topic_for(session_id))
-
-    def note_save(topic_name: str, content: str, session_id: str):
-        topic = _set_topic(session_id, topic_name)
-        if not content.strip():
-            return gr.update(), note_list_html(topic, session_id)
-        notes.add(topic, content.strip())
-        return gr.update(value=""), note_list_html(topic, session_id)
-
-    def note_list_html(topic_name: str | None = None, session_id: str | None = None) -> str:
-        t = topic_name or _topic_for(session_id)
-        all_notes = notes.list_notes(t)
-        if not all_notes:
-            return f"<p style='color:#999;'>📭 话题「{t}」还没有笔记</p>"
-        html = "<div style='max-height:300px;overflow-y:auto;'>"
-        for n in all_notes:
-            content = n["content"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            html += (
-                f"<div style='border-bottom:1px solid #eee;padding:6px 0;'>"
-                f"<small style='color:#999;'>{n['created_at'][:16]}</small>"
-                f"<p style='margin:2px 0;white-space:pre-wrap;'>{content}</p>"
-                f"</div>"
-            )
-        html += "</div>"
-        return html
-
-    def note_topic_change(topic_name: str, session_id: str):
-        topic = _set_topic(session_id, topic_name)
-        return note_list_html(topic, session_id)
-
     # ═══ 论文卡片 ───
+
+    def _research_document_choices() -> list[tuple[str, str]]:
+        return [
+            (
+                f"{item['title']} · 第 {item['revision']} 版",
+                item["document_id"],
+            )
+            for item in research_documents.list(limit=50)
+        ]
+
+    def research_documents_html() -> str:
+        documents = research_documents.list(limit=20)
+        if not documents:
+            return (
+                "<p style='color:#999;padding:0.5rem 0;'>暂无研究档案。"
+                "在对话中明确要求“把这份研究方案保存为文档”即可创建。</p>"
+            )
+        cards = []
+        for document in documents:
+            title = html.escape(str(document["title"]))
+            summary = html.escape(str(document.get("summary") or ""))
+            cards.append(
+                "<div style='padding:0.55rem 0;border-bottom:1px solid #edf0f4;'>"
+                f"<strong>{title}</strong><br>"
+                f"<small style='color:#6b7280;'>第 {document['revision']} 版 · {document['updated_at']}</small><br>"
+                f"<span style='color:#49566b;font-size:0.8rem;'>{summary}</span>"
+                "</div>"
+            )
+        return "<div class='paper-list'>" + "".join(cards) + "</div>"
+
+    def refresh_research_documents():
+        return (
+            research_documents_html(),
+            gr.update(choices=_research_document_choices(), value=None),
+            "选择一份档案可预览 Markdown 并下载 Word 文档。",
+            None,
+        )
+
+    def show_research_document(document_id: str):
+        document = research_documents.read(document_id)
+        if document is None:
+            return "⚠️ 未找到该档案，请刷新列表。", None
+        return document["content"], document["docx_path"]
 
     def paper_cards_html():
         if not agent.paper_store:
@@ -1593,25 +1472,36 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     refresh_papers_btn = gr.Button("刷新论文库", size="sm")
                 refresh_papers_btn.click(fn=paper_cards_html, outputs=[paper_list], queue=False)
 
-                with gr.Accordion("研究笔记", open=False, elem_classes=["utility-panel"]):
-                    topic_dd = gr.Dropdown(
-                        label="话题", allow_custom_value=True,
-                        choices=[t["name"] for t in notes.list_topics()],
-                        value=_topic_for(agent.thread_id),
+                with gr.Accordion("研究档案", open=False, elem_classes=["utility-panel"]):
+                    research_document_list = gr.HTML(value=research_documents_html())
+                    refresh_research_documents_btn = gr.Button("刷新研究档案", size="sm")
+                    research_document_picker = gr.Dropdown(
+                        choices=_research_document_choices(),
+                        label="查看或下载",
+                        interactive=True,
                     )
-                    note_input = gr.Textbox(
-                        label="新笔记", placeholder="记录一个可复用的观察…", lines=3,
+                    research_document_preview = gr.Markdown(
+                        "选择一份档案可预览 Markdown 并下载 Word 文档。",
                     )
-                    note_save_btn = gr.Button("保存笔记", variant="primary", size="sm")
-                    note_display = gr.HTML(
-                        value=note_list_html(session_id=agent.thread_id), elem_classes=["note-list"],
+                    research_document_download = gr.File(
+                        label="Word 文档",
+                        interactive=False,
                     )
-                note_save_btn.click(
-                    fn=note_save, inputs=[topic_dd, note_input, session_state],
-                    outputs=[note_input, note_display],
+                refresh_research_documents_btn.click(
+                    fn=refresh_research_documents,
+                    outputs=[
+                        research_document_list,
+                        research_document_picker,
+                        research_document_preview,
+                        research_document_download,
+                    ],
+                    queue=False,
                 )
-                topic_dd.change(
-                    fn=note_topic_change, inputs=[topic_dd, session_state], outputs=[note_display],
+                research_document_picker.change(
+                    fn=show_research_document,
+                    inputs=[research_document_picker],
+                    outputs=[research_document_preview, research_document_download],
+                    queue=False,
                 )
 
                 with gr.Accordion("每日检索关键词", open=False, elem_classes=["utility-panel"]):
@@ -1732,18 +1622,17 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                     show_progress="hidden",
                 )
 
-        demo.load(fn=note_topic_list, inputs=[session_state], outputs=[topic_dd])
         # These callbacks also update the workspace controls after a session change.
         session_picker.change(
             fn=switch_session, inputs=[session_picker],
-            outputs=[chatbot, chat_history_state, session_state, status, topic_dd, note_display],
+            outputs=[chatbot, chat_history_state, session_state, status],
             queue=False,
         )
         new_session_btn.click(
             fn=new_session,
             outputs=[
                 session_picker, chatbot, chat_history_state,
-                session_state, status, delete_confirm, topic_dd, note_display,
+                session_state, status, delete_confirm,
             ],
             queue=False,
         )
@@ -1752,7 +1641,7 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
             inputs=[session_state, delete_confirm],
             outputs=[
                 session_picker, chatbot, chat_history_state,
-                session_state, delete_confirm, status, topic_dd, note_display,
+                session_state, delete_confirm, status,
             ],
             queue=False,
         )

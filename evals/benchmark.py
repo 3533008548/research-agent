@@ -26,8 +26,8 @@ def validate_manifest(manifest: dict[str, Any]) -> list[str]:
     """Return schema errors; an empty list means the benchmark is usable."""
     errors: list[str] = []
     tasks = manifest.get("tasks")
-    if not isinstance(tasks, list) or len(tasks) != 15:
-        return ["任务清单必须恰好包含 15 个任务"]
+    if not isinstance(tasks, list) or len(tasks) != 14:
+        return ["任务清单必须恰好包含 14 个任务"]
 
     task_ids = set()
     capabilities = set()

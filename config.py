@@ -21,6 +21,9 @@ _DFLT = {
     "model": "deepseek-v4-flash",
     "pdf_max_pages": 15,
     "rag_enabled": True,
+    "rag_reranker_enabled": False,
+    "rag_reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    "rag_reranker_candidate_limit": 20,
     "ui_port": 7860,
     "ui_debug": False,
     "verify_timeout_seconds": 8,
@@ -52,6 +55,9 @@ class Config:
 
     pdf_max_pages: int = 15
     rag_enabled: bool = True
+    rag_reranker_enabled: bool = False
+    rag_reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    rag_reranker_candidate_limit: int = 20
 
     ui_port: int = 7860
     ui_debug: bool = False
@@ -74,7 +80,6 @@ class Config:
     data_dir: str = "runtime"
     checkpoint_db: str = ""
     memory_db: str = ""
-    notes_db: str = ""
     daily_db: str = ""
     chroma_dir: str = ""
     papers_dir: str = ""
@@ -91,7 +96,6 @@ class Config:
         os.environ["APP_DATA_DIR"] = self.data_dir
         self.checkpoint_db = self.checkpoint_db or str(paths.checkpoint_db)
         self.memory_db = self.memory_db or str(paths.memory_db)
-        self.notes_db = self.notes_db or str(paths.notes_db)
         self.daily_db = self.daily_db or str(paths.daily_db)
         self.chroma_dir = self.chroma_dir or str(paths.chroma_dir)
         self.papers_dir = self.papers_dir or str(paths.papers_dir)
@@ -136,7 +140,19 @@ class Config:
                 if "pdf" in yaml_cfg:
                     cfg["pdf_max_pages"] = yaml_cfg["pdf"].get("max_pages", cfg["pdf_max_pages"])
                 if "rag" in yaml_cfg:
-                    cfg["rag_enabled"] = yaml_cfg["rag"].get("enabled", cfg["rag_enabled"])
+                    rag_settings = yaml_cfg["rag"]
+                    cfg["rag_enabled"] = rag_settings.get("enabled", cfg["rag_enabled"])
+                    reranker = rag_settings.get("reranker", {})
+                    if isinstance(reranker, dict):
+                        cfg["rag_reranker_enabled"] = reranker.get(
+                            "enabled", cfg["rag_reranker_enabled"],
+                        )
+                        cfg["rag_reranker_model"] = reranker.get(
+                            "model", cfg["rag_reranker_model"],
+                        )
+                        cfg["rag_reranker_candidate_limit"] = reranker.get(
+                            "candidate_limit", cfg["rag_reranker_candidate_limit"],
+                        )
                 if "ui" in yaml_cfg:
                     cfg["ui_port"] = yaml_cfg["ui"].get("port", cfg["ui_port"])
                 if "daily_search" in yaml_cfg:
@@ -220,6 +236,11 @@ class Config:
             openalex_api_key=cfg.get("openalex_api_key", "") or os.getenv("OPENALEX_API_KEY", ""),
             pdf_max_pages=cfg["pdf_max_pages"],
             rag_enabled=cfg["rag_enabled"],
+            rag_reranker_enabled=bool(cfg.get("rag_reranker_enabled", False)),
+            rag_reranker_model=str(cfg.get("rag_reranker_model") or _DFLT["rag_reranker_model"]),
+            rag_reranker_candidate_limit=max(
+                1, min(20, int(cfg.get("rag_reranker_candidate_limit", 20))),
+            ),
             ui_port=cfg["ui_port"],
             ui_debug=cfg.get("ui_debug", False),
             daily_search_enabled=cfg.get("daily_search_enabled", False),

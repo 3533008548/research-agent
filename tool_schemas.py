@@ -10,12 +10,12 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "search_papers",
-                "description": "搜索学术论文。openalex 用于通用文献，arxiv 用于预印本与近期研究。",
+                "description": "搜索学术论文。默认合并 OpenAlex 与 arXiv、去重并保留来源；也可限定单一来源。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "搜索关键词"},
-                        "source": {"type": "string", "enum": ["openalex", "arxiv"], "description": "数据源"},
+                        "source": {"type": "string", "enum": ["all", "openalex", "arxiv"], "description": "数据源，默认 all"},
                         "limit": {"type": "integer", "description": "返回数（1-10）"},
                     },
                     "required": ["query"],
@@ -34,6 +34,65 @@ def _raw_tool_schemas() -> list[dict]:
                         "max_pages": {"type": "integer", "description": "最大页数"},
                     },
                     "required": ["url_or_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_paper_card",
+                "description": "为已索引的本地 PDF 生成可追溯论文证据卡，结论带页码和来源块锚点。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paper_id_or_title": {"type": "string", "description": "已索引论文的标题或 paper_id"},
+                        "max_pages": {"type": "integer", "description": "最多解析页数（1-100，默认 100）"},
+                    },
+                    "required": ["paper_id_or_title"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "save_research_document",
+                "description": "保存或更新一份独立研究档案：同时写入可检索 Markdown 和可下载 Word 文档。仅在用户明确要求保存、导出或更新研究方案时调用；不要改写用户画像或会话摘要。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "简洁、稳定的文档标题"},
+                        "content": {"type": "string", "description": "完整 Markdown 正文；应自包含研究问题、假设、方法、计划和待验证项等用户要求的内容"},
+                        "document_id": {"type": "string", "description": "仅更新已有档案时传入；先搜索获取 ID"},
+                    },
+                    "required": ["title", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_research_documents",
+                "description": "按需搜索用户已保存的研究档案；用于查找此前方案、假设、实验计划或决策记录。不会把所有档案自动放入上下文。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "关键词；为空时列出最近更新档案"},
+                        "limit": {"type": "integer", "description": "返回数量（1-10，默认 5）"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_research_document",
+                "description": "读取一份研究档案的完整内容。仅在已从搜索结果获得明确文档 ID，或用户明确给出 ID 时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "document_id": {"type": "string", "description": "研究档案 ID"},
+                    },
+                    "required": ["document_id"],
                 },
             },
         },

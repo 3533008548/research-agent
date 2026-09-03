@@ -3,7 +3,7 @@
 
 结构: APP_DATA_DIR/primary/db/memory.db
   triples   (id, paper_title, relation, value, created_at)
-  summaries (id, thread_id, topic, summary, created_at)
+  summaries (id, thread_id, summary, created_at)
 """
 
 import sqlite3
@@ -16,7 +16,7 @@ from runtime_paths import get_runtime_paths
 
 
 class MemoryStore:
-    """轻量记忆存储 — 三元组 + 话题摘要"""
+    """轻量记忆存储 — 三元组 + 会话摘要。"""
 
     MAX_SUMMARIES_PER_THREAD = 3
 
@@ -43,7 +43,7 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id TEXT NOT NULL,
-                topic TEXT DEFAULT '',
+                topic TEXT DEFAULT '',  -- 兼容已有数据库；新摘要不再写入该字段。
                 summary TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -96,12 +96,12 @@ class MemoryStore:
 
     # ── 摘要 ──
 
-    def add_summary(self, thread_id: str, topic: str, summary: str):
+    def add_summary(self, thread_id: str, summary: str):
         now = datetime.now().isoformat()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO summaries (thread_id, topic, summary, created_at) VALUES (?, ?, ?, ?)",
-                (thread_id, topic, summary, now),
+                "INSERT INTO summaries (thread_id, summary, created_at) VALUES (?, ?, ?)",
+                (thread_id, summary, now),
             )
             rows = self._conn.execute(
                 "SELECT id FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT -1 OFFSET ?",
@@ -120,35 +120,21 @@ class MemoryStore:
             ).fetchone()
         return row["created_at"] if row else None
 
-    def get_recent_summary(self, thread_id: str, topic: str = "") -> Optional[str]:
-        """获取最近一条摘要，可选按话题过滤"""
-        if topic:
-            with self._lock:
-                rows = self._conn.execute(
-                    "SELECT summary FROM summaries WHERE thread_id=? AND topic=? ORDER BY created_at DESC LIMIT 1",
-                    (thread_id, topic),
-                ).fetchall()
-        else:
-            with self._lock:
-                rows = self._conn.execute(
-                    "SELECT summary FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT 1",
-                    (thread_id,),
-                ).fetchall()
+    def get_recent_summary(self, thread_id: str) -> Optional[str]:
+        """获取当前会话最近一条摘要。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT summary FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT 1",
+                (thread_id,),
+            ).fetchall()
         return rows[0]["summary"] if rows else None
 
-    def get_all_summaries(self, thread_id: str, topic: str = "") -> list[dict]:
-        if topic:
-            with self._lock:
-                rows = self._conn.execute(
-                    "SELECT * FROM summaries WHERE thread_id=? AND topic=? ORDER BY created_at DESC LIMIT 3",
-                    (thread_id, topic),
-                ).fetchall()
-        else:
-            with self._lock:
-                rows = self._conn.execute(
-                    "SELECT * FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT 3",
-                    (thread_id,),
-                ).fetchall()
+    def get_all_summaries(self, thread_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM summaries WHERE thread_id=? ORDER BY created_at DESC LIMIT 3",
+                (thread_id,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def search_summaries(
@@ -172,9 +158,9 @@ class MemoryStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM summaries "
-                "WHERE thread_id=? AND (topic LIKE ? OR summary LIKE ?) "
+                "WHERE thread_id=? AND summary LIKE ? "
                 "ORDER BY created_at DESC LIMIT ?",
-                (thread_id, pattern, pattern, limit),
+                (thread_id, pattern, limit),
             ).fetchall()
         return [dict(r) for r in rows]
 

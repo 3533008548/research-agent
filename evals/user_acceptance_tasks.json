@@ -104,19 +104,6 @@
       ]
     },
     {
-      "id": "UA08",
-      "suite": "workflow",
-      "journey": "科研笔记",
-      "title": "将可检验假设保存为科研笔记",
-      "mode": "chat",
-      "prompt": "请把这条假设保存到 TSN-diffusion 主题的科研笔记：条件扩散可能在突发负载下减少截止期违例；需要在 20、50、100 flows 上与 PPO 对比。保存后说明记录了哪些可检验条件。",
-      "automated": {"min_answer_chars": 60, "max_duration_ms": 60000, "required_trace_tools": ["note_add"]},
-      "manual_rubric": [
-        {"id": "traceability", "label": "可追溯性", "description": "是否保留主题、假设、条件和比较基线。", "critical": true},
-        {"id": "faithfulness", "label": "忠实记录", "description": "是否没有改写或虚构输入中的数值条件。"}
-      ]
-    },
-    {
       "id": "UA09",
       "suite": "workflow",
       "journey": "每日发现",

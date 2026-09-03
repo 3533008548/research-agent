@@ -107,11 +107,7 @@ def maybe_store_conversation_summary(
         summary = str(response.json()["choices"][0]["message"]["content"]).strip()
         if not summary:
             return False
-        memory_store.add_summary(
-            thread_id,
-            str(metadata.get("topic") or ""),
-            summary[:SUMMARY_CHAR_LIMIT],
-        )
+        memory_store.add_summary(thread_id, summary[:SUMMARY_CHAR_LIMIT])
         return True
     except RequestCancelledError:
         raise

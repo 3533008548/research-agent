@@ -1,9 +1,9 @@
 """
-📄 PDF 增强阅读器 — 表格感知提取 + 双栏布局识别 + 章节自动标注
+📄 PDF 增强阅读器 — 表格感知提取 + 双栏布局重排 + 章节自动标注
 
-改进摘要（对比原始的 fitz.get_text()）：
+改进摘要：
   1. 表格感知 — 用 pdfplumber 提取表格并格式化为 Markdown 表格
-  2. 双栏布局 — 检测双栏排版，先读左栏再读右栏，避免文字交叉混排
+  2. 双栏布局 — 用 PyMuPDF 的文本块坐标，先读左栏再读右栏
   3. 章节标注 — 自动识别 Introduction / Method / Experiments 等标题并标注 ##
 """
 
@@ -18,6 +18,11 @@ try:
 except ImportError:
     pdfplumber = None
 
+try:
+    import pymupdf
+except ImportError:
+    pymupdf = None
+
 
 # ═══════════════════════════════════════════════════════════════
 #  章节标题检测模式
@@ -30,6 +35,7 @@ _SECTION_NAMES = [
     "background",
     "related work",
     "preliminaries",
+    "preliminary",
     "problem (?:formulation|definition|statement)",
     "method(?:ology)?",
     "proposed (?:method|approach|framework|architecture|model|algorithm|system)",
@@ -72,10 +78,10 @@ class PaperReader:
     """增强型 PDF 阅读器 — 表格感知 + 双栏排序 + 章节标注"""
 
     def __init__(self, max_pages: int = 15, max_chars: int | None = None):
-        if pdfplumber is None:
+        if pdfplumber is None or pymupdf is None:
             raise ImportError(
-                "需要安装 pdfplumber 才能解析 PDF：\n"
-                "   pip install pdfplumber"
+                "需要安装 pdfplumber 和 PyMuPDF 才能解析 PDF：\n"
+                "   pip install pdfplumber PyMuPDF"
             )
         self.max_pages = max_pages
         self.max_chars = max_chars
@@ -100,21 +106,21 @@ class PaperReader:
         if not pdf_path.exists():
             return f"❌ 文件不存在: {pdf_path}"
 
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            total_pages = len(pdf.pages)
+        with pymupdf.open(pdf_path) as text_pdf, pdfplumber.open(str(pdf_path)) as table_pdf:
+            total_pages = len(text_pdf)
             pages_to_read = min(total_pages, self.max_pages)
 
             page_texts = []
             raw_tables = []  # (page_num, table_index, header: list, rows: list, y0: float, y1: float)
 
             for i in range(pages_to_read):
-                page = pdf.pages[i]
-                text = self._extract_text(page)
+                table_page = table_pdf.pages[i]
+                text = self._extract_text(text_pdf[i])
                 if text:
                     page_texts.append(f"━━━ 第 {i+1} 页 ━━━\n{text}")
 
                 # 提取表格（带位置，用于跨页检测）
-                found = page.find_tables()
+                found = table_page.find_tables()
                 for ti, tbl in enumerate(found):
                     try:
                         data = tbl.extract()
@@ -122,7 +128,9 @@ class PaperReader:
                             continue
                         header = [str(c or "").strip() for c in data[0]]
                         rows = [[str(c or "").strip() for c in row] for row in data[1:] if any(str(c or "").strip() for c in row)]
-                        if not rows:
+                        cell_count = len(header) * (len(rows) + 1)
+                        nonempty_cells = sum(bool(cell) for row in [header, *rows] for cell in row)
+                        if not rows or not cell_count or nonempty_cells / cell_count < 0.35:
                             continue
                         raw_tables.append((i, ti, header, rows, float(tbl.bbox[1]), float(tbl.bbox[3])))
                     except Exception:
@@ -188,138 +196,63 @@ class PaperReader:
     # ── 1️⃣ 双栏布局感知提取 ──
 
     def _extract_text(self, page) -> str:
-        """从一页中提取文本，自动处理双栏布局"""
-        words = page.extract_words(keep_blank_chars=True, x_tolerance=3)
-        if not words:
+        """按文本块坐标重建阅读顺序，避免按词分组造成跨列混排。"""
+        page_width = float(page.rect.width)
+        page_height = float(page.rect.height)
+        blocks = []
+        for x0, y0, x1, y1, text, *_ in page.get_text("blocks"):
+            content = " ".join(text.split())
+            if not content:
+                continue
+            # 竖排版权文字和页脚会干扰双栏判断，也不属于论文正文。
+            if y0 >= page_height * 0.94 or y1 - y0 > page_height * 0.5:
+                continue
+            blocks.append({
+                "text": content,
+                "x0": float(x0),
+                "x1": float(x1),
+                "y": float(y0),
+                "width": float(x1 - x0),
+            })
+
+        if not blocks:
             return ""
 
-        # 分组为行（按 y 坐标）
-        lines = self._group_into_lines(words, page.height)
+        mid_x = page_width / 2
+        column_width = page_width * 0.58
+        def _is_centered(block: dict) -> bool:
+            center = (block["x0"] + block["x1"]) / (2 * page_width)
+            return 0.4 <= center <= 0.6
 
-        # 检测双栏
-        is_two_column, mid_x = self._detect_columns(lines, page.width)
+        columns = [
+            block for block in blocks
+            if block["width"] <= column_width and not _is_centered(block)
+        ]
+        left = [block for block in columns if (block["x0"] + block["x1"]) / 2 < mid_x]
+        right = [block for block in columns if (block["x0"] + block["x1"]) / 2 >= mid_x]
 
-        if not is_two_column:
-            # 单栏：简单按 y 排序
-            lines.sort(key=lambda l: l["y"])
-            return "\n".join(l["text"] for l in lines)
+        # 两侧各至少有三个正文块才按双栏阅读；否则保持自上而下顺序。
+        if len(left) < 3 or len(right) < 3:
+            return "\n".join(
+                block["text"] for block in sorted(blocks, key=lambda block: (block["y"], block["x0"]))
+            )
 
-        # 双栏：分离出 左栏/右栏/跨栏 行
-        left, right, full = [], [], []
-        for line in lines:
-            avg_x = (line["x0"] + line["x1"]) / 2
-            # 跨栏：同时覆盖左右两侧
-            if line["x0"] < mid_x - 20 and line["x1"] > mid_x + 20:
-                full.append(line)
-            elif avg_x < mid_x:
-                left.append(line)
-            else:
-                right.append(line)
-
-        full.sort(key=lambda l: l["y"])
-        left.sort(key=lambda l: l["y"])
-        right.sort(key=lambda l: l["y"])
-
-        # 输出顺序：跨栏行插入左栏的对应 y 位置 → 然后输出右栏
-        ordered = []
-        left_idx = 0
-        for header_line in full:
-            # 在 left 中找到所有 y < header_line["y"] 的，先输出
-            while left_idx < len(left) and left[left_idx]["y"] <= header_line["y"]:
-                ordered.append(left[left_idx])
-                left_idx += 1
-            ordered.append(header_line)
-        # 剩余左栏
-        while left_idx < len(left):
-            ordered.append(left[left_idx])
-            left_idx += 1
-
-        result = [l["text"] for l in ordered]
-        result.append("")  # 分隔左栏和右栏
-        result.append("─── 右栏 ───")
-        result.extend(l["text"] for l in right)
-
-        return "\n".join(result)
-
-    def _group_into_lines(self, words: list[dict], page_height: float) -> list[dict]:
-        """将单词按行分组（基于 y 坐标容差）"""
-        if not words:
-            return []
-
-        # 估算行高：取最常见单词高度
-        heights = [w.get("height", 10) for w in words if w.get("height")]
-        y_tolerance = (max(heights) if heights else 10) * 0.6
-
-        lines = []
-        # 按 (y, x) 排序
-        sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
-
-        current = None
-        for w in sorted_words:
-            if current is None or abs(w["top"] - current["y"]) > y_tolerance:
-                if current is not None:
-                    lines.append(current)
-                current = {
-                    "text": w.get("text", ""),
-                    "x0": w["x0"],
-                    "x1": w["x1"],
-                    "y": w["top"],
-                    "words": [w],
-                }
-            else:
-                # 同行单词，x0/x1 延展
-                current["x0"] = min(current["x0"], w["x0"])
-                current["x1"] = max(current["x1"], w["x1"])
-                current["words"].append(w)
-                # 行文本：按 x 排序
-                current["words"].sort(key=lambda x: x["x0"])
-                current["text"] = " ".join(
-                    ww.get("text", "") for ww in current["words"]
-                )
-
-        if current is not None:
-            lines.append(current)
-
-        return lines
-
-    def _detect_columns(self, lines: list[dict], page_width: float) -> tuple:
-        """
-        检测页面是否为双栏布局。
-
-        返回: (is_two_column: bool, mid_x: float)
-        - 算法: 统计"仅左""仅右""跨栏"行的比例
-        - 若左右都有 >15% 的行，且跨栏行 <50%，判定为双栏
-        """
-        if not lines or page_width <= 0:
-            return False, page_width / 2
-
-        mid = page_width / 2
-        left_count = right_count = full_count = 0
-
-        for line in lines:
-            span = line["x1"] - line["x0"]
-            # 跨栏：行宽超过半页的 70%
-            if span > page_width * 0.35:
-                full_count += 1
-            elif (line["x0"] + line["x1"]) / 2 < mid:
-                left_count += 1
-            else:
-                right_count += 1
-
-        total = left_count + right_count + full_count
-        if total == 0:
-            return False, mid
-
-        left_ratio = left_count / total
-        right_ratio = right_count / total
-        full_ratio = full_count / total
-
-        is_two_col = (
-            left_ratio > 0.15
-            and right_ratio > 0.15
-            and full_ratio < 0.50
+        first_body_y = min(block["y"] for block in left + right)
+        header = [
+            block for block in blocks
+            if (block["width"] > column_width or _is_centered(block)) and block["y"] < first_body_y
+        ]
+        trailing = [
+            block for block in blocks
+            if (block["width"] > column_width or _is_centered(block)) and block["y"] >= first_body_y
+        ]
+        ordered = (
+            sorted(header, key=lambda block: (block["y"], block["x0"]))
+            + sorted(left, key=lambda block: block["y"])
+            + sorted(right, key=lambda block: block["y"])
+            + sorted(trailing, key=lambda block: (block["y"], block["x0"]))
         )
-        return is_two_col, mid
+        return "\n".join(block["text"] for block in ordered)
 
     # ── 2️⃣ 表格感知提取 ──
 
@@ -424,7 +357,7 @@ def extract_images(
       5. 过滤面积 < 5000 px² 的小图（图标/logo）
     """
     try:
-        import fitz  # PyMuPDF
+        import pymupdf
     except ImportError:
         print("      ⚠ PyMuPDF 未安装，跳过图片提取。pip install PyMuPDF", file=sys.stderr)
         return []
@@ -449,7 +382,7 @@ def extract_images(
 
     saved = []
     captions_map = {}  # label → caption text（用于描述时附带）
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     total_pages = min(len(doc), max_pages)
 
     for page_num in range(total_pages):
@@ -534,7 +467,7 @@ def extract_images(
                 max_x = max(b[2] for b in bboxes)
                 max_y = max(b[3] for b in bboxes)
                 # 稍微扩展一点，避免边缘裁剪
-                clip = fitz.Rect(min_x - 5, min_y - 5, max_x + 5, max_y + 5)
+                clip = pymupdf.Rect(min_x - 5, min_y - 5, max_x + 5, max_y + 5)
                 pix = page.get_pixmap(clip=clip, dpi=150)
                 fname = img_dir / f"{stem}_{label}.png"
                 pix.save(str(fname))

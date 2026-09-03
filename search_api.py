@@ -1,7 +1,7 @@
-"""Public academic search adapters used by the Agent tools.
+"""Public academic search adapters for interactive and deep-research tools.
 
-Only OpenAlex and arXiv are exposed to interactive and deep-research flows.
-Daily discovery has its own bounded adapters in ``daily_orchestrator.py``.
+Provider transport is separate from formatting so normal chat search shares
+paper identity rules with daily discovery without adding another service.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from datetime import datetime
 from typing import Any
 
 import requests
+
+from paper_records import deduplicate_paper_records, normalize_arxiv_id, normalize_doi
 
 
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
@@ -28,10 +30,7 @@ _UNRELATED_VIDEO_MARKERS = (
 
 def _is_network_tsn_query(query: str) -> bool:
     normalized = query.casefold()
-    network_markers = (
-        "网络", "调度", "流量", "负载",
-        "network", "scheduling", "traffic", "flow",
-    )
+    network_markers = ("网络", "调度", "流量", "负载", "network", "scheduling", "traffic", "flow")
     tsn_markers = ("tsn", "time-sensitive networking", "time sensitive networking")
     return any(marker in normalized for marker in tsn_markers) and any(
         marker in normalized for marker in network_markers
@@ -46,14 +45,13 @@ def _content_terms(query: str) -> set[str]:
 
 
 def _openalex_search_query(query: str) -> str:
-    """Use an exact TSN phrase before applying provider-side relevance ranking."""
     if not _is_network_tsn_query(query):
         return query
     return '"Time-Sensitive Networking" AND (scheduling OR traffic OR bursty OR flow OR latency)'
 
 
 def _score_public_relevance(query: str, title: str, abstract: str) -> tuple[float, str]:
-    """Score a provider candidate without relying on another model call."""
+    """Score a provider candidate without another model call."""
     text = f"{title}\n{abstract}".casefold()
     if any(marker in text for marker in _UNRELATED_VIDEO_MARKERS):
         return 0.0, "命中与网络研究无关的视频动作识别术语"
@@ -62,7 +60,6 @@ def _score_public_relevance(query: str, title: str, abstract: str) -> tuple[floa
         has_tsn_domain = bool(re.search(r"time[- ]sensitive networks?|\btsn\b", text))
         if not has_tsn_domain:
             return 0.0, "未命中 Time-Sensitive Networking 或 TSN"
-
         score = 0.55
         reasons = ["命中 Time-Sensitive Networking/TSN"]
         if any(marker in text for marker in ("schedul", "gate control", "time-aware")):
@@ -85,28 +82,18 @@ def _score_public_relevance(query: str, title: str, abstract: str) -> tuple[floa
     matched = sum(term in text for term in terms)
     if not matched:
         return 0.0, "标题和摘要均未命中查询术语"
-    score = round(matched / len(terms), 2)
-    return score, f"命中 {matched}/{len(terms)} 个查询术语"
+    return round(matched / len(terms), 2), f"命中 {matched}/{len(terms)} 个查询术语"
 
 
-def _filter_public_papers(
-    query: str,
-    papers: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _filter_public_papers(query: str, papers: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Reject low-confidence provider hits before they enter research evidence."""
     accepted: list[dict[str, Any]] = []
     rejected_reasons: dict[str, int] = {}
     strict_tsn = _is_network_tsn_query(query)
     for paper in papers:
         score, reason = _score_public_relevance(
-            query,
-            str(paper.get("title") or ""),
-            str(paper.get("abstract") or ""),
+            query, str(paper.get("title") or ""), str(paper.get("abstract") or ""),
         )
-        # For explicitly networking TSN questions, require the domain phrase
-        # plus a material scheduling/traffic/DiffTSN condition. For other
-        # questions, discard only zero-overlap candidates; semantic expansion
-        # remains the provider's responsibility.
         keep = score >= 0.75 if strict_tsn else score > 0
         if keep:
             accepted.append({**paper, "relevance_score": score, "relevance_reason": reason})
@@ -115,9 +102,7 @@ def _filter_public_papers(
 
     scores = [float(item["relevance_score"]) for item in accepted]
     return accepted, {
-        "total": len(papers),
-        "accepted": len(accepted),
-        "rejected": len(papers) - len(accepted),
+        "total": len(papers), "accepted": len(accepted), "rejected": len(papers) - len(accepted),
         "score_min": min(scores) if scores else None,
         "score_max": max(scores) if scores else None,
         "rejection_reason": "；".join(
@@ -139,8 +124,7 @@ def _quality_line(quality: dict[str, Any]) -> str:
     )
 
 
-def search_arxiv(query: str, max_results: int = 5) -> str:
-    """Search arXiv for temporary searches and deep research."""
+def _fetch_arxiv_records(query: str, max_results: int = 5) -> tuple[list[dict[str, Any]], str | None]:
     safe_query = urllib.parse.quote(query)
     url = (
         "https://export.arxiv.org/api/query"
@@ -152,64 +136,38 @@ def search_arxiv(query: str, max_results: int = 5) -> str:
         response.raise_for_status()
         root = ET.fromstring(response.content)
     except (requests.RequestException, ET.ParseError) as exc:
-        return f"❌ arXiv API 请求失败: {exc}"
+        return [], f"arXiv API 请求失败: {exc}"
 
-    entries = root.findall("atom:entry", ARXIV_NS)
-    if not entries:
-        return "📭 arXiv 未找到相关论文。"
-
-    papers = []
-    for entry in entries:
-        title = _xml_text(entry, "atom:title") or "N/A"
-        abstract = _xml_text(entry, "atom:summary")
-        authors = [
-            _xml_text(author, "atom:name")
-            for author in entry.findall("atom:author", ARXIV_NS)
-            if _xml_text(author, "atom:name")
-        ]
+    records: list[dict[str, Any]] = []
+    for entry in root.findall("atom:entry", ARXIV_NS):
         link = _xml_text(entry, "atom:id")
         published = _xml_text(entry, "atom:published")[:10]
-        papers.append({
-            "title": title,
-            "abstract": abstract,
-            "authors": authors,
-            "link": link,
-            "published": published,
+        arxiv_id = normalize_arxiv_id(link)
+        records.append({
+            "title": _xml_text(entry, "atom:title") or "N/A",
+            "abstract": _xml_text(entry, "atom:summary"),
+            "authors": [
+                _xml_text(author, "atom:name")
+                for author in entry.findall("atom:author", ARXIV_NS)
+                if _xml_text(author, "atom:name")
+            ],
+            "year": int(published[:4]) if published[:4].isdigit() else None,
+            "published_at": published, "venue": "arXiv", "citation_count": 0,
+            "doi": "", "url": link, "arxiv_id": arxiv_id,
+            "sources": ["arxiv"], "source_ids": {"arxiv": arxiv_id or link},
         })
-
-    accepted, quality = _filter_public_papers(query, papers)
-    if not accepted:
-        return _quality_line(quality)
-
-    lines = [
-        f"📚 **arXiv 搜索结果** — 查询: 「{query}」",
-        _quality_line(quality),
-    ]
-    for index, paper in enumerate(accepted, 1):
-        short_abstract = paper["abstract"][:250] + "..." if len(paper["abstract"]) > 250 else paper["abstract"]
-        lines.extend([
-            f"\n  {index}. **{paper['title']}**",
-            f"     作者: {', '.join(paper['authors'][:5])}{' et al.' if len(paper['authors']) > 5 else ''}",
-            f"     日期: {paper['published']}  |  arXiv: {paper['link'].rsplit('/', 1)[-1] if paper['link'] else ''}",
-            f"     相关性: {paper['relevance_score']:.2f} | 依据: {paper['relevance_reason']}",
-            f"     链接: {paper['link']}",
-            f"     摘要: {short_abstract}",
-        ])
-    return "\n".join(lines)
+    return records, None
 
 
-def search_openalex(
+def _fetch_openalex_records(
     query: str,
     limit: int = 5,
     timeout: int | float | tuple[float, float] = 30,
     api_key: str | None = None,
-) -> str:
-    """Search OpenAlex; read the raw key from ``OPENALEX_API_KEY`` by default."""
+) -> tuple[list[dict[str, Any]], str | None, str]:
     provider_query = _openalex_search_query(query)
     params = {
-        "search": provider_query,
-        "per-page": min(limit, 10),
-        "sort": "relevance_score:desc",
+        "search": provider_query, "per-page": min(limit, 10), "sort": "relevance_score:desc",
         "select": (
             "id,title,authorships,publication_year,publication_date,cited_by_count,doi,"
             "primary_location,abstract_inverted_index"
@@ -221,54 +179,136 @@ def search_openalex(
     try:
         response = requests.get("https://api.openalex.org/works", params=params, timeout=timeout)
         response.raise_for_status()
-        papers = response.json().get("results", [])
+        results = response.json().get("results", [])
     except requests.RequestException as exc:
-        return f"❌ OpenAlex API 请求失败: {exc}"
+        return [], f"OpenAlex API 请求失败: {exc}", provider_query
 
-    if not papers:
-        return "📭 OpenAlex 未找到相关论文。"
-
-    normalized_papers = []
-    for paper in papers:
+    records: list[dict[str, Any]] = []
+    for paper in results:
         location = paper.get("primary_location") or {}
-        authors = [
-            item.get("author", {}).get("display_name", "")
-            for item in paper.get("authorships", [])[:5]
-            if item.get("author", {}).get("display_name")
-        ]
-        abstract = _openalex_abstract(paper.get("abstract_inverted_index")) or "无摘要"
-        venue = (location.get("source") or {}).get("display_name", "") or "N/A"
-        link = location.get("landing_page_url") or paper.get("doi") or paper.get("id", "")
-        normalized_papers.append({
+        record_id = str(paper.get("id") or "")
+        records.append({
             "title": paper.get("title") or "N/A",
-            "abstract": abstract,
-            "authors": authors,
+            "abstract": _openalex_abstract(paper.get("abstract_inverted_index")) or "无摘要",
+            "authors": [
+                item.get("author", {}).get("display_name", "")
+                for item in paper.get("authorships", [])[:5]
+                if item.get("author", {}).get("display_name")
+            ],
             "year": paper.get("publication_year") or "N/A",
-            "cited_by_count": paper.get("cited_by_count") or 0,
-            "venue": venue,
-            "link": link,
+            "published_at": str(paper.get("publication_date") or "")[:10],
+            "citation_count": paper.get("cited_by_count") or 0,
+            "venue": (location.get("source") or {}).get("display_name", "") or "N/A",
+            "doi": normalize_doi(paper.get("doi")),
+            "url": location.get("landing_page_url") or paper.get("doi") or record_id,
+            "sources": ["openalex"], "source_ids": {"openalex": record_id},
         })
+    return records, None, provider_query
 
-    accepted, quality = _filter_public_papers(query, normalized_papers)
-    if not accepted:
+
+def _render_search_results(
+    query: str,
+    papers: list[dict[str, Any]],
+    quality: dict[str, Any],
+    *,
+    label: str,
+    provider_query: str = "",
+    failures: list[str] | None = None,
+) -> str:
+    if not papers:
         return _quality_line(quality)
-
-    lines = [
-        f"📚 **OpenAlex 搜索结果** — 查询: 「{query}」",
-        f"🔎 OpenAlex 检索式: 「{provider_query}」",
-        _quality_line(quality),
-    ]
-    for index, paper in enumerate(accepted, 1):
-        short_abstract = paper["abstract"][:200] + "..." if len(paper["abstract"]) > 200 else paper["abstract"]
+    lines = [f"📚 **{label}搜索结果** — 查询: 「{query}」"]
+    if provider_query:
+        lines.append(f"🔎 OpenAlex 检索式: 「{provider_query}」")
+    lines.append(_quality_line(quality))
+    if failures:
+        lines.append("⚠️ 未完成来源：" + "；".join(failures))
+    for index, paper in enumerate(papers, 1):
+        abstract = str(paper.get("abstract") or "")
+        short_abstract = abstract[:220] + "..." if len(abstract) > 220 else abstract
+        metadata = (
+            f"年份: {paper.get('year') or 'N/A'}  | 引用: {paper.get('citation_count') or 0}"
+            f"  | 期刊: {paper.get('venue') or 'N/A'}"
+        )
+        if paper.get("arxiv_id"):
+            metadata += f"  | arXiv: {paper['arxiv_id']}"
         lines.extend([
-            f"\n  {index}. **{paper['title']}**",
-            f"     作者: {', '.join(paper['authors'])}",
-            f"     年份: {paper['year']}  |  引用: {paper['cited_by_count']}  |  期刊: {paper['venue']}",
-            f"     相关性: {paper['relevance_score']:.2f} | 依据: {paper['relevance_reason']}",
-            f"     链接: {paper['link']}",
+            f"\n  {index}. **{paper.get('title') or 'N/A'}**  [{' + '.join(paper.get('sources') or [])}]",
+            f"     作者: {', '.join((paper.get('authors') or [])[:5]) or 'N/A'}",
+            f"     {metadata}",
+            f"     相关性: {float(paper.get('relevance_score') or 0):.2f} | 依据: {paper.get('relevance_reason') or '来源排序'}",
+            f"     链接: {paper.get('url') or 'N/A'}",
             f"     摘要: {short_abstract}",
         ])
     return "\n".join(lines)
+
+
+def search_arxiv(query: str, max_results: int = 5) -> str:
+    """Search arXiv while retaining a standalone display for explicit selection."""
+    papers, failure = _fetch_arxiv_records(query, max_results)
+    if failure:
+        return f"❌ {failure}"
+    accepted, quality = _filter_public_papers(query, papers)
+    return _render_search_results(query, accepted, quality, label="arXiv ")
+
+
+def search_openalex(
+    query: str,
+    limit: int = 5,
+    timeout: int | float | tuple[float, float] = 30,
+    api_key: str | None = None,
+) -> str:
+    """Search OpenAlex; read the raw key from ``OPENALEX_API_KEY`` by default."""
+    papers, failure, provider_query = _fetch_openalex_records(query, limit, timeout, api_key)
+    if failure:
+        return f"❌ {failure}"
+    accepted, quality = _filter_public_papers(query, papers)
+    return _render_search_results(
+        query, accepted, quality, label="OpenAlex ", provider_query=provider_query,
+    )
+
+
+def search_public_papers(query: str, limit: int = 5, source: str = "all") -> str:
+    """Merge existing OpenAlex/arXiv results and report provider failures safely."""
+    selected = ("openalex", "arxiv") if source == "all" else (source,)
+    records: list[dict[str, Any]] = []
+    failures: list[str] = []
+    total = rejected = 0
+    for provider in selected:
+        if provider == "openalex":
+            fetched, failure, _ = _fetch_openalex_records(query, limit=min(limit * 2, 10))
+        elif provider == "arxiv":
+            fetched, failure = _fetch_arxiv_records(query, max_results=min(limit * 2, 10))
+        else:
+            continue
+        if failure:
+            failures.append(failure)
+            continue
+        accepted, quality = _filter_public_papers(query, fetched)
+        total += quality["total"]
+        rejected += quality["rejected"]
+        records.extend(accepted)
+
+    merged = deduplicate_paper_records(records)
+    merged.sort(
+        key=lambda item: (
+            -float(item.get("relevance_score") or 0),
+            -_year_value(item.get("year")),
+            -int(item.get("citation_count") or 0),
+            str(item.get("title") or "").casefold(),
+        )
+    )
+    displayed = merged[:limit]
+    scores = [float(item.get("relevance_score") or 0) for item in displayed]
+    quality = {
+        "total": total, "accepted": len(displayed), "rejected": rejected,
+        "score_min": min(scores) if scores else None,
+        "score_max": max(scores) if scores else None,
+        "rejection_reason": "多源相关性门控",
+    }
+    if not displayed and failures:
+        return "❌ 所有已选来源均未完成：" + "；".join(failures)
+    return _render_search_results(query, displayed, quality, label="多源学术", failures=failures)
 
 
 def list_downloaded_papers() -> str:
@@ -285,6 +325,13 @@ def list_downloaded_papers() -> str:
         modified = datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         lines.append(f"  {index}. {item.name}  ({item.stat().st_size / 1024:.0f} KB, {modified})")
     return "\n".join(lines)
+
+
+def _year_value(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _xml_text(entry, path: str) -> str:
