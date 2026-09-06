@@ -67,7 +67,7 @@ def execute_tool(
     name: str,
     args: dict,
     paper_store=None,
-    glm_api_key: str = "",
+    vision_model: str = "",
     profile_manager=None,
     memory_store=None,
     session_id: str = "",
@@ -84,7 +84,7 @@ def execute_tool(
     handler = _TOOL_HANDLERS.get(name)
     if handler:
         result = handler(
-            args, paper_store=paper_store, glm_api_key=glm_api_key,
+            args, paper_store=paper_store, vision_model=vision_model,
             profile_manager=profile_manager, memory_store=memory_store,
             llm_client=llm_client, model=model,
             cancel_event=cancel_event,

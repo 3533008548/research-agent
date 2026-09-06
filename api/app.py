@@ -6,11 +6,15 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from api.auth import APIKeyAuthenticator
 from api.routes import router
 from api.run_manager import ChatRunManager
 from badcase_store import BadcaseStore
+from research_documents import ResearchDocumentStore
+from scheduler import Scheduler
 
 
 def _default_badcase_store(agent) -> BadcaseStore:
@@ -48,5 +52,49 @@ def create_app(
     app.state.daily_run_manager = daily_run_manager
     app.state.badcase_store = badcase_store or _default_badcase_store(agent)
     app.state.api_authenticator = APIKeyAuthenticator(api_key, required=require_api_key)
+    # The React workbench needs the same local, user-owned data that the
+    # legacy Gradio panels use.  Test doubles and API-only embeddings may not
+    # expose Config, so leave these optional instead of manufacturing a second
+    # runtime directory for them.
+    cfg = getattr(agent, "cfg", None)
+    paths = getattr(cfg, "runtime_paths", None)
+    app.state.workspace_paths = paths
+    app.state.research_document_store = ResearchDocumentStore(paths) if paths else None
+    app.state.workspace_scheduler = (
+        getattr(daily_run_manager, "scheduler", None)
+        if daily_run_manager is not None
+        else (Scheduler(cfg.daily_db, request_timeout_seconds=cfg.daily_request_timeout_seconds) if cfg else None)
+    )
     app.include_router(router)
     return app
+
+
+def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str = "/app") -> bool:
+    """Serve a built React client beside the legacy Gradio route when present.
+
+    Source-only checkouts intentionally keep working: the Python API can start
+    before Node has produced ``frontend/dist``.  The container build creates
+    the directory, while local React development normally uses Vite's proxy.
+    """
+    dist = Path(dist_dir)
+    index = dist / "index.html"
+    if not index.is_file():
+        return False
+
+    normalized_path = "/" + mount_path.strip("/")
+    assets = dist / "assets"
+    if assets.is_dir():
+        app.mount(
+            f"{normalized_path}/assets",
+            StaticFiles(directory=assets),
+            name="react-assets",
+        )
+
+    @app.get(normalized_path, include_in_schema=False)
+    @app.get(f"{normalized_path}/{{client_path:path}}", include_in_schema=False)
+    def react_client(client_path: str = "") -> FileResponse:
+        # A client-side route should receive the SPA shell.  Static assets are
+        # matched by the earlier mount and therefore never reach this handler.
+        return FileResponse(index)
+
+    return True

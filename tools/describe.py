@@ -1,19 +1,32 @@
-"""
-🖼 describe_image 工具 — GLM-4V 看图描述（带缓存 + 图注）
-"""
+"""🖼 ``describe_image`` — DeepSeek 视觉描述（带缓存和图注）。"""
 
 import base64
 import json
-import requests
-import sys
 from pathlib import Path
+
+from llm_client import RequestPolicy, RequestPriority
 from runtime_paths import get_runtime_paths
 
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+DEFAULT_VISION_MODEL = "deepseek-v4-flash-vision-exp"
 
 
-def handle_describe_image(args: dict, glm_api_key: str = "", memory_store=None, **kw) -> str:
+def handle_describe_image(
+    args: dict,
+    *,
+    memory_store=None,
+    llm_client=None,
+    vision_model: str = DEFAULT_VISION_MODEL,
+    cancel_event=None,
+    **_kwargs,
+) -> str:
+    """Describe a local paper image through the shared DeepSeek client.
+
+    Image analysis is an optional, low-priority request.  It shares the normal
+    client for admission control, but failures do not contribute to the chat
+    circuit breaker.
+    """
     image_path = str(args.get("image_path", "") or "").strip()
     if not image_path:
         return "❌ 请提供图片路径。"
@@ -44,8 +57,9 @@ def handle_describe_image(args: dict, glm_api_key: str = "", memory_store=None, 
         return "❌ 仅支持 PNG、JPG 或 JPEG 图片。"
     if p.stat().st_size > MAX_IMAGE_BYTES:
         return "❌ 图片过大（上限 10MB），请先压缩后再分析。"
-    if not glm_api_key:
-        return "❌ GLM-4V API Key 未配置。请在 .env 中设置 GLM_API_KEY。"
+    if llm_client is None:
+        return "❌ DeepSeek 视觉模型未启用，请先配置 DEEPSEEK_API_KEY。"
+    vision_model = vision_model or DEFAULT_VISION_MODEL
 
     # ── 描述缓存命中 ──
     if memory_store:
@@ -81,23 +95,31 @@ def handle_describe_image(args: dict, glm_api_key: str = "", memory_store=None, 
         prompt += "如果是网络架构图，描述每层结构和数据流；如果是流程图，描述每个步骤；如果是实验数据图，描述数据和结论。用中文回答。"
 
     try:
-        resp = requests.post(
-            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-            headers={"Authorization": f"Bearer {glm_api_key}", "Content-Type": "application/json"},
-            json={
-                "model": "glm-4v",
+        resp = llm_client.post(
+            {
+                "model": vision_model,
                 "messages": [{"role": "user", "content": [
                     {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
                 ]}],
-                "temperature": 0.3, "stream": False,
+                "temperature": 0.3,
+                "stream": False,
             },
-            timeout=60,
+            policy=RequestPolicy(
+                purpose="describe_image",
+                priority=RequestPriority.SUMMARY,
+                deadline_seconds=60,
+                max_retries=0,
+                counts_toward_circuit=False,
+            ),
+            cancel_event=cancel_event,
         )
-        resp.raise_for_status()
-        desc = resp.json()["choices"][0]["message"]["content"]
+        try:
+            desc = resp.json()["choices"][0]["message"]["content"]
+        finally:
+            resp.close()
     except Exception as e:
-        return f"❌ GLM-4V 调用失败: {e}"
+        return f"❌ DeepSeek 视觉模型调用失败: {e}"
 
     # ── 存入缓存 ──
     if memory_store:

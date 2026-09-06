@@ -111,7 +111,7 @@ def build_graph(
     paper_store = None,
     token_usage: dict = None,
     checkpoint_db: str | None = None,
-    glm_api_key: str = "",
+    vision_model: str = "deepseek-v4-flash-vision-exp",
     stream_callback = None,
     event_callback = None,
     cancel_event: threading.Event | None = None,
@@ -127,6 +127,7 @@ def build_graph(
     max_tool_rounds: int | None = None,
     tool_argument_normalizer: Callable[[str, dict], dict] | None = None,
     tool_context: ToolExecutionContext | None = None,
+    force_tool_name: str | None = None,
 ):
     # A graph must use the process-wide client owned by ResearchAgent. Creating
     # one here would silently defeat shared admission control in multi-agent
@@ -137,6 +138,11 @@ def build_graph(
         from runtime_paths import get_runtime_paths
         checkpoint_db = str(get_runtime_paths().checkpoint_db)
     tool_schemas = get_tool_schemas(allowed_tool_names)
+    forced_tool = str(force_tool_name or "").strip()
+    if forced_tool and not any(
+        schema.get("function", {}).get("name") == forced_tool for schema in tool_schemas
+    ):
+        raise ValueError("forced tool must be included in the available tool set")
     if max_tool_rounds is not None:
         max_tool_rounds = max(1, int(max_tool_rounds))
 
@@ -231,7 +237,17 @@ def build_graph(
         # omit tool fields completely instead of relying on model compliance.
         if tool_schemas:
             payload["tools"] = tool_schemas
-            payload["tool_choice"] = "auto"
+            already_called_forced_tool = any(
+                tool_call.get("function", {}).get("name") == forced_tool
+                for message in messages
+                if message.get("role") == "assistant"
+                for tool_call in (message.get("tool_calls") or [])
+            )
+            payload["tool_choice"] = (
+                {"type": "function", "function": {"name": forced_tool}}
+                if forced_tool and not already_called_forced_tool
+                else "auto"
+            )
 
         def _api_status(message: str) -> None:
             if token_usage is not None:
@@ -502,7 +518,7 @@ def build_graph(
                     args = normalized_args
             print(f"      🔧 {name}", file=sys.stderr)
             result = tool_runtime.execute(
-                name, args, paper_store=paper_store, glm_api_key=glm_api_key,
+                name, args, paper_store=paper_store, vision_model=vision_model,
                 profile_manager=profile_manager, memory_store=memory_store,
                 llm_client=llm_client, model=model,
             )

@@ -230,7 +230,6 @@ def _r03_research_resume(context: RuntimeContext) -> RuntimeCaseResult:
             api_key="offline-key",
             model="offline-model",
             paper_store=None,
-            glm_api_key="",
             llm_client=None,
             verify_timeout_seconds=3,
         )

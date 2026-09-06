@@ -8,7 +8,9 @@ daily_search:
   - openalex
   - openaire
   - dblp
+  - ieee
 model: deepseek-v4-flash
+vision_model: deepseek-v4-flash-vision-exp
 agent:
   verify_timeout_seconds: 8
 api_resilience:

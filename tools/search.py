@@ -4,6 +4,7 @@
 
 import sys
 from pathlib import Path
+from paper_artifacts import load_document_map, related_context
 from search_api import list_downloaded_papers, search_public_papers
 from runtime_paths import get_runtime_paths
 
@@ -23,8 +24,8 @@ def handle_search_papers(args: dict, **kw) -> str:
         return "❌ 请提供论文检索关键词。"
     source = str(args.get("source", "all") or "all").lower()
     limit = _bounded_int(args.get("limit", 5), 5, 1, 10)
-    if source not in {"all", "openalex", "arxiv"}:
-        return "❌ source 仅支持 all、openalex 或 arxiv。"
+    if source not in {"all", "openalex", "arxiv", "ieee"}:
+        return "❌ source 仅支持 all、openalex、arxiv 或 ieee。"
     return search_public_papers(query, limit=limit, source=source)
 
 
@@ -53,8 +54,16 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
         "hybrid": "混合检索结果",
     }.get(retrieval_mode, "语义检索结果")
     lines = [f"{prefix}📚 {heading} — 「{query}」（共 {len(results)} 条）\n"]
+    paths = get_runtime_paths()
     for i, r in enumerate(results, 1):
         sec = r.get("section", "未标注")
+        context = ""
+        locator = ""
+        element_id = str(r.get("element_id") or "")
+        if element_id and r.get("paper_id"):
+            document_map = load_document_map(paths, str(r["paper_id"]))
+            if document_map is not None:
+                context, locator = related_context(document_map, element_id)
         if r.get("retrieval") == "keyword":
             metric = f"关键词分: {r['keyword_score']}"
         elif r.get("retrieval") == "hybrid":
@@ -64,7 +73,10 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
             )
         else:
             metric = f"距离: {r['distance']}"
-        lines.append(f"  {i}. [{r['title']} · {sec}章节]  {metric}\n     {r['text']}")
+        location = f" · {locator}" if locator else ""
+        lines.append(f"  {i}. [{r['title']}{location} · {sec}章节]  {metric}\n     {r['text']}")
+        if context:
+            lines.append(f"     关联上下文：\n{context}")
     return "\n".join(lines)
 
 

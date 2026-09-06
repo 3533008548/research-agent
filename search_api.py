@@ -15,6 +15,7 @@ from typing import Any
 
 import requests
 
+from ieee_xplore import IEEE_METADATA_URL, ieee_records, ieee_search_params
 from paper_records import deduplicate_paper_records, normalize_arxiv_id, normalize_doi
 
 
@@ -206,6 +207,32 @@ def _fetch_openalex_records(
     return records, None, provider_query
 
 
+def _fetch_ieee_records(
+    query: str,
+    limit: int = 5,
+    timeout: int | float | tuple[float, float] = 30,
+    api_key: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Retrieve IEEE Xplore metadata; do not request article full text here."""
+    key = (api_key if api_key is not None else os.getenv("IEEE_API_KEY", "")).strip()
+    if not key:
+        return [], "IEEE Xplore API Key 未配置"
+    response = None
+    try:
+        response = requests.get(
+            IEEE_METADATA_URL,
+            params=ieee_search_params(query, limit=min(limit, 200), api_key=key),
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return ieee_records(response.json()), None
+    except requests.RequestException as exc:
+        return [], f"IEEE Xplore API 请求失败: {exc}"
+    finally:
+        if response is not None:
+            response.close()
+
+
 def _render_search_results(
     query: str,
     papers: list[dict[str, Any]],
@@ -240,6 +267,10 @@ def _render_search_results(
             f"     链接: {paper.get('url') or 'N/A'}",
             f"     摘要: {short_abstract}",
         ])
+        if paper.get("access_type"):
+            lines.append(f"     IEEE 获取权限: {paper['access_type']}")
+        if paper.get("open_access_pdf_url"):
+            lines.append(f"     IEEE 开放全文 PDF: {paper['open_access_pdf_url']}")
     return "\n".join(lines)
 
 
@@ -268,9 +299,26 @@ def search_openalex(
     )
 
 
+def search_ieee(
+    query: str,
+    limit: int = 5,
+    timeout: int | float | tuple[float, float] = 30,
+    api_key: str | None = None,
+) -> str:
+    """Search IEEE Xplore metadata using the locally configured API key."""
+    papers, failure = _fetch_ieee_records(query, limit, timeout, api_key)
+    if failure:
+        return f"❌ {failure}"
+    accepted, quality = _filter_public_papers(query, papers)
+    return _render_search_results(query, accepted, quality, label="IEEE Xplore ")
+
+
 def search_public_papers(query: str, limit: int = 5, source: str = "all") -> str:
-    """Merge existing OpenAlex/arXiv results and report provider failures safely."""
-    selected = ("openalex", "arxiv") if source == "all" else (source,)
+    """Merge public metadata sources and report provider failures safely."""
+    has_ieee_key = bool(os.getenv("IEEE_API_KEY", "").strip())
+    selected = (
+        ("openalex", "arxiv", "ieee") if has_ieee_key else ("openalex", "arxiv")
+    ) if source == "all" else (source,)
     records: list[dict[str, Any]] = []
     failures: list[str] = []
     total = rejected = 0
@@ -279,6 +327,8 @@ def search_public_papers(query: str, limit: int = 5, source: str = "all") -> str
             fetched, failure, _ = _fetch_openalex_records(query, limit=min(limit * 2, 10))
         elif provider == "arxiv":
             fetched, failure = _fetch_arxiv_records(query, max_results=min(limit * 2, 10))
+        elif provider == "ieee":
+            fetched, failure = _fetch_ieee_records(query, limit=min(limit * 2, 10))
         else:
             continue
         if failure:

@@ -54,6 +54,7 @@ def main() -> None:
         max_results_per_keyword=cfg.daily_max_results_per_keyword,
         daily_sources=cfg.daily_sources,
         openalex_api_key=cfg.openalex_api_key,
+        ieee_api_key=cfg.ieee_api_key,
     )
     daily_worker = RedisDailyRunWorker(
         daily_orchestrator, scheduler, daily_broker,

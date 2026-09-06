@@ -57,15 +57,15 @@ class ResearchOrchestrator:
         api_key: str,
         model: str,
         paper_store,
-        glm_api_key: str,
         llm_client,
         verify_timeout_seconds: int,
+        vision_model: str = "deepseek-v4-flash-vision-exp",
     ) -> None:
         self.sessions = session_store
         self.api_key = api_key
         self.model = model
         self.paper_store = paper_store
-        self.glm_api_key = glm_api_key
+        self.vision_model = vision_model
         self.llm_client = llm_client
         self.verify_timeout_seconds = verify_timeout_seconds
 
@@ -434,7 +434,7 @@ class ResearchOrchestrator:
             paper_store=self.paper_store,
             token_usage=usage,
             checkpoint_db=":memory:",
-            glm_api_key=self.glm_api_key,
+            vision_model=self.vision_model,
             event_callback=events.append,
             cancel_event=cancel_event,
             memory_store=None,

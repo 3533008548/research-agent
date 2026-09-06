@@ -13,7 +13,9 @@ from pathlib import Path
 
 import requests
 
-from pdf_reader import read_pdf_enhanced
+from paper_artifacts import attach_image_assets, build_document_map, remove_document_map, write_document_map
+from paper_quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
+from pdf_reader import PaperReader, extract_images
 from runtime_paths import get_runtime_paths
 
 
@@ -165,6 +167,20 @@ def _resolve_local_pdf(path_text: str, papers_dir: Path) -> Path:
     return candidate
 
 
+def _quality_checked_document_map(
+    parsed_document: dict,
+    *,
+    paper_id: str,
+    title: str,
+    source_file: str,
+    max_pages: int,
+) -> tuple[dict, dict]:
+    document_map = build_document_map(
+        parsed_document, paper_id=paper_id, title=title, source_file=source_file,
+    )
+    return prepare_document_map(document_map, requested_pages=max_pages)
+
+
 def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) -> str:
     raw_input = str(args.get("url_or_path", "") or "").strip()
     if not raw_input or len(raw_input) > 2048:
@@ -198,43 +214,118 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         except ValueError as exc:
             return f"❌ {exc}"
 
-    try:
-        result = read_pdf_enhanced(str(pdf_path), max_pages=max_pages, max_chars=None)
-    except ImportError as exc:
-        return f"❌ {exc}"
-    except Exception as exc:
-        return f"❌ PDF 解析失败: {type(exc).__name__}: {exc}"
+    title = pdf_path.stem.replace("_", " ")
+    existing_ids = [
+        str(paper.get("paper_id") or "")
+        for paper in (paper_store.list_papers() if paper_store else [])
+        if str(paper.get("title") or "") == title and str(paper.get("paper_id") or "")
+    ]
+    paper_id = f"paper_{uuid.uuid4().hex[:12]}"
+    selected: tuple[PaperReader, dict, dict, dict, str] | None = None
+    failed_attempts: list[str] = []
 
-    if result and not result.startswith("❌"):
+    # A second pass must use a materially different strategy. Re-running the
+    # same parser cannot repair a deterministic layout or table-detection bug.
+    for label, table_aware in (("表格感知解析", True), ("备用文本解析", False)):
         try:
-            from pdf_reader import extract_images
-
-            images = extract_images(
-                str(pdf_path), max_pages=max_pages, output_dir=paths.images_dir,
+            reader = PaperReader(max_pages=max_pages, max_chars=None)
+            parsed_document = (
+                reader.parse_document(str(pdf_path))
+                if table_aware else reader.parse_document(str(pdf_path), extract_tables=False)
             )
-            if images:
-                result += "\n\n🖼️ **提取的图片**:\n" + "\n".join(f"  - {item}" for item in images)
+            document_map, quality = _quality_checked_document_map(
+                parsed_document,
+                paper_id=paper_id,
+                title=title,
+                source_file=pdf_path.name,
+                max_pages=max_pages,
+            )
+        except ImportError as exc:
+            failed_attempts.append(f"{label}: {exc}")
+            continue
         except Exception as exc:
-            print(f"      ⚠️ 图片提取失败: {exc}", file=sys.stderr)
+            failed_attempts.append(f"{label}: {type(exc).__name__}: {exc}")
+            continue
+        if quality["accepted"]:
+            selected = (reader, parsed_document, document_map, quality, label)
+            break
+        failed_attempts.append(f"{label}: {quality_failure_summary(quality)}")
 
-    if paper_store and result and not result.startswith("❌"):
+    if selected is None:
+        detail = "；".join(failed_attempts[:2]) or "未获得可用解析结果"
+        return f"❌ PDF 未索引：切块质量检查失败，已使用备用解析策略重试。{detail}"
+
+    reader, parsed_document, document_map, quality, parser_label = selected
+    images: list[str] = []
+    try:
+        images = extract_images(
+            str(pdf_path), max_pages=max_pages, output_dir=paths.images_dir,
+        )
+        if images:
+            attach_image_assets(parsed_document, images)
+            document_map, quality = _quality_checked_document_map(
+                parsed_document,
+                paper_id=paper_id,
+                title=title,
+                source_file=pdf_path.name,
+                max_pages=max_pages,
+            )
+    except Exception as exc:
+        print(f"      ⚠️ 图片提取失败: {exc}", file=sys.stderr)
+
+    quality["attempts"] = 2 if parser_label == "备用文本解析" else 1
+    quality["parser"] = parser_label
+    result = reader.render_document(parsed_document)
+    if images:
+        result += "\n\n🖼️ **提取的图片**:\n" + "\n".join(f"  - {item}" for item in images)
+
+    if paper_store:
         try:
-            title = pdf_path.stem.replace("_", " ")
-            for paper in paper_store.list_papers():
-                if paper["title"] == title:
-                    paper_store.delete_paper(paper["paper_id"])
-                    print(f"      🗑️ 已删除旧索引: {title}", file=sys.stderr)
-                    break
-            paper_id = paper_store.index_paper(result, title=title)
+            indexed_id = paper_store.index_document_map(
+                document_map, title=title, paper_id=paper_id,
+            )
+            if indexed_id != paper_id:
+                raise RuntimeError("向量库未返回新论文 ID")
+
+            if hasattr(paper_store, "get_paper_chunks"):
+                index_check = verify_index_round_trip(
+                    document_map, paper_store.get_paper_chunks(paper_id),
+                )
+                quality["index_round_trip"] = index_check
+                if not index_check["accepted"]:
+                    paper_store.delete_paper(paper_id)
+                    raise RuntimeError("向量库入库后自检失败，已回滚新索引")
+            else:
+                quality["index_round_trip"] = {"accepted": True, "skipped": True}
+
+            document_map_path = write_document_map(
+                paths, paper_id=paper_id, document_map=document_map,
+            )
+            for existing_id in existing_ids:
+                if existing_id != paper_id:
+                    paper_store.delete_paper(existing_id)
+                    remove_document_map(paths, existing_id)
+            if existing_ids:
+                print(f"      🔄 新索引通过检查后已替换旧索引: {title}", file=sys.stderr)
             print("      📎 已索引到论文库", file=sys.stderr)
+            quality_note = (
+                f"已自动合并 {quality['repairs']['merged_orphan_text_chunks']} 个碎片块"
+                if quality.get("status") == "repaired" else "质量检查通过"
+            )
             result += (
                 "\n\n---\n"
-                f"📌 已索引论文 ID：`{paper_id}`。后续细节可使用 query_papers 检索。\n"
+                f"📌 已索引论文 ID：`{paper_id}`。{quality_note}；解析策略：{parser_label}。\n"
+                f"页面元素映射：`{document_map_path}`。\n"
                 "如需完整的可追溯精读，请明确要求“生成论文证据卡”；"
-                "系统会把结论保存为带页码和来源块锚点的本地 Markdown 文件。"
+                "系统会把结论保存为带页码、图表和来源块锚点的本地 Markdown 文件。"
             )
         except Exception as exc:
+            try:
+                paper_store.delete_paper(paper_id)
+            except Exception:
+                pass
             print(f"      ⚠️ RAG 索引失败: {exc}", file=sys.stderr)
+            return f"❌ PDF 未索引：入库自检失败，原有论文索引未改动。{type(exc).__name__}: {exc}"
 
     if paper_store:
         try:

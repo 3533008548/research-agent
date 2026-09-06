@@ -23,7 +23,7 @@ import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime
 
 try:
@@ -296,36 +296,61 @@ class PaperStore:
         if not text:
             return ""
 
-        paper_id = paper_id or f"paper_{uuid.uuid4().hex[:12]}"
-        chunks = chunk_text(text)
+        return self._index_chunks(chunk_text(text), title=title, paper_id=paper_id)
 
-        if not chunks:
-            return paper_id
+    def index_document_map(
+        self,
+        document_map: dict[str, Any],
+        *,
+        title: str = "Unknown",
+        paper_id: Optional[str] = None,
+    ) -> str:
+        """Index page-scoped chunks created by ``paper_artifacts.build_document_map``."""
+        resolved_title = str(document_map.get("title") or title)
+        resolved_id = str(document_map.get("paper_id") or paper_id or "") or None
+        chunks = list(document_map.get("chunks") or [])
+        return self._index_chunks(chunks, title=resolved_title, paper_id=resolved_id)
 
-        # 构建文档、元数据和ID
-        texts = [c["text"] for c in chunks]
+    def _index_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        *,
+        title: str,
+        paper_id: Optional[str],
+    ) -> str:
+        """Persist already segmented chunks while keeping old text-only callers compatible."""
+        resolved_id = paper_id or f"paper_{uuid.uuid4().hex[:12]}"
+        usable = [chunk for chunk in chunks if str(chunk.get("text") or "").strip()]
+        if not usable:
+            return resolved_id
+
+        texts = []
         metadatas = []
         chunk_ids = []
-        for chunk in chunks:
+        char_pos = 0
+        for index, chunk in enumerate(usable):
+            text = str(chunk["text"]).strip()
+            start = int(chunk.get("char_start", char_pos))
+            end = int(chunk.get("char_end", start + len(text)))
+            page = chunk.get("page")
             metadatas.append({
-                "paper_id": paper_id,
+                "paper_id": resolved_id,
                 "title": title,
-                "section": chunk.get("section", "未标注"),
-                "chunk_index": chunk["index"],
-                "char_start": chunk["char_start"],
-                "char_end": chunk["char_end"],
+                "section": str(chunk.get("section") or "未标注"),
+                "chunk_index": index,
+                "char_start": start,
+                "char_end": end,
+                "page": int(page) if isinstance(page, int) and page > 0 else -1,
+                "element_id": str(chunk.get("id") or ""),
+                "element_kind": str(chunk.get("kind") or "text"),
                 "indexed_at": datetime.now().isoformat(),
             })
-            chunk_ids.append(f"{paper_id}_chunk_{chunk['index']}")
+            texts.append(text)
+            chunk_ids.append(f"{resolved_id}_chunk_{index}")
+            char_pos = end + 2
 
-        # 存入 ChromaDB（嵌入由 DefaultEmbeddingFunction 自动处理）
-        self._collection.add(
-            ids=chunk_ids,
-            documents=texts,
-            metadatas=metadatas,
-        )
-
-        return paper_id
+        self._collection.add(ids=chunk_ids, documents=texts, metadatas=metadatas)
+        return resolved_id
 
     def query(
         self,
@@ -392,6 +417,9 @@ class PaperStore:
                     "chunk_index": meta.get("chunk_index", 0),
                     "char_start": meta.get("char_start", 0),
                     "char_end": meta.get("char_end", 0),
+                    "page": meta.get("page", -1),
+                    "element_id": meta.get("element_id", ""),
+                    "element_kind": meta.get("element_kind", "text"),
                     "distance": round(max(dist - weight_penalty, 0), 4),
                 })
 
@@ -633,6 +661,9 @@ class PaperStore:
                 "chunk_index": meta.get("chunk_index", 0),
                 "char_start": meta.get("char_start", 0),
                 "char_end": meta.get("char_end", 0),
+                "page": meta.get("page", -1),
+                "element_id": meta.get("element_id", ""),
+                "element_kind": meta.get("element_kind", "text"),
                 "retrieval": "keyword",
             })
 
@@ -716,6 +747,9 @@ class PaperStore:
                     "char_start": meta.get("char_start", 0),
                     "char_end": meta.get("char_end", 0),
                     "chunk_index": meta.get("chunk_index", 0),
+                    "page": meta.get("page", -1),
+                    "element_id": meta.get("element_id", ""),
+                    "element_kind": meta.get("element_kind", "text"),
                 })
         chunks.sort(key=lambda c: c["char_start"])
         return chunks
@@ -741,6 +775,7 @@ class NoOpStore:
     def query_hybrid(self, *a, **kw): return []
     def query_with_timeout(self, *a, **kw): return [], None
     def index_paper(self, *a, **kw): return ""
+    def index_document_map(self, *a, **kw): return ""
     def list_papers(self): return []
     def delete_paper(self, *a, **kw): return 0
     paper_count = 0

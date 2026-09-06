@@ -19,6 +19,60 @@ class SessionResponse(BaseModel):
     updated_at: str
 
 
+class SessionMessageResponse(BaseModel):
+    """A user-visible message in one session's restored conversation."""
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ResearchDocumentResponse(BaseModel):
+    document_id: str
+    title: str
+    summary: str = ""
+    created_at: str
+    updated_at: str
+    revision: int
+
+
+class ResearchDocumentDetailResponse(ResearchDocumentResponse):
+    content: str
+    download_url: str
+
+
+class PaperResponse(BaseModel):
+    paper_id: str
+    title: str
+    chunks: int
+    indexed_at: str = ""
+
+
+class DailyKeywordResponse(BaseModel):
+    keyword: str
+    active: bool
+    added_at: str
+    search_status: str = "idle"
+
+
+class DailyKeywordCreateRequest(BaseModel):
+    keyword: str = Field(min_length=1, max_length=500)
+
+
+class WorkspaceSettingsResponse(BaseModel):
+    model: str
+    rag_enabled: bool
+    pdf_max_pages: int
+    daily_search_enabled: bool
+    restart_required: bool = True
+
+
+class WorkspaceSettingsUpdateRequest(BaseModel):
+    model: str | None = Field(default=None, min_length=1, max_length=120)
+    rag_enabled: bool | None = None
+    pdf_max_pages: int | None = Field(default=None, ge=5, le=100)
+    daily_search_enabled: bool | None = None
+
+
 class ChatRunCreateRequest(BaseModel):
     message: str = Field(min_length=1, max_length=12_000)
 

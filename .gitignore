@@ -11,6 +11,8 @@ evals/reports/*.json
 .env
 .env.*
 !.env.example
+frontend/node_modules/
+frontend/dist/
 # 旧版分散路径（保留忽略以支持显式迁移）
 chroma_data/
 checkpoint.db

@@ -8,7 +8,9 @@ from cancellation import RequestCancelledError
 from llm_client import RequestPolicy, RequestPriority
 from paper_artifacts import (
     create_source_map,
+    build_source_map_from_document,
     fallback_paper_card,
+    load_document_map,
     paper_card_prompt,
     select_evidence_blocks,
     write_paper_artifact,
@@ -98,12 +100,16 @@ def handle_generate_paper_card(
 
     max_pages = _bounded_int(args.get("max_pages"), 100, 1, 100)
     try:
-        source_map = create_source_map(
-            source_pdf,
-            paper_id=str(paper["paper_id"]),
-            title=str(paper.get("title") or source_pdf.stem),
-            max_pages=max_pages,
-        )
+        document_map = load_document_map(paths, str(paper["paper_id"]))
+        if document_map is not None:
+            source_map = build_source_map_from_document(document_map)
+        else:
+            source_map = create_source_map(
+                source_pdf,
+                paper_id=str(paper["paper_id"]),
+                title=str(paper.get("title") or source_pdf.stem),
+                max_pages=max_pages,
+            )
         evidence = select_evidence_blocks(source_map)
         if llm_client is not None and model:
             card = _call_card_model(llm_client, model, paper_card_prompt(source_map, evidence), cancel_event)

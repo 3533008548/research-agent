@@ -345,6 +345,7 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
                 max_results_per_keyword=cfg.daily_max_results_per_keyword,
                 daily_sources=cfg.daily_sources,
                 openalex_api_key=cfg.openalex_api_key,
+                ieee_api_key=cfg.ieee_api_key,
             )
 
             def _daily_progress(event: dict) -> None:

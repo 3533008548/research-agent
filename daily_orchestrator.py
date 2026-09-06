@@ -1,6 +1,6 @@
 """Bounded, evidence-oriented multi-agent pipeline for daily paper discovery.
 
-The three source scouts are deterministic network adapters.  A single shared
+The source scouts are deterministic network adapters.  A single shared
 LLM call is reserved for curation across the *whole* run; a critic is invoked
 only when deterministic quality gates indicate that it can add value.
 """
@@ -21,6 +21,7 @@ from typing import Any, Callable
 import requests
 
 from cancellation import RequestCancelledError, raise_if_cancelled
+from ieee_xplore import IEEE_METADATA_URL, ieee_records, ieee_search_params
 from llm_client import RequestPolicy, RequestPriority
 from paper_records import (
     deduplicate_paper_records,
@@ -56,8 +57,9 @@ class DailyResearchOrchestrator:
         request_timeout_seconds: int = 8,
         max_keyword_concurrency: int = 2,
         max_results_per_keyword: int = 3,
-        daily_sources: tuple[str, ...] | list[str] = ("openalex", "openaire", "dblp"),
+        daily_sources: tuple[str, ...] | list[str] = ("openalex", "openaire", "dblp", "ieee"),
         openalex_api_key: str = "",
+        ieee_api_key: str = "",
     ) -> None:
         self.scheduler = scheduler
         self.llm_client = llm_client
@@ -65,15 +67,19 @@ class DailyResearchOrchestrator:
         self.request_timeout_seconds = max(3, int(request_timeout_seconds))
         self.max_keyword_concurrency = max(1, min(2, int(max_keyword_concurrency)))
         self.max_results_per_keyword = max(1, min(5, int(max_results_per_keyword)))
-        allowed_daily_sources = {"openalex", "openaire", "dblp"}
+        self.openalex_api_key = str(openalex_api_key or "").strip()
+        self.ieee_api_key = str(ieee_api_key or "").strip()
+        allowed_daily_sources = {"openalex", "openaire", "dblp", "ieee"}
         configured_sources = tuple(
             str(source).strip().lower()
             for source in daily_sources
             if str(source).strip().lower() in allowed_daily_sources
+            and (str(source).strip().lower() != "ieee" or self.ieee_api_key)
         )
         self.daily_sources = configured_sources or ("openalex", "openaire", "dblp")
-        self.temporary_sources = ("openalex", "arxiv")
-        self.openalex_api_key = str(openalex_api_key or "").strip()
+        self.temporary_sources = (
+            ("openalex", "arxiv", "ieee") if self.ieee_api_key else ("openalex", "arxiv")
+        )
         # Source-level permits are stricter than keyword-level parallelism.
         # This prevents a burst of active keywords from tripping one provider.
         self._source_slots = {
@@ -81,6 +87,7 @@ class DailyResearchOrchestrator:
             "openalex": threading.BoundedSemaphore(1),
             "openaire": threading.BoundedSemaphore(1),
             "dblp": threading.BoundedSemaphore(1),
+            "ieee": threading.BoundedSemaphore(1),
         }
 
     def run(
@@ -286,6 +293,7 @@ class DailyResearchOrchestrator:
             "openalex": self._openalex_scout,
             "openaire": self._openaire_scout,
             "dblp": self._dblp_scout,
+            "ieee": self._ieee_scout,
         }
         items: list[dict[str, Any]] = []
         stats: dict[str, Any] = {}
@@ -380,6 +388,39 @@ class DailyResearchOrchestrator:
                 url=primary_location.get("landing_page_url") or item.get("id") or "",
                 source_id=item.get("id") or "",
             ))
+        return candidates
+
+    def _ieee_scout(
+        self, keyword: str, cancel_event: threading.Event | None,
+    ) -> list[dict[str, Any]]:
+        """Search IEEE metadata only; full text remains opt-in and access-aware."""
+        if not self.ieee_api_key:
+            return []
+        response = self._request_source(
+            "ieee", IEEE_METADATA_URL, cancel_event,
+            params=ieee_search_params(
+                keyword, limit=self.max_results_per_keyword, api_key=self.ieee_api_key,
+            ),
+        )
+        candidates = []
+        for record in ieee_records(response):
+            candidate = self._candidate(
+                keyword=keyword,
+                source="ieee",
+                title=record["title"],
+                abstract=record.get("abstract") or "",
+                authors=record.get("authors") or [],
+                year=record.get("year"),
+                published_at=record.get("published_at") or "",
+                venue=record.get("venue") or "",
+                citation_count=record.get("citation_count") or 0,
+                doi=record.get("doi") or "",
+                url=record.get("url") or "",
+                source_id=(record.get("source_ids") or {}).get("ieee") or "",
+            )
+            candidate["access_type"] = record.get("access_type") or ""
+            candidate["open_access_pdf_url"] = record.get("open_access_pdf_url") or ""
+            candidates.append(candidate)
         return candidates
 
     def _openaire_scout(

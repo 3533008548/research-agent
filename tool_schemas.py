@@ -10,12 +10,12 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "search_papers",
-                "description": "搜索学术论文。默认合并 OpenAlex 与 arXiv、去重并保留来源；也可限定单一来源。",
+                "description": "搜索学术论文。默认合并 OpenAlex、arXiv 和已配置的 IEEE Xplore，去重并保留来源；也可限定单一来源。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "搜索关键词"},
-                        "source": {"type": "string", "enum": ["all", "openalex", "arxiv"], "description": "数据源，默认 all"},
+                        "source": {"type": "string", "enum": ["all", "openalex", "arxiv", "ieee"], "description": "数据源，默认 all；ieee 需要本地配置 IEEE_API_KEY"},
                         "limit": {"type": "integer", "description": "返回数（1-10）"},
                     },
                     "required": ["query"],
@@ -100,7 +100,7 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "describe_image",
-                "description": "用 GLM-4V 描述论文图片（架构图/流程图/实验图）。",
+                "description": "用 DeepSeek 视觉模型描述论文图片（架构图/流程图/实验图）。",
                 "parameters": {
                     "type": "object",
                     "properties": {

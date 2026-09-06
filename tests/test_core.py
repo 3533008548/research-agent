@@ -72,6 +72,7 @@ class TestFastAPIService(unittest.TestCase):
         def __init__(self, sessions):
             self.sessions = sessions
             self._traces = {}
+            self._histories = {}
 
         def create_session(self, title=None):
             return self.sessions.create(title)
@@ -81,6 +82,9 @@ class TestFastAPIService(unittest.TestCase):
 
         def delete_session(self, session_id):
             return self.sessions.delete(session_id)
+
+        def get_history(self, session_id):
+            return list(self._histories.get(session_id, []))
 
         def step(self, message, *, session_id, run_id, cancel_event, on_token):
             if cancel_event.is_set():
@@ -228,6 +232,94 @@ class TestFastAPIService(unittest.TestCase):
         self.assertEqual(started.json()["kind"], "chat")
         detail = client.get(f"/api/v1/runs/{started.json()['run_id']}")
         self.assertEqual(detail.json()["kind"], "chat")
+
+    def test_session_messages_restore_only_user_visible_history(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+
+        client = TestClient(create_app(agent=self.agent))
+        session_id = client.post("/api/v1/sessions", json={"title": "历史"}).json()["thread_id"]
+        self.agent._histories[session_id] = [
+            {"role": "user", "content": "研究问题"},
+            {"role": "assistant", "content": "研究回答"},
+        ]
+
+        response = client.get(f"/api/v1/sessions/{session_id}/messages")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), self.agent._histories[session_id])
+        self.assertEqual(client.get("/api/v1/sessions/missing/messages").status_code, 404)
+
+    def test_react_frontend_mount_serves_spa_shell_and_assets(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.app import mount_react_frontend
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            assets = dist / "assets"
+            assets.mkdir()
+            dist.joinpath("index.html").write_text("<main>React client</main>", encoding="utf-8")
+            assets.joinpath("app.js").write_text("console.log('asset')", encoding="utf-8")
+            app = FastAPI()
+            self.assertTrue(mount_react_frontend(app, dist))
+            client = TestClient(app)
+            self.assertIn("React client", client.get("/app/").text)
+            self.assertIn("React client", client.get("/app/sessions/example").text)
+            self.assertIn("console.log", client.get("/app/assets/app.js").text)
+            self.assertFalse(mount_react_frontend(FastAPI(), dist / "missing"))
+
+    def test_workspace_routes_keep_documents_keywords_and_settings_outside_chat_state(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+        from runtime_paths import RuntimePaths
+
+        paths = RuntimePaths.from_root(Path(self.tmp) / "workspace-runtime")
+        self.agent.cfg = SimpleNamespace(
+            runtime_paths=paths,
+            daily_db=str(paths.daily_db),
+            daily_request_timeout_seconds=8,
+            model="workspace-model",
+            rag_enabled=True,
+            pdf_max_pages=15,
+            daily_search_enabled=False,
+        )
+        self.agent.paper_store = SimpleNamespace(list_papers=lambda: [{
+            "paper_id": "paper-1", "title": "本地论文", "chunks": 3, "indexed_at": "2026-09-05",
+        }])
+        app = create_app(agent=self.agent)
+        try:
+            client = TestClient(app)
+            document = app.state.research_document_store.save("研究方案", "# 研究方案\n\n方案正文")
+
+            listed = client.get("/api/v1/workspace/research-documents")
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual(listed.json()[0]["document_id"], document["document_id"])
+            detail = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}")
+            self.assertEqual(detail.status_code, 200)
+            self.assertIn("方案正文", detail.json()["content"])
+            self.assertEqual(
+                client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/download").status_code,
+                200,
+            )
+
+            papers = client.get("/api/v1/workspace/papers")
+            self.assertEqual(papers.status_code, 200)
+            self.assertEqual(papers.json()[0]["title"], "本地论文")
+
+            created_keyword = client.post("/api/v1/workspace/daily-keywords", json={"keyword": "TSN scheduling"})
+            self.assertEqual(created_keyword.status_code, 201)
+            self.assertEqual(client.get("/api/v1/workspace/daily-keywords").json()[0]["keyword"], "TSN scheduling")
+            self.assertEqual(client.delete("/api/v1/workspace/daily-keywords/TSN%20scheduling").status_code, 204)
+
+            saved = client.put("/api/v1/workspace/settings", json={
+                "model": "deepseek-v4-pro", "rag_enabled": False,
+                "pdf_max_pages": 25, "daily_search_enabled": True,
+            })
+            self.assertEqual(saved.status_code, 200)
+            self.assertEqual(saved.json()["model"], "deepseek-v4-pro")
+            self.assertEqual(paths.read_settings()["pdf_max_pages"], 25)
+        finally:
+            app.state.workspace_scheduler.close()
 
     def test_badcase_feedback_keeps_only_a_safe_run_snapshot_and_follows_session_delete(self):
         from fastapi.testclient import TestClient
@@ -497,6 +589,14 @@ class TestRetrievalAdmissionPolicy(unittest.TestCase):
             "这篇论文的原文实验数据和作者是谁？"
         ))
 
+    def test_explicit_research_document_request_uses_the_archive_path(self):
+        from research_agent import should_force_research_document_save
+
+        self.assertTrue(should_force_research_document_save("把这份方案保存成科研档案"))
+        self.assertTrue(should_force_research_document_save("请导出当前研究计划"))
+        self.assertFalse(should_force_research_document_save("把偏好保存到用户画像"))
+        self.assertFalse(should_force_research_document_save("不要保存这份研究方案"))
+
 
 class TestPdfReaderLayout(unittest.TestCase):
     """PDF 文本块的阅读顺序不应被双栏布局打乱。"""
@@ -535,6 +635,13 @@ class TestPdfReaderLayout(unittest.TestCase):
         chunks = chunk_text(cleaned)
         self.assertTrue(all("PDF 解析完成" not in chunk["text"] for chunk in chunks))
         self.assertTrue(any(chunk["section"] == "Abstract" for chunk in chunks))
+
+    def test_reader_rejects_an_impossible_table_box(self):
+        from pdf_reader import PaperReader
+
+        page = SimpleNamespace(height=1_000)
+        self.assertFalse(PaperReader._valid_table_bbox([10, 20, 300, 16_000], page))
+        self.assertTrue(PaperReader._valid_table_bbox([10, 20, 300, 900], page))
 
 
 @unittest.skipUnless(
@@ -1000,6 +1107,48 @@ class TestVerifyNode(unittest.TestCase):
         finally:
             app.checkpointer.conn.close()
 
+    def test_forced_research_document_save_calls_the_archive_tool_once(self):
+        from graph_builder import build_graph
+        from llm_client import LLMClient
+
+        responses = [
+            self._FakeResponse({
+                "content": None,
+                "tool_calls": [{
+                    "id": "archive-1", "type": "function",
+                    "function": {
+                        "name": "save_research_document",
+                        "arguments": '{"title":"TSN 方案","content":"# TSN 方案"}',
+                    },
+                }],
+            }),
+            self._FakeResponse({"content": "已创建科研档案：TSN 方案。"}),
+        ]
+        with patch("llm_client.requests.post", side_effect=responses) as post, \
+             patch("graph_builder.execute_tool", return_value="✅ 已创建研究档案") as execute:
+            app = build_graph(
+                api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
+                allowed_tool_names={"save_research_document"},
+                force_tool_name="save_research_document",
+                llm_client=LLMClient("test-key", "https://example.test/chat"),
+            )
+            try:
+                result = app.invoke(
+                    {"messages": [{"role": "user", "content": "把方案保存成科研档案"}], "metadata": {}},
+                    config={"configurable": {"thread_id": "archive-save"}},
+                )
+            finally:
+                app.checkpointer.conn.close()
+
+        first_payload, second_payload = (call.kwargs["json"] for call in post.call_args_list)
+        self.assertEqual(
+            first_payload["tool_choice"],
+            {"type": "function", "function": {"name": "save_research_document"}},
+        )
+        self.assertEqual(second_payload["tool_choice"], "auto")
+        execute.assert_called_once()
+        self.assertEqual(result["messages"][-1]["content"], "已创建科研档案：TSN 方案。")
+
     def test_verify_clears_retry_metadata_after_success(self):
         """修正后的回复通过验证后，不应把旧反馈带入下一轮对话。"""
         from graph_builder import build_graph
@@ -1289,6 +1438,330 @@ class TestScheduler(unittest.TestCase):
 class TestPaperArtifacts(unittest.TestCase):
     """Evidence cards remain local, source-bounded and independently auditable."""
 
+    def test_document_map_keeps_table_figure_and_nearby_text_on_the_same_page(self):
+        from paper_artifacts import (
+            attach_image_assets,
+            build_document_map,
+            build_source_map_from_document,
+            related_context,
+        )
+
+        parsed = {
+            "source_file": "sample.pdf", "total_pages": 3, "processed_pages": 3,
+            "pages": [{"page": 3, "elements": [
+                {
+                    "id": "p003-t01", "kind": "text", "page": 3, "section": "Experiments",
+                    "is_heading": False, "text": "The following table compares all baselines.",
+                    "bbox": [0, 0, 100, 20], "related_ids": ["p003-b01", "p003-f01"],
+                },
+                {
+                    "id": "p003-b01", "kind": "table", "page": 3, "section": "Experiments",
+                    "label": "Table 2", "caption": "Table 2: Main results.",
+                    "text": "| Model | Score |\n| --- | --- |\n| Ours | 91.2 |",
+                    "bbox": [0, 30, 100, 80], "related_ids": ["p003-t01"],
+                },
+                {
+                    "id": "p003-f01", "kind": "figure", "page": 3, "section": "Experiments",
+                    "label": "Figure 3", "caption": "Figure 3: Ablation trend.",
+                    "asset_path": "", "bbox": [0, 90, 100, 180], "related_ids": ["p003-t01"],
+                },
+            ]}],
+        }
+        document_map = build_document_map(
+            parsed, paper_id="paper-1", title="Sample", source_file="sample.pdf",
+        )
+        attach_image_assets(document_map, ["C:/tmp/sample_Figure3.png"])
+        source_map = build_source_map_from_document(document_map)
+
+        table_block = next(item for item in source_map["blocks"] if item["id"] == "p003-b01")
+        figure = next(item for item in document_map["pages"][0]["elements"] if item["id"] == "p003-f01")
+        table_chunk = next(item for item in document_map["chunks"] if item["kind"] == "table")
+        context, locator = related_context(document_map, table_chunk["id"])
+
+        self.assertEqual(table_block["page"], 3)
+        self.assertTrue(figure["asset_path"].endswith("sample_Figure3.png"))
+        self.assertIn("following table", context)
+        self.assertEqual(locator, "p.3 · Table 2")
+
+    def test_query_tool_adds_related_context_for_a_page_mapped_result(self):
+        from paper_artifacts import build_document_map, write_document_map
+        from runtime_paths import RuntimePaths
+        from tools.search import handle_query_papers
+
+        parsed = {
+            "source_file": "sample.pdf", "total_pages": 1, "processed_pages": 1,
+            "pages": [{"page": 1, "elements": [
+                {
+                    "id": "p001-t01", "kind": "text", "page": 1, "section": "Results",
+                    "is_heading": False, "text": "The paragraph explains the table result.",
+                    "bbox": [0, 0, 1, 1], "related_ids": ["p001-b01"],
+                },
+                {
+                    "id": "p001-b01", "kind": "table", "page": 1, "section": "Results",
+                    "label": "Table 1", "caption": "Table 1: Main score.",
+                    "text": "| Score |\n| --- |\n| 91.2 |", "bbox": [0, 2, 1, 3],
+                    "related_ids": ["p001-t01"],
+                },
+            ]}],
+        }
+
+        class _Store:
+            @staticmethod
+            def query_with_timeout(*_args, **_kwargs):
+                return ([{
+                    "text": "Table 1: Main score.", "section": "Results", "title": "Sample",
+                    "paper_id": "paper-1", "element_id": "p001-c02", "element_kind": "table",
+                    "retrieval": "hybrid", "hybrid_score": 0.02,
+                }], None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RuntimePaths.from_root(Path(tmp) / "runtime")
+            paths.ensure_initialized()
+            document_map = build_document_map(
+                parsed, paper_id="paper-1", title="Sample", source_file="sample.pdf",
+            )
+            write_document_map(paths, paper_id="paper-1", document_map=document_map)
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(paths.root)}, clear=False):
+                result = handle_query_papers({"query": "main score"}, paper_store=_Store())
+
+        self.assertIn("p.1 · Table 1", result)
+        self.assertIn("关联上下文", result)
+        self.assertIn("explains the table", result)
+
+    def test_obsolete_document_map_cleanup_never_removes_a_nonempty_artifact_directory(self):
+        from paper_artifacts import build_document_map, remove_document_map, write_document_map
+        from runtime_paths import RuntimePaths
+
+        parsed = {
+            "source_file": "sample.pdf", "total_pages": 1, "processed_pages": 1,
+            "pages": [{"page": 1, "elements": [{
+                "id": "p001-t01", "kind": "text", "page": 1, "section": "Abstract",
+                "is_heading": False, "text": "A sufficiently complete paper paragraph.", "related_ids": [],
+            }]}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = RuntimePaths.from_root(Path(tmp) / "runtime")
+            paths.ensure_initialized()
+            document_map = build_document_map(
+                parsed, paper_id="old-paper", title="Sample", source_file="sample.pdf",
+            )
+            map_path = write_document_map(paths, paper_id="old-paper", document_map=document_map)
+            keep_path = map_path.parent / "other-derived-file.txt"
+            keep_path.write_text("keep", encoding="utf-8")
+
+            self.assertTrue(remove_document_map(paths, "old-paper"))
+            self.assertFalse(map_path.exists())
+            self.assertTrue(keep_path.exists())
+            self.assertFalse(remove_document_map(paths, "old-paper"))
+
+    def test_read_pdf_indexes_and_persists_the_page_map(self):
+        from tools.read_pdf import handle_read_pdf
+
+        parsed = {
+            "source_file": "Sample.pdf", "total_pages": 1, "processed_pages": 1,
+            "pages": [{"page": 1, "elements": [{
+                "id": "p001-t01", "kind": "text", "page": 1, "section": "Abstract",
+                "is_heading": False,
+                "text": "Structured paper text with enough context to form a reliable retrieval passage for testing.",
+                "bbox": [0, 0, 1, 1], "related_ids": [],
+            }]}],
+        }
+
+        class _Reader:
+            def __init__(self, **_kwargs):
+                return None
+
+            @staticmethod
+            def parse_document(_path):
+                return parsed
+
+            @staticmethod
+            def render_document(_document):
+                return "📄 **PDF 解析完成**\n\nStructured paper text with enough context to form a reliable retrieval passage for testing."
+
+        class _Store:
+            indexed = None
+
+            @staticmethod
+            def list_papers():
+                return []
+
+            @classmethod
+            def index_document_map(cls, document_map, **_kwargs):
+                cls.indexed = document_map
+                return str(document_map["paper_id"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            papers = runtime / "primary" / "papers"
+            papers.mkdir(parents=True)
+            (papers / "Sample.pdf").write_bytes(b"%PDF-placeholder")
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False), patch(
+                "tools.read_pdf.PaperReader", _Reader,
+            ), patch("tools.read_pdf.extract_images", return_value=[]):
+                result = handle_read_pdf({"url_or_path": "Sample.pdf"}, paper_store=_Store())
+
+            maps = list((runtime / "derived" / "paper_artifacts").glob("*/document_map.json"))
+            self.assertEqual(len(maps), 1)
+            self.assertIsNotNone(_Store.indexed)
+            self.assertEqual(_Store.indexed["chunks"][0]["page"], 1)
+            self.assertIn("页面元素映射", result)
+
+    def test_quality_gate_merges_an_orphan_formula_fragment_without_losing_sources(self):
+        from paper_quality import prepare_document_map
+
+        document_map = {
+            "total_pages": 1,
+            "processed_pages": 1,
+            "pages": [{"page": 1, "elements": [
+                {"id": "p001-t01", "kind": "text", "page": 1, "is_heading": False,
+                 "text": "A complete paragraph with enough source material for retrieval. " * 2, "related_ids": []},
+                {"id": "p001-t02", "kind": "text", "page": 1, "is_heading": False,
+                 "text": ". (34)", "related_ids": []},
+            ]}],
+            "chunks": [
+                {"id": "p001-c01", "kind": "text", "page": 1, "section": "Method",
+                 "text": "A complete paragraph with enough source material for retrieval. " * 2,
+                 "source_element_ids": ["p001-t01"], "related_ids": []},
+                {"id": "p001-c02", "kind": "text", "page": 1, "section": "Method",
+                 "text": ". (34)", "source_element_ids": ["p001-t02"], "related_ids": []},
+            ],
+        }
+
+        prepared, report = prepare_document_map(document_map, requested_pages=1)
+
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["status"], "repaired")
+        self.assertEqual(report["repairs"]["merged_orphan_text_chunks"], 1)
+        self.assertEqual(len(prepared["chunks"]), 1)
+        self.assertEqual(prepared["chunks"][0]["source_element_ids"], ["p001-t01", "p001-t02"])
+
+    def test_quality_gate_rejects_untraceable_chunks_and_index_round_trip_loss(self):
+        from paper_quality import assess_document_map, verify_index_round_trip
+
+        document_map = {
+            "total_pages": 1,
+            "processed_pages": 1,
+            "pages": [{"page": 1, "elements": [
+                {"id": "p001-t01", "kind": "text", "page": 1, "is_heading": False,
+                 "text": "A sufficiently long paragraph that should be traceable in the index.", "related_ids": []},
+            ]}],
+            "chunks": [{
+                "id": "p001-c01", "kind": "text", "page": 1, "section": "Method",
+                "text": "A sufficiently long paragraph that should be traceable in the index.",
+                "source_element_ids": ["missing-source"], "related_ids": [],
+            }],
+        }
+
+        report = assess_document_map(document_map, requested_pages=1)
+        index_report = verify_index_round_trip(document_map, [])
+
+        self.assertFalse(report["accepted"])
+        self.assertIn("untraceable_chunks", {item["code"] for item in report["issues"]})
+        self.assertFalse(index_report["accepted"])
+        self.assertEqual(index_report["issues"][0]["code"], "index_round_trip_mismatch")
+
+    def test_read_pdf_retries_with_fallback_before_replacing_an_existing_index(self):
+        from tools.read_pdf import handle_read_pdf
+
+        calls = []
+        good_text = "A complete paragraph that is deliberately long enough to pass the retrieval quality threshold."
+        normal = {
+            "source_file": "Sample.pdf", "total_pages": 2, "processed_pages": 1,
+            "pages": [{"page": 1, "elements": [{
+                "id": "p001-t01", "kind": "text", "page": 1, "section": "Abstract",
+                "is_heading": False, "text": good_text, "bbox": [0, 0, 1, 1], "related_ids": [],
+            }]}],
+        }
+        fallback = {**normal, "total_pages": 1, "processed_pages": 1}
+
+        class _Reader:
+            def __init__(self, **_kwargs):
+                return None
+
+            @staticmethod
+            def parse_document(_path, **kwargs):
+                calls.append(("parse", kwargs))
+                return fallback if kwargs.get("extract_tables") is False else normal
+
+            @staticmethod
+            def render_document(_document):
+                return "📄 **PDF 解析完成**\n\n" + good_text
+
+        class _Store:
+            indexed = None
+
+            @staticmethod
+            def list_papers():
+                return [{"paper_id": "old-paper", "title": "Sample"}]
+
+            @classmethod
+            def index_document_map(cls, document_map, **_kwargs):
+                calls.append(("index", document_map["paper_id"]))
+                cls.indexed = document_map
+                return str(document_map["paper_id"])
+
+            @classmethod
+            def get_paper_chunks(cls, _paper_id):
+                return [{"element_id": chunk["id"]} for chunk in cls.indexed["chunks"]]
+
+            @staticmethod
+            def delete_paper(paper_id):
+                calls.append(("delete", paper_id))
+                return 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            papers = runtime / "primary" / "papers"
+            papers.mkdir(parents=True)
+            (papers / "Sample.pdf").write_bytes(b"%PDF-placeholder")
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False), patch(
+                "tools.read_pdf.PaperReader", _Reader,
+            ), patch("tools.read_pdf.extract_images", return_value=[]):
+                result = handle_read_pdf({"url_or_path": "Sample.pdf"}, paper_store=_Store())
+
+        self.assertEqual(calls[:2], [("parse", {}), ("parse", {"extract_tables": False})])
+        self.assertLess(calls.index(("index", _Store.indexed["paper_id"])), calls.index(("delete", "old-paper")))
+        self.assertEqual(_Store.indexed["quality"]["parser"], "备用文本解析")
+        self.assertIn("备用文本解析", result)
+
+    def test_paper_card_prefers_the_persisted_document_map(self):
+        from paper_artifacts import build_document_map, write_document_map
+        from runtime_paths import RuntimePaths
+        from tools.paper_card import handle_generate_paper_card
+
+        parsed = {
+            "source_file": "Sample_Paper.pdf", "total_pages": 1, "processed_pages": 1,
+            "pages": [{"page": 1, "elements": [{
+                "id": "p001-b01", "kind": "table", "page": 1, "section": "Results",
+                "label": "Table 1", "caption": "Table 1: Main result.",
+                "text": "| Score |\n| --- |\n| 91.2 |", "bbox": [0, 0, 1, 1], "related_ids": [],
+            }]}],
+        }
+
+        class _Store:
+            @staticmethod
+            def list_papers():
+                return [{"paper_id": "paper-1", "title": "Sample Paper"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            papers = runtime / "primary" / "papers"
+            papers.mkdir(parents=True)
+            (papers / "Sample_Paper.pdf").write_bytes(b"%PDF-placeholder")
+            paths = RuntimePaths.from_root(runtime)
+            paths.ensure_initialized()
+            document_map = build_document_map(
+                parsed, paper_id="paper-1", title="Sample Paper", source_file="Sample_Paper.pdf",
+            )
+            write_document_map(paths, paper_id="paper-1", document_map=document_map)
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False), patch(
+                "tools.paper_card.create_source_map", side_effect=AssertionError("should reuse document map"),
+            ):
+                result = handle_generate_paper_card({"paper_id_or_title": "paper-1"}, paper_store=_Store())
+
+        self.assertIn("已生成证据草稿", result)
+
     def test_source_map_keeps_page_and_section_anchors(self):
         from paper_artifacts import build_source_map_from_reader_text
 
@@ -1467,6 +1940,45 @@ class TestResearchDocuments(unittest.TestCase):
 
 
 class TestPaperRecordNormalization(unittest.TestCase):
+    def test_ieee_normalization_only_exposes_explicit_open_access_pdf(self):
+        from ieee_xplore import ieee_records
+
+        records = ieee_records({"articles": [
+            {
+                "title": "Open Access TSN Scheduling",
+                "abstract": "A Time-Sensitive Networking scheduling method.",
+                "authors": {"authors": [{"full_name": "Alice"}]},
+                "publication_year": "2026",
+                "publication_date": "2026-03-01",
+                "publication_title": "IEEE Access",
+                "citing_paper_count": "12",
+                "doi": "10.1109/example.2026.1",
+                "article_number": "12345678",
+                "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=12345678",
+                "accessType": "Open Access",
+            },
+            {
+                "title": "Restricted TSN Scheduling",
+                "article_number": "87654321",
+                "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=87654321",
+                "accessType": "Locked",
+            },
+            {
+                "title": "Ephemera TSN Scheduling",
+                "article_number": "99999999",
+                "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=99999999",
+                "accessType": "Ephemera",
+            },
+        ]})
+
+        self.assertEqual(records[0]["authors"], ["Alice"])
+        self.assertEqual(records[0]["year"], 2026)
+        self.assertEqual(records[0]["open_access_pdf_url"], records[0]["url"].replace(
+            "/document/12345678", "/stamp/stamp.jsp?tp=&arnumber=12345678",
+        ))
+        self.assertEqual(records[1]["open_access_pdf_url"], "")
+        self.assertEqual(records[2]["open_access_pdf_url"], "")
+
     def test_deduplication_prefers_doi_and_merges_provider_metadata(self):
         from paper_records import deduplicate_paper_records
 
@@ -1510,6 +2022,42 @@ class TestPaperRecordNormalization(unittest.TestCase):
         self.assertIn("Shared Paper", result)
         self.assertIn("[openalex]", result)
         self.assertIn("未完成来源", result)
+
+    def test_ieee_search_sends_key_without_displaying_it(self):
+        from search_api import search_ieee
+
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"articles": [{
+                    "title": "Time-Sensitive Networking Scheduling for Bursty Traffic",
+                    "abstract": "A scheduling method for TSN under bursty traffic.",
+                    "publication_year": "2026",
+                    "article_number": "12345678",
+                    "accessType": "Open Access",
+                    "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=12345678",
+                }]}
+
+            def close(self):
+                return None
+
+        with patch("search_api.requests.get", return_value=_Response()) as request_get:
+            result = search_ieee(
+                "TSN scheduling under bursty traffic", limit=3, api_key="ieee-test-key",
+            )
+
+        self.assertEqual(request_get.call_args.kwargs["params"], {
+            "querytext": "TSN scheduling under bursty traffic",
+            "max_records": 3,
+            "format": "json",
+            "apikey": "ieee-test-key",
+        })
+        self.assertIn("IEEE Xplore 搜索结果", result)
+        self.assertIn("IEEE 获取权限: Open Access", result)
+        self.assertIn("IEEE 开放全文 PDF", result)
+        self.assertNotIn("ieee-test-key", result)
 
 
 class TestDailyMultiAgentOrchestration(unittest.TestCase):
@@ -1605,7 +2153,7 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
             finally:
                 scheduler.close()
 
-    def test_source_sets_keep_arxiv_out_of_daily_and_send_raw_openalex_key(self):
+    def test_source_sets_keep_arxiv_out_of_daily_and_send_raw_source_keys(self):
         from daily_orchestrator import DailyResearchOrchestrator
         from scheduler import Scheduler
 
@@ -1631,6 +2179,50 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 with patch("daily_orchestrator.requests.get", return_value=_Response()) as request_get:
                     self.assertEqual(orchestrator._openalex_scout("TSN", None), [])
                 self.assertEqual(request_get.call_args.kwargs["params"]["api_key"], "oa-test-key")
+
+                ieee_enabled = DailyResearchOrchestrator(
+                    scheduler=scheduler,
+                    ieee_api_key="ieee-test-key",
+                )
+                self.assertEqual(ieee_enabled.daily_sources, ("openalex", "openaire", "dblp", "ieee"))
+                self.assertEqual(ieee_enabled.temporary_sources, ("openalex", "arxiv", "ieee"))
+            finally:
+                scheduler.close()
+
+    def test_ieee_scout_preserves_access_metadata(self):
+        from daily_orchestrator import DailyResearchOrchestrator
+        from scheduler import Scheduler
+
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"articles": [{
+                    "title": "TSN Scheduling for Bursty Traffic",
+                    "abstract": "Scheduling algorithm for Time-Sensitive Networking.",
+                    "publication_year": "2026",
+                    "article_number": "12345678",
+                    "accessType": "Open Access",
+                    "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=12345678",
+                }]}
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                orchestrator = DailyResearchOrchestrator(
+                    scheduler=scheduler, ieee_api_key="ieee-test-key",
+                )
+                with patch("daily_orchestrator.requests.get", return_value=_Response()) as request_get:
+                    candidates = orchestrator._ieee_scout("TSN scheduling", None)
+
+                self.assertEqual(request_get.call_args.kwargs["params"]["apikey"], "ieee-test-key")
+                self.assertEqual(candidates[0]["sources"], ["ieee"])
+                self.assertEqual(candidates[0]["access_type"], "Open Access")
+                self.assertTrue(candidates[0]["open_access_pdf_url"])
             finally:
                 scheduler.close()
 
@@ -2142,7 +2734,6 @@ class TestResearchOrchestration(unittest.TestCase):
             api_key="test-key",
             model="deepseek-chat",
             paper_store=None,
-            glm_api_key="",
             llm_client=MagicMock(),
             verify_timeout_seconds=3,
         )
@@ -2958,6 +3549,65 @@ class TestToolRuntime(unittest.TestCase):
         self.assertEqual(dispatcher.call_args.kwargs["session_id"], "session-a")
 
 
+class TestImageDescription(unittest.TestCase):
+    """图片描述复用共享 DeepSeek 客户端，而不是单独的模型供应商。"""
+
+    def test_image_description_uses_low_priority_deepseek_request(self):
+        from tools.describe import handle_describe_image
+
+        class _Response:
+            @staticmethod
+            def json():
+                return {"choices": [{"message": {"content": "这是一个网络架构图。"}}]}
+
+            @staticmethod
+            def close():
+                return None
+
+        class _LLM:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, payload, **kwargs):
+                self.calls.append((payload, kwargs))
+                return _Response()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            image_dir = runtime / "derived" / "images"
+            image_dir.mkdir(parents=True)
+            (image_dir / "Figure_1.png").write_bytes(b"\x89PNG\r\n\x1a\nplaceholder")
+            client = _LLM()
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
+                result = handle_describe_image(
+                    {"image_path": "Figure_1.png"},
+                    llm_client=client,
+                    vision_model="deepseek-v4-flash-vision-exp",
+                )
+
+        self.assertIn("网络架构图", result)
+        payload, kwargs = client.calls[0]
+        self.assertEqual(payload["model"], "deepseek-v4-flash-vision-exp")
+        self.assertTrue(payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        policy = kwargs["policy"]
+        self.assertEqual(policy.purpose, "describe_image")
+        self.assertEqual(policy.priority.name, "SUMMARY")
+        self.assertFalse(policy.counts_toward_circuit)
+
+    def test_image_description_reports_missing_shared_client(self):
+        from tools.describe import handle_describe_image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            image_dir = runtime / "derived" / "images"
+            image_dir.mkdir(parents=True)
+            (image_dir / "Figure_1.png").write_bytes(b"placeholder")
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
+                result = handle_describe_image({"image_path": "Figure_1.png"})
+
+        self.assertIn("DeepSeek 视觉模型未启用", result)
+
+
 class TestCircuitBreaker(unittest.TestCase):
     def test_half_open_admits_a_single_probe_and_reopens_on_failure(self):
         """恢复期结束后只能有一个请求探测下游服务。"""
@@ -3082,15 +3732,27 @@ class TestRuntimePaths(unittest.TestCase):
             else:
                 os.environ["APP_DATA_DIR"] = old_data_dir
 
-    def test_openalex_key_uses_a_dedicated_environment_variable(self):
+    def test_public_source_keys_use_dedicated_environment_variables(self):
         from config import Config
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
-            os.environ, {"OPENALEX_API_KEY": "oa-test-key"}, clear=False,
+            os.environ,
+            {"OPENALEX_API_KEY": "oa-test-key", "IEEE_API_KEY": "ieee-test-key"},
+            clear=False,
         ):
             cfg = Config.load({"data_dir": tmp})
             self.assertEqual(cfg.openalex_api_key, "oa-test-key")
-            self.assertEqual(cfg.daily_sources, ("openalex", "openaire", "dblp"))
+            self.assertEqual(cfg.ieee_api_key, "ieee-test-key")
+            self.assertEqual(cfg.daily_sources, ("openalex", "openaire", "dblp", "ieee"))
+
+    def test_vision_model_uses_a_dedicated_environment_variable(self):
+        from config import Config
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"DEEPSEEK_VISION_MODEL": "deepseek-v4-flash-vision-exp"}, clear=False,
+        ):
+            cfg = Config.load({"data_dir": tmp})
+            self.assertEqual(cfg.vision_model, "deepseek-v4-flash-vision-exp")
 
     def test_migration_script_previews_then_copies_without_deleting_source(self):
         with tempfile.TemporaryDirectory() as tmp:

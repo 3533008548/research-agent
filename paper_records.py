@@ -70,7 +70,10 @@ def merge_paper_records(target: dict[str, Any], source: dict[str, Any]) -> None:
     target["sources"] = sorted(set(target.get("sources") or []) | set(source.get("sources") or []))
     target["keywords"] = sorted(set(target.get("keywords") or []) | set(source.get("keywords") or []))
     target.setdefault("source_ids", {}).update(source.get("source_ids") or {})
-    for key in ("abstract", "authors", "published_at", "venue", "doi", "url", "year", "arxiv_id"):
+    for key in (
+        "abstract", "authors", "published_at", "venue", "doi", "url", "year", "arxiv_id",
+        "access_type", "open_access_pdf_url",
+    ):
         if not target.get(key) and source.get(key):
             target[key] = source[key]
     if len(str(source.get("abstract") or "")) > len(str(target.get("abstract") or "")):

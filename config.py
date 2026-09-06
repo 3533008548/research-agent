@@ -19,6 +19,7 @@ from runtime_paths import RuntimePaths
 # ── 默认值 ──
 _DFLT = {
     "model": "deepseek-v4-flash",
+    "vision_model": "deepseek-v4-flash-vision-exp",
     "pdf_max_pages": 15,
     "rag_enabled": True,
     "rag_reranker_enabled": False,
@@ -30,7 +31,7 @@ _DFLT = {
     "daily_request_timeout_seconds": 8,
     "daily_keyword_concurrency": 2,
     "daily_max_results_per_keyword": 3,
-    "daily_sources": ("openalex", "openaire", "dblp"),
+    "daily_sources": ("openalex", "openaire", "dblp", "ieee"),
     "api_max_concurrency": 4,
     "api_interactive_reserved_slots": 1,
     "api_queue_size": 20,
@@ -47,11 +48,12 @@ _DFLT = {
 @dataclass
 class Config:
     model: str = "deepseek-chat"
+    vision_model: str = "deepseek-v4-flash-vision-exp"
     deepseek_key: str = ""
     api_url: str = "https://api.deepseek.com/chat/completions"
-    glm_key: str = ""
     hf_endpoint: str = ""
     openalex_api_key: str = ""
+    ieee_api_key: str = ""
 
     pdf_max_pages: int = 15
     rag_enabled: bool = True
@@ -66,7 +68,7 @@ class Config:
     daily_request_timeout_seconds: int = 8
     daily_keyword_concurrency: int = 2
     daily_max_results_per_keyword: int = 3
-    daily_sources: tuple[str, ...] = ("openalex", "openaire", "dblp")
+    daily_sources: tuple[str, ...] = ("openalex", "openaire", "dblp", "ieee")
     api_max_concurrency: int = 4
     api_interactive_reserved_slots: int = 1
     api_queue_size: int = 20
@@ -137,6 +139,8 @@ class Config:
                     raise ValueError("config.yaml 的顶层必须是键值对象")
                 if "model" in yaml_cfg:
                     cfg["model"] = yaml_cfg["model"]
+                if "vision_model" in yaml_cfg:
+                    cfg["vision_model"] = yaml_cfg["vision_model"]
                 if "pdf" in yaml_cfg:
                     cfg["pdf_max_pages"] = yaml_cfg["pdf"].get("max_pages", cfg["pdf_max_pages"])
                 if "rag" in yaml_cfg:
@@ -168,7 +172,7 @@ class Config:
                     )
                     configured_sources = yaml_cfg["daily_search"].get("sources")
                     if isinstance(configured_sources, list):
-                        allowed_sources = {"openalex", "openaire", "dblp"}
+                        allowed_sources = {"openalex", "openaire", "dblp", "ieee"}
                         sources = tuple(
                             str(source).strip().lower()
                             for source in configured_sources
@@ -201,6 +205,7 @@ class Config:
         user_settings = paths.read_settings()
         validators = {
             "model": lambda value: isinstance(value, str) and bool(value.strip()),
+            "vision_model": lambda value: isinstance(value, str) and bool(value.strip()),
             "rag_enabled": lambda value: isinstance(value, bool),
             "pdf_max_pages": lambda value: isinstance(value, int) and not isinstance(value, bool),
             "daily_search_enabled": lambda value: isinstance(value, bool),
@@ -213,10 +218,11 @@ class Config:
         env_map = {
             "DEEPSEEK_API_KEY": "deepseek_key",
             "DEEPSEEK_API_URL": "api_url",
-            "GLM_API_KEY": "glm_key",
             "HF_ENDPOINT": "hf_endpoint",
             "OPENALEX_API_KEY": "openalex_api_key",
+            "IEEE_API_KEY": "ieee_api_key",
             "DEEPSEEK_MODEL": "model",
+            "DEEPSEEK_VISION_MODEL": "vision_model",
         }
         for env, attr in env_map.items():
             val = os.getenv(env, "")
@@ -229,11 +235,12 @@ class Config:
 
         return cls(
             model=cfg["model"],
+            vision_model=cfg["vision_model"],
             deepseek_key=cfg.get("deepseek_key", "") or os.getenv("DEEPSEEK_API_KEY", ""),
             api_url=cfg.get("api_url", _DFLT["api_url"]),
-            glm_key=cfg.get("glm_key", "") or os.getenv("GLM_API_KEY", ""),
             hf_endpoint=cfg.get("hf_endpoint", ""),
             openalex_api_key=cfg.get("openalex_api_key", "") or os.getenv("OPENALEX_API_KEY", ""),
+            ieee_api_key=cfg.get("ieee_api_key", "") or os.getenv("IEEE_API_KEY", ""),
             pdf_max_pages=cfg["pdf_max_pages"],
             rag_enabled=cfg["rag_enabled"],
             rag_reranker_enabled=bool(cfg.get("rag_reranker_enabled", False)),

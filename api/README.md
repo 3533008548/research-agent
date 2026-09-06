@@ -1,6 +1,7 @@
 # FastAPI 服务说明
 
-Gradio 页面仍可通过 `http://localhost:7860/` 访问；交互式 API 文档位于
+React 页面构建完成后，可通过 `http://localhost:7860/app/` 访问；原 Gradio 页面仍保留在
+`http://localhost:7860/` 作为渐进迁移期间的回退入口。交互式 API 文档位于
 `http://localhost:7860/docs`。
 
 ## 统一运行任务模型
@@ -65,7 +66,15 @@ Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TL
 | `GET` | `/api/v1/metrics` | Prometheus 聚合运行指标，需鉴权 |
 | `GET`、`POST` | `/api/v1/sessions` | 列出或创建会话 |
 | `DELETE` | `/api/v1/sessions/{session_id}` | 取消会话中的活跃任务并删除会话 |
+| `GET` | `/api/v1/sessions/{session_id}/messages` | 恢复该会话的用户可见对话 |
 | `GET` | `/api/v1/sessions/{session_id}/runs` | 列出该会话最近的聊天与深度研究任务 |
+| `GET` | `/api/v1/workspace/research-documents` | 列出研究档案元数据 |
+| `GET` | `/api/v1/workspace/research-documents/{id}` | 按需读取一份研究档案的 Markdown |
+| `GET` | `/api/v1/workspace/research-documents/{id}/download` | 下载该档案的 Word 文档 |
+| `GET` | `/api/v1/workspace/papers` | 列出本地已索引论文与片段数 |
+| `GET`、`POST` | `/api/v1/workspace/daily-keywords` | 列出或添加每日检索关键词 |
+| `DELETE` | `/api/v1/workspace/daily-keywords/{keyword}` | 删除一个每日检索关键词 |
+| `GET`、`PUT` | `/api/v1/workspace/settings` | 读取或保存运行时设置（重启后生效） |
 | `POST` | `/api/v1/chat` | 兼容用聊天入口：创建一个聊天任务 |
 | `POST` | `/api/v1/runs` | 创建 `chat`、`research` 或 `daily` 任务 |
 | `GET` | `/api/v1/runs/{run_id}` | 查看状态、安全指标与最终结果 |

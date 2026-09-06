@@ -74,6 +74,27 @@ _EXPLICIT_EVIDENCE_MARKERS = (
     "论文", "文献", "引用", "原文", "最新进展", "最新研究", "搜索论文",
     "检索论文", "找论文", "doi", "arxiv", "paper", "作者", "哪篇",
 )
+_RESEARCH_DOCUMENT_TERMS = ("科研档案", "研究档案")
+_RESEARCH_DOCUMENT_ACTIONS = ("保存", "存档", "导出", "生成")
+_RESEARCH_DOCUMENT_CONTENT_TERMS = ("方案", "计划", "假设", "决策记录")
+
+
+def should_force_research_document_save(user_input: str) -> bool:
+    """Recognize an explicit request to persist a user-owned research document.
+
+    This is deliberately a narrow rule, not another intent model: the user
+    must ask to save/export and name either the archive itself or a research
+    artefact.  It prevents a model from substituting a profile summary for a
+    durable document after the user has explicitly asked for one.
+    """
+    text = " ".join(str(user_input or "").casefold().split())
+    if not text or any(marker in text for marker in ("不要保存", "不保存", "无需保存")):
+        return False
+    if not any(action in text for action in _RESEARCH_DOCUMENT_ACTIONS):
+        return False
+    return any(term in text for term in _RESEARCH_DOCUMENT_TERMS) or any(
+        term in text for term in _RESEARCH_DOCUMENT_CONTENT_TERMS
+    )
 
 
 def should_answer_without_tools(user_input: str) -> bool:
@@ -271,8 +292,13 @@ class ResearchAgent:
                 if on_token:
                     on_token(token)
 
-            allowed_tool_names = set() if should_answer_without_tools(user_input) else None
-            if allowed_tool_names is not None:
+            force_research_document_save = should_force_research_document_save(user_input)
+            if force_research_document_save:
+                allowed_tool_names = {"save_research_document"}
+                _record_event({"type": "tool_policy", "policy": "forced_research_document_save"})
+            else:
+                allowed_tool_names = set() if should_answer_without_tools(user_input) else None
+            if allowed_tool_names is not None and not force_research_document_save:
                 _record_event({"type": "tool_policy", "policy": "direct_engineering_answer"})
             app = None
             try:
@@ -288,6 +314,7 @@ class ResearchAgent:
                     app = self._build_app(
                         usage, _on_token if on_token else None, _record_event,
                         cancel_event=cancel_event, allowed_tool_names=allowed_tool_names,
+                        force_tool_name="save_research_document" if force_research_document_save else None,
                         run_id=chat_run_id, session_id=thread_id,
                     )
                 result = app.invoke(
@@ -428,7 +455,7 @@ class ResearchAgent:
                 api_key=self.api_key,
                 model=self.model,
                 paper_store=self._paper_store,
-                glm_api_key=self.cfg.glm_key,
+                vision_model=self.cfg.vision_model,
                 llm_client=self.llm_client,
                 verify_timeout_seconds=self.cfg.verify_timeout_seconds,
             )
@@ -750,6 +777,7 @@ class ResearchAgent:
     def _build_app(
         self, usage: dict, on_token=None, event_callback=None, cancel_event=None,
         allowed_tool_names: set[str] | None = None,
+        force_tool_name: str | None = None,
         run_id: str = "",
         session_id: str = "",
     ):
@@ -759,7 +787,7 @@ class ResearchAgent:
             paper_store=self._paper_store,
             token_usage=usage,
             checkpoint_db=self.cfg.checkpoint_db,
-            glm_api_key=self.cfg.glm_key,
+            vision_model=self.cfg.vision_model,
             stream_callback=on_token,
             event_callback=event_callback,
             cancel_event=cancel_event,
@@ -769,6 +797,7 @@ class ResearchAgent:
             verify_guard=self.verify_guard,
             llm_client=self.llm_client,
             allowed_tool_names=allowed_tool_names,
+            force_tool_name=force_tool_name,
             tool_context=ToolExecutionContext(
                 run_kind="chat",
                 run_id=run_id,

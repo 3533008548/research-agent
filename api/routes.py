@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from api.auth import require_api_key
 from api.observability import render_prometheus_metrics
@@ -16,11 +16,19 @@ from api.schemas import (
     ChatRunCreateRequest,
     ChatRunResponse,
     ChatRunStartResponse,
+    DailyKeywordCreateRequest,
+    DailyKeywordResponse,
+    PaperResponse,
+    ResearchDocumentDetailResponse,
+    ResearchDocumentResponse,
     RunCreateRequest,
     RunResponse,
     RunStartResponse,
     SessionCreateRequest,
+    SessionMessageResponse,
     SessionResponse,
+    WorkspaceSettingsResponse,
+    WorkspaceSettingsUpdateRequest,
 )
 
 
@@ -149,6 +157,188 @@ def health(request: Request) -> dict[str, str]:
     return {"status": "ok", "model": str(request.app.state.agent.model)}
 
 
+def _workspace_paths(request: Request):
+    paths = getattr(request.app.state, "workspace_paths", None)
+    if paths is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="workspace features unavailable")
+    return paths
+
+
+def _workspace_scheduler(request: Request):
+    scheduler = getattr(request.app.state, "workspace_scheduler", None)
+    if scheduler is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="daily keyword service unavailable")
+    return scheduler
+
+
+def _research_documents(request: Request):
+    store = getattr(request.app.state, "research_document_store", None)
+    if store is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="research document service unavailable")
+    return store
+
+
+def _document_payload(document: dict) -> dict:
+    return {
+        "document_id": document["document_id"],
+        "title": document["title"],
+        "summary": document.get("summary", ""),
+        "created_at": document["created_at"],
+        "updated_at": document["updated_at"],
+        "revision": document["revision"],
+    }
+
+
+def _workspace_settings_payload(request: Request) -> dict:
+    paths = _workspace_paths(request)
+    cfg = request.app.state.agent.cfg
+    stored = paths.read_settings()
+    model = str(stored.get("model") or cfg.model).strip() or cfg.model
+    return {
+        "model": model,
+        "rag_enabled": stored.get("rag_enabled") if isinstance(stored.get("rag_enabled"), bool) else cfg.rag_enabled,
+        "pdf_max_pages": stored.get("pdf_max_pages") if isinstance(stored.get("pdf_max_pages"), int) and not isinstance(stored.get("pdf_max_pages"), bool) else cfg.pdf_max_pages,
+        "daily_search_enabled": stored.get("daily_search_enabled") if isinstance(stored.get("daily_search_enabled"), bool) else cfg.daily_search_enabled,
+        "restart_required": True,
+    }
+
+
+@router.get(
+    "/workspace/research-documents",
+    response_model=list[ResearchDocumentResponse],
+    dependencies=[Depends(require_api_key)],
+)
+def list_research_documents(request: Request) -> list[dict]:
+    """List document metadata without injecting document bodies into chat state."""
+    return [_document_payload(document) for document in _research_documents(request).list(limit=50)]
+
+
+@router.get(
+    "/workspace/research-documents/{document_id}",
+    response_model=ResearchDocumentDetailResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_research_document(document_id: str, request: Request) -> dict:
+    document = _research_documents(request).read(document_id)
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
+    return {
+        **_document_payload(document),
+        "content": document.get("content", ""),
+        "download_url": f"/api/v1/workspace/research-documents/{document_id}/download",
+    }
+
+
+@router.get(
+    "/workspace/research-documents/{document_id}/download",
+    dependencies=[Depends(require_api_key)],
+)
+def download_research_document(document_id: str, request: Request) -> FileResponse:
+    document = _research_documents(request).read(document_id)
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
+    path = _workspace_paths(request).safe_child(
+        _workspace_paths(request).research_documents_dir / document_id,
+        str(document.get("docx_file") or "document.docx"),
+    )
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="document download not found")
+    return FileResponse(path, filename=f"{document['title']}.docx")
+
+
+@router.get(
+    "/workspace/papers",
+    response_model=list[PaperResponse],
+    dependencies=[Depends(require_api_key)],
+)
+def list_workspace_papers(request: Request) -> list[dict]:
+    paper_store = getattr(request.app.state.agent, "paper_store", None)
+    if paper_store is None:
+        return []
+    return list(paper_store.list_papers())
+
+
+@router.get(
+    "/workspace/daily-keywords",
+    response_model=list[DailyKeywordResponse],
+    dependencies=[Depends(require_api_key)],
+)
+def list_daily_keywords(request: Request) -> list[dict]:
+    return [
+        {
+            "keyword": item["keyword"],
+            "active": bool(item.get("active", True)),
+            "added_at": item["added_at"],
+            "search_status": item.get("search_status", "idle"),
+        }
+        for item in _workspace_scheduler(request).list_keywords()
+    ]
+
+
+@router.post(
+    "/workspace/daily-keywords",
+    response_model=DailyKeywordResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_api_key)],
+)
+def create_daily_keyword(payload: DailyKeywordCreateRequest, request: Request) -> dict:
+    scheduler = _workspace_scheduler(request)
+    keyword = payload.keyword.strip()
+    error = scheduler.validate_keyword(keyword)
+    if error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=error)
+    if any(item["keyword"] == keyword for item in scheduler.list_keywords()):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="关键词已存在")
+    scheduler.add_keyword(keyword)
+    return next(
+        {
+            "keyword": item["keyword"],
+            "active": bool(item.get("active", True)),
+            "added_at": item["added_at"],
+            "search_status": item.get("search_status", "idle"),
+        }
+        for item in scheduler.list_keywords()
+        if item["keyword"] == keyword
+    )
+
+
+@router.delete(
+    "/workspace/daily-keywords/{keyword}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_api_key)],
+)
+def delete_daily_keyword(keyword: str, request: Request) -> Response:
+    scheduler = _workspace_scheduler(request)
+    if not any(item["keyword"] == keyword for item in scheduler.list_keywords()):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关键词不存在")
+    scheduler.remove_keyword(keyword)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/workspace/settings",
+    response_model=WorkspaceSettingsResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_workspace_settings(request: Request) -> dict:
+    return _workspace_settings_payload(request)
+
+
+@router.put(
+    "/workspace/settings",
+    response_model=WorkspaceSettingsResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def update_workspace_settings(payload: WorkspaceSettingsUpdateRequest, request: Request) -> dict:
+    updates = payload.model_dump(exclude_none=True)
+    if "model" in updates:
+        updates["model"] = updates["model"].strip()
+        if not updates["model"]:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="模型不能为空")
+    _workspace_paths(request).update_settings(updates)
+    return _workspace_settings_payload(request)
+
+
 @router.get("/metrics", include_in_schema=False, dependencies=[Depends(require_api_key)])
 def prometheus_metrics(request: Request) -> PlainTextResponse:
     """Expose aggregate operational metrics without any user or model payload."""
@@ -187,6 +377,18 @@ def delete_session(session_id: str, request: Request) -> Response:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found")
     request.app.state.badcase_store.delete_for_session(session_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/sessions/{session_id}/messages",
+    response_model=list[SessionMessageResponse],
+    dependencies=[Depends(require_api_key)],
+)
+def list_session_messages(session_id: str, request: Request) -> list[dict]:
+    """Restore only the user-visible turns needed by a stateless web client."""
+    if not request.app.state.agent.sessions.get(session_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found")
+    return request.app.state.agent.get_history(session_id)
 
 
 @router.get(

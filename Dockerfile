@@ -1,4 +1,13 @@
+ARG NODE_IMAGE=node:24-bookworm-slim
 ARG PYTHON_IMAGE=python:3.11-slim
+FROM ${NODE_IMAGE} AS frontend-build
+
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -26,6 +35,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
     && pip install --no-cache-dir -r requirements.txt
 
 COPY . ./
+COPY --from=frontend-build /frontend/dist ./frontend/dist
 RUN mkdir -p /app/runtime/derived/home/.cache /app/runtime/derived/cache \
     && chown -R app:app /app
 

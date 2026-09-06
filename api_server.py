@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import gradio as gr
 
-from api.app import create_app
+from api.app import create_app, mount_react_frontend
 from api.redis_runs import (
     RedisChatRunBroker,
     RedisChatRunManager,
@@ -48,6 +49,7 @@ def create_server():
         api_key=os.getenv("API_AUTH_TOKEN"),
         require_api_key=os.getenv("API_AUTH_REQUIRED", "").strip().lower() in {"1", "true", "yes"},
     )
+    mount_react_frontend(app, Path(__file__).resolve().parent / "frontend" / "dist")
     ui = build_ui(cfg=cfg, agent=agent, launch=False)
     return gr.mount_gradio_app(
         app,
