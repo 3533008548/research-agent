@@ -1,35 +1,54 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode } from "react";
 
 import {
   cancelRun,
+  createBadcase,
+  createDailyRun,
   createDailyKeyword,
   createRun,
   createSession,
   deleteDailyKeyword,
   deleteSession,
   downloadResearchDocument,
+  getDailyRunDetail,
   getResearchDocument,
   getRun,
   getSessionMessages,
+  getSessionUsage,
+  getDailyDigest,
   getWorkspaceSettings,
   listDailyKeywords,
+  listDailyRuns,
+  listBadcases,
   listPapers,
   listResearchDocuments,
+  listSessionRuns,
   listSessions,
   streamRun,
+  updateDailyPaperStatus,
   updateWorkspaceSettings,
+  uploadWorkspaceFile,
 } from "./api";
 import {
   ApiError,
+  type BadcaseCandidate,
+  type BadcaseCategory,
+  type DailyDigest,
   type DailyKeyword,
+  type DailyPaper,
+  type DailyRunDetail,
+  type DailyRunKind,
   type Message,
   type Paper,
   type ResearchDocument,
   type ResearchDocumentDetail,
+  type ResearchScope,
   type Run,
   type RunEvent,
   type Session,
+  type SessionUsage,
   type WorkspaceSettings,
+  type WorkspaceUpload,
 } from "./types";
 
 const MarkdownContent = lazy(() => import("./MarkdownContent"));
@@ -43,7 +62,10 @@ type Notice = { kind: "error" | "info"; text: string } | null;
 type DisplayMessage = Message & { id: string; streaming?: boolean };
 type WorkbenchTab =
   | { id: "chat"; kind: "chat"; title: string }
-  | { id: string; kind: "document"; title: string; document: ResearchDocumentDetail };
+  | { id: string; kind: "document"; title: string; document: ResearchDocumentDetail }
+  | { id: "daily"; kind: "daily"; title: string }
+  | { id: string; kind: "dailyRun"; title: string; detail: DailyRunDetail }
+  | { id: "runs"; kind: "runs"; title: string };
 
 const TOOL_LABELS: Record<string, string> = {
   search_papers: "检索论文",
@@ -87,12 +109,34 @@ function statusLabel(status: string | undefined): string {
     completed: "已完成",
     cancelled: "已取消",
     failed: "执行失败",
+    partial_failed: "部分完成",
   };
   return labels[status || ""] || status || "等待开始";
 }
 
 function modeLabel(mode: ResearchMode): string {
   return mode === "research" ? "深度研究" : "对话";
+}
+
+function dailyPaperStatusLabel(status: DailyPaper["status"]): string {
+  return ({ new: "未处理", want_read: "想读", read: "已读", skipped: "已跳过" })[status];
+}
+
+function badcaseCategoryLabel(category: BadcaseCategory): string {
+  return ({
+    retrieval_miss: "召回遗漏",
+    citation_quality: "引用质量",
+    answer_quality: "回答质量",
+    tool_failure: "工具失败",
+    performance: "性能",
+    safety: "安全",
+    other: "其他",
+  })[category];
+}
+
+function dailyRunTitle(detail: DailyRunDetail): string {
+  const date = detail.created_at ? detail.created_at.slice(0, 10) : "未命名";
+  return `每日检索 · ${date}`;
 }
 
 function durationLabel(value: number | null | undefined): string {
@@ -166,11 +210,13 @@ function RunInspector({
   run,
   events,
   onCancel,
+  onOpenRunCenter,
   cancelling,
 }: {
   run: Run | null;
   events: RunEvent[];
   onCancel: () => void;
+  onOpenRunCenter: () => void;
   cancelling: boolean;
 }) {
   return (
@@ -180,7 +226,10 @@ function RunInspector({
           <p className="eyebrow">运行检查器</p>
           <h2>本轮任务</h2>
         </div>
-        {run && <span className={`status status-${run.status}`}>{statusLabel(run.status)}</span>}
+        <div className="run-inspector-actions">
+          <button className="text-button" type="button" onClick={onOpenRunCenter}>历史运行</button>
+          {run && <span className={`status status-${run.status}`}>{statusLabel(run.status)}</span>}
+        </div>
       </div>
 
       {!run ? (
@@ -231,8 +280,10 @@ export function App() {
     () => localStorage.getItem(ACTIVE_SESSION_KEY),
   );
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
+  const [sessionUsage, setSessionUsage] = useState<SessionUsage | null>(null);
   const [draft, setDraft] = useState("");
   const [mode, setMode] = useState<ResearchMode>("chat");
+  const [researchScope, setResearchScope] = useState<ResearchScope>("both");
   const [currentRun, setCurrentRun] = useState<Run | null>(null);
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -255,8 +306,24 @@ export function App() {
     pdf_max_pages: 15,
     daily_search_enabled: false,
   });
+  const [attachment, setAttachment] = useState<WorkspaceUpload | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [dailyDigest, setDailyDigest] = useState<DailyDigest>({ progress: "", papers: [] });
+  const [dailyRuns, setDailyRuns] = useState<Run[]>([]);
+  const [dailyLoading, setDailyLoading] = useState(false);
+  const [dailyAction, setDailyAction] = useState<DailyRunKind | null>(null);
+  const [dailySearchDraft, setDailySearchDraft] = useState("");
+  const [runCenterRuns, setRunCenterRuns] = useState<Run[]>([]);
+  const [badcases, setBadcases] = useState<BadcaseCandidate[]>([]);
+  const [runCenterLoading, setRunCenterLoading] = useState(false);
+  const [badcaseSubmitting, setBadcaseSubmitting] = useState<string | null>(null);
+  const [badcaseCategories, setBadcaseCategories] = useState<Record<string, BadcaseCategory>>({});
+  const [manualBadcaseRunId, setManualBadcaseRunId] = useState("");
+  const [manualBadcaseCategory, setManualBadcaseCategory] = useState<BadcaseCategory>("answer_quality");
+  const [manualBadcaseNote, setManualBadcaseNote] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const activeWorkbenchTab = workbenchTabs.find((tab) => tab.id === activeWorkbenchTabId) || workbenchTabs[0];
   const selectedDocumentId = activeWorkbenchTab?.kind === "document"
     ? activeWorkbenchTab.document.document_id
@@ -270,10 +337,14 @@ export function App() {
   }, [messages]);
 
   const loadSession = useCallback(async (sessionId: string) => {
-    const history = await getSessionMessages(apiKey, sessionId);
+    const [history, usage] = await Promise.all([
+      getSessionMessages(apiKey, sessionId),
+      getSessionUsage(apiKey, sessionId),
+    ]);
     setActiveSessionId(sessionId);
     localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
     setMessages(displayMessages(history));
+    setSessionUsage(usage);
     setCurrentRun(null);
     setRunEvents([]);
   }, [apiKey]);
@@ -290,6 +361,7 @@ export function App() {
       } else {
         setActiveSessionId(null);
         setMessages([]);
+        setSessionUsage(null);
       }
       setNotice(null);
     } catch (error) {
@@ -318,7 +390,12 @@ export function App() {
       } else if (panel === "papers") {
         setPapers(await listPapers(apiKey));
       } else if (panel === "keywords") {
-        setKeywords(await listDailyKeywords(apiKey));
+        const [nextKeywords, nextDailyRuns] = await Promise.all([
+          listDailyKeywords(apiKey),
+          listDailyRuns(apiKey),
+        ]);
+        setKeywords(nextKeywords);
+        setDailyRuns(nextDailyRuns);
       } else {
         const settings = await getWorkspaceSettings(apiKey);
         setWorkspaceSettings(settings);
@@ -354,6 +431,25 @@ export function App() {
     }
   }
 
+  async function selectDailyRun(runId: string) {
+    try {
+      const detail = await getDailyRunDetail(apiKey, runId);
+      const tabId = `daily-run:${detail.run_id}`;
+      const title = dailyRunTitle(detail);
+      setWorkbenchTabs((current) => {
+        const existing = current.find((tab) => tab.id === tabId);
+        if (existing?.kind === "dailyRun") {
+          return current.map((tab) => tab.id === tabId ? { ...tab, title, detail } : tab);
+        }
+        return [...current, { id: tabId, kind: "dailyRun", title, detail }];
+      });
+      setActiveWorkbenchTabId(tabId);
+      setNotice(null);
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    }
+  }
+
   function closeWorkbenchTab(tabId: string) {
     if (tabId === "chat") {
       return;
@@ -370,6 +466,35 @@ export function App() {
       setNotice(null);
     } catch (error) {
       setNotice({ kind: "error", text: userFacingError(error) });
+    }
+  }
+
+  async function uploadAttachment(file: File) {
+    if (isUploading || isSending) {
+      return;
+    }
+    setIsUploading(true);
+    try {
+      const upload = await uploadWorkspaceFile(apiKey, file);
+      setAttachment(upload);
+      setNotice({
+        kind: "info",
+        text: upload.duplicate
+          ? `已找到已有文件：${upload.filename}。发送后会直接使用它。`
+          : `已添加 ${upload.filename}。发送后会开始${upload.kind === "pdf" ? "解析与索引" : "图片理解"}。`,
+      });
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    } finally {
+      setIsUploading(false);
+    }
+  }
+
+  function selectAttachment(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (file) {
+      void uploadAttachment(file);
     }
   }
 
@@ -399,6 +524,173 @@ export function App() {
       setNotice(null);
     } catch (error) {
       setNotice({ kind: "error", text: userFacingError(error) });
+    }
+  }
+
+  async function loadDailyCenter() {
+    setDailyLoading(true);
+    try {
+      const [digest, runs] = await Promise.all([
+        getDailyDigest(apiKey),
+        listDailyRuns(apiKey),
+      ]);
+      setDailyDigest(digest);
+      setDailyRuns(runs);
+      setNotice(null);
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    } finally {
+      setDailyLoading(false);
+    }
+  }
+
+  async function openDailyCenter() {
+    setWorkbenchTabs((current) => current.some((tab) => tab.id === "daily")
+      ? current
+      : [...current, { id: "daily", kind: "daily", title: "每日检索" }]);
+    setActiveWorkbenchTabId("daily");
+    await loadDailyCenter();
+  }
+
+  async function updateDailyPaper(paper: DailyPaper, status: Exclude<DailyPaper["status"], "new">) {
+    try {
+      await updateDailyPaperStatus(apiKey, paper.keyword, paper.title, status);
+      setDailyDigest((current) => ({
+        ...current,
+        papers: current.papers.map((item) => item.keyword === paper.keyword && item.title === paper.title
+          ? { ...item, status }
+          : item),
+      }));
+      setNotice(null);
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    }
+  }
+
+  async function startDailyAction(kind: DailyRunKind) {
+    if (isSending) {
+      return;
+    }
+    const keyword = dailySearchDraft.trim();
+    if (kind === "search" && !keyword) {
+      setNotice({ kind: "info", text: "请输入要临时检索的关键词。" });
+      return;
+    }
+
+    setDailyAction(kind);
+    setIsSending(true);
+    setNotice(null);
+    setRunEvents([]);
+    try {
+      const started = await createDailyRun(apiKey, kind, keyword || undefined);
+      setCurrentRun({
+        run_id: started.run_id,
+        kind: started.kind,
+        session_id: null,
+        status: started.status,
+        model: "",
+        answer: "",
+        duration_ms: null,
+        metrics: {},
+        error_type: "",
+        created_at: "",
+        updated_at: "",
+        completed_at: null,
+        events: [],
+      });
+      const controller = new AbortController();
+      abortRef.current = controller;
+      await streamRun(apiKey, started.stream_url, (runEvent) => {
+        setRunEvents((current) => appendRunEvent(current, runEvent));
+        if (runEvent.type === "status" || runEvent.type === "done") {
+          setCurrentRun((current) => current && { ...current, status: runEvent.status || current.status });
+        }
+        if (runEvent.type === "error") {
+          setCurrentRun((current) => current && {
+            ...current,
+            status: "failed",
+            error_type: runEvent.error_type || "RunError",
+          });
+        }
+      }, controller.signal);
+      setCurrentRun(await getRun(apiKey, started.run_id));
+      if (kind === "search") {
+        setDailySearchDraft("");
+      }
+      await loadDailyCenter();
+    } catch (error) {
+      const message = userFacingError(error);
+      setNotice({ kind: "error", text: message });
+      setCurrentRun((current) => current && { ...current, status: "failed" });
+    } finally {
+      abortRef.current = null;
+      setIsSending(false);
+      setDailyAction(null);
+    }
+  }
+
+  async function loadRunCenter() {
+    setRunCenterLoading(true);
+    try {
+      const [sessionRuns, nextDailyRuns, nextBadcases, usage] = await Promise.all([
+        activeSessionId ? listSessionRuns(apiKey, activeSessionId) : Promise.resolve([] as Run[]),
+        listDailyRuns(apiKey),
+        listBadcases(apiKey),
+        activeSessionId ? getSessionUsage(apiKey, activeSessionId) : Promise.resolve(null),
+      ]);
+      setRunCenterRuns([...sessionRuns, ...nextDailyRuns].sort((left, right) => (
+        `${right.updated_at}${right.created_at}`.localeCompare(`${left.updated_at}${left.created_at}`)
+      )));
+      setDailyRuns(nextDailyRuns);
+      setBadcases(nextBadcases);
+      setSessionUsage(usage);
+      setNotice(null);
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    } finally {
+      setRunCenterLoading(false);
+    }
+  }
+
+  async function openRunCenter() {
+    setWorkbenchTabs((current) => current.some((tab) => tab.id === "runs")
+      ? current
+      : [...current, { id: "runs", kind: "runs", title: "运行中心" }]);
+    setActiveWorkbenchTabId("runs");
+    await loadRunCenter();
+  }
+
+  async function markRunAsBadcase(run: Run) {
+    const category = badcaseCategories[run.run_id] || "answer_quality";
+    setBadcaseSubmitting(run.run_id);
+    try {
+      const candidate = await createBadcase(apiKey, run.run_id, category);
+      setBadcases((current) => [candidate, ...current.filter((item) => item.candidate_id !== candidate.candidate_id)]);
+      setNotice({ kind: "info", text: `已将该运行标记为 Badcase：${badcaseCategoryLabel(category)}。` });
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    } finally {
+      setBadcaseSubmitting(null);
+    }
+  }
+
+  async function markManualBadcase() {
+    const runId = manualBadcaseRunId.trim();
+    if (!runId) {
+      setNotice({ kind: "info", text: "请填写要标记的运行 ID。" });
+      return;
+    }
+    const requestId = `manual:${runId}`;
+    setBadcaseSubmitting(requestId);
+    try {
+      const candidate = await createBadcase(apiKey, runId, manualBadcaseCategory, manualBadcaseNote);
+      setBadcases((current) => [candidate, ...current.filter((item) => item.candidate_id !== candidate.candidate_id)]);
+      setManualBadcaseNote("");
+      setNotice({ kind: "info", text: `已将 ${runId} 标记为 Badcase。` });
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    } finally {
+      setBadcaseSubmitting(null);
     }
   }
 
@@ -461,6 +753,7 @@ export function App() {
         localStorage.removeItem(ACTIVE_SESSION_KEY);
         setActiveSessionId(null);
         setMessages([]);
+        setSessionUsage(null);
         setCurrentRun(null);
         setRunEvents([]);
       }
@@ -489,10 +782,14 @@ export function App() {
     });
   }
 
-  async function sendMessage(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const content = draft.trim();
-    if (!content || isSending) {
+  async function sendMessage(
+    event: FormEvent<HTMLFormElement> | undefined,
+    resumeResearch = false,
+  ) {
+    event?.preventDefault();
+    const content = resumeResearch ? "" : draft.trim();
+    const pendingAttachment = resumeResearch ? null : attachment;
+    if ((!content && !pendingAttachment && !resumeResearch) || isSending || isUploading) {
       return;
     }
     if (!activeSessionId) {
@@ -500,19 +797,35 @@ export function App() {
       return;
     }
 
-    const requestMode = mode;
-    setDraft("");
+    const requestMode: ResearchMode = resumeResearch ? "research" : mode;
+    if (requestMode === "research" && pendingAttachment) {
+      setNotice({ kind: "info", text: "请先在普通对话中发送并索引附件，再发起深度研究。" });
+      return;
+    }
+    const shownContent = resumeResearch ? "继续上次深度研究" : [
+      pendingAttachment ? `📎 ${pendingAttachment.filename}` : "",
+      content,
+    ].filter(Boolean).join("\n");
+    if (!resumeResearch) {
+      setDraft("");
+    }
     setIsSending(true);
     setNotice(null);
     setRunEvents([]);
     setMessages((current) => [
       ...current,
-      { id: `user-${Date.now()}`, role: "user", content },
+      { id: `user-${Date.now()}`, role: "user", content: shownContent },
       { id: `assistant-${Date.now()}`, role: "assistant", content: "", streaming: true },
     ]);
 
     try {
-      const started = await createRun(apiKey, requestMode, activeSessionId, content);
+      const started = await createRun(
+        apiKey, requestMode, activeSessionId, content, pendingAttachment?.upload_id,
+        researchScope, resumeResearch,
+      );
+      if (!resumeResearch) {
+        setAttachment(null);
+      }
       setCurrentRun({
         run_id: started.run_id,
         kind: started.kind,
@@ -549,8 +862,12 @@ export function App() {
       const detail = await getRun(apiKey, started.run_id);
       setCurrentRun(detail);
       completeAnswer(detail.answer || undefined);
-      const refreshedSessions = await listSessions(apiKey);
+      const [refreshedSessions, usage] = await Promise.all([
+        listSessions(apiKey),
+        getSessionUsage(apiKey, activeSessionId),
+      ]);
       setSessions(refreshedSessions);
+      setSessionUsage(usage);
     } catch (error) {
       const message = userFacingError(error);
       completeAnswer(`⚠️ ${message}`);
@@ -669,7 +986,7 @@ export function App() {
             </WorkspacePanel>
 
             <WorkspacePanel
-              title="每日检索关键词"
+              title="每日检索"
               open={openWorkspacePanel === "keywords"}
               onToggle={() => void toggleWorkspacePanel("keywords")}
             >
@@ -697,6 +1014,26 @@ export function App() {
                     </div>
                   ) : (
                     <p className="panel-hint">尚未设置每日检索关键词。</p>
+                  )}
+                  <button className="text-button" type="button" onClick={() => void openDailyCenter()}>
+                    打开今日检索
+                  </button>
+                  {dailyRuns.length > 0 && (
+                    <div className="workspace-list daily-report-list">
+                      <p className="workspace-list-label">最近报告</p>
+                      {dailyRuns.slice(0, 6).map((run) => (
+                        <button
+                          className="workspace-list-item"
+                          key={run.run_id}
+                          type="button"
+                          onClick={() => void selectDailyRun(run.run_id)}
+                          title={run.run_id}
+                        >
+                          <strong>{run.created_at ? `每日检索 · ${run.created_at.slice(0, 10)}` : "每日检索报告"}</strong>
+                          <span>{statusLabel(run.status)} · {run.metrics.selected_count ?? 0} 篇入选</span>
+                        </button>
+                      ))}
+                    </div>
                   )}
                 </>
               )}
@@ -760,6 +1097,9 @@ export function App() {
                   title={tab.title}
                 >
                   {tab.kind === "document" && <span aria-hidden="true">▣</span>}
+                  {tab.kind === "daily" && <span aria-hidden="true">◌</span>}
+                  {tab.kind === "dailyRun" && <span aria-hidden="true">▧</span>}
+                  {tab.kind === "runs" && <span aria-hidden="true">◫</span>}
                   <span>{tab.title}</span>
                 </button>
                 {tab.kind !== "chat" && (
@@ -797,6 +1137,297 @@ export function App() {
                 </Suspense>
               </div>
             </article>
+          ) : activeWorkbenchTab?.kind === "dailyRun" ? (
+            <article className="document-page" aria-label={`每日检索报告：${activeWorkbenchTab.title}`}>
+              <header className="document-page-heading">
+                <div>
+                  <p className="eyebrow">每日检索报告</p>
+                  <h1>{activeWorkbenchTab.title}</h1>
+                  <p className="document-page-meta">
+                    <span className={`status status-${activeWorkbenchTab.detail.status}`}>{statusLabel(activeWorkbenchTab.detail.status)}</span>
+                    {" · "}{activeWorkbenchTab.detail.run_id}
+                  </p>
+                </div>
+              </header>
+              <div className="document-page-content daily-report-page">
+                {activeWorkbenchTab.detail.brief && (
+                  <section className="daily-report-brief">
+                    <h2>本次摘要</h2>
+                    <p>{activeWorkbenchTab.detail.brief}</p>
+                  </section>
+                )}
+                {activeWorkbenchTab.detail.warnings.length > 0 && (
+                  <section className="daily-report-warnings">
+                    <h2>质量提示</h2>
+                    <ul>{activeWorkbenchTab.detail.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+                  </section>
+                )}
+                <section className="daily-report-papers">
+                  <h2>论文推荐</h2>
+                  {activeWorkbenchTab.detail.papers.length ? (
+                    <div className="daily-paper-list">
+                      {activeWorkbenchTab.detail.papers.map((paper) => (
+                        <article className="daily-paper" key={`${paper.title}:${paper.url}`}>
+                          <div className="daily-paper-main">
+                            <p className="daily-paper-meta">
+                              {paper.selected ? "已入选" : "候选"}
+                              {paper.source ? ` · ${paper.source}` : ""}
+                              {paper.year ? ` · ${paper.year}` : ""}
+                              {paper.citation_count !== null ? ` · 引用 ${paper.citation_count}` : ""}
+                            </p>
+                            {paper.url ? (
+                              <a className="daily-paper-title" href={paper.url} target="_blank" rel="noreferrer">{paper.title}</a>
+                            ) : (
+                              <strong className="daily-paper-title">{paper.title}</strong>
+                            )}
+                            {paper.reason && <p className="daily-paper-reason">推荐理由：{paper.reason}</p>}
+                            {paper.tags.length > 0 && <p className="daily-paper-tags">{paper.tags.map((tag) => <span key={tag}>{tag}</span>)}</p>}
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p>该任务尚未产生可展示的论文推荐。</p>
+                  )}
+                </section>
+              </div>
+            </article>
+          ) : activeWorkbenchTab?.kind === "runs" ? (
+            <article className="utility-page" aria-label="运行中心">
+              <header className="utility-page-heading">
+                <div>
+                  <p className="eyebrow">可追溯运行</p>
+                  <h1>运行中心</h1>
+                  <p>查看当前会话及每日检索的近期任务；问题运行可记录为不含内容的 Badcase 候选。</p>
+                </div>
+                <button className="button button-secondary" type="button" onClick={() => void loadRunCenter()} disabled={runCenterLoading}>
+                  {runCenterLoading ? "刷新中…" : "刷新"}
+                </button>
+              </header>
+              <div className="utility-page-content">
+                <section className="token-summary" aria-label="当前会话 Token 统计">
+                  <div className="section-heading">
+                    <div><h2>当前会话 Token</h2><p>来自持久化的对话与深度研究统计；每日检索暂不计入。</p></div>
+                  </div>
+                  {sessionUsage ? (
+                    <div className="token-summary-grid">
+                      <div><span>输入</span><strong>{sessionUsage.prompt.toLocaleString()}</strong></div>
+                      <div><span>输出</span><strong>{sessionUsage.completion.toLocaleString()}</strong></div>
+                      <div><span>合计</span><strong>{sessionUsage.total.toLocaleString()}</strong></div>
+                      <div><span>模型调用</span><strong>{sessionUsage.calls.toLocaleString()}</strong></div>
+                    </div>
+                  ) : (
+                    <p className="empty-panel">选择一个会话后显示其 Token 统计。</p>
+                  )}
+                </section>
+                <section className="daily-section run-center-section">
+                  <div className="section-heading">
+                    <div><h2>近期运行</h2><p>当前会话与每日检索各保留最近 20 条。</p></div>
+                  </div>
+                  {runCenterLoading ? (
+                    <p className="empty-panel">正在读取运行记录…</p>
+                  ) : runCenterRuns.length ? (
+                    <div className="run-center-list">
+                      {runCenterRuns.map((run) => (
+                        <article className="run-center-row" key={run.run_id}>
+                          <div className="run-center-main">
+                            <div className="run-center-meta">
+                              <span className={`status status-${run.status}`}>{statusLabel(run.status)}</span>
+                              <span>{run.kind === "daily" ? "每日检索" : run.kind === "research" ? "深度研究" : "对话"}</span>
+                              <span>{durationLabel(run.duration_ms) || "未完成"}</span>
+                            </div>
+                            <strong title={run.run_id}>{run.run_id}</strong>
+                            {run.error_type && <p className="run-center-error">{run.error_type}</p>}
+                          </div>
+                          <div className="badcase-editor">
+                            <select
+                              aria-label={`${run.run_id} 的 Badcase 分类`}
+                              value={badcaseCategories[run.run_id] || "answer_quality"}
+                              onChange={(event) => setBadcaseCategories((current) => ({
+                                ...current,
+                                [run.run_id]: event.target.value as BadcaseCategory,
+                              }))}
+                            >
+                              {(["retrieval_miss", "citation_quality", "answer_quality", "tool_failure", "performance", "safety", "other"] as BadcaseCategory[]).map((category) => (
+                                <option key={category} value={category}>{badcaseCategoryLabel(category)}</option>
+                              ))}
+                            </select>
+                            <button
+                              className="button button-secondary"
+                              type="button"
+                              onClick={() => void markRunAsBadcase(run)}
+                              disabled={badcaseSubmitting === run.run_id || !["completed", "failed", "cancelled", "partial_failed"].includes(run.status)}
+                            >
+                              {badcaseSubmitting === run.run_id ? "记录中…" : "标记问题"}
+                            </button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="empty-panel">当前范围内尚无运行记录。</p>
+                  )}
+                </section>
+
+                <section className="daily-section">
+                  <div className="section-heading">
+                    <div><h2>Badcase 候选</h2><p>只保存分类、运行状态和匿名运行指标，不保存对话、论文或模型正文。</p></div>
+                  </div>
+                  {badcases.length ? (
+                    <ol className="badcase-list">
+                      {badcases.map((candidate) => (
+                        <li key={candidate.candidate_id}>
+                          <span className="status">{badcaseCategoryLabel(candidate.category)}</span>
+                          <strong title={candidate.run_id}>{candidate.run_id}</strong>
+                          <span>{candidate.status === "triage" ? "待整理" : candidate.status === "promoted" ? "已转为评测" : "已忽略"} · {candidate.occurrence_count} 次</span>
+                        </li>
+                      ))}
+                    </ol>
+                  ) : (
+                    <p className="empty-panel">还没有标记的问题运行。</p>
+                  )}
+                  <form
+                    className="manual-badcase-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void markManualBadcase();
+                    }}
+                  >
+                    <div>
+                      <h3>手动标记</h3>
+                      <p>可粘贴运行卡片中的 run_id；备注只写脱敏现象，不要写入原始问题、回答、论文内容或密钥。</p>
+                    </div>
+                    <input
+                      value={manualBadcaseRunId}
+                      onChange={(event) => setManualBadcaseRunId(event.target.value)}
+                      placeholder="run_id，例如 chat-… 或 research-…"
+                      aria-label="要标记的运行 ID"
+                    />
+                    <select
+                      value={manualBadcaseCategory}
+                      onChange={(event) => setManualBadcaseCategory(event.target.value as BadcaseCategory)}
+                      aria-label="Badcase 分类"
+                    >
+                      {(["retrieval_miss", "citation_quality", "answer_quality", "tool_failure", "performance", "safety", "other"] as BadcaseCategory[]).map((category) => (
+                        <option key={category} value={category}>{badcaseCategoryLabel(category)}</option>
+                      ))}
+                    </select>
+                    <textarea
+                      value={manualBadcaseNote}
+                      onChange={(event) => setManualBadcaseNote(event.target.value)}
+                      maxLength={500}
+                      placeholder="可选脱敏备注（最多 500 字）"
+                      aria-label="脱敏备注"
+                    />
+                    <button
+                      className="button button-secondary"
+                      type="submit"
+                      disabled={!manualBadcaseRunId.trim() || badcaseSubmitting === `manual:${manualBadcaseRunId.trim()}`}
+                    >
+                      {badcaseSubmitting === `manual:${manualBadcaseRunId.trim()}` ? "记录中…" : "添加候选"}
+                    </button>
+                  </form>
+                </section>
+              </div>
+            </article>
+          ) : activeWorkbenchTab?.kind === "daily" ? (
+            <article className="utility-page" aria-label="每日检索中心">
+              <header className="utility-page-heading">
+                <div>
+                  <p className="eyebrow">文献发现</p>
+                  <h1>每日检索中心</h1>
+                  <p>{dailyDigest.progress || "管理今日文献并保留明确的阅读决策。"}</p>
+                </div>
+                <button className="button button-secondary" type="button" onClick={() => void loadDailyCenter()} disabled={dailyLoading || isSending}>
+                  {dailyLoading ? "刷新中…" : "刷新"}
+                </button>
+              </header>
+              <div className="utility-page-content">
+                <section className="daily-actions" aria-label="检索操作">
+                  <div className="daily-action-buttons">
+                    <button className="button button-primary" type="button" onClick={() => void startDailyAction("daily")} disabled={isSending}>
+                      {dailyAction === "daily" ? "检索中…" : "执行今日检索"}
+                    </button>
+                    <button className="button button-secondary" type="button" onClick={() => void startDailyAction("retry")} disabled={isSending}>
+                      {dailyAction === "retry" ? "重试中…" : "重试失败项"}
+                    </button>
+                    <button className="button button-secondary" type="button" onClick={() => void startDailyAction("resume")} disabled={isSending}>
+                      {dailyAction === "resume" ? "继续中…" : "继续未完成"}
+                    </button>
+                  </div>
+                  <form
+                    className="daily-search-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void startDailyAction("search");
+                    }}
+                  >
+                    <input
+                      value={dailySearchDraft}
+                      onChange={(event) => setDailySearchDraft(event.target.value)}
+                      placeholder="临时检索关键词，例如：TSN scheduling"
+                      disabled={isSending}
+                    />
+                    <button className="button button-secondary" type="submit" disabled={isSending || !dailySearchDraft.trim()}>
+                      {dailyAction === "search" ? "检索中…" : "临时检索"}
+                    </button>
+                  </form>
+                </section>
+
+                <section className="daily-section">
+                  <div className="section-heading">
+                    <div><h2>今日论文</h2><p>{dailyDigest.papers.length ? `共 ${dailyDigest.papers.length} 篇，可标记后续阅读。` : "尚无今日结果。"}</p></div>
+                  </div>
+                  {dailyLoading ? (
+                    <p className="empty-panel">正在读取今日结果…</p>
+                  ) : dailyDigest.papers.length ? (
+                    <div className="daily-paper-list">
+                      {dailyDigest.papers.map((paper) => (
+                        <article className="daily-paper" key={`${paper.keyword}:${paper.title}`}>
+                          <div className="daily-paper-main">
+                            <p className="daily-paper-meta">{paper.keyword}{paper.source ? ` · ${paper.source}` : ""}</p>
+                            {paper.url ? (
+                              <a className="daily-paper-title" href={paper.url} target="_blank" rel="noreferrer">{paper.title}</a>
+                            ) : (
+                              <strong className="daily-paper-title">{paper.title}</strong>
+                            )}
+                          </div>
+                          <div className="daily-paper-actions">
+                            <span className={`status daily-paper-status status-${paper.status}`}>{dailyPaperStatusLabel(paper.status)}</span>
+                            <button type="button" onClick={() => void updateDailyPaper(paper, "want_read")} disabled={paper.status === "want_read"}>想读</button>
+                            <button type="button" onClick={() => void updateDailyPaper(paper, "read")} disabled={paper.status === "read"}>已读</button>
+                            <button type="button" onClick={() => void updateDailyPaper(paper, "skipped")} disabled={paper.status === "skipped"}>跳过</button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="empty-panel">执行今日检索后，匹配论文会出现在这里。</p>
+                  )}
+                </section>
+
+                <section className="daily-section">
+                  <div className="section-heading">
+                    <div><h2>最近运行</h2><p>只保留状态和统计，不重复展示论文正文。</p></div>
+                  </div>
+                  {dailyRuns.length ? (
+                    <ol className="daily-run-list">
+                      {dailyRuns.map((run) => (
+                        <li key={run.run_id}>
+                          <span className={`status status-${run.status}`}>{statusLabel(run.status)}</span>
+                          <button className="daily-run-open" type="button" onClick={() => void selectDailyRun(run.run_id)} title={run.run_id}>
+                            {run.created_at ? `查看 ${run.created_at.slice(0, 10)} 报告` : "查看检索报告"}
+                          </button>
+                          <span>{run.metrics.selected_count ?? 0} 篇入选 · {durationLabel(run.duration_ms) || "处理中"}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  ) : (
+                    <p className="empty-panel">尚无每日检索运行记录。</p>
+                  )}
+                </section>
+              </div>
+            </article>
           ) : (
             <>
               <div className="conversation-heading">
@@ -818,6 +1449,27 @@ export function App() {
                 </div>
               </div>
 
+              {mode === "research" && (
+                <div className="research-options" aria-label="深度研究选项">
+                  <label>
+                    来源范围
+                    <select value={researchScope} onChange={(event) => setResearchScope(event.target.value as ResearchScope)} disabled={isSending}>
+                      <option value="both">本地论文 + 公开文献</option>
+                      <option value="local">仅本地论文库</option>
+                      <option value="public">仅公开文献</option>
+                    </select>
+                  </label>
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    onClick={() => void sendMessage(undefined, true)}
+                    disabled={isSending || !activeSessionId}
+                  >
+                    继续上次研究
+                  </button>
+                </div>
+              )}
+
               <div className="message-list" ref={messageListRef} aria-live="polite">
                 {isLoading ? (
                   <p className="empty-state">正在加载会话…</p>
@@ -832,6 +1484,30 @@ export function App() {
               </div>
 
               <form className="composer" onSubmit={(event) => void sendMessage(event)}>
+                <input
+                  ref={uploadInputRef}
+                  className="file-input"
+                  type="file"
+                  accept=".pdf,.png,.jpg,.jpeg"
+                  onChange={selectAttachment}
+                  disabled={isSending || isUploading}
+                />
+                <div className="composer-attachments">
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    onClick={() => uploadInputRef.current?.click()}
+                    disabled={isSending || isUploading}
+                  >
+                    {isUploading ? "上传中…" : "添加 PDF / 图片"}
+                  </button>
+                  {attachment && (
+                    <span className="attachment-chip">
+                      <span title={attachment.filename}>📎 {attachment.filename}</span>
+                      <button type="button" onClick={() => setAttachment(null)} disabled={isSending}>×</button>
+                    </span>
+                  )}
+                </div>
                 <textarea
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
@@ -840,8 +1516,8 @@ export function App() {
                   disabled={isSending || !activeSessionId}
                 />
                 <div className="composer-footer">
-                  <span>{mode === "research" ? "将检索本地论文与公开文献" : "支持引用、公式与 Markdown"}</span>
-                  <button className="button button-primary" type="submit" disabled={isSending || !draft.trim() || !activeSessionId}>
+                  <span>{attachment ? "发送后会在后台处理附件，进度显示在右侧。" : mode === "research" ? "可选择来源范围，或继续上次未完成研究" : "支持引用、公式与 Markdown"}</span>
+                  <button className="button button-primary" type="submit" disabled={isSending || isUploading || (!draft.trim() && !attachment) || !activeSessionId}>
                     {isSending ? "生成中…" : mode === "research" ? "开始研究" : "发送"}
                   </button>
                 </div>
@@ -850,7 +1526,13 @@ export function App() {
           )}
         </section>
 
-        <RunInspector run={currentRun} events={runEvents} onCancel={() => void stopCurrentRun()} cancelling={isSending} />
+        <RunInspector
+          run={currentRun}
+          events={runEvents}
+          onCancel={() => void stopCurrentRun()}
+          onOpenRunCenter={() => void openRunCenter()}
+          cancelling={isSending}
+        />
       </div>
     </main>
   );

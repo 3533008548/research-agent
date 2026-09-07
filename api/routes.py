@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from api.auth import require_api_key
@@ -16,8 +16,11 @@ from api.schemas import (
     ChatRunCreateRequest,
     ChatRunResponse,
     ChatRunStartResponse,
+    DailyDigestResponse,
     DailyKeywordCreateRequest,
     DailyKeywordResponse,
+    DailyPaperStatusUpdateRequest,
+    DailyRunDetailResponse,
     PaperResponse,
     ResearchDocumentDetailResponse,
     ResearchDocumentResponse,
@@ -27,9 +30,12 @@ from api.schemas import (
     SessionCreateRequest,
     SessionMessageResponse,
     SessionResponse,
+    SessionUsageResponse,
     WorkspaceSettingsResponse,
     WorkspaceSettingsUpdateRequest,
+    WorkspaceUploadResponse,
 )
+from workspace_uploads import UploadValidationError
 
 
 router = APIRouter(prefix="/api/v1")
@@ -129,6 +135,44 @@ def _daily_payload(run: dict) -> dict:
     )
 
 
+def _daily_run_detail_payload(scheduler, run: dict) -> dict:
+    """Project a persisted daily result into a workbench document page."""
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    critique = run.get("critique") if isinstance(run.get("critique"), dict) else {}
+    papers = []
+    for candidate in scheduler.get_daily_candidates(str(run["run_id"])):
+        title = str(candidate.get("title") or "").strip()
+        if not title:
+            continue
+        curation = candidate.get("curation") if isinstance(candidate.get("curation"), dict) else {}
+        raw_sources = candidate.get("sources") or candidate.get("source") or ""
+        source = ", ".join(str(item) for item in raw_sources) if isinstance(raw_sources, list) else str(raw_sources)
+        raw_tags = curation.get("tags") if isinstance(curation.get("tags"), list) else []
+        year = candidate.get("year")
+        citations = candidate.get("citation_count")
+        papers.append({
+            "title": title,
+            "url": str(candidate.get("url") or ""),
+            "source": source,
+            "year": int(year) if isinstance(year, int) and not isinstance(year, bool) else None,
+            "citation_count": int(citations) if isinstance(citations, int) and not isinstance(citations, bool) else None,
+            "reason": str(curation.get("reason") or "")[:320],
+            "tags": [str(tag)[:60] for tag in raw_tags[:8] if str(tag).strip()],
+            "selected": bool(candidate.get("selected")),
+        })
+    warnings = critique.get("warnings") if isinstance(critique.get("warnings"), list) else []
+    return {
+        "run_id": run["run_id"],
+        "kind": run.get("kind", "daily"),
+        "status": run.get("status", "queued"),
+        "created_at": run.get("created_at", ""),
+        "updated_at": run.get("updated_at", ""),
+        "brief": str(result.get("brief") or "")[:600],
+        "warnings": [str(warning)[:160] for warning in warnings[:4] if str(warning).strip()],
+        "papers": papers,
+    }
+
+
 def _manager(request: Request):
     return request.app.state.chat_run_manager
 
@@ -178,6 +222,13 @@ def _research_documents(request: Request):
     return store
 
 
+def _workspace_uploads(request: Request):
+    uploads = getattr(request.app.state, "workspace_uploads", None)
+    if uploads is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="workspace uploads unavailable")
+    return uploads
+
+
 def _document_payload(document: dict) -> dict:
     return {
         "document_id": document["document_id"],
@@ -211,6 +262,26 @@ def _workspace_settings_payload(request: Request) -> dict:
 def list_research_documents(request: Request) -> list[dict]:
     """List document metadata without injecting document bodies into chat state."""
     return [_document_payload(document) for document in _research_documents(request).list(limit=50)]
+
+
+@router.post(
+    "/workspace/uploads",
+    response_model=WorkspaceUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_api_key)],
+)
+async def upload_workspace_file(
+    request: Request,
+    file: UploadFile = File(...),
+) -> dict:
+    """Store one local PDF/image and return an opaque id for a later chat run."""
+    try:
+        upload = _workspace_uploads(request).save(file.filename or "", file.file)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    finally:
+        await file.close()
+    return upload.public_payload()
 
 
 @router.get(
@@ -316,6 +387,58 @@ def delete_daily_keyword(keyword: str, request: Request) -> Response:
 
 
 @router.get(
+    "/workspace/daily-digest",
+    response_model=DailyDigestResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_daily_digest(request: Request) -> dict:
+    scheduler = _workspace_scheduler(request)
+    return {"progress": scheduler.get_progress(), "papers": scheduler.get_today_papers()}
+
+
+@router.put(
+    "/workspace/daily-papers/status",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_api_key)],
+)
+def update_daily_paper_status(
+    payload: DailyPaperStatusUpdateRequest,
+    request: Request,
+) -> Response:
+    scheduler = _workspace_scheduler(request)
+    if not any(
+        item["keyword"] == payload.keyword and item["title"] == payload.title
+        for item in scheduler.get_today_papers()
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="今日检索结果中未找到该论文")
+    scheduler.set_daily_paper_status(payload.keyword, payload.title, payload.status)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/workspace/daily-runs",
+    response_model=list[RunResponse],
+    dependencies=[Depends(require_api_key)],
+)
+def list_daily_runs(request: Request, limit: int = 20) -> list[dict]:
+    scheduler = _workspace_scheduler(request)
+    return [_daily_payload(run) for run in scheduler.list_daily_runs(limit=limit)]
+
+
+@router.get(
+    "/workspace/daily-runs/{run_id}",
+    response_model=DailyRunDetailResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_daily_run_detail(run_id: str, request: Request) -> dict:
+    scheduler = _workspace_scheduler(request)
+    run = scheduler.get_daily_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="daily run not found")
+    return _daily_run_detail_payload(scheduler, run)
+
+
+@router.get(
     "/workspace/settings",
     response_model=WorkspaceSettingsResponse,
     dependencies=[Depends(require_api_key)],
@@ -392,6 +515,28 @@ def list_session_messages(session_id: str, request: Request) -> list[dict]:
 
 
 @router.get(
+    "/sessions/{session_id}/usage",
+    response_model=SessionUsageResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_session_usage(session_id: str, request: Request) -> dict:
+    """Return persisted counters without reloading conversation content."""
+    if not request.app.state.agent.sessions.get(session_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found")
+    usage = request.app.state.agent.sessions.get_usage(session_id)
+    return {
+        key: max(0, int(value)) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+        for key, value in {
+            "prompt": usage.get("prompt"),
+            "completion": usage.get("completion"),
+            "total": usage.get("total"),
+            "calls": usage.get("calls"),
+            "context_limit": usage.get("context_limit"),
+        }.items()
+    }
+
+
+@router.get(
     "/sessions/{session_id}/runs",
     response_model=list[RunResponse],
     dependencies=[Depends(require_api_key)],
@@ -454,17 +599,27 @@ def create_run(payload: RunCreateRequest, request: Request) -> dict:
     """Create any externally runnable task through the one public run contract."""
     try:
         if payload.kind == "chat":
-            if not payload.session_id or not (payload.message or "").strip():
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="chat requires session_id and message")
-            run = _manager(request).start(payload.session_id, payload.message)
+            if not payload.session_id:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="chat requires session_id")
+            message = str(payload.message or "").strip()
+            if payload.upload_id:
+                try:
+                    message = _workspace_uploads(request).agent_message(payload.upload_id, message)
+                except KeyError:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="upload not found") from None
+            if not message:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="chat requires message or upload_id")
+            run = _manager(request).start(payload.session_id, message)
             session_id = payload.session_id
         elif payload.kind == "research":
-            if not payload.session_id or not (payload.query or "").strip():
+            if not payload.session_id or (not payload.resume and not (payload.query or "").strip()):
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="research requires session_id and query")
             manager = request.app.state.research_run_manager
             if manager is None:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="research queue unavailable")
-            run = manager.start(payload.session_id, payload.query, payload.scope)
+            run = manager.start(
+                payload.session_id, payload.query or "", payload.scope, resume=payload.resume,
+            )
             session_id = payload.session_id
         else:
             manager = request.app.state.daily_run_manager
@@ -511,6 +666,19 @@ def _badcase_payload(candidate: dict) -> dict:
             "occurrence_count", "created_at", "updated_at",
         )
     }
+
+
+@router.get(
+    "/workspace/badcases",
+    response_model=list[BadcaseCandidateResponse],
+    dependencies=[Depends(require_api_key)],
+)
+def list_badcases(request: Request, limit: int = 50) -> list[dict]:
+    """List content-free feedback candidates for the local review workflow."""
+    return [
+        _badcase_payload(candidate)
+        for candidate in request.app.state.badcase_store.list(limit=max(1, min(limit, 100)))
+    ]
 
 
 @router.post(

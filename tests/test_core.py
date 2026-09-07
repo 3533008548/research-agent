@@ -157,8 +157,8 @@ class TestFastAPIService(unittest.TestCase):
             self.cancelled.discard(run_id)
 
     class _FakeResearchBroker(_FakeRunBroker):
-        def enqueue(self, run_id, session_id, query, scope):
-            self.jobs.append((run_id, session_id, query, scope))
+        def enqueue(self, run_id, session_id, query, scope, *, resume=False):
+            self.jobs.append((run_id, session_id, query, scope, resume))
             return str(len(self.jobs))
 
         def reserve(self, _consumer, **_kwargs):
@@ -166,8 +166,8 @@ class TestFastAPIService(unittest.TestCase):
                 return None
             from api.redis_runs import QueuedResearchRun
 
-            run_id, session_id, query, scope = self.jobs.pop(0)
-            return QueuedResearchRun("research-job-1", run_id, session_id, query, scope)
+            run_id, session_id, query, scope, resume = self.jobs.pop(0)
+            return QueuedResearchRun("research-job-1", run_id, session_id, query, scope, resume)
 
     class _FakeDailyBroker(_FakeRunBroker):
         def enqueue(self, run_id, kind):
@@ -232,6 +232,30 @@ class TestFastAPIService(unittest.TestCase):
         self.assertEqual(started.json()["kind"], "chat")
         detail = client.get(f"/api/v1/runs/{started.json()['run_id']}")
         self.assertEqual(detail.json()["kind"], "chat")
+
+    def test_canonical_run_endpoint_resumes_latest_research(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+        from api.redis_runs import RedisResearchRunManager
+
+        broker = self._FakeResearchBroker()
+        manager = RedisResearchRunManager(self.agent, broker)
+        client = TestClient(create_app(agent=self.agent, research_run_manager=manager))
+        session_id = client.post("/api/v1/sessions", json={"title": "研究续跑"}).json()["thread_id"]
+        interrupted = self.store.create_research_run(session_id, "已中断的研究", status="running")
+        self.store.update_research_run(interrupted["run_id"], status="failed", evidence=[{"title": "已保存证据"}])
+
+        resumed = client.post("/api/v1/runs", json={
+            "kind": "research", "session_id": session_id, "scope": "public", "resume": True,
+        })
+        self.assertEqual(resumed.status_code, 202)
+        self.assertEqual(resumed.json()["run_id"], interrupted["run_id"])
+        self.assertEqual(resumed.json()["status"], "queued")
+        self.assertTrue(broker.jobs[-1][-1])
+        self.assertEqual(
+            client.post("/api/v1/runs", json={"kind": "research", "session_id": session_id}).status_code,
+            422,
+        )
 
     def test_session_messages_restore_only_user_visible_history(self):
         from fastapi.testclient import TestClient
@@ -306,9 +330,87 @@ class TestFastAPIService(unittest.TestCase):
             self.assertEqual(papers.status_code, 200)
             self.assertEqual(papers.json()[0]["title"], "本地论文")
 
+            uploaded = client.post(
+                "/api/v1/workspace/uploads",
+                files={"file": ("example.pdf", b"%PDF-1.4 test", "application/pdf")},
+            )
+            self.assertEqual(uploaded.status_code, 201)
+            upload = uploaded.json()
+            self.assertEqual(upload["kind"], "pdf")
+            self.assertFalse(upload["duplicate"])
+            self.assertTrue((paths.papers_dir / "example.pdf").is_file())
+            self.assertNotIn("path", upload)
+
+            duplicate = client.post(
+                "/api/v1/workspace/uploads",
+                files={"file": ("same-content.pdf", b"%PDF-1.4 test", "application/pdf")},
+            )
+            self.assertEqual(duplicate.status_code, 201)
+            self.assertTrue(duplicate.json()["duplicate"])
+            self.assertEqual(duplicate.json()["filename"], "example.pdf")
+            self.assertEqual(
+                client.post("/api/v1/workspace/uploads", files={"file": ("notes.txt", b"x", "text/plain")}).status_code,
+                422,
+            )
+
+            session_id = client.post("/api/v1/sessions", json={"title": "上传"}).json()["thread_id"]
+            started_upload = client.post("/api/v1/runs", json={
+                "kind": "chat", "session_id": session_id, "upload_id": upload["upload_id"],
+                "message": "请提取重点",
+            })
+            self.assertEqual(started_upload.status_code, 202)
+            upload_run = client.get(f"/api/v1/runs/{started_upload.json()['run_id']}")
+            self.assertEqual(upload_run.status_code, 200)
+            self.assertIn("read_pdf", upload_run.json()["answer"])
+            self.store.save_usage(session_id, {
+                "prompt": 120, "completion": 45, "total": 165, "calls": 2, "context_limit": 131072,
+            })
+            usage = client.get(f"/api/v1/sessions/{session_id}/usage")
+            self.assertEqual(usage.status_code, 200)
+            self.assertEqual(usage.json()["total"], 165)
+            self.assertEqual(
+                client.post("/api/v1/runs", json={
+                    "kind": "chat", "session_id": session_id, "upload_id": "upload-missing",
+                }).status_code,
+                404,
+            )
+
             created_keyword = client.post("/api/v1/workspace/daily-keywords", json={"keyword": "TSN scheduling"})
             self.assertEqual(created_keyword.status_code, 201)
             self.assertEqual(client.get("/api/v1/workspace/daily-keywords").json()[0]["keyword"], "TSN scheduling")
+            scheduler = app.state.workspace_scheduler
+            scheduler.record_daily_keyword_result("TSN scheduling", [{
+                "title": "A TSN Scheduling Paper", "url": "https://example.test/paper", "sources": ["ieee"],
+            }])
+            digest = client.get("/api/v1/workspace/daily-digest")
+            self.assertEqual(digest.status_code, 200)
+            self.assertEqual(digest.json()["papers"][0]["source"], "ieee")
+            self.assertEqual(
+                client.put("/api/v1/workspace/daily-papers/status", json={
+                    "keyword": "TSN scheduling", "title": "A TSN Scheduling Paper", "status": "want_read",
+                }).status_code,
+                204,
+            )
+            self.assertEqual(client.get("/api/v1/workspace/daily-digest").json()["papers"][0]["status"], "want_read")
+            daily_run = scheduler.create_daily_run("daily", ["TSN scheduling"], status="queued")
+            scheduler.save_daily_candidates(daily_run["run_id"], [{
+                "candidate_id": "daily-paper-1", "title": "A TSN Scheduling Paper",
+                "url": "https://example.test/paper", "sources": ["ieee"], "year": 2026,
+                "citation_count": 12, "selected": True,
+                "curation": {"reason": "与关键词高度相关", "tags": ["TSN", "scheduling"]},
+            }])
+            scheduler.update_daily_run(
+                daily_run["run_id"], status="completed",
+                results={"brief": "今日推荐 1 篇", "selected": [{"candidate_id": "daily-paper-1"}]},
+                critique={"warnings": ["阅读前核验实验设置。"]},
+            )
+            listed_daily_runs = client.get("/api/v1/workspace/daily-runs")
+            self.assertEqual(listed_daily_runs.status_code, 200)
+            self.assertEqual(listed_daily_runs.json()[0]["run_id"], daily_run["run_id"])
+            daily_detail = client.get(f"/api/v1/workspace/daily-runs/{daily_run['run_id']}")
+            self.assertEqual(daily_detail.status_code, 200)
+            self.assertEqual(daily_detail.json()["papers"][0]["reason"], "与关键词高度相关")
+            self.assertEqual(client.get("/api/v1/workspace/daily-runs/daily-missing").status_code, 404)
             self.assertEqual(client.delete("/api/v1/workspace/daily-keywords/TSN%20scheduling").status_code, 204)
 
             saved = client.put("/api/v1/workspace/settings", json={
@@ -355,6 +457,10 @@ class TestFastAPIService(unittest.TestCase):
             self.assertEqual(duplicate.status_code, 200)
             self.assertEqual(duplicate.json()["candidate_id"], candidate_id)
             self.assertEqual(duplicate.json()["occurrence_count"], 2)
+            listed = client.get("/api/v1/workspace/badcases")
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual(listed.json()[0]["candidate_id"], candidate_id)
+            self.assertNotIn("note", listed.json()[0])
 
             self.assertEqual(client.delete(f"/api/v1/sessions/{session_id}").status_code, 204)
             self.assertIsNone(app.state.badcase_store.get(candidate_id))
@@ -534,6 +640,15 @@ class TestFastAPIService(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["final_answer"], "研究完成：RAG 重排方法")
         self.assertTrue(any(event["type"] == "status" for event in broker.events[started["run_id"]]))
+
+        interrupted = self.store.create_research_run(session_id, "可恢复的研究", status="running")
+        self.store.update_research_run(interrupted["run_id"], status="failed", evidence=[{"title": "已保存证据"}])
+        resumed = manager.start(session_id, "", "public", resume=True)
+        self.assertEqual(resumed["run_id"], interrupted["run_id"])
+        self.assertEqual(resumed["status"], "queued")
+        self.assertTrue(broker.jobs[-1][-1])
+        self.assertTrue(worker.run_once(block_ms=1))
+        self.assertEqual(manager.get(resumed["run_id"])["status"], "completed")
 
     def test_durable_worker_executes_queued_daily_run(self):
         from api.redis_runs import RedisDailyRunManager, RedisDailyRunWorker

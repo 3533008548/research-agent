@@ -14,6 +14,17 @@ export interface Session {
 }
 
 export type RunKind = "chat" | "research" | "daily";
+export type DailyRunKind = "daily" | "retry" | "search" | "resume";
+export type DailyPaperStatus = "new" | "want_read" | "read" | "skipped";
+export type ResearchScope = "both" | "local" | "public";
+export type BadcaseCategory =
+  | "retrieval_miss"
+  | "citation_quality"
+  | "answer_quality"
+  | "tool_failure"
+  | "performance"
+  | "safety"
+  | "other";
 
 export interface RunStart {
   run_id: string;
@@ -71,11 +82,75 @@ export interface Paper {
   indexed_at: string;
 }
 
+export interface WorkspaceUpload {
+  upload_id: string;
+  filename: string;
+  kind: "pdf" | "image";
+  size_bytes: number;
+  duplicate: boolean;
+}
+
 export interface DailyKeyword {
   keyword: string;
   active: boolean;
   added_at: string;
   search_status: string;
+}
+
+export interface DailyPaper {
+  keyword: string;
+  title: string;
+  url: string;
+  source: string;
+  status: DailyPaperStatus;
+  searched_at: string;
+}
+
+export interface DailyDigest {
+  progress: string;
+  papers: DailyPaper[];
+}
+
+export interface DailyRunPaper {
+  title: string;
+  url: string;
+  source: string;
+  year: number | null;
+  citation_count: number | null;
+  reason: string;
+  tags: string[];
+  selected: boolean;
+}
+
+export interface DailyRunDetail {
+  run_id: string;
+  kind: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  brief: string;
+  warnings: string[];
+  papers: DailyRunPaper[];
+}
+
+export interface SessionUsage {
+  prompt: number;
+  completion: number;
+  total: number;
+  calls: number;
+  context_limit: number;
+}
+
+export interface BadcaseCandidate {
+  candidate_id: string;
+  run_id: string;
+  category: BadcaseCategory;
+  source: string;
+  status: "triage" | "promoted" | "dismissed";
+  fingerprint: string;
+  occurrence_count: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface WorkspaceSettings {

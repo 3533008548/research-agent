@@ -26,6 +26,16 @@ class SessionMessageResponse(BaseModel):
     content: str
 
 
+class SessionUsageResponse(BaseModel):
+    """Persisted token counters for the active conversation only."""
+
+    prompt: int = 0
+    completion: int = 0
+    total: int = 0
+    calls: int = 0
+    context_limit: int = 0
+
+
 class ResearchDocumentResponse(BaseModel):
     document_id: str
     title: str
@@ -47,6 +57,14 @@ class PaperResponse(BaseModel):
     indexed_at: str = ""
 
 
+class WorkspaceUploadResponse(BaseModel):
+    upload_id: str
+    filename: str
+    kind: Literal["pdf", "image"]
+    size_bytes: int
+    duplicate: bool = False
+
+
 class DailyKeywordResponse(BaseModel):
     keyword: str
     active: bool
@@ -56,6 +74,48 @@ class DailyKeywordResponse(BaseModel):
 
 class DailyKeywordCreateRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=500)
+
+
+class DailyPaperResponse(BaseModel):
+    keyword: str
+    title: str
+    url: str = ""
+    source: str = ""
+    status: Literal["new", "want_read", "read", "skipped"] = "new"
+    searched_at: str = ""
+
+
+class DailyDigestResponse(BaseModel):
+    progress: str = ""
+    papers: list[DailyPaperResponse] = Field(default_factory=list)
+
+
+class DailyRunPaperResponse(BaseModel):
+    title: str
+    url: str = ""
+    source: str = ""
+    year: int | None = None
+    citation_count: int | None = None
+    reason: str = ""
+    tags: list[str] = Field(default_factory=list)
+    selected: bool = False
+
+
+class DailyRunDetailResponse(BaseModel):
+    run_id: str
+    kind: str
+    status: str
+    created_at: str
+    updated_at: str
+    brief: str = ""
+    warnings: list[str] = Field(default_factory=list)
+    papers: list[DailyRunPaperResponse] = Field(default_factory=list)
+
+
+class DailyPaperStatusUpdateRequest(BaseModel):
+    keyword: str = Field(min_length=1, max_length=500)
+    title: str = Field(min_length=1, max_length=1_000)
+    status: Literal["want_read", "read", "skipped"]
 
 
 class WorkspaceSettingsResponse(BaseModel):
@@ -110,8 +170,10 @@ class RunCreateRequest(BaseModel):
     kind: Literal["chat", "research", "daily"]
     session_id: str | None = Field(default=None, max_length=120)
     message: str | None = Field(default=None, max_length=12_000)
+    upload_id: str | None = Field(default=None, max_length=80)
     query: str | None = Field(default=None, max_length=12_000)
     scope: Literal["both", "local", "public"] = "both"
+    resume: bool = False
     daily_kind: Literal["daily", "retry", "search", "resume"] | None = None
     keyword: str | None = Field(default=None, max_length=500)
 

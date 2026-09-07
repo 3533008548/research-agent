@@ -6,6 +6,7 @@ langgraph>=0.2
 langgraph-checkpoint-sqlite
 gradio>=5.0
 fastapi>=0.110
+python-multipart>=0.0.9
 uvicorn>=0.27
 python-dotenv>=1.0.0
 redis>=5.0,<7

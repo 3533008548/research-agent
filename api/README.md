@@ -67,13 +67,20 @@ Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TL
 | `GET`、`POST` | `/api/v1/sessions` | 列出或创建会话 |
 | `DELETE` | `/api/v1/sessions/{session_id}` | 取消会话中的活跃任务并删除会话 |
 | `GET` | `/api/v1/sessions/{session_id}/messages` | 恢复该会话的用户可见对话 |
+| `GET` | `/api/v1/sessions/{session_id}/usage` | 读取该会话持久化的输入、输出与合计 Token 统计 |
 | `GET` | `/api/v1/sessions/{session_id}/runs` | 列出该会话最近的聊天与深度研究任务 |
 | `GET` | `/api/v1/workspace/research-documents` | 列出研究档案元数据 |
 | `GET` | `/api/v1/workspace/research-documents/{id}` | 按需读取一份研究档案的 Markdown |
 | `GET` | `/api/v1/workspace/research-documents/{id}/download` | 下载该档案的 Word 文档 |
 | `GET` | `/api/v1/workspace/papers` | 列出本地已索引论文与片段数 |
+| `POST` | `/api/v1/workspace/uploads` | 上传 PDF 或图片，返回仅当前服务可用的脱敏上传 ID |
 | `GET`、`POST` | `/api/v1/workspace/daily-keywords` | 列出或添加每日检索关键词 |
 | `DELETE` | `/api/v1/workspace/daily-keywords/{keyword}` | 删除一个每日检索关键词 |
+| `GET` | `/api/v1/workspace/daily-digest` | 读取当天论文与本地阅读状态 |
+| `PUT` | `/api/v1/workspace/daily-papers/status` | 更新当天论文为想读、已读或跳过 |
+| `GET` | `/api/v1/workspace/daily-runs` | 列出最近每日检索运行 |
+| `GET` | `/api/v1/workspace/daily-runs/{run_id}` | 读取某次检索的摘要、质量提示与论文推荐，用于报告标签页 |
+| `GET` | `/api/v1/workspace/badcases` | 列出内容安全的本地 Badcase 候选 |
 | `GET`、`PUT` | `/api/v1/workspace/settings` | 读取或保存运行时设置（重启后生效） |
 | `POST` | `/api/v1/chat` | 兼容用聊天入口：创建一个聊天任务 |
 | `POST` | `/api/v1/runs` | 创建 `chat`、`research` 或 `daily` 任务 |
@@ -87,6 +94,10 @@ Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TL
 
 每日任务的 `daily_kind` 支持 `daily`、`retry`、`search`、`resume`：其中 `resume`
 会使用原 `run_id` 重新排队最近一次可恢复的每日任务。
+
+深度研究可在请求体中传入 `scope`（`both`、`local` 或 `public`）限定来源范围。传入
+`{"kind":"research","session_id":"…","resume":true}` 会继续当前会话最近一项未完成研究，
+沿用其 `run_id` 与已持久化证据；若该研究已经完成，则直接返回已有结果，不会重复执行。
 
 ### 持久运行事件
 

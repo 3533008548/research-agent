@@ -1,6 +1,12 @@
 import {
   ApiError,
+  type BadcaseCandidate,
+  type BadcaseCategory,
   type DailyKeyword,
+  type DailyDigest,
+  type DailyRunDetail,
+  type DailyPaperStatus,
+  type DailyRunKind,
   type Message,
   type Paper,
   type ResearchDocument,
@@ -9,7 +15,10 @@ import {
   type RunEvent,
   type RunKind,
   type RunStart,
+  type ResearchScope,
   type Session,
+  type SessionUsage,
+  type WorkspaceUpload,
   type WorkspaceSettings,
 } from "./types";
 
@@ -70,12 +79,35 @@ export function getSessionMessages(apiKey: string, sessionId: string): Promise<M
   return request(`/sessions/${encodeURIComponent(sessionId)}/messages`, apiKey);
 }
 
+export function getSessionUsage(apiKey: string, sessionId: string): Promise<SessionUsage> {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/usage`, apiKey);
+}
+
+export function listSessionRuns(apiKey: string, sessionId: string): Promise<Run[]> {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/runs`, apiKey);
+}
+
 export function listResearchDocuments(apiKey: string): Promise<ResearchDocument[]> {
   return request("/workspace/research-documents", apiKey);
 }
 
 export function getResearchDocument(apiKey: string, documentId: string): Promise<ResearchDocumentDetail> {
   return request(`/workspace/research-documents/${encodeURIComponent(documentId)}`, apiKey);
+}
+
+export async function uploadWorkspaceFile(apiKey: string, file: File): Promise<WorkspaceUpload> {
+  const body = new FormData();
+  body.append("file", file, file.name);
+  const response = await fetch(`${API_PREFIX}/workspace/uploads`, {
+    method: "POST",
+    headers: headers(apiKey),
+    body,
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({ detail: "文件上传失败" }));
+    throw new ApiError(data.detail || "文件上传失败", response.status);
+  }
+  return response.json() as Promise<WorkspaceUpload>;
 }
 
 export async function downloadResearchDocument(apiKey: string, document: ResearchDocumentDetail): Promise<void> {
@@ -110,6 +142,46 @@ export function deleteDailyKeyword(apiKey: string, keyword: string): Promise<voi
   return request(`/workspace/daily-keywords/${encodeURIComponent(keyword)}`, apiKey, { method: "DELETE" });
 }
 
+export function getDailyDigest(apiKey: string): Promise<DailyDigest> {
+  return request("/workspace/daily-digest", apiKey);
+}
+
+export function updateDailyPaperStatus(
+  apiKey: string,
+  keyword: string,
+  title: string,
+  status: Exclude<DailyPaperStatus, "new">,
+): Promise<void> {
+  return request("/workspace/daily-papers/status", apiKey, {
+    method: "PUT",
+    body: JSON.stringify({ keyword, title, status }),
+  });
+}
+
+export function listDailyRuns(apiKey: string): Promise<Run[]> {
+  return request("/workspace/daily-runs", apiKey);
+}
+
+export function getDailyRunDetail(apiKey: string, runId: string): Promise<DailyRunDetail> {
+  return request(`/workspace/daily-runs/${encodeURIComponent(runId)}`, apiKey);
+}
+
+export function listBadcases(apiKey: string): Promise<BadcaseCandidate[]> {
+  return request("/workspace/badcases", apiKey);
+}
+
+export function createBadcase(
+  apiKey: string,
+  runId: string,
+  category: BadcaseCategory,
+  note = "",
+): Promise<BadcaseCandidate> {
+  return request(`/runs/${encodeURIComponent(runId)}/badcases`, apiKey, {
+    method: "POST",
+    body: JSON.stringify({ category, note: note.trim() || undefined }),
+  });
+}
+
 export function getWorkspaceSettings(apiKey: string): Promise<WorkspaceSettings> {
   return request("/workspace/settings", apiKey);
 }
@@ -133,14 +205,35 @@ export function createRun(
   kind: Extract<RunKind, "chat" | "research">,
   sessionId: string,
   content: string,
+  uploadId?: string,
+  researchScope: ResearchScope = "both",
+  resume = false,
 ): Promise<RunStart> {
   return request("/runs", apiKey, {
     method: "POST",
     body: JSON.stringify(
       kind === "chat"
-        ? { kind, session_id: sessionId, message: content }
-        : { kind, session_id: sessionId, query: content, scope: "both" },
+        ? { kind, session_id: sessionId, message: content || undefined, upload_id: uploadId }
+        : {
+          kind, session_id: sessionId, query: content || undefined,
+          scope: researchScope, resume: resume || undefined,
+        },
     ),
+  });
+}
+
+export function createDailyRun(
+  apiKey: string,
+  dailyKind: DailyRunKind,
+  keyword?: string,
+): Promise<RunStart> {
+  return request("/runs", apiKey, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "daily",
+      daily_kind: dailyKind,
+      keyword: dailyKind === "search" ? keyword?.trim() || undefined : undefined,
+    }),
   });
 }
 

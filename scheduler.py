@@ -661,3 +661,52 @@ class Scheduler:
             (f"{today}%",),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_today_papers(self) -> list[dict]:
+        """Return today's curated papers with their local reading state."""
+        today = date.today().isoformat()
+        engagement = {
+            (str(row["keyword"]), str(row["paper_title"])): str(row["status"])
+            for row in self._conn.execute(
+                "SELECT keyword, paper_title, status FROM engagement WHERE date=?", (today,),
+            ).fetchall()
+        }
+        papers: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for search in self.get_today_results():
+            keyword = str(search.get("keyword") or "")
+            try:
+                results = json.loads(search.get("results_json") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                results = []
+            if not isinstance(results, list):
+                continue
+            for result in results:
+                item = result if isinstance(result, dict) else {"title": str(result or "")}
+                title = str(item.get("title") or "").strip()
+                key = (keyword, title)
+                if not title or key in seen:
+                    continue
+                seen.add(key)
+                sources = item.get("sources") or item.get("source") or ""
+                source = ", ".join(str(value) for value in sources) if isinstance(sources, list) else str(sources)
+                papers.append({
+                    "keyword": keyword,
+                    "title": title,
+                    "url": str(item.get("url") or ""),
+                    "source": source,
+                    "status": engagement.get(key, "new"),
+                    "searched_at": str(search.get("searched_at") or ""),
+                })
+        return papers
+
+    def set_daily_paper_status(self, keyword: str, paper_title: str, status: str) -> None:
+        """Persist one explicit reading decision for a paper shown in today's digest."""
+        if status == "want_read":
+            self.mark_want_read(keyword, paper_title)
+        elif status == "read":
+            self.mark_read(keyword, paper_title)
+        elif status == "skipped":
+            self.mark_skip(keyword, paper_title)
+        else:
+            raise ValueError("不支持的论文阅读状态")

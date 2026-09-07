@@ -82,13 +82,14 @@ class ResearchOrchestrator:
         on_progress: ProgressCallback | None = None,
     ) -> ResearchResult:
         query = (query or "").strip()
-        if run_id and resume:
-            raise ValueError("不能同时指定现有研究运行和 resume")
         if run_id:
             run = self.sessions.get_research_run(run_id)
             if not run or run.get("thread_id") != thread_id:
                 raise ValueError("深度研究运行不存在，或不属于当前会话")
-            if run.get("status") not in {"queued", "running", "cancelling"}:
+            allowed_statuses = {"queued", "running", "cancelling"}
+            if resume:
+                allowed_statuses.update({"failed", "cancelled", "partial_failed"})
+            if run.get("status") not in allowed_statuses:
                 raise ValueError("深度研究运行不是可执行状态")
             query = query or str(run.get("query") or "").strip()
         else:
@@ -114,12 +115,7 @@ class ResearchOrchestrator:
             raise ValueError("请提供研究问题")
         if scope not in {"both", "local", "public"}:
             scope = "both"
-        reuse_evidence = bool(
-            run
-            and not run_id
-            and run.get("status") in {"cancelled", "failed", "running"}
-            and run.get("evidence")
-        )
+        reuse_evidence = bool(run and resume and run.get("evidence"))
         if reuse_evidence:
             run_id = str(run["run_id"])
             query = str(run["query"])

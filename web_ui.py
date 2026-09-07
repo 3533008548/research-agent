@@ -17,8 +17,6 @@ import html
 import os
 import re
 import sys
-import shutil
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -45,6 +43,7 @@ from badcase_store import BadcaseStore
 from research_documents import ResearchDocumentStore
 from run_timeline import RunTimelineService
 from ui_request_guard import BrowserRunGuard
+from workspace_uploads import UploadValidationError, WorkspaceUploadStore
 
 
 # Gradio does not enable inline delimiters unless they are supplied explicitly.
@@ -227,7 +226,7 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
     agent = agent or ResearchAgent(cfg=cfg)
     badcases = BadcaseStore(str(cfg.runtime_paths.badcases_db))
     research_documents = ResearchDocumentStore(cfg.runtime_paths)
-    pending_conflicts = {}
+    uploads = WorkspaceUploadStore(cfg.runtime_paths)
     from scheduler import Scheduler
     scheduler = Scheduler(
         cfg.daily_db, request_timeout_seconds=cfg.daily_request_timeout_seconds,
@@ -479,14 +478,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
 
     # ═══ 聊天函数 ═══
 
-    def _build_file_cmd(text: str, dest: Path, ext: str) -> str:
-        """根据文件类型构建 Agent 命令"""
-        if ext == ".pdf":
-            cmd = f"read_pdf {dest}"
-        else:
-            cmd = f"describe_image {dest}"
-        return cmd if not text else f"{cmd}\n{text}"
-
     def assistant_reply(
         message, session_id: str,
         request: gr.Request | None = None,
@@ -505,73 +496,16 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
         else:
             text = message.strip() if isinstance(message, str) else ""
 
-        # 保存上传文件 + 构建命令（含校验）
+        # Upload storage is shared with FastAPI; Gradio only supplies its
+        # temporary path while the storage and naming rules live in one place.
         for fpath in files:
-            fname = Path(fpath).name
-            fsize = Path(fpath).stat().st_size
-            ext = Path(fpath).suffix.lower()
-            if ext not in (".pdf", ".png", ".jpg", ".jpeg"):
-                yield f"⚠️ 不支持的文件类型: {ext}"; return
-
-            # 大小校验（100MB）
-            if fsize > 100 * 1024 * 1024:
-                yield f"⚠️ 文件过大（{fsize/1024/1024:.0f}MB，上限 100MB）"; return
-
-            # 内容 hash
-            file_hash = hashlib.md5(Path(fpath).read_bytes()).hexdigest()
-            base_dir = Path(cfg.papers_dir) if ext == ".pdf" else Path(cfg.images_dir)
-            dest = cfg.runtime_paths.safe_child(base_dir, fname)
-
-            # 检查内容重复
-            dup_path = None
-            for existing in base_dir.glob("*"):
-                if existing.is_file() and existing.suffix.lower() == ext:
-                    try:
-                        if hashlib.md5(existing.read_bytes()).hexdigest() == file_hash:
-                            dup_path = existing; break
-                    except Exception:
-                        pass
-
-            # 处理冲突
-            if dup_path and dup_path.name != fname:
-                yield f"⚠️ 文件内容与 `{dup_path.name}` 完全相同。回复「**保存**」继续上传或「**跳过**」取消。"
-                pending_conflicts[(session_id, fpath)] = {
-                    "dest": dest, "hash": file_hash, "existing": dup_path, "text": text,
-                }
+            try:
+                with Path(fpath).open("rb") as source:
+                    upload = uploads.save(Path(fpath).name, source)
+            except (OSError, UploadValidationError) as exc:
+                yield f"⚠️ 上传失败：{exc}"
                 return
-            elif dest.exists():
-                yield f"⚠️ `{fname}` 已存在。回复「**覆盖**」替换或「**重命名**」自动改名。"
-                pending_conflicts[(session_id, fpath)] = {
-                    "dest": dest, "hash": file_hash, "existing": dest, "text": text,
-                }
-                return
-
-            # 无冲突 → 直接保存
-            shutil.copy(fpath, dest)
-            text = _build_file_cmd(text, dest, ext)
-
-        # 检查是否有待处理的冲突回复
-        msg = text.strip()
-        if msg in ("覆盖", "重命名", "保存", "跳过") and pending_conflicts:
-            for conflict_key, info in list(pending_conflicts.items()):
-                conflict_session_id, fpath = conflict_key
-                if conflict_session_id != session_id:
-                    continue
-                if msg == "覆盖":
-                    shutil.copy(fpath, info["dest"])
-                    text = _build_file_cmd(info["text"], info["dest"], info["dest"].suffix.lower())
-                elif msg == "重命名":
-                    new_name = f"{info['dest'].stem}_1{info['dest'].suffix}"
-                    new_dest = info["dest"].parent / new_name
-                    shutil.copy(fpath, new_dest)
-                    text = _build_file_cmd(info["text"], new_dest, new_dest.suffix.lower())
-                elif msg == "保存":
-                    shutil.copy(fpath, info["dest"])
-                    text = _build_file_cmd(info["text"], info["dest"], info["dest"].suffix.lower())
-                elif msg == "跳过":
-                    yield "✅ 已跳过。"; return
-                pending_conflicts.pop(conflict_key)
-                break
+            text = f"{uploads.agent_message(upload.upload_id)}\n{text}".strip()
 
         msg = text.strip()
 
@@ -1255,8 +1189,6 @@ def build_ui(*, cfg=None, agent=None, launch: bool = True):
         _invalidate_browser_request(request)
         agent.delete_session(session_id)
         badcases.delete_for_session(session_id)
-        for key in [key for key in pending_conflicts if key[0] == session_id]:
-            pending_conflicts.pop(key, None)
         remaining = agent.list_sessions()
         next_session_id = remaining[0]["thread_id"] if remaining else agent.thread_id
         history = agent.get_history(next_session_id)

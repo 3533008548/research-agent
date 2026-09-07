@@ -15,6 +15,7 @@ from api.run_manager import ChatRunManager
 from badcase_store import BadcaseStore
 from research_documents import ResearchDocumentStore
 from scheduler import Scheduler
+from workspace_uploads import WorkspaceUploadStore
 
 
 def _default_badcase_store(agent) -> BadcaseStore:
@@ -59,6 +60,7 @@ def create_app(
     cfg = getattr(agent, "cfg", None)
     paths = getattr(cfg, "runtime_paths", None)
     app.state.workspace_paths = paths
+    app.state.workspace_uploads = WorkspaceUploadStore(paths) if paths else None
     app.state.research_document_store = ResearchDocumentStore(paths) if paths else None
     app.state.workspace_scheduler = (
         getattr(daily_run_manager, "scheduler", None)

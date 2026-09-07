@@ -260,6 +260,7 @@ class QueuedResearchRun:
     session_id: str
     query: str
     scope: str
+    resume: bool = False
 
 
 class RedisResearchRunBroker(RedisChatRunBroker):
@@ -273,11 +274,16 @@ class RedisResearchRunBroker(RedisChatRunBroker):
     def group_name(self) -> str:
         return f"{self.prefix}:research-workers"
 
-    def enqueue(self, run_id: str, session_id: str, query: str, scope: str) -> str:
+    def enqueue(
+        self, run_id: str, session_id: str, query: str, scope: str, *, resume: bool = False,
+    ) -> str:
         try:
             item_id = self._redis.xadd(
                 self.queue_key,
-                {"run_id": run_id, "session_id": session_id, "query": query, "scope": scope},
+                {
+                    "run_id": run_id, "session_id": session_id, "query": query,
+                    "scope": scope, "resume": "1" if resume else "0",
+                },
             )
             return str(item_id)
         except Exception as exc:
@@ -290,6 +296,7 @@ class RedisResearchRunBroker(RedisChatRunBroker):
                 message_id=str(message_id), run_id=str(fields["run_id"]),
                 session_id=str(fields["session_id"]), query=str(fields["query"]),
                 scope=str(fields.get("scope") or "both"),
+                resume=str(fields.get("resume") or "").strip().lower() in {"1", "true", "yes"},
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -597,15 +604,28 @@ class RedisResearchRunManager(_RedisRunStream):
         self.agent = agent
         self.broker = broker
 
-    def start(self, session_id: str, query: str, scope: str = "both") -> dict[str, Any]:
+    def start(
+        self, session_id: str, query: str, scope: str = "both", *, resume: bool = False,
+    ) -> dict[str, Any]:
         if not self.agent.sessions.get(session_id):
             raise KeyError(session_id)
         if scope not in {"both", "local", "public"}:
             raise ValueError("invalid research scope")
-        run = self.agent.sessions.create_research_run(session_id, query, status="queued")
+        if resume:
+            run = self.agent.sessions.get_latest_research_run(session_id)
+            if run is None:
+                raise ValueError("当前会话没有可继续的深度研究")
+            if run.get("status") == "completed":
+                return run
+            run = self.agent.sessions.update_research_run(str(run["run_id"]), status="queued") or run
+            query = str(run.get("query") or "")
+        else:
+            if not query.strip():
+                raise ValueError("research query is blank")
+            run = self.agent.sessions.create_research_run(session_id, query, status="queued")
         run_id = str(run["run_id"])
         try:
-            self.broker.enqueue(run_id, session_id, query, scope)
+            self.broker.enqueue(run_id, session_id, query, scope, resume=resume)
             self.broker.publish(run_id, {"type": "status", "status": "queued", "run_id": run_id})
         except QueueUnavailableError:
             self.agent.sessions.update_research_run(run_id, status="failed")
@@ -619,7 +639,7 @@ class RedisResearchRunManager(_RedisRunStream):
                 runner="redis-worker",
                 model=str(self.agent.model),
                 scope=scope,
-                toolset="research-bounded",
+                toolset="research-resume" if resume else "research-bounded",
             ),
         )
         return self.get(run_id) or run
@@ -684,7 +704,7 @@ class RedisResearchRunWorker(_RedisRunWorker):
         try:
             self.agent.research(
                 job.query, scope=job.scope, session_id=job.session_id, run_id=job.run_id,
-                cancel_event=cancel_event,
+                resume=job.resume, cancel_event=cancel_event,
                 on_progress=lambda event: self.broker.publish(job.run_id, _safe_status_event(event)),
             )
             current = self.agent.sessions.get_research_run(job.run_id) or run
