@@ -4,25 +4,41 @@
 
 import sys
 from pathlib import Path
-from search_api import search_arxiv, search_semantic_scholar, list_downloaded_papers
+from paper_artifacts import load_document_map, related_context
+from search_api import list_downloaded_papers, search_public_papers
 from runtime_paths import get_runtime_paths
 
 
+def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    """Tool schemas are advisory; malformed model arguments must not abort a run."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
 def handle_search_papers(args: dict, **kw) -> str:
-    query = args.get("query", "")
-    source = args.get("source", "semantic_scholar")
-    limit = min(args.get("limit", 5), 10)
-    if source == "arxiv":
-        return search_arxiv(query, max_results=limit)
-    return search_semantic_scholar(query, limit=limit)
+    query = str(args.get("query", "") or "").strip()
+    if not query:
+        return "❌ 请提供论文检索关键词。"
+    source = str(args.get("source", "all") or "all").lower()
+    limit = _bounded_int(args.get("limit", 5), 5, 1, 10)
+    if source not in {"all", "openalex", "arxiv", "ieee"}:
+        return "❌ source 仅支持 all、openalex、arxiv 或 ieee。"
+    return search_public_papers(query, limit=limit, source=source)
 
 
 def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     if not paper_store:
         return "❌ RAG 功能未启用。"
-    query = args.get("query", "")
-    top_k = min(args.get("top_k", 3), 5)
-    section = args.get("section", None)
+    query = str(args.get("query", "") or "").strip()
+    if not query:
+        return "❌ 请提供要在论文库中检索的问题。"
+    top_k = _bounded_int(args.get("top_k", 3), 3, 1, 5)
+    section_value = args.get("section")
+    section = str(section_value).strip() if section_value is not None else None
+    section = section or None
     results, pending = paper_store.query_with_timeout(
         query, top_k=top_k, section=section,
     )
@@ -31,17 +47,36 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     if not results:
         prefix = f"⏳ {pending}\n\n" if pending else ""
         return prefix + "📭 未找到相关内容。请先阅读并索引论文（read_pdf 会自动索引）。"
-    is_keyword_result = results[0].get("retrieval") == "keyword"
+    retrieval_mode = results[0].get("retrieval", "semantic")
     prefix = f"⏳ {pending}\n\n" if pending else ""
-    heading = "关键词候选" if is_keyword_result else "检索结果"
+    heading = {
+        "keyword": "关键词候选",
+        "hybrid": "混合检索结果",
+    }.get(retrieval_mode, "语义检索结果")
     lines = [f"{prefix}📚 {heading} — 「{query}」（共 {len(results)} 条）\n"]
+    paths = get_runtime_paths()
     for i, r in enumerate(results, 1):
         sec = r.get("section", "未标注")
-        metric = (
-            f"关键词分: {r['keyword_score']}"
-            if is_keyword_result else f"距离: {r['distance']}"
-        )
-        lines.append(f"  {i}. [{r['title']} · {sec}章节]  {metric}\n     {r['text']}")
+        context = ""
+        locator = ""
+        element_id = str(r.get("element_id") or "")
+        if element_id and r.get("paper_id"):
+            document_map = load_document_map(paths, str(r["paper_id"]))
+            if document_map is not None:
+                context, locator = related_context(document_map, element_id)
+        if r.get("retrieval") == "keyword":
+            metric = f"关键词分: {r['keyword_score']}"
+        elif r.get("retrieval") == "hybrid":
+            metric = (
+                f"重排分: {r['reranker_score']}"
+                if r.get("reranked") else f"混合分: {r['hybrid_score']}"
+            )
+        else:
+            metric = f"距离: {r['distance']}"
+        location = f" · {locator}" if locator else ""
+        lines.append(f"  {i}. [{r['title']}{location} · {sec}章节]  {metric}\n     {r['text']}")
+        if context:
+            lines.append(f"     关联上下文：\n{context}")
     return "\n".join(lines)
 
 
@@ -64,7 +99,7 @@ def handle_list_indexed(args: dict, paper_store=None, **kw) -> str:
 def handle_delete_paper(args: dict, paper_store=None, **kw) -> str:
     if not paper_store:
         return "❌ RAG 功能未启用。"
-    pid_or_title = args.get("paper_id_or_title", "")
+    pid_or_title = str(args.get("paper_id_or_title", "") or "").strip()
     if not pid_or_title:
         return "❌ 请指定论文标题或 paper_id。"
     papers = paper_store.list_papers()

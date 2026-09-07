@@ -1,22 +1,28 @@
 """
-📄 PDF 增强阅读器 — 表格感知提取 + 双栏布局识别 + 章节自动标注
+📄 PDF 增强阅读器 — 表格感知提取 + 双栏布局重排 + 章节自动标注
 
-改进摘要（对比原始的 fitz.get_text()）：
+改进摘要：
   1. 表格感知 — 用 pdfplumber 提取表格并格式化为 Markdown 表格
-  2. 双栏布局 — 检测双栏排版，先读左栏再读右栏，避免文字交叉混排
+  2. 双栏布局 — 用 PyMuPDF 的文本块坐标，先读左栏再读右栏
   3. 章节标注 — 自动识别 Introduction / Method / Experiments 等标题并标注 ##
 """
 
 import re
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
+
+try:
+    import pymupdf
+except ImportError:
+    pymupdf = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -30,6 +36,7 @@ _SECTION_NAMES = [
     "background",
     "related work",
     "preliminaries",
+    "preliminary",
     "problem (?:formulation|definition|statement)",
     "method(?:ology)?",
     "proposed (?:method|approach|framework|architecture|model|algorithm|system)",
@@ -69,340 +76,357 @@ _SECTION_PATTERN = re.compile(
 # ═══════════════════════════════════════════════════════════════
 
 class PaperReader:
-    """增强型 PDF 阅读器 — 表格感知 + 双栏排序 + 章节标注"""
+    """增强型 PDF 阅读器，先保留页面元素关系，再渲染为兼容的 Markdown 文本。"""
+
+    _TABLE_CAPTION = re.compile(r"(?:table|tab\\.?|表)\\s*\\d+", re.IGNORECASE)
+    _FIGURE_CAPTION = re.compile(r"(?:figure|fig\\.?|图)\\s*\\d+", re.IGNORECASE)
 
     def __init__(self, max_pages: int = 15, max_chars: int | None = None):
-        if pdfplumber is None:
+        if pymupdf is None:
             raise ImportError(
-                "需要安装 pdfplumber 才能解析 PDF：\n"
-                "   pip install pdfplumber"
+                "需要安装 PyMuPDF 才能解析 PDF：\n"
+                "   pip install PyMuPDF"
             )
         self.max_pages = max_pages
         self.max_chars = max_chars
 
-    # ── 对外接口 ──
+    def parse_document(self, pdf_path: str | Path, *, extract_tables: bool = True) -> dict[str, Any]:
+        """Parse a PDF into page-scoped text, table and figure elements.
+
+        This is deliberately a plain dictionary so it can be persisted as JSON
+        and consumed by both the RAG indexer and evidence-card generator.
+
+        ``extract_tables=False`` is the deterministic fallback used only when
+        the table-aware pass fails its structural quality check.  It preserves
+        readable text and figures instead of letting an unreliable table mask
+        remove body blocks from the retrieval index.
+        """
+        source = Path(pdf_path)
+        if not source.exists():
+            raise FileNotFoundError(f"文件不存在: {source}")
+        if extract_tables and pdfplumber is None:
+            raise ImportError(
+                "需要安装 pdfplumber 才能进行表格感知解析：\n"
+                "   pip install pdfplumber"
+            )
+
+        table_context = pdfplumber.open(str(source)) if extract_tables else nullcontext(None)
+        with pymupdf.open(source) as text_pdf, table_context as table_pdf:
+            total_pages = len(text_pdf)
+            pages_to_read = min(total_pages, self.max_pages)
+            pages: list[dict[str, Any]] = []
+            section = "未标注"
+
+            for index in range(pages_to_read):
+                page_number = index + 1
+                text_blocks = self._extract_text_blocks(text_pdf[index])
+                table_elements = (
+                    self._extract_table_elements(table_pdf.pages[index], page_number, text_blocks)
+                    if table_pdf is not None else []
+                )
+                table_boxes = [element["bbox"] for element in table_elements]
+                text_blocks = [
+                    block for block in text_blocks
+                    if not any(self._center_in_box(block["bbox"], box) for box in table_boxes)
+                ]
+                text_elements, section = self._text_elements(
+                    text_blocks, page_number, section,
+                )
+                figure_elements = self._extract_figure_elements(
+                    text_pdf[index], page_number, text_blocks,
+                )
+                elements = text_elements + table_elements + figure_elements
+                self._link_related_elements(elements)
+                pages.append({"page": page_number, "elements": elements})
+
+        self._link_table_continuations(pages)
+        return {
+            "version": 1,
+            "source_file": source.name,
+            "total_pages": total_pages,
+            "processed_pages": pages_to_read,
+            "pages": pages,
+        }
 
     def read(self, pdf_path: str) -> str:
-        """
-        读取 PDF 并返回结构化文本。
+        """Keep the original text-returning interface for callers and users."""
+        try:
+            return self.render_document(self.parse_document(pdf_path))
+        except FileNotFoundError as exc:
+            return f"❌ {exc}"
 
-        返回格式：
-          📄 PDF 解析完成
-            文件名: xxx.pdf  |  总页数: N  |  已读: M  |  提取: X 字符
+    def render_document(self, document: dict[str, Any]) -> str:
+        """Render page elements as readable Markdown without losing page boundaries."""
+        page_texts: list[str] = []
+        for page_record in document.get("pages") or []:
+            page = page_record.get("page")
+            lines = [f"━━━ 第 {page} 页 ━━━"]
+            elements = list(page_record.get("elements") or [])
+            for element in elements:
+                kind = element.get("kind")
+                if kind == "text":
+                    text = str(element.get("text") or "").strip()
+                    if text:
+                        lines.append(f"## {text}" if element.get("is_heading") else text)
+                elif kind == "table":
+                    label = str(element.get("label") or "表格")
+                    caption = str(element.get("caption") or "").strip()
+                    lines.extend(["", f"📊 **{label}**" + (f"：{caption}" if caption else ""), str(element.get("text") or "")])
+                elif kind == "figure":
+                    label = str(element.get("label") or "图片")
+                    caption = str(element.get("caption") or "").strip()
+                    if caption:
+                        lines.extend(["", f"🖼️ **{label}**：{caption}"])
+            page_texts.append("\n".join(lines).strip())
 
-          ## Abstract
-          ...
-
-          ## 1. Introduction
-          ...
-        """
-        pdf_path = Path(pdf_path)
-        if not pdf_path.exists():
-            return f"❌ 文件不存在: {pdf_path}"
-
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            total_pages = len(pdf.pages)
-            pages_to_read = min(total_pages, self.max_pages)
-
-            page_texts = []
-            raw_tables = []  # (page_num, table_index, header: list, rows: list, y0: float, y1: float)
-
-            for i in range(pages_to_read):
-                page = pdf.pages[i]
-                text = self._extract_text(page)
-                if text:
-                    page_texts.append(f"━━━ 第 {i+1} 页 ━━━\n{text}")
-
-                # 提取表格（带位置，用于跨页检测）
-                found = page.find_tables()
-                for ti, tbl in enumerate(found):
-                    try:
-                        data = tbl.extract()
-                        if not data or len(data) < 2:
-                            continue
-                        header = [str(c or "").strip() for c in data[0]]
-                        rows = [[str(c or "").strip() for c in row] for row in data[1:] if any(str(c or "").strip() for c in row)]
-                        if not rows:
-                            continue
-                        raw_tables.append((i, ti, header, rows, float(tbl.bbox[1]), float(tbl.bbox[3])))
-                    except Exception:
-                        pass
-
-            # ── 跨页表格合并 ──
-            merged_tables = []
-            skip_next = set()
-            for idx in range(len(raw_tables)):
-                if idx in skip_next:
-                    continue
-                pn, ti, hdr, rows, y0, y1 = raw_tables[idx]
-                # 检查下一页是否有延续：同页号 + 2，且下一页表格列数匹配
-                for j in range(idx + 1, min(idx + 4, len(raw_tables))):
-                    pn2, ti2, hdr2, rows2, y0_2, y1_2 = raw_tables[j]
-                    if pn2 == pn + 1 and ti2 == 0 and y0_2 < 60:  # 下一页顶部
-                        if len(hdr) == len(hdr2):
-                            rows.extend(rows2)
-                            skip_next.add(j)
-                merged_tables.append((pn, hdr, rows))
-
-            # ── 格式化为 Markdown ──
-            table_mds = []
-            for pn, hdr, rows in merged_tables:
-                col_count = len(hdr)
-                md = []
-                hdr_padded = hdr + [""] * (col_count - len(hdr))
-                md.append("| " + " | ".join(hdr_padded) + " |")
-                md.append("| " + " | ".join(["---"] * col_count) + " |")
-                for row in rows:
-                    cells = (row + [""] * col_count)[:col_count]
-                    md.append("| " + " | ".join(cells) + " |")
-                table_mds.append("\n".join(md))
-
-            if table_mds:
-                # 表格直接插入对应页位置
-                page_texts.append("\n\n📊 **表格**:\n" + "\n\n".join(table_mds))
-
-        # 3) 章节标注（对整个文本做一次）
         full_text = "\n\n".join(page_texts)
-        full_text = self._mark_sections(full_text)
-
-        # 页码截断提示
-        if total_pages > self.max_pages:
-            full_text += f"\n\n...（共 {total_pages} 页，已读取前 {self.max_pages} 页）"
-
-        # Token 截断（max_chars=None 时不截断）
+        if document.get("total_pages", 0) > document.get("processed_pages", 0):
+            full_text += (
+                f"\n\n...（共 {document['total_pages']} 页，已读取前 "
+                f"{document['processed_pages']} 页）"
+            )
         char_count = len(full_text)
         if self.max_chars is not None and char_count > self.max_chars:
             full_text = full_text[:self.max_chars] + (
                 f"\n\n...（内容过长，已截断至前 {self.max_chars} 字符）"
             )
             char_count = self.max_chars
-
         return (
-            f"📄 **PDF 解析完成**\n"
-            f"   文件名: {pdf_path.name}  |  "
-            f"总页数: {total_pages}  |  已读: {pages_to_read}  |  "
-            f"提取: {char_count} 字符\n\n"
+            "📄 **PDF 解析完成**\n"
+            f"   文件名: {document.get('source_file', '未知')}  |  "
+            f"总页数: {document.get('total_pages', 0)}  |  "
+            f"已读: {document.get('processed_pages', 0)}  |  提取: {char_count} 字符\n\n"
             f"{full_text}"
         )
 
-    # ── 1️⃣ 双栏布局感知提取 ──
+    # ── 页面元素提取 ──
 
-    def _extract_text(self, page) -> str:
-        """从一页中提取文本，自动处理双栏布局"""
-        words = page.extract_words(keep_blank_chars=True, x_tolerance=3)
-        if not words:
-            return ""
-
-        # 分组为行（按 y 坐标）
-        lines = self._group_into_lines(words, page.height)
-
-        # 检测双栏
-        is_two_column, mid_x = self._detect_columns(lines, page.width)
-
-        if not is_two_column:
-            # 单栏：简单按 y 排序
-            lines.sort(key=lambda l: l["y"])
-            return "\n".join(l["text"] for l in lines)
-
-        # 双栏：分离出 左栏/右栏/跨栏 行
-        left, right, full = [], [], []
-        for line in lines:
-            avg_x = (line["x0"] + line["x1"]) / 2
-            # 跨栏：同时覆盖左右两侧
-            if line["x0"] < mid_x - 20 and line["x1"] > mid_x + 20:
-                full.append(line)
-            elif avg_x < mid_x:
-                left.append(line)
-            else:
-                right.append(line)
-
-        full.sort(key=lambda l: l["y"])
-        left.sort(key=lambda l: l["y"])
-        right.sort(key=lambda l: l["y"])
-
-        # 输出顺序：跨栏行插入左栏的对应 y 位置 → 然后输出右栏
-        ordered = []
-        left_idx = 0
-        for header_line in full:
-            # 在 left 中找到所有 y < header_line["y"] 的，先输出
-            while left_idx < len(left) and left[left_idx]["y"] <= header_line["y"]:
-                ordered.append(left[left_idx])
-                left_idx += 1
-            ordered.append(header_line)
-        # 剩余左栏
-        while left_idx < len(left):
-            ordered.append(left[left_idx])
-            left_idx += 1
-
-        result = [l["text"] for l in ordered]
-        result.append("")  # 分隔左栏和右栏
-        result.append("─── 右栏 ───")
-        result.extend(l["text"] for l in right)
-
-        return "\n".join(result)
-
-    def _group_into_lines(self, words: list[dict], page_height: float) -> list[dict]:
-        """将单词按行分组（基于 y 坐标容差）"""
-        if not words:
+    def _extract_text_blocks(self, page) -> list[dict[str, Any]]:
+        """Return text blocks in reading order while retaining their bounding boxes."""
+        page_width = float(page.rect.width)
+        page_height = float(page.rect.height)
+        blocks = []
+        for x0, y0, x1, y1, text, *_ in page.get_text("blocks"):
+            content = " ".join(text.split())
+            if not content or y0 >= page_height * 0.94 or y1 - y0 > page_height * 0.5:
+                continue
+            blocks.append({
+                "text": content,
+                "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                "x0": float(x0), "x1": float(x1), "y": float(y0),
+                "width": float(x1 - x0),
+            })
+        if not blocks:
             return []
 
-        # 估算行高：取最常见单词高度
-        heights = [w.get("height", 10) for w in words if w.get("height")]
-        y_tolerance = (max(heights) if heights else 10) * 0.6
+        mid_x = page_width / 2
+        column_width = page_width * 0.58
+        is_centered = lambda block: 0.4 <= (block["x0"] + block["x1"]) / (2 * page_width) <= 0.6
+        columns = [block for block in blocks if block["width"] <= column_width and not is_centered(block)]
+        left = [block for block in columns if (block["x0"] + block["x1"]) / 2 < mid_x]
+        right = [block for block in columns if (block["x0"] + block["x1"]) / 2 >= mid_x]
+        if len(left) < 3 or len(right) < 3:
+            return sorted(blocks, key=lambda block: (block["y"], block["x0"]))
 
-        lines = []
-        # 按 (y, x) 排序
-        sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
-
-        current = None
-        for w in sorted_words:
-            if current is None or abs(w["top"] - current["y"]) > y_tolerance:
-                if current is not None:
-                    lines.append(current)
-                current = {
-                    "text": w.get("text", ""),
-                    "x0": w["x0"],
-                    "x1": w["x1"],
-                    "y": w["top"],
-                    "words": [w],
-                }
-            else:
-                # 同行单词，x0/x1 延展
-                current["x0"] = min(current["x0"], w["x0"])
-                current["x1"] = max(current["x1"], w["x1"])
-                current["words"].append(w)
-                # 行文本：按 x 排序
-                current["words"].sort(key=lambda x: x["x0"])
-                current["text"] = " ".join(
-                    ww.get("text", "") for ww in current["words"]
-                )
-
-        if current is not None:
-            lines.append(current)
-
-        return lines
-
-    def _detect_columns(self, lines: list[dict], page_width: float) -> tuple:
-        """
-        检测页面是否为双栏布局。
-
-        返回: (is_two_column: bool, mid_x: float)
-        - 算法: 统计"仅左""仅右""跨栏"行的比例
-        - 若左右都有 >15% 的行，且跨栏行 <50%，判定为双栏
-        """
-        if not lines or page_width <= 0:
-            return False, page_width / 2
-
-        mid = page_width / 2
-        left_count = right_count = full_count = 0
-
-        for line in lines:
-            span = line["x1"] - line["x0"]
-            # 跨栏：行宽超过半页的 70%
-            if span > page_width * 0.35:
-                full_count += 1
-            elif (line["x0"] + line["x1"]) / 2 < mid:
-                left_count += 1
-            else:
-                right_count += 1
-
-        total = left_count + right_count + full_count
-        if total == 0:
-            return False, mid
-
-        left_ratio = left_count / total
-        right_ratio = right_count / total
-        full_ratio = full_count / total
-
-        is_two_col = (
-            left_ratio > 0.15
-            and right_ratio > 0.15
-            and full_ratio < 0.50
+        first_body_y = min(block["y"] for block in left + right)
+        header = [block for block in blocks if (block["width"] > column_width or is_centered(block)) and block["y"] < first_body_y]
+        trailing = [block for block in blocks if (block["width"] > column_width or is_centered(block)) and block["y"] >= first_body_y]
+        return (
+            sorted(header, key=lambda block: (block["y"], block["x0"]))
+            + sorted(left, key=lambda block: block["y"])
+            + sorted(right, key=lambda block: block["y"])
+            + sorted(trailing, key=lambda block: (block["y"], block["x0"]))
         )
-        return is_two_col, mid
 
-    # ── 2️⃣ 表格感知提取 ──
+    def _text_elements(
+        self, blocks: list[dict[str, Any]], page: int, current_section: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        elements = []
+        for index, block in enumerate(blocks, start=1):
+            text = block["text"]
+            is_heading = len(text) <= 80 and bool(_SECTION_PATTERN.match(text))
+            if is_heading:
+                current_section = text
+            elements.append({
+                "id": f"p{page:03d}-t{index:02d}",
+                "kind": "text",
+                "page": page,
+                "order": index,
+                "section": current_section,
+                "is_heading": is_heading,
+                "text": text,
+                "bbox": block["bbox"],
+                "related_ids": [],
+            })
+        return elements, current_section
 
-    def _extract_tables(self, page) -> str:
-        """提取页面中的表格，格式化为 Markdown"""
-        tables = page.extract_tables()
-        if not tables:
-            return ""
-
-        result_parts = []
-        for table in tables:
-            if not table or len(table) < 2:
-                continue  # 至少需要表头+一行数据
-
-            # 清理 None 和空白
-            cleaned = []
-            for row in table:
-                cleaned_row = [str(cell or "").strip() for cell in row]
-                # 跳过全空行
-                if any(cell for cell in cleaned_row):
-                    cleaned.append(cleaned_row)
-
-            if len(cleaned) < 2:
+    def _extract_table_elements(
+        self, page, page_number: int, text_blocks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        elements = []
+        try:
+            found = page.find_tables()
+        except Exception:
+            return elements
+        for index, table in enumerate(found, start=1):
+            try:
+                bbox = [float(value) for value in table.bbox]
+                if not self._valid_table_bbox(bbox, page):
+                    continue
+                data = table.extract()
+                if not data or len(data) < 2:
+                    continue
+                header = [str(cell or "").strip() for cell in data[0]]
+                rows = [
+                    [str(cell or "").strip() for cell in row]
+                    for row in data[1:]
+                    if any(str(cell or "").strip() for cell in row)
+                ]
+                cell_count = len(header) * (len(rows) + 1)
+                nonempty = sum(bool(cell) for row in [header, *rows] for cell in row)
+                if not rows or not cell_count or nonempty / cell_count < 0.35:
+                    continue
+                col_count = len(header)
+                markdown = self._table_markdown(header, rows)
+                caption_block = self._find_caption(text_blocks, bbox, self._TABLE_CAPTION, prefer_below=False)
+                caption = caption_block["text"] if caption_block else ""
+                label = self._caption_label(caption, self._TABLE_CAPTION, f"Table {index}")
+                elements.append({
+                    "id": f"p{page_number:03d}-b{len(elements) + 1:02d}",
+                    "kind": "table", "page": page_number, "order": 10_000 + index,
+                    "section": "未标注", "label": label, "caption": caption,
+                    "caption_element_id": "", "text": markdown, "bbox": bbox,
+                    "columns": col_count, "related_ids": [],
+                })
+            except Exception:
                 continue
+        return elements
 
-            # 对齐列数（以最长行为准）
-            col_count = max(len(row) for row in cleaned)
+    def _extract_figure_elements(
+        self, page, page_number: int, text_blocks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        images = []
+        try:
+            for info in page.get_image_info():
+                bbox = info.get("bbox")
+                if not bbox:
+                    continue
+                x0, y0, x1, y1 = (float(value) for value in bbox)
+                if (x1 - x0) * (y1 - y0) >= 5_000:
+                    images.append([x0, y0, x1, y1])
+        except Exception:
+            return []
+        groups: list[list[list[float]]] = []
+        for bbox in sorted(images, key=lambda item: (item[1], item[0])):
+            if groups and bbox[1] - max(item[3] for item in groups[-1]) < 20:
+                groups[-1].append(bbox)
+            else:
+                groups.append([bbox])
 
-            md = []
-            # 表头
-            header = self._pad_row(cleaned[0], col_count)
-            md.append("| " + " | ".join(header) + " |")
-            # 分隔线
-            md.append("| " + " | ".join(["---"] * col_count) + " |")
-            # 数据行
-            for row in cleaned[1:]:
-                cells = self._pad_row(row, col_count)
-                md.append("| " + " | ".join(cells) + " |")
-
-            result_parts.append("\n".join(md))
-
-        return "\n\n".join(result_parts)
+        elements = []
+        for index, group in enumerate(groups, start=1):
+            bbox = [min(item[0] for item in group), min(item[1] for item in group), max(item[2] for item in group), max(item[3] for item in group)]
+            caption_block = self._find_caption(text_blocks, bbox, self._FIGURE_CAPTION, prefer_below=True)
+            caption = caption_block["text"] if caption_block else ""
+            label = self._caption_label(caption, self._FIGURE_CAPTION, f"Figure {index}")
+            elements.append({
+                "id": f"p{page_number:03d}-f{index:02d}",
+                "kind": "figure", "page": page_number, "order": 20_000 + index,
+                "section": "未标注", "label": label, "caption": caption,
+                "caption_element_id": "", "asset_path": "", "bbox": bbox,
+                "related_ids": [],
+            })
+        return elements
 
     @staticmethod
-    def _pad_row(row: list[str], n: int) -> list[str]:
-        """补齐/截断行到 n 列"""
-        if len(row) > n:
-            return row[:n]
-        return row + [""] * (n - len(row))
+    def _table_markdown(header: list[str], rows: list[list[str]]) -> str:
+        col_count = len(header)
+        lines = [
+            "| " + " | ".join(header + [""] * (col_count - len(header))) + " |",
+            "| " + " | ".join(["---"] * col_count) + " |",
+        ]
+        for row in rows:
+            lines.append("| " + " | ".join((row + [""] * col_count)[:col_count]) + " |")
+        return "\n".join(lines)
 
-    # ── 3️⃣ 章节自动标注 ──
+    @staticmethod
+    def _valid_table_bbox(bbox: list[float], page) -> bool:
+        """Reject impossible pdfplumber boxes before a visual page becomes a fake table."""
+        if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            return False
+        page_height = float(getattr(page, "height", 0) or 0)
+        return not page_height or bbox[3] <= page_height + 2
 
-    def _mark_sections(self, text: str) -> str:
-        """在文本中检测章节标题，添加 ## 标记"""
-        lines = text.split("\n")
-        marked = []
-        prev_empty = False
+    @staticmethod
+    def _center_in_box(inner: list[float], outer: list[float]) -> bool:
+        center_x = (inner[0] + inner[2]) / 2
+        center_y = (inner[1] + inner[3]) / 2
+        return outer[0] <= center_x <= outer[2] and outer[1] <= center_y <= outer[3]
 
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped:
-                marked.append(line)
-                prev_empty = True
+    @staticmethod
+    def _caption_label(caption: str, pattern: re.Pattern, fallback: str) -> str:
+        match = pattern.search(caption or "")
+        return match.group(0).replace("Fig.", "Figure").replace("fig.", "Figure") if match else fallback
+
+    @staticmethod
+    def _find_caption(
+        text_blocks: list[dict[str, Any]], bbox: list[float], pattern: re.Pattern, *, prefer_below: bool,
+    ) -> dict[str, Any] | None:
+        candidates = []
+        for block in text_blocks:
+            if not pattern.search(block["text"]):
                 continue
-
-            # 章节标题的特征：短（≤80 字符）、独立行、匹配模式
-            if len(stripped) > 80:
-                marked.append(line)
-                prev_empty = False
-                continue
-
-            if _SECTION_PATTERN.match(stripped):
-                # 前面加空行（除非已有）
-                if not prev_empty:
-                    marked.append("")
-                marked.append(f"## {stripped}")
-                marked.append("")  # 标题后空行
-                prev_empty = True
+            x0, y0, x1, y1 = block["bbox"]
+            before = bbox[1] - y1
+            after = y0 - bbox[3]
+            if prefer_below:
+                direction, distance = (0, after) if after >= 0 else (1, before)
             else:
-                marked.append(line)
-                prev_empty = False
+                direction, distance = (0, before) if before >= 0 else (1, after)
+            if 0 <= distance <= 160:
+                candidates.append((direction, distance, block))
+        return min(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
 
-        return "\n".join(marked)
+    @staticmethod
+    def _link_related_elements(elements: list[dict[str, Any]]) -> None:
+        text_elements = [element for element in elements if element.get("kind") == "text"]
+        for element in elements:
+            if element.get("kind") == "text":
+                continue
+            bbox = element.get("bbox") or [0, 0, 0, 0]
+            caption = PaperReader._find_caption(
+                [{"text": text["text"], "bbox": text["bbox"], "id": text["id"]} for text in text_elements],
+                bbox,
+                PaperReader._TABLE_CAPTION if element.get("kind") == "table" else PaperReader._FIGURE_CAPTION,
+                prefer_below=element.get("kind") == "figure",
+            )
+            related = []
+            if caption:
+                element["caption_element_id"] = caption["id"]
+                related.append(caption["id"])
+            before = [text for text in text_elements if text["bbox"][3] <= bbox[1]]
+            after = [text for text in text_elements if text["bbox"][1] >= bbox[3]]
+            if before:
+                related.append(max(before, key=lambda text: text["bbox"][3])["id"])
+            if after:
+                related.append(min(after, key=lambda text: text["bbox"][1])["id"])
+            element["related_ids"] = list(dict.fromkeys(related))
+            nearest = next((text for text in reversed(before)), None) or next(iter(after), None)
+            if nearest:
+                element["section"] = nearest.get("section", "未标注")
+
+    @staticmethod
+    def _link_table_continuations(pages: list[dict[str, Any]]) -> None:
+        previous = None
+        for page in pages:
+            tables = [element for element in page.get("elements") or [] if element.get("kind") == "table"]
+            if previous and tables:
+                current = tables[0]
+                if current["bbox"][1] < 60 and current.get("columns") == previous.get("columns"):
+                    current["continued_from"] = previous["id"]
+                    previous["continued_to"] = current["id"]
+            if tables:
+                previous = tables[-1]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -424,7 +448,7 @@ def extract_images(
       5. 过滤面积 < 5000 px² 的小图（图标/logo）
     """
     try:
-        import fitz  # PyMuPDF
+        import pymupdf
     except ImportError:
         print("      ⚠ PyMuPDF 未安装，跳过图片提取。pip install PyMuPDF", file=sys.stderr)
         return []
@@ -449,7 +473,7 @@ def extract_images(
 
     saved = []
     captions_map = {}  # label → caption text（用于描述时附带）
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     total_pages = min(len(doc), max_pages)
 
     for page_num in range(total_pages):
@@ -534,7 +558,7 @@ def extract_images(
                 max_x = max(b[2] for b in bboxes)
                 max_y = max(b[3] for b in bboxes)
                 # 稍微扩展一点，避免边缘裁剪
-                clip = fitz.Rect(min_x - 5, min_y - 5, max_x + 5, max_y + 5)
+                clip = pymupdf.Rect(min_x - 5, min_y - 5, max_x + 5, max_y + 5)
                 pix = page.get_pixmap(clip=clip, dpi=150)
                 fname = img_dir / f"{stem}_{label}.png"
                 pix.save(str(fname))

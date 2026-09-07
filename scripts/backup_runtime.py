@@ -54,8 +54,10 @@ def main() -> int:
         for source, relative in (
             (paths.checkpoint_db, "primary/db/checkpoint.db"),
             (paths.memory_db, "primary/db/memory.db"),
-            (paths.notes_db, "primary/db/notes.db"),
+            # 笔记功能已下线；仍将旧数据库纳入备份，避免丢失用户已有数据。
+            (paths.database_dir / "notes.db", "primary/db/notes.db"),
             (paths.daily_db, "primary/db/daily.db"),
+            (paths.badcases_db, "primary/db/badcases.db"),
         ):
             _backup_sqlite(source, staging / relative)
         for source, relative in (
@@ -69,6 +71,8 @@ def main() -> int:
                 shutil.copy2(source, target)
         if paths.papers_dir.exists():
             shutil.copytree(paths.papers_dir, staging / "primary/papers")
+        if paths.research_documents_dir.exists():
+            shutil.copytree(paths.research_documents_dir, staging / "primary/research_documents")
         if args.include_derived:
             for source, relative in (
                 (paths.chroma_dir, "derived/chroma"),

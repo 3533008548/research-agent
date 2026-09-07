@@ -1,0 +1,222 @@
+{
+  "version": "v1.4",
+  "corpus": "synthetic-research-corpus-v1",
+  "tasks": [
+    {
+      "id": "T01",
+      "capability": "论文精读",
+      "title": "解释 DiffTSN 的扩散训练目标",
+      "fixture": {"paper_ids": ["diffusion-tsn"]},
+      "prompt": "精读 Conditional Diffusion for Multi-Agent TSN Scheduling，解释前向扩散、反向去噪和训练损失分别做什么。",
+      "expected": {
+        "tool_trace_contains": ["read_pdf", "query_papers"],
+        "answer_checks": [
+          {"label": "前向过程", "any_of": ["前向扩散", "加噪", "Gaussian noise"]},
+          {"label": "反向过程", "any_of": ["反向去噪", "denois", "逆向"]},
+          {"label": "损失", "any_of": ["MSE", "噪声预测", "deadline"]}
+        ],
+        "must_not_include": ["该方法使用 PPO 作为训练目标"],
+        "manual_rubric": ["术语解释准确", "明确区分生成过程与约束惩罚", "结论可追溯到论文段落"]
+      }
+    },
+    {
+      "id": "T02",
+      "capability": "RAG 检索",
+      "title": "定位 DiffTSN 的实验结论",
+      "fixture": {"paper_ids": ["diffusion-tsn"], "section": "Experiments"},
+      "prompt": "DiffTSN 在什么负载设置下优于 PPO，改善了哪个指标、幅度是多少？",
+      "expected": {
+        "tool_trace_contains": ["query_papers"],
+        "answer_checks": [
+          {"label": "负载设置", "any_of": ["BurstTSN", "bursty", "突发"]},
+          {"label": "指标", "any_of": ["deadline violation", "截止期违例", "违例"]},
+          {"label": "数值", "any_of": ["18%", "18 percent"]}
+        ],
+        "manual_rubric": ["回答包含实验条件", "不把平均时延误称为唯一指标"]
+      }
+    },
+    {
+      "id": "T03",
+      "capability": "跨论文对比",
+      "title": "对比扩散调度与图注意力 Actor-Critic",
+      "fixture": {"paper_ids": ["diffusion-tsn", "attention-tsn"]},
+      "prompt": "比较 DiffTSN 与 Graph Attention Actor-Critic 的决策机制、鲁棒性风险和适合的使用场景。",
+      "expected": {
+        "tool_trace_contains": ["query_papers"],
+        "answer_checks": [
+          {"label": "扩散机制", "any_of": ["迭代去噪", "diffusion", "生成"]},
+          {"label": "注意力策略", "any_of": ["图注意力", "actor-critic", "直接选择"]},
+          {"label": "分布偏移", "any_of": ["分布偏移", "训练分布", "robust"]}
+        ],
+        "manual_rubric": ["至少给出一项共同点和两项差异", "不凭空宣称绝对性能优劣"]
+      }
+    },
+    {
+      "id": "T04",
+      "capability": "鲁棒性评估设计",
+      "title": "避免把训练条件误当成实验结论",
+      "fixture": {"paper_ids": ["diffusion-tsn", "robust-tsn"]},
+      "prompt": "说明验证动态负载下 TSN 调度鲁棒性时，至少应报告哪些指标和实验设置。",
+      "expected": {
+        "answer_checks": [
+          {"label": "指标", "any_of": ["截止期违例", "deadline", "latency", "feasibility"]},
+          {"label": "设置", "any_of": ["分布偏移", "动态负载", "bursty"]}
+        ],
+        "manual_rubric": ["区分训练负载与测试负载", "包含风险或可行性维度"]
+      }
+    },
+    {
+      "id": "T06",
+      "capability": "每日速递",
+      "title": "从三源模拟结果生成待读清单",
+      "fixture": {"daily_feed": "synthetic-research-corpus-v1"},
+      "prompt": "对关键词“diffusion TSN”执行一次每日检索，列出新论文，并把两篇结果标记为待读。",
+      "expected": {
+        "tool_trace_contains": ["daily_search"],
+        "state_assertions": {"keyword": "diffusion TSN", "new_count": 2, "unread_count": 2},
+        "answer_checks": [{"label": "检索结果", "any_of": ["Diffusion Models for Network Scheduling", "Multi-Agent TSN under Bursty Traffic"]}],
+        "manual_rubric": ["结果标明来源或标题", "不对模拟结果声称实时网络检索"]
+      }
+    },
+    {
+      "id": "T07",
+      "capability": "会话隔离",
+      "title": "不同会话不串历史",
+      "fixture": {"sessions": {"eval-a": "只讨论图注意力", "eval-b": "只讨论扩散调度"}},
+      "prompt": "在 eval-b 中问：我上一轮讨论的主题是什么？",
+      "expected": {
+        "state_assertions": {"session_id": "eval-b", "history_isolated": true},
+        "answer_checks": [{"label": "当前会话上下文", "any_of": ["扩散", "DiffTSN", "当前会话"]}],
+        "must_not_include": ["只讨论图注意力"],
+        "manual_rubric": ["不泄漏 eval-a 历史", "无法确定时明确说明而非编造"]
+      }
+    },
+    {
+      "id": "T08",
+      "capability": "会话删除",
+      "title": "删除会话的边界",
+      "fixture": {"sessions": ["eval-delete", "eval-keep"]},
+      "prompt": "删除 eval-delete 会话，并确认 eval-keep 与全局论文库仍保留。",
+      "expected": {
+        "state_assertions": {"deleted_session": "eval-delete", "remaining_session": "eval-keep", "paper_store_preserved": true},
+        "answer_checks": [{"label": "删除确认", "any_of": ["已删除", "eval-delete"]}],
+        "manual_rubric": ["只删除目标会话的 checkpoint/摘要/用量", "明确论文库不受影响"]
+      }
+    },
+    {
+      "id": "T09",
+      "capability": "模型请求韧性",
+      "title": "超时后只重试同一模型",
+      "fixture": {"model": "deepseek-v4-flash", "failure": "ReadTimeout before first token"},
+      "prompt": "模拟 DeepSeek 首 token 前读取超时，说明系统的重试、熔断和用户提示应如何表现。",
+      "expected": {
+        "tool_trace_contains": ["llm_client"],
+        "state_assertions": {"model": "deepseek-v4-flash", "fallback_model_used": false},
+        "answer_checks": [
+          {"label": "同模型", "any_of": ["同一模型", "deepseek-v4-flash", "不降级"]},
+          {"label": "恢复提示", "any_of": ["重试", "熔断", "/retry"]}
+        ],
+        "performance": {"max_duration_ms": 55000},
+        "manual_rubric": ["不建议切换备用模型", "区分首 token 前与已输出后的行为"]
+      }
+    },
+    {
+      "id": "T10",
+      "capability": "RAG 初始化降级",
+      "title": "嵌入模型首次初始化不阻塞对话",
+      "fixture": {"embedding_state": "cold", "paper_ids": ["diffusion-tsn"]},
+      "prompt": "首次 RAG 检索遇到嵌入模型下载很慢时，系统应如何保证用户仍能获得可解释的结果？",
+      "expected": {
+        "answer_checks": [
+          {"label": "有界等待", "any_of": ["8 秒", "有界", "不等待"]},
+          {"label": "关键词候选", "any_of": ["关键词", "本地候选", "后台初始化"]}
+        ],
+        "performance": {"max_tool_duration_ms": 8500},
+        "manual_rubric": ["明确语义检索与关键词候选的差别", "不把后台下载伪装成成功的语义检索"]
+      }
+    },
+    {
+      "id": "T11",
+      "capability": "深度研究证据闭环",
+      "title": "深度研究结论必须引用可恢复证据",
+      "fixture": {"research_run": "synthetic-completed", "scope": "both"},
+      "prompt": "对 DiffTSN 在突发负载下的适用条件做一次深度研究，用证据编号给出结论并说明限制。",
+      "expected": {
+        "state_assertions": {
+          "research_status": "completed",
+          "evidence_persisted": true,
+          "public_evidence_relevance": true,
+          "public_evidence_rejection_metadata": true
+        },
+        "answer_checks": [
+          {"label": "条件", "any_of": ["突发", "bursty", "负载"]},
+          {"label": "限制", "any_of": ["限制", "局限", "需要验证", "证据不足", "分布偏移"]}
+        ],
+        "min_evidence_references": 2,
+        "manual_rubric": ["结论与 [E#] 证据对应", "不将预印本结论夸大为通用事实"]
+      }
+    },
+    {
+      "id": "T12",
+      "capability": "每日来源故障恢复",
+      "title": "单一来源失败不阻断每日推送恢复",
+      "fixture": {"daily_run": "partial-failed", "failed_source": "openaire"},
+      "prompt": "OpenAIRE 本次超时而 OpenAlex 与 DBLP 成功时，每日任务应显示什么状态，/daily resume 会做什么？",
+      "expected": {
+        "state_assertions": {"run_status": "partial_failed", "resume_without_refetch": true},
+        "answer_checks": [
+          {"label": "部分失败", "any_of": ["部分", "partial_failed", "单一来源"]},
+          {"label": "恢复", "any_of": ["resume", "恢复", "已保存候选"]}
+        ],
+        "manual_rubric": ["不把单源失败描述成整个任务失败", "说明恢复不重复抓取已保存候选"]
+      }
+    },
+    {
+      "id": "T13",
+      "capability": "OpenAlex 鉴权边界",
+      "title": "OpenAlex Key 不进入输出或持久化数据",
+      "fixture": {"provider": "openalex", "api_key": "redacted"},
+      "prompt": "说明 OpenAlex API Key 的配置格式、发送位置以及哪些位置绝不能记录它。",
+      "expected": {
+        "state_assertions": {"provider": "openalex", "api_key_exposed": false},
+        "answer_checks": [
+          {"label": "配置键", "any_of": ["OPENALEX_API_KEY", "api_key"]},
+          {"label": "不泄露", "any_of": ["不记录", "不写入", "不泄露", "不得写入", "严禁"]}
+        ],
+        "must_not_include": ["Bearer "],
+        "manual_rubric": ["区分原始 Key 与 HTTP Authorization 头", "提及日志、Git 和运行记录边界"]
+      }
+    },
+    {
+      "id": "T14",
+      "capability": "交互请求优先级",
+      "title": "后台研究不饿死交互式对话",
+      "fixture": {"background_tasks": 2, "interactive_slots": 1},
+      "prompt": "每日 Curator 和深度研究正在排队时，普通用户对话为何仍应优先获得模型并发槽？",
+      "expected": {
+        "state_assertions": {"interactive_admitted": true, "model_unchanged": true},
+        "answer_checks": [
+          {"label": "优先级", "any_of": ["交互", "优先", "预留"]},
+          {"label": "同模型", "any_of": ["同一模型", "不降级", "model"]}
+        ],
+        "performance": {"first_token_ms": 4000},
+        "manual_rubric": ["说明保留交互槽而非无限提高并发", "不建议静默切换模型"]
+      }
+    },
+    {
+      "id": "T15",
+      "capability": "长任务取消",
+      "title": "停止长任务后保留可恢复的候选与证据",
+      "fixture": {"cancel_stage": "curator", "saved_candidates": 3},
+      "prompt": "用户在每日任务 Curator 阶段点击停止，系统应取消哪些后续工作、保留什么，并如何继续？",
+      "expected": {
+        "state_assertions": {"run_status": "cancelled", "saved_candidates": 3, "resumable": true},
+        "answer_checks": [
+          {"label": "取消", "any_of": ["停止", "取消", "cancelled"]},
+          {"label": "继续", "any_of": ["resume", "继续", "候选"]}
+        ],
+        "manual_rubric": ["不把已取消请求伪装为完成", "候选和证据可供恢复而非丢弃"]
+      }
+    }
+  ]
+}

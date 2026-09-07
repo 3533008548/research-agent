@@ -1,15 +1,21 @@
 daily_search:
   enabled: true
   request_timeout_seconds: 8
+  keyword_concurrency: 2
   keywords: []
   max_results_per_keyword: 3
   sources:
-  - semantic_scholar
+  - openalex
+  - openaire
+  - dblp
+  - ieee
 model: deepseek-v4-flash
+vision_model: deepseek-v4-flash-vision-exp
 agent:
   verify_timeout_seconds: 8
 api_resilience:
   max_concurrency: 4
+  interactive_reserved_slots: 1
   queue_size: 20
   connect_timeout_seconds: 3.05
   read_timeout_seconds: 30
@@ -21,6 +27,11 @@ pdf:
   max_pages: 20
 rag:
   enabled: true
+  reranker:
+    # 首次使用先运行 scripts/warm_reranker.py；运行时只从本地缓存加载。
+    enabled: true
+    model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+    candidate_limit: 20
 ui:
   port: 7860
   theme: soft

@@ -19,13 +19,21 @@ from runtime_paths import RuntimePaths
 # ── 默认值 ──
 _DFLT = {
     "model": "deepseek-v4-flash",
+    "vision_model": "deepseek-v4-flash-vision-exp",
     "pdf_max_pages": 15,
     "rag_enabled": True,
+    "rag_reranker_enabled": False,
+    "rag_reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    "rag_reranker_candidate_limit": 20,
     "ui_port": 7860,
     "ui_debug": False,
     "verify_timeout_seconds": 8,
     "daily_request_timeout_seconds": 8,
+    "daily_keyword_concurrency": 2,
+    "daily_max_results_per_keyword": 3,
+    "daily_sources": ("openalex", "openaire", "dblp", "ieee"),
     "api_max_concurrency": 4,
+    "api_interactive_reserved_slots": 1,
     "api_queue_size": 20,
     "api_connect_timeout_seconds": 3.05,
     "api_read_timeout_seconds": 30,
@@ -33,25 +41,36 @@ _DFLT = {
     "api_max_retries": 2,
     "api_circuit_failure_threshold": 3,
     "api_circuit_recovery_seconds": 120,
+    "api_url": "https://api.deepseek.com/chat/completions",
 }
 
 
 @dataclass
 class Config:
     model: str = "deepseek-chat"
+    vision_model: str = "deepseek-v4-flash-vision-exp"
     deepseek_key: str = ""
-    glm_key: str = ""
+    api_url: str = "https://api.deepseek.com/chat/completions"
     hf_endpoint: str = ""
+    openalex_api_key: str = ""
+    ieee_api_key: str = ""
 
     pdf_max_pages: int = 15
     rag_enabled: bool = True
+    rag_reranker_enabled: bool = False
+    rag_reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    rag_reranker_candidate_limit: int = 20
 
     ui_port: int = 7860
     ui_debug: bool = False
     daily_search_enabled: bool = False
     verify_timeout_seconds: int = 8
     daily_request_timeout_seconds: int = 8
+    daily_keyword_concurrency: int = 2
+    daily_max_results_per_keyword: int = 3
+    daily_sources: tuple[str, ...] = ("openalex", "openaire", "dblp", "ieee")
     api_max_concurrency: int = 4
+    api_interactive_reserved_slots: int = 1
     api_queue_size: int = 20
     api_connect_timeout_seconds: float = 3.05
     api_read_timeout_seconds: int = 30
@@ -63,7 +82,6 @@ class Config:
     data_dir: str = "runtime"
     checkpoint_db: str = ""
     memory_db: str = ""
-    notes_db: str = ""
     daily_db: str = ""
     chroma_dir: str = ""
     papers_dir: str = ""
@@ -80,7 +98,6 @@ class Config:
         os.environ["APP_DATA_DIR"] = self.data_dir
         self.checkpoint_db = self.checkpoint_db or str(paths.checkpoint_db)
         self.memory_db = self.memory_db or str(paths.memory_db)
-        self.notes_db = self.notes_db or str(paths.notes_db)
         self.daily_db = self.daily_db or str(paths.daily_db)
         self.chroma_dir = self.chroma_dir or str(paths.chroma_dir)
         self.papers_dir = self.papers_dir or str(paths.papers_dir)
@@ -105,17 +122,41 @@ class Config:
             pass
 
         # ── 3. config.yaml 加载 ──
+        config_path = Path("config.yaml")
         try:
             import yaml
-            if Path("config.yaml").exists():
-                with open("config.yaml", encoding="utf-8") as f:
+        except ImportError as exc:
+            if config_path.exists():
+                raise RuntimeError(
+                    "检测到 config.yaml，但缺少 PyYAML；请安装 requirements.txt"
+                ) from exc
+            yaml = None
+        if yaml is not None and config_path.exists():
+            try:
+                with config_path.open(encoding="utf-8") as f:
                     yaml_cfg = yaml.safe_load(f) or {}
+                if not isinstance(yaml_cfg, dict):
+                    raise ValueError("config.yaml 的顶层必须是键值对象")
                 if "model" in yaml_cfg:
                     cfg["model"] = yaml_cfg["model"]
+                if "vision_model" in yaml_cfg:
+                    cfg["vision_model"] = yaml_cfg["vision_model"]
                 if "pdf" in yaml_cfg:
                     cfg["pdf_max_pages"] = yaml_cfg["pdf"].get("max_pages", cfg["pdf_max_pages"])
                 if "rag" in yaml_cfg:
-                    cfg["rag_enabled"] = yaml_cfg["rag"].get("enabled", cfg["rag_enabled"])
+                    rag_settings = yaml_cfg["rag"]
+                    cfg["rag_enabled"] = rag_settings.get("enabled", cfg["rag_enabled"])
+                    reranker = rag_settings.get("reranker", {})
+                    if isinstance(reranker, dict):
+                        cfg["rag_reranker_enabled"] = reranker.get(
+                            "enabled", cfg["rag_reranker_enabled"],
+                        )
+                        cfg["rag_reranker_model"] = reranker.get(
+                            "model", cfg["rag_reranker_model"],
+                        )
+                        cfg["rag_reranker_candidate_limit"] = reranker.get(
+                            "candidate_limit", cfg["rag_reranker_candidate_limit"],
+                        )
                 if "ui" in yaml_cfg:
                     cfg["ui_port"] = yaml_cfg["ui"].get("port", cfg["ui_port"])
                 if "daily_search" in yaml_cfg:
@@ -123,6 +164,22 @@ class Config:
                     cfg["daily_request_timeout_seconds"] = yaml_cfg["daily_search"].get(
                         "request_timeout_seconds", cfg["daily_request_timeout_seconds"]
                     )
+                    cfg["daily_keyword_concurrency"] = yaml_cfg["daily_search"].get(
+                        "keyword_concurrency", cfg["daily_keyword_concurrency"]
+                    )
+                    cfg["daily_max_results_per_keyword"] = yaml_cfg["daily_search"].get(
+                        "max_results_per_keyword", cfg["daily_max_results_per_keyword"]
+                    )
+                    configured_sources = yaml_cfg["daily_search"].get("sources")
+                    if isinstance(configured_sources, list):
+                        allowed_sources = {"openalex", "openaire", "dblp", "ieee"}
+                        sources = tuple(
+                            str(source).strip().lower()
+                            for source in configured_sources
+                            if str(source).strip().lower() in allowed_sources
+                        )
+                        if sources:
+                            cfg["daily_sources"] = sources
                 if "agent" in yaml_cfg:
                     cfg["verify_timeout_seconds"] = yaml_cfg["agent"].get(
                         "verify_timeout_seconds", cfg["verify_timeout_seconds"]
@@ -130,15 +187,15 @@ class Config:
                 if "api_resilience" in yaml_cfg:
                     settings = yaml_cfg["api_resilience"]
                     for key in (
-                        "max_concurrency", "queue_size", "connect_timeout_seconds",
+                        "max_concurrency", "interactive_reserved_slots", "queue_size", "connect_timeout_seconds",
                         "read_timeout_seconds", "request_deadline_seconds", "max_retries",
                         "circuit_failure_threshold", "circuit_recovery_seconds",
                     ):
                         config_key = f"api_{key}"
                         if key in settings:
                             cfg[config_key] = settings[key]
-        except Exception:
-            pass
+            except (OSError, ValueError, yaml.YAMLError, TypeError, AttributeError) as exc:
+                raise ValueError(f"无法读取 config.yaml：{exc}") from exc
 
         # ── 4. 运行时用户设置（UI 修改写入这里，不污染源码配置） ──
         cli_data_dir = (cli_overrides or {}).get("data_dir")
@@ -148,6 +205,7 @@ class Config:
         user_settings = paths.read_settings()
         validators = {
             "model": lambda value: isinstance(value, str) and bool(value.strip()),
+            "vision_model": lambda value: isinstance(value, str) and bool(value.strip()),
             "rag_enabled": lambda value: isinstance(value, bool),
             "pdf_max_pages": lambda value: isinstance(value, int) and not isinstance(value, bool),
             "daily_search_enabled": lambda value: isinstance(value, bool),
@@ -159,9 +217,12 @@ class Config:
         # ── 5. 环境变量覆盖 ──
         env_map = {
             "DEEPSEEK_API_KEY": "deepseek_key",
-            "GLM_API_KEY": "glm_key",
+            "DEEPSEEK_API_URL": "api_url",
             "HF_ENDPOINT": "hf_endpoint",
+            "OPENALEX_API_KEY": "openalex_api_key",
+            "IEEE_API_KEY": "ieee_api_key",
             "DEEPSEEK_MODEL": "model",
+            "DEEPSEEK_VISION_MODEL": "vision_model",
         }
         for env, attr in env_map.items():
             val = os.getenv(env, "")
@@ -174,17 +235,31 @@ class Config:
 
         return cls(
             model=cfg["model"],
+            vision_model=cfg["vision_model"],
             deepseek_key=cfg.get("deepseek_key", "") or os.getenv("DEEPSEEK_API_KEY", ""),
-            glm_key=cfg.get("glm_key", "") or os.getenv("GLM_API_KEY", ""),
+            api_url=cfg.get("api_url", _DFLT["api_url"]),
             hf_endpoint=cfg.get("hf_endpoint", ""),
+            openalex_api_key=cfg.get("openalex_api_key", "") or os.getenv("OPENALEX_API_KEY", ""),
+            ieee_api_key=cfg.get("ieee_api_key", "") or os.getenv("IEEE_API_KEY", ""),
             pdf_max_pages=cfg["pdf_max_pages"],
             rag_enabled=cfg["rag_enabled"],
+            rag_reranker_enabled=bool(cfg.get("rag_reranker_enabled", False)),
+            rag_reranker_model=str(cfg.get("rag_reranker_model") or _DFLT["rag_reranker_model"]),
+            rag_reranker_candidate_limit=max(
+                1, min(20, int(cfg.get("rag_reranker_candidate_limit", 20))),
+            ),
             ui_port=cfg["ui_port"],
             ui_debug=cfg.get("ui_debug", False),
             daily_search_enabled=cfg.get("daily_search_enabled", False),
             verify_timeout_seconds=max(3, int(cfg.get("verify_timeout_seconds", 8))),
             daily_request_timeout_seconds=max(3, int(cfg.get("daily_request_timeout_seconds", 8))),
+            daily_keyword_concurrency=max(1, min(2, int(cfg.get("daily_keyword_concurrency", 2)))),
+            daily_max_results_per_keyword=max(1, min(5, int(cfg.get("daily_max_results_per_keyword", 3)))),
+            daily_sources=tuple(cfg.get("daily_sources", _DFLT["daily_sources"])),
             api_max_concurrency=max(1, int(cfg.get("api_max_concurrency", 4))),
+            api_interactive_reserved_slots=max(
+                0, int(cfg.get("api_interactive_reserved_slots", 1))
+            ),
             api_queue_size=max(0, int(cfg.get("api_queue_size", 20))),
             api_connect_timeout_seconds=max(1.0, float(cfg.get("api_connect_timeout_seconds", 3.05))),
             api_read_timeout_seconds=max(3, int(cfg.get("api_read_timeout_seconds", 30))),

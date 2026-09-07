@@ -16,16 +16,27 @@
 import json
 import sys
 import sqlite3
+import threading
+import time
 from pathlib import Path
-from typing import Annotated, TypedDict
+from typing import Annotated, Callable, TypedDict
 
 import requests
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from llm_client import LLMRequestTimeoutError
+from cancellation import RequestCancelledError, raise_if_cancelled
+from conversation_memory import context_usage_ratio, maybe_store_conversation_summary
+from llm_client import (
+    LLMCircuitOpenError,
+    LLMQueueFullError,
+    LLMRequestTimeoutError,
+    RequestPolicy,
+    RequestPriority,
+)
 from prompts import SYSTEM_PROMPT
-from tool_schemas import get_tool_schemas
+from tool_catalog import get_tool_schemas
+from tool_runtime import ToolExecutionContext, ToolRuntime
 from tools import execute_tool
 
 
@@ -100,22 +111,91 @@ def build_graph(
     paper_store = None,
     token_usage: dict = None,
     checkpoint_db: str | None = None,
-    glm_api_key: str = "",
+    vision_model: str = "deepseek-v4-flash-vision-exp",
     stream_callback = None,
+    event_callback = None,
+    cancel_event: threading.Event | None = None,
     profile_manager = None,
     memory_store = None,  # MemoryStore 实例
     verify_timeout_seconds: int = 8,
     verify_guard = None,
     llm_client = None,
+    system_prompt: str | None = None,
+    allowed_tool_names: set[str] | None = None,
+    enable_verify: bool = True,
+    request_policy: RequestPolicy | None = None,
+    max_tool_rounds: int | None = None,
+    tool_argument_normalizer: Callable[[str, dict], dict] | None = None,
+    tool_context: ToolExecutionContext | None = None,
+    force_tool_name: str | None = None,
 ):
+    # A graph must use the process-wide client owned by ResearchAgent. Creating
+    # one here would silently defeat shared admission control in multi-agent
+    # execution.
+    if llm_client is None:
+        raise ValueError("build_graph requires the shared llm_client instance")
     if checkpoint_db is None:
         from runtime_paths import get_runtime_paths
         checkpoint_db = str(get_runtime_paths().checkpoint_db)
-    tool_schemas = get_tool_schemas()
+    tool_schemas = get_tool_schemas(allowed_tool_names)
+    forced_tool = str(force_tool_name or "").strip()
+    if forced_tool and not any(
+        schema.get("function", {}).get("name") == forced_tool for schema in tool_schemas
+    ):
+        raise ValueError("forced tool must be included in the available tool set")
+    if max_tool_rounds is not None:
+        max_tool_rounds = max(1, int(max_tool_rounds))
+
+    def emit(event_type: str, **details) -> None:
+        """Best-effort trace hook; instrumentation must never interrupt inference."""
+        if not event_callback:
+            return
+        try:
+            event_callback({"type": event_type, **details})
+        except Exception:
+            pass
+
+    def ensure_active(stage: str) -> None:
+        """在图节点边界停止已取消的请求，避免启动下一次外部调用。"""
+        if cancel_event is not None and cancel_event.is_set():
+            emit("request_cancelled", stage=stage)
+        raise_if_cancelled(cancel_event, f"请求已在 {stage} 取消")
+
+    runtime_context = tool_context or ToolExecutionContext(
+        run_kind="research" if allowed_tool_names is not None else "chat",
+        allowed_tool_names=(
+            frozenset(allowed_tool_names) if allowed_tool_names is not None else None
+        ),
+        cancel_event=cancel_event,
+    )
+    # Keep the dispatcher injectable at this seam: it preserves lightweight
+    # graph tests while the runtime owns all cross-cutting policy.
+    tool_runtime = ToolRuntime(
+        runtime_context, event_callback=emit, executor=execute_tool,
+    )
+
+    def watch_stream_cancellation(response):
+        """取消时关闭已建立的 SSE 连接，打断 ``iter_lines`` 的阻塞读取。"""
+        if cancel_event is None:
+            return lambda: None
+        stopped = threading.Event()
+
+        def _watch() -> None:
+            while not stopped.wait(0.1):
+                if cancel_event.is_set():
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+
+        threading.Thread(target=_watch, daemon=True, name="cancel-sse-watch").start()
+        return stopped.set
 
     # ═══ LLM 节点 ═══
 
     def llm_node(state: AgentState) -> dict:
+        ensure_active("llm")
         messages = sanitize_model_messages(list(state.get("messages", [])))
 
         # 清理孤儿 tool_calls
@@ -130,9 +210,9 @@ def build_graph(
                     messages[i] = dict(m)
                     del messages[i]["tool_calls"]
 
-        # 话题/笔记上下文也会以 system message 传入，不能因此跳过核心约束提示词。
+        # 对话上下文不会替代核心约束提示词。
         profile_text = profile_manager.summary() if profile_manager else ""
-        prompt = SYSTEM_PROMPT
+        prompt = system_prompt or SYSTEM_PROMPT
         if profile_text:
             prompt = f"[用户画像] {profile_text}\n\n{prompt}"
         messages.insert(0, {"role": "system", "content": prompt})
@@ -143,34 +223,58 @@ def build_graph(
 
         if memory_store:
             metadata = state.get("metadata", {})
-            topic = metadata.get("topic", "")
             thread_id = metadata.get("session_id", "research-main")
-            recent = memory_store.get_recent_summary(thread_id, topic)
+            recent = memory_store.get_recent_summary(thread_id)
             if recent:
                 messages.append({"role": "system", "content": f"[对话摘要] {recent}"})
 
         payload = {
-            "model": model, "messages": messages, "tools": tool_schemas,
-            "tool_choice": "auto", "temperature": 0.7,
-            "stream": stream_callback is not None,
+            "model": model, "messages": messages,
+            "temperature": 0.7, "stream": stream_callback is not None,
         }
+        # An empty tool list with ``tool_choice=auto`` is rejected by some
+        # OpenAI-compatible providers.  Direct engineering answers therefore
+        # omit tool fields completely instead of relying on model compliance.
+        if tool_schemas:
+            payload["tools"] = tool_schemas
+            already_called_forced_tool = any(
+                tool_call.get("function", {}).get("name") == forced_tool
+                for message in messages
+                if message.get("role") == "assistant"
+                for tool_call in (message.get("tool_calls") or [])
+            )
+            payload["tool_choice"] = (
+                {"type": "function", "function": {"name": forced_tool}}
+                if forced_tool and not already_called_forced_tool
+                else "auto"
+            )
 
         def _api_status(message: str) -> None:
             if token_usage is not None:
                 token_usage["api_status"] = message
+            emit("llm_status", status=message)
 
-        request_budget = llm_client.new_request_budget() if llm_client else None
-        if llm_client:
-            resp = llm_client.post(
-                payload,
-                stream=stream_callback is not None,
-                on_status=_api_status,
-                budget=request_budget,
+        request_budget = llm_client.new_request_budget(
+            request_policy or RequestPolicy(
+                purpose="chat",
+                priority=RequestPriority.INTERACTIVE,
             )
-        else:
-            resp = requests.post(api_url, headers={
-                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-            }, json=payload, timeout=120)
+        )
+        request_started = time.perf_counter()
+        emit("llm_request_started", model=model, stream=stream_callback is not None)
+        try:
+            post_args = {
+                "stream": stream_callback is not None,
+                "on_status": _api_status,
+                "budget": request_budget,
+            }
+            if cancel_event is not None:
+                post_args["cancel_event"] = cancel_event
+            resp = llm_client.post(payload, **post_args)
+        except Exception as exc:
+            emit("llm_request_failed", error_type=type(exc).__name__)
+            raise
+        emit("llm_response_headers", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
 
         if resp.status_code == 429:
             return {"messages": [{"role": "assistant", "content": "⚠️ API 限流，请稍后再试"}]}
@@ -189,10 +293,18 @@ def build_graph(
                 nonlocal full_text
                 lines = iter(response.iter_lines(decode_unicode=True))
                 while True:
-                    if llm_client and not llm_client.prepare_stream_read(
-                        response, request_budget
-                    ):
-                        raise requests.exceptions.ReadTimeout("stream deadline exceeded")
+                    ensure_active("stream_read")
+                    if llm_client:
+                        if cancel_event is None:
+                            stream_read_ready = llm_client.prepare_stream_read(
+                                response, request_budget,
+                            )
+                        else:
+                            stream_read_ready = llm_client.prepare_stream_read(
+                                response, request_budget, cancel_event=cancel_event,
+                            )
+                        if not stream_read_ready:
+                            raise requests.exceptions.ReadTimeout("stream deadline exceeded")
                     try:
                         line = next(lines)
                     except StopIteration:
@@ -237,6 +349,7 @@ def build_graph(
                         token_usage["last_round_cost"] = cost
 
             while True:
+                stop_watch = watch_stream_cancellation(resp)
                 try:
                     completed = _consume_stream(resp)
                     if not completed:
@@ -246,7 +359,27 @@ def build_graph(
                     if llm_client:
                         llm_client.finish_stream(resp, success=True)
                     break
+                except RequestCancelledError:
+                    if llm_client:
+                        llm_client.finish_stream(resp, success=False, cancelled=True)
+                    else:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    emit("request_cancelled", stage="stream")
+                    raise
                 except requests.RequestException as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        if llm_client:
+                            llm_client.finish_stream(resp, success=False, cancelled=True)
+                        else:
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                        emit("request_cancelled", stage="stream")
+                        raise RequestCancelledError("模型流式响应已取消") from exc
                     if llm_client:
                         llm_client.finish_stream(resp, success=False)
                     else:
@@ -259,10 +392,14 @@ def build_graph(
                         not full_text and llm_client
                         and request_budget.reserve_retry()
                     ):
-                        resp = llm_client.post(
-                            payload, stream=True, on_status=_api_status,
-                            budget=request_budget,
-                        )
+                        retry_args = {
+                            "stream": True,
+                            "on_status": _api_status,
+                            "budget": request_budget,
+                        }
+                        if cancel_event is not None:
+                            retry_args["cancel_event"] = cancel_event
+                        resp = llm_client.post(payload, **retry_args)
                         continue
                     if not full_text:
                         raise LLMRequestTimeoutError(
@@ -284,12 +421,19 @@ def build_graph(
                         except Exception:
                             pass
                     raise
+                finally:
+                    stop_watch()
             assistant_msg = {"role": "assistant", "content": full_text or None}
             if tool_calls_acc:
                 assistant_msg["tool_calls"] = [
                     {"id": v["id"], "type": "function", "function": v["function"]}
                     for v in sorted(tool_calls_acc.values(), key=lambda x: x.get("id", ""))
                 ]
+            emit(
+                "llm_request_finished",
+                duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
+                **request_budget.metrics(),
+            )
             return {"messages": [assistant_msg]}
 
         # 非流式模式
@@ -314,45 +458,71 @@ def build_graph(
                 {"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
                 for tc in msg["tool_calls"]
             ]
+        emit(
+            "llm_request_finished",
+            duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
+            **request_budget.metrics(),
+        )
         return {"messages": [assistant_msg]}
 
     # ═══ 路由 ═══
 
     def router(state: AgentState) -> str:
+        ensure_active("route")
         messages = state.get("messages", [])
         if not messages:
             return END
         last = messages[-1]
         if last.get("tool_calls"):
             return "tools"
-        return "verify"
+        return "verify" if enable_verify else END
+
+    def after_tools_router(state: AgentState) -> str:
+        """End bounded research workers after their final evidence tool round.
+
+        The normal chat graph remains unbounded apart from its outer recursion
+        limit. Research workers, however, do not need to ask the model for one
+        more prose turn after gathering evidence: the research synthesizer owns
+        that task. Ending here preserves collected tool messages rather than
+        losing them to a graph recursion error when a model keeps searching.
+        """
+        if max_tool_rounds is not None:
+            rounds = sum(
+                1 for message in state.get("messages", [])
+                if message.get("role") == "assistant" and message.get("tool_calls")
+            )
+            if rounds >= max_tool_rounds:
+                emit("tool_round_limit_reached", limit=max_tool_rounds)
+                return END
+        return "llm"
 
     # ═══ 工具节点 ═══
 
     def tool_node(state: AgentState) -> dict:
+        ensure_active("tools")
         messages = state.get("messages", [])
         tool_calls = messages[-1].get("tool_calls", [])
         tool_msgs = []
         for tc in tool_calls:
+            ensure_active("before_tool")
             name = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
                 args = {}
-            print(f"      🔧 {name}({json.dumps(args, ensure_ascii=False)})", file=sys.stderr)
-            result = execute_tool(name, args, paper_store=paper_store, glm_api_key=glm_api_key, profile_manager=profile_manager, memory_store=memory_store)
-            if isinstance(result, str):
-                # ── 按工具类型差异化截断 ──
-                limits = {
-                    "query_papers": 5000,
-                    "search_papers": 3000,
-                    "read_pdf": 12000,
-                    "describe_image": 2000,
-                    "memory_search": 1500,
-                }
-                limit = limits.get(name, 3000)
-                if len(result) > limit:
-                    result = result[:limit] + f"\n\n...（截断至 {limit} 字符）"
+            if not isinstance(args, dict):
+                args = {}
+            if tool_argument_normalizer is not None:
+                normalized_args = tool_argument_normalizer(name, dict(args))
+                if isinstance(normalized_args, dict):
+                    args = normalized_args
+            print(f"      🔧 {name}", file=sys.stderr)
+            result = tool_runtime.execute(
+                name, args, paper_store=paper_store, vision_model=vision_model,
+                profile_manager=profile_manager, memory_store=memory_store,
+                llm_client=llm_client, model=model,
+            )
+            ensure_active("after_tool")
             tool_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         return {"messages": tool_msgs}
 
@@ -381,11 +551,17 @@ def build_graph(
         return severe, minor
 
     def verify_node(state: AgentState) -> dict:
+        ensure_active("verify")
         messages = state.get("messages", [])
         metadata = state.get("metadata") or {}
 
         def _complete_verification() -> dict:
-            """结束本轮验证时清除只对重试有效的状态。"""
+            """结束本轮验证时清除只对本轮有效的状态。"""
+            if token_usage:
+                # The final answer already contains any user-facing caveat, and
+                # the run timeline records a skipped/failed verification. Do not
+                # leave an old optional-stage warning in the next chat turn.
+                token_usage.pop("verify_status", None)
             cleaned = dict(metadata)
             for key in (
                 "verify_feedback", "verify_count", "verify_issues", "verify_history",
@@ -485,20 +661,52 @@ def build_graph(
             f"\n--- Response ---\n{content[:1500]}\n\nIssues (or OK):"
         )
 
+        verify_policy = RequestPolicy(
+            purpose="verify",
+            priority=RequestPriority.VERIFY,
+            deadline_seconds=verify_timeout_seconds,
+            max_retries=0,
+            counts_toward_circuit=False,
+        )
+
+        def _verify_status(message: str) -> None:
+            if token_usage:
+                token_usage["verify_status"] = f"🔎 验证中：{message}"
+            emit("verify_status", status=message)
+
         try:
-            resp = requests.post(api_url, headers={
-                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-            }, json={"model": model, "messages": [{"role": "user", "content": verify_prompt}],
-                      "stream": False, "temperature": 0.1},
-                timeout=(3.05, verify_timeout_seconds))
-            resp.raise_for_status()
+            verify_budget = llm_client.new_request_budget(
+                verify_policy,
+            )
+            emit("verify_request_started", model=model, **verify_budget.metrics())
+            resp = llm_client.post(
+                {"model": model, "messages": [{"role": "user", "content": verify_prompt}],
+                 "stream": False, "temperature": 0.1},
+                stream=False,
+                on_status=_verify_status,
+                budget=verify_budget,
+                cancel_event=cancel_event,
+            )
             result = resp.json()["choices"][0]["message"]["content"].strip()
+            emit("verify_request_finished", **verify_budget.metrics())
+        except RequestCancelledError:
+            emit("verify_request_cancelled")
+            raise
+        except (LLMQueueFullError, LLMCircuitOpenError) as e:
+            # Queue pressure and the shared model circuit do not mean that the
+            # verify feature itself is unhealthy. Skip this optional stage
+            # without opening its local feature guard.
+            if token_usage:
+                token_usage["verify_status"] = "⚠️ 验证跳过（模型繁忙或暂不可用）"
+            emit("verify_request_skipped", error_type=type(e).__name__)
+            return _complete_verification()
         except Exception as e:
             # ── 快速降级：失败两次后熔断，后续请求直接返回主回答 ──
             if verify_guard:
                 verify_guard.record_failure()
             if token_usage:
                 token_usage["verify_status"] = "⚠️ 验证跳过（服务超时或不可用）"
+            emit("verify_request_failed", error_type=type(e).__name__)
             print(f"      ⚠ verify 跳过: {type(e).__name__}: {e}", file=sys.stderr)
             return _complete_verification()
         if verify_guard:
@@ -512,39 +720,19 @@ def build_graph(
         if not result or result.upper().startswith("OK"):
             if token_usage:
                 token_usage.pop("verify_status", None)
-            # ── 对话摘要：上下文 > 50% 或 > 10 轮对话时生成 ──
+            # Successful evidence-backed turns may compact their recent history.
             if memory_store:
-                user_msg_count = sum(1 for m in messages if m.get("role") == "user")
-                pct_ctx = (token_usage.get("last_prompt", 0) / token_usage.get("context_limit", 131072)) if token_usage else 0
-                thread_id = metadata.get("session_id", "research-main")
-                # ── 摘要频率控制：10 分钟内不重复摘要 ──
-                from datetime import datetime as _dt, timedelta as _td
-                last_sum = memory_store.get_last_summary_time(thread_id)
-                recent_sum = False
-                if last_sum:
-                    try:
-                        recent_sum = (_dt.fromisoformat(last_sum) + _td(minutes=10)) > _dt.now()
-                    except Exception:
-                        recent_sum = False
-                if (user_msg_count > 10 or pct_ctx > 0.5) and not recent_sum:
-                    try:
-                        recent_msgs = []
-                        for m in messages[-20:]:
-                            c = m.get("content", "") or ""
-                            recent_msgs.append(f"[{m.get('role','')}] {c[:300]}")
-                        raw = "\n".join(recent_msgs)
-                        sum_prompt = f"Summarize this research conversation in 150 chars Chinese:\n{raw[:3000]}"
-                        sr = requests.post(api_url, headers={
-                            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-                        }, json={"model": model, "messages": [{"role": "user", "content": sum_prompt}],
-                                  "stream": False, "temperature": 0.2},
-                            timeout=(3.05, verify_timeout_seconds))
-                        if sr.status_code == 200:
-                            summary = sr.json()["choices"][0]["message"]["content"].strip()[:300]
-                            topic = state.get("metadata", {}).get("topic", "")
-                            memory_store.add_summary(thread_id, topic, summary)
-                    except Exception:
-                        pass
+                pct_ctx = context_usage_ratio(token_usage)
+                maybe_store_conversation_summary(
+                    messages=messages,
+                    metadata=metadata,
+                    context_ratio=pct_ctx,
+                    memory_store=memory_store,
+                    llm_client=llm_client,
+                    model=model,
+                    timeout_seconds=verify_timeout_seconds,
+                    cancel_event=cancel_event,
+                )
                 # ── 预算预警前置：> 60% 提示（> 90% 强警告）──
                 if pct_ctx > 0.9 and token_usage:
                     token_usage["budget_warning"] = "⚠️ 上下文 90%+，建议 /new"
@@ -609,8 +797,10 @@ def build_graph(
     graph.add_node("tools", tool_node)
     graph.add_node("verify", verify_node)
     graph.set_entry_point("llm")
-    graph.add_conditional_edges("llm", router, {"tools": "tools", "verify": "verify"})
-    graph.add_edge("tools", "llm")
+    graph.add_conditional_edges(
+        "llm", router, {"tools": "tools", "verify": "verify", END: END},
+    )
+    graph.add_conditional_edges("tools", after_tools_router, {"llm": "llm", END: END})
     graph.add_conditional_edges("verify", verify_router, {"llm": "llm", END: END})
 
     conn = sqlite3.connect(checkpoint_db, check_same_thread=False)

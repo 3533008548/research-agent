@@ -5,11 +5,14 @@
 __pycache__/
 runtime/
 backups/
+evals/reports/*.json
 
 # Secrets stay on the host and are injected by Docker Compose at runtime.
 .env
 .env.*
 !.env.example
+frontend/node_modules/
+frontend/dist/
 # 旧版分散路径（保留忽略以支持显式迁移）
 chroma_data/
 checkpoint.db
@@ -23,3 +26,9 @@ daily.db-*
 
 # 下载的论文 PDF
 data/papers/
+
+# 本地项目规划、面试与交接材料
+工程化与多Agent实施方案.md
+Agent开发岗位项目面试题库.md
+交接文档_2026-08-09.md
+项目接手指南.md

@@ -1,0 +1,25 @@
+{
+  "meta": {"count": 1, "per_page": 1},
+  "results": [
+    {
+      "id": "https://openalex.org/W42424242",
+      "title": "Offline Fixture for Time-Sensitive Networking Research",
+      "abstract_inverted_index": {
+        "Deterministic": [0],
+        "fixture": [1],
+        "for": [2],
+        "runtime": [3],
+        "replay": [4]
+      },
+      "authorships": [{"author": {"display_name": "Fixture Author"}}],
+      "publication_year": 2026,
+      "publication_date": "2026-01-15",
+      "cited_by_count": 12,
+      "doi": "https://doi.org/10.5555/offline.openalex",
+      "primary_location": {
+        "landing_page_url": "https://example.invalid/openalex-fixture",
+        "source": {"display_name": "Offline Proceedings"}
+      }
+    }
+  ]
+}

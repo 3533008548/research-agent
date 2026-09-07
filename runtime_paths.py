@@ -47,6 +47,11 @@ class RuntimePaths:
         return self.primary_dir / "papers"
 
     @property
+    def research_documents_dir(self) -> Path:
+        """User-owned research plans and their Word exports; never treated as chat memory."""
+        return self.primary_dir / "research_documents"
+
+    @property
     def derived_dir(self) -> Path:
         return self.root / "derived"
 
@@ -57,6 +62,11 @@ class RuntimePaths:
     @property
     def images_dir(self) -> Path:
         return self.derived_dir / "images"
+
+    @property
+    def paper_artifacts_dir(self) -> Path:
+        """Rebuildable source maps and evidence cards derived from managed PDFs."""
+        return self.derived_dir / "paper_artifacts"
 
     @property
     def meta_dir(self) -> Path:
@@ -79,12 +89,13 @@ class RuntimePaths:
         return self.database_dir / "memory.db"
 
     @property
-    def notes_db(self) -> Path:
-        return self.database_dir / "notes.db"
-
-    @property
     def daily_db(self) -> Path:
         return self.database_dir / "daily.db"
+
+    @property
+    def badcases_db(self) -> Path:
+        """本地 Badcase 候选池；仅保存脱敏运行快照与人工分类。"""
+        return self.database_dir / "badcases.db"
 
     @property
     def profile_path(self) -> Path:
@@ -95,8 +106,10 @@ class RuntimePaths:
         for directory in (
             self.database_dir,
             self.papers_dir,
+            self.research_documents_dir,
             self.chroma_dir,
             self.images_dir,
+            self.paper_artifacts_dir,
             self.meta_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)

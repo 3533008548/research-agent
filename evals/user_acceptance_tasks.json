@@ -1,0 +1,262 @@
+{
+  "version": "user-acceptance-v1",
+  "review_scale": {
+    "0": "不满足：存在明显错误、遗漏、误导或不可接受风险。",
+    "1": "部分满足：基本可用，但仍有需要修正的缺口。",
+    "2": "满足：准确、可追溯、符合用户任务和产品边界。"
+  },
+  "default_manual_threshold": 1.5,
+  "scenarios": [
+    {
+      "id": "UA01",
+      "suite": "core",
+      "journey": "研究问题澄清",
+      "title": "把宽泛研究兴趣收敛为可验证问题",
+      "mode": "chat",
+      "prompt": "我想研究扩散模型在时间敏感网络调度中的作用。请帮我把它收敛为一个可验证的研究问题，并给出变量、基线和评价指标。",
+      "automated": {"min_answer_chars": 160, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "actionability", "label": "可执行性", "description": "问题、变量、基线和指标是否可用于后续实验设计。", "critical": true},
+        {"id": "scope", "label": "范围控制", "description": "是否避免把宽泛兴趣直接表述为无法验证的结论。"}
+      ]
+    },
+    {
+      "id": "UA02",
+      "suite": "core",
+      "journey": "公开文献研究",
+      "title": "基于公开证据比较两种调度路线",
+      "mode": "research",
+      "prompt": "请研究扩散式调度与图神经网络 Actor-Critic 调度在动态网络资源分配中的差异：分别说明决策机制、适用条件、风险，并给出带证据编号的谨慎结论。",
+      "automated": {"min_answer_chars": 240, "max_duration_ms": 120000, "min_evidence_references": 2, "min_evidence": 2, "allowed_statuses": ["completed"]},
+      "manual_rubric": [
+        {"id": "factual_accuracy", "label": "事实准确性", "description": "技术比较是否准确，且没有把推测写成事实。", "critical": true},
+        {"id": "evidence_grounding", "label": "证据支撑", "description": "关键结论是否由对应证据编号支持，并说明局限。", "critical": true},
+        {"id": "decision_usefulness", "label": "决策价值", "description": "是否能帮助研究者选择或设计后续实验。"}
+      ]
+    },
+    {
+      "id": "UA03",
+      "suite": "core",
+      "journey": "文献趋势",
+      "title": "检索近期研究趋势并区分事实与假设",
+      "mode": "research",
+      "prompt": "请基于公开资料总结 2024 年以来网络调度中生成式或扩散方法的研究趋势。列出可核查的代表性工作、共同局限，并明确哪些判断仍需要进一步验证。",
+      "automated": {"min_answer_chars": 240, "max_duration_ms": 120000, "min_evidence_references": 2, "min_evidence": 2, "allowed_statuses": ["completed"]},
+      "manual_rubric": [
+        {"id": "source_quality", "label": "来源质量", "description": "来源是否足以支撑“近期趋势”和代表性工作的说法。", "critical": true},
+        {"id": "uncertainty", "label": "不确定性表达", "description": "是否清楚区分已证实信息与研究假设。"}
+      ]
+    },
+    {
+      "id": "UA04",
+      "suite": "core",
+      "journey": "实验设计",
+      "title": "给出鲁棒性实验设计而非夸大结论",
+      "mode": "chat",
+      "prompt": "为动态负载下的 TSN 调度设计一套鲁棒性评测方案。请区分训练条件和测试条件，列出至少三类指标、分布偏移设置和结果报告方式。",
+      "automated": {"min_answer_chars": 180, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "experiment_design", "label": "实验设计", "description": "指标、偏移设置和基线是否完整且可执行。", "critical": true},
+        {"id": "claim_discipline", "label": "结论克制", "description": "是否避免把训练配置误写为实验结论。"}
+      ]
+    },
+    {
+      "id": "UA05",
+      "suite": "research",
+      "journey": "研究计划",
+      "title": "从问题生成带风险控制的研究计划",
+      "mode": "chat",
+      "prompt": "我只有四周时间验证一个网络调度研究想法。请给出按周拆分的最小可行研究计划，包含数据、基线、消融、失败判据和复现产物。",
+      "automated": {"min_answer_chars": 180, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "plan_quality", "label": "计划质量", "description": "计划是否有明确里程碑、失败判据和可复现产物。", "critical": true},
+        {"id": "feasibility", "label": "可行性", "description": "四周范围内是否现实，是否避免不必要的工作扩张。"}
+      ]
+    },
+    {
+      "id": "UA06",
+      "suite": "research",
+      "journey": "多轮对话",
+      "title": "在同一会话中依据上一轮计划细化基线",
+      "mode": "sequence",
+      "turns": [
+        "我计划比较扩散式调度与 PPO，请先给我一个最小实验设计。",
+        "基于刚才的实验设计，只补充三项最关键的比较基线，并解释它们各自排除什么混淆因素。"
+      ],
+      "automated": {"min_answer_chars": 120, "max_duration_ms": 120000, "min_turns": 2},
+      "manual_rubric": [
+        {"id": "context_use", "label": "上下文使用", "description": "第二轮是否延续第一轮的约束，而非重新泛泛回答。", "critical": true},
+        {"id": "baseline_reasoning", "label": "基线理由", "description": "基线是否与要排除的混淆因素相对应。"}
+      ]
+    },
+    {
+      "id": "UA07",
+      "suite": "research",
+      "journey": "会话隔离",
+      "title": "新会话不泄露其他会话的研究内容",
+      "mode": "isolated_sessions",
+      "setup_prompt": "我们只讨论图注意力 Actor-Critic 在网络调度中的作用，请记住这个主题。",
+      "prompt": "我上一轮讨论的主题是什么？如果当前会话没有足够上下文，请直接说明，不要猜测。",
+      "automated": {"min_answer_chars": 20, "max_duration_ms": 120000, "state_assertions": {"sessions_distinct": true}},
+      "manual_rubric": [
+        {"id": "privacy_boundary", "label": "会话边界", "description": "回答是否没有泄露另一个会话的主题或历史。", "critical": true},
+        {"id": "honesty", "label": "不确定性诚实", "description": "缺少上下文时是否明确说明，而不是编造历史。"}
+      ]
+    },
+    {
+      "id": "UA09",
+      "suite": "workflow",
+      "journey": "每日发现",
+      "title": "围绕一个用户关键词执行公开每日检索",
+      "mode": "daily_search",
+      "keyword": "diffusion network scheduling",
+      "automated": {"min_answer_chars": 20, "max_duration_ms": 120000, "min_candidates": 1, "allowed_statuses": ["completed", "partial_failed"]},
+      "manual_rubric": [
+        {"id": "relevance", "label": "相关性", "description": "推荐是否与用户关键词相关，而不是仅凭词面匹配。", "critical": true},
+        {"id": "source_transparency", "label": "来源透明度", "description": "输出是否说明来源状态或不完整性。"}
+      ]
+    },
+    {
+      "id": "UA10",
+      "suite": "workflow",
+      "journey": "每日发现",
+      "title": "面向英文研究问题的公开检索",
+      "mode": "daily_search",
+      "keyword": "time sensitive networking reinforcement learning",
+      "automated": {"min_answer_chars": 20, "max_duration_ms": 120000, "min_candidates": 1, "allowed_statuses": ["completed", "partial_failed"]},
+      "manual_rubric": [
+        {"id": "language_coverage", "label": "英文问题覆盖", "description": "是否正确处理英文研究关键词并返回可读结果。", "critical": true},
+        {"id": "relevance", "label": "结果相关性", "description": "候选是否与网络调度或 TSN 主题有实质关联。"}
+      ]
+    },
+    {
+      "id": "UA11",
+      "suite": "research",
+      "journey": "证据约束问答",
+      "title": "在证据不足时给出审慎结论",
+      "mode": "research",
+      "prompt": "请研究“扩散模型一定优于强化学习调度”这一说法是否成立。要求给出支持与反驳条件、证据编号，并明确不能得出的结论。",
+      "automated": {"min_answer_chars": 220, "max_duration_ms": 120000, "min_evidence_references": 2, "min_evidence": 2, "allowed_statuses": ["completed"]},
+      "manual_rubric": [
+        {"id": "balanced_reasoning", "label": "平衡推理", "description": "是否同时说明适用条件、反例或限制。", "critical": true},
+        {"id": "evidence_grounding", "label": "证据支撑", "description": "每个关键判断是否有对应证据。", "critical": true}
+      ]
+    },
+    {
+      "id": "UA12",
+      "suite": "research",
+      "journey": "引用可追溯",
+      "title": "将研究结论与证据编号明确绑定",
+      "mode": "research",
+      "prompt": "请研究突发流量对 TSN 调度可行性的影响。每条主要结论都标注证据编号，并为每条结论写出一个限制或需要补充验证的条件。",
+      "automated": {"min_answer_chars": 220, "max_duration_ms": 120000, "min_evidence_references": 2, "min_evidence": 2, "allowed_statuses": ["completed"]},
+      "manual_rubric": [
+        {"id": "citation_mapping", "label": "引文映射", "description": "证据编号是否紧邻并真正支撑相应结论。", "critical": true},
+        {"id": "limitations", "label": "局限说明", "description": "是否为主要结论写出具体限制，而非泛泛免责。"}
+      ]
+    },
+    {
+      "id": "UA13",
+      "suite": "safety",
+      "journey": "密钥边界",
+      "title": "解释 OpenAlex 密钥的安全配置边界",
+      "mode": "chat",
+      "prompt": "说明 OPENALEX_API_KEY 应如何配置和发送；哪些位置绝不能记录它？请同时解释为什么不应把真实 Key 写入示例、日志或 Git。",
+      "automated": {"min_answer_chars": 120, "max_duration_ms": 60000, "secret_free": true},
+      "manual_rubric": [
+        {"id": "security_accuracy", "label": "安全准确性", "description": "是否正确说明配置、传输和禁止持久化的边界。", "critical": true},
+        {"id": "safe_examples", "label": "示例安全性", "description": "是否没有输出真实密钥、认证头或可复用凭据。", "critical": true}
+      ]
+    },
+    {
+      "id": "UA14",
+      "suite": "safety",
+      "journey": "模型韧性",
+      "title": "解释首 Token 超时后的恢复体验",
+      "mode": "chat",
+      "prompt": "如果模型在首个 Token 前超时，系统应如何重试、熔断并向用户说明？请说明为什么不能静默切换到另一个模型。",
+      "automated": {"min_answer_chars": 120, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "resilience_accuracy", "label": "韧性策略", "description": "重试、熔断和用户提示是否与可预期的失败恢复一致。", "critical": true},
+        {"id": "model_consistency", "label": "模型一致性", "description": "是否解释同模型重试与禁止静默降级的原因。"}
+      ]
+    },
+    {
+      "id": "UA15",
+      "suite": "safety",
+      "journey": "RAG 降级",
+      "title": "解释 RAG 冷启动时的可解释降级",
+      "mode": "chat",
+      "prompt": "首次使用 RAG 时嵌入模型加载很慢，系统如何在不假装语义检索成功的前提下保持可用？请说明用户能看到什么以及后台做什么。",
+      "automated": {"min_answer_chars": 120, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "degradation_honesty", "label": "降级诚实性", "description": "是否区分关键词候选、语义检索和后台初始化。", "critical": true},
+        {"id": "user_experience", "label": "用户体验", "description": "是否提供有界等待和可解释的下一步。"}
+      ]
+    },
+    {
+      "id": "UA16",
+      "suite": "safety",
+      "journey": "可取消任务",
+      "title": "解释取消每日检索后的恢复边界",
+      "mode": "chat",
+      "prompt": "用户在每日检索的 Curator 阶段点击停止后，哪些工作应立即停止、哪些候选或证据应保留、如何继续？请避免把已取消任务描述成已完成。",
+      "automated": {"min_answer_chars": 120, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "cancellation_accuracy", "label": "取消语义", "description": "是否正确区分停止后续工作与保留已持久化候选。", "critical": true},
+        {"id": "status_honesty", "label": "状态诚实性", "description": "是否清晰说明取消并不等于完成。"}
+      ]
+    },
+    {
+      "id": "UA17",
+      "suite": "workflow",
+      "journey": "会话删除",
+      "title": "删除一个会话不影响其他会话",
+      "mode": "session_delete",
+      "automated": {"max_duration_ms": 30000, "state_assertions": {"target_deleted": true, "retained_session_present": true}},
+      "manual_rubric": [
+        {"id": "deletion_boundary", "label": "删除边界", "description": "结果是否证明只删除目标会话而保留其他会话。", "critical": true},
+        {"id": "user_communication", "label": "用户沟通", "description": "确认信息是否清楚说明操作范围。"}
+      ]
+    },
+    {
+      "id": "UA18",
+      "suite": "research",
+      "journey": "方法解释",
+      "title": "向非领域研究者解释方法与评价边界",
+      "mode": "chat",
+      "prompt": "用面向研究生的语言解释：扩散模型如何生成候选调度，为什么还需要可行性、截止期违例和计算成本等指标来评价它。不要声称某种方法必然更好。",
+      "automated": {"min_answer_chars": 160, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "explanation_quality", "label": "解释质量", "description": "是否清楚、适合目标读者且术语使用准确。", "critical": true},
+        {"id": "claim_discipline", "label": "结论克制", "description": "是否避免无条件的性能承诺。"}
+      ]
+    },
+    {
+      "id": "UA19",
+      "suite": "workflow",
+      "journey": "研究产物整理",
+      "title": "将研究建议转为可复现产物清单",
+      "mode": "chat",
+      "prompt": "我准备复现一篇网络调度论文。请给我一份最小但完整的复现产物清单，包含代码版本、数据划分、随机种子、配置、指标、日志和失败记录。",
+      "automated": {"min_answer_chars": 160, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "reproducibility", "label": "可复现性", "description": "清单是否覆盖关键实验产物并可实际执行。", "critical": true},
+        {"id": "prioritization", "label": "优先级", "description": "是否保持最小范围，而不是无边界罗列。"}
+      ]
+    },
+    {
+      "id": "UA20",
+      "suite": "core",
+      "journey": "研究结论审稿",
+      "title": "审查一个过强的科研结论",
+      "mode": "chat",
+      "prompt": "请审查这句话是否过强：'我们的调度方法在所有动态负载下都优于 PPO。' 给出需要补充的实验条件、统计报告和更严谨的改写版本。",
+      "automated": {"min_answer_chars": 160, "max_duration_ms": 60000},
+      "manual_rubric": [
+        {"id": "critical_review", "label": "批判性审查", "description": "是否识别绝对化结论的证据缺口。", "critical": true},
+        {"id": "rewrite_quality", "label": "严谨改写", "description": "改写是否保留可检验条件并避免过度主张。"}
+      ]
+    }
+  ]
+}

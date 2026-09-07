@@ -22,6 +22,7 @@ if sys.platform == "win32":
 import json
 import argparse
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
@@ -45,12 +46,69 @@ except ImportError:
     pass
 
 # ── 项目模块 ──
+from cancellation import RequestCancelledError, raise_if_cancelled
 from graph_builder import build_graph
 from llm_client import LLMClient, LLMClientError
-from profile import ProfileManager
+from user_profile import ProfileManager
+from research_orchestrator import ResearchOrchestrator
 from resilience import CircuitBreaker
+from run_contract import execution_metadata
 from search_api import list_downloaded_papers
 from session_store import SessionStore
+from tool_catalog import get_tool_definition
+from tool_runtime import ToolExecutionContext
+
+
+# Keep a normal chat turn bounded even when the model repeatedly requests tools.
+# A graph "round" contains several internal nodes, so this still leaves room for
+# multiple search/read calls while preventing an accidental unbounded cost loop.
+MAX_AGENT_GRAPH_STEPS = 16
+
+
+_DIRECT_ENGINEERING_MARKERS = (
+    "系统应如何", "系统应该如何", "为什么仍应", "为何仍应", "为什么要",
+    "超时", "熔断", "降级", "并发槽", "优先级", "取消", "会话隔离",
+    "会话删除", "配置格式", "安全边界", "绝不能记录", "至少应报告", "实验设置",
+)
+_EXPLICIT_EVIDENCE_MARKERS = (
+    "论文", "文献", "引用", "原文", "最新进展", "最新研究", "搜索论文",
+    "检索论文", "找论文", "doi", "arxiv", "paper", "作者", "哪篇",
+)
+_RESEARCH_DOCUMENT_TERMS = ("科研档案", "研究档案")
+_RESEARCH_DOCUMENT_ACTIONS = ("保存", "存档", "导出", "生成")
+_RESEARCH_DOCUMENT_CONTENT_TERMS = ("方案", "计划", "假设", "决策记录")
+
+
+def should_force_research_document_save(user_input: str) -> bool:
+    """Recognize an explicit request to persist a user-owned research document.
+
+    This is deliberately a narrow rule, not another intent model: the user
+    must ask to save/export and name either the archive itself or a research
+    artefact.  It prevents a model from substituting a profile summary for a
+    durable document after the user has explicitly asked for one.
+    """
+    text = " ".join(str(user_input or "").casefold().split())
+    if not text or any(marker in text for marker in ("不要保存", "不保存", "无需保存")):
+        return False
+    if not any(action in text for action in _RESEARCH_DOCUMENT_ACTIONS):
+        return False
+    return any(term in text for term in _RESEARCH_DOCUMENT_TERMS) or any(
+        term in text for term in _RESEARCH_DOCUMENT_CONTENT_TERMS
+    )
+
+
+def should_answer_without_tools(user_input: str) -> bool:
+    """Keep explanatory engineering turns out of the expensive research loop.
+
+    This is intentionally narrow: explicit requests for papers or citations
+    still receive the full retrieval tool set.  The rule prevents a generic
+    design question from downloading unrelated papers merely to manufacture
+    references before a useful answer can be streamed.
+    """
+    text = str(user_input or "").casefold()
+    if not text or not any(marker in text for marker in _DIRECT_ENGINEERING_MARKERS):
+        return False
+    return not any(marker in text for marker in _EXPLICIT_EVIDENCE_MARKERS)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -91,12 +149,14 @@ class ResearchAgent:
         # 每个会话各自保存 Token 统计；请求内新建图实例，避免流式回调跨会话串线。
         self._usage_cache: dict[str, dict] = {}
         self._retry_inputs: dict[str, dict] = {}
+        self._last_traces: dict[str, dict] = {}
         self.runtime_status: dict[str, object] = {}
         self.verify_guard = CircuitBreaker(failure_threshold=2, recovery_seconds=120)
         self.llm_client = LLMClient(
             api_key=self.api_key,
-            api_url="https://api.deepseek.com/chat/completions",
+            api_url=cfg.api_url,
             max_concurrency=cfg.api_max_concurrency,
+            interactive_reserved_slots=cfg.api_interactive_reserved_slots,
             queue_size=cfg.api_queue_size,
             connect_timeout_seconds=cfg.api_connect_timeout_seconds,
             read_timeout_seconds=cfg.api_read_timeout_seconds,
@@ -117,7 +177,12 @@ class ResearchAgent:
             try:
                 from paper_store import PaperStore
                 print("      📚 初始化论文向量库...", file=sys.stderr, flush=True)
-                self._paper_store = PaperStore(persist_dir=cfg.chroma_dir)
+                self._paper_store = PaperStore(
+                    persist_dir=cfg.chroma_dir,
+                    reranker_enabled=cfg.rag_reranker_enabled,
+                    reranker_model=cfg.rag_reranker_model,
+                    reranker_candidate_limit=cfg.rag_reranker_candidate_limit,
+                )
                 print(
                     f"      ✅ 已加载 {self._paper_store.paper_count} 篇论文, "
                     f"{self._paper_store.chunk_count} 个块",
@@ -132,6 +197,13 @@ class ResearchAgent:
         self.sessions = SessionStore(cfg.checkpoint_db)
         if self.sessions.ensure_legacy_session():
             print("      💾 已迁移旧对话为「历史会话」", file=sys.stderr)
+        cleaned_checkpoints = self.sessions.cleanup_orphaned_checkpoints()
+        cleaned_rows = sum(cleaned_checkpoints.values())
+        if cleaned_rows:
+            print(
+                f"      🧹 已清理 {cleaned_rows} 条无归属的已删除会话记录",
+                file=sys.stderr,
+            )
         existing_sessions = self.sessions.list()
         if existing_sessions:
             self._thread_id = existing_sessions[0]["thread_id"]
@@ -150,52 +222,305 @@ class ResearchAgent:
     def step(
         self,
         user_input: str,
-        context: str | None = None,
         on_token=None,
         session_id: str | None = None,
-        topic: str | None = None,
+        cancel_event: threading.Event | None = None,
+        run_id: str | None = None,
     ) -> str:
-        """单轮推理：输入用户消息，返回 Agent 回复文本。context 可选注入话题/笔记上下文。
-           ``session_id`` 省略时使用当前 CLI 会话；Web 请求必须显式传入。"""
+        """单轮推理：输入用户消息，返回 Agent 回复文本。
+
+        ``session_id`` 省略时使用当前 CLI 会话；Web 请求必须显式传入。
+        """
+        try:
+            raise_if_cancelled(cancel_event, "请求已取消")
+        except RequestCancelledError:
+            return "⏹️ 请求已取消。"
         thread_id = session_id or self._thread_id
         state = {"messages": [], "metadata": {"session_id": thread_id}}
-        if topic:
-            state["metadata"]["topic"] = topic
-        if context:
-            state["messages"].append({"role": "system", "content": context})
         state["messages"].append({"role": "user", "content": user_input})
 
-        # 同一会话的对话和删除互斥；不同会话仍可并行执行。
-        with self._lock_for(thread_id):
+        # 同一会话的对话和删除互斥；不同会话仍可并行执行。等待锁时也响应取消。
+        session_lock = self._lock_for(thread_id)
+        while not session_lock.acquire(timeout=0.2):
+            try:
+                raise_if_cancelled(cancel_event, "等待会话操作时已取消")
+            except RequestCancelledError:
+                return "⏹️ 请求已取消。"
+        try:
             if not self.sessions.get(thread_id):
                 return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
-            self._retry_inputs[thread_id] = {
-                "user_input": user_input, "context": context, "topic": topic,
-            }
+            self._retry_inputs[thread_id] = {"user_input": user_input}
             usage = self.get_usage(thread_id)
-            app = self._build_app(usage, on_token)
+            usage_before = dict(usage)
+            started_at = time.perf_counter()
+            if run_id:
+                chat_run = self.sessions.get_chat_run(run_id)
+                if not chat_run or chat_run.get("thread_id") != thread_id:
+                    raise ValueError("聊天运行不存在，或不属于当前会话")
+                if chat_run.get("status") not in {"running", "cancelling"}:
+                    raise ValueError("聊天运行不是可执行状态")
+            else:
+                chat_run = self.sessions.create_chat_run(thread_id, self.model)
+            chat_run_id = str(chat_run["run_id"])
+            self.sessions.add_run_event(
+                thread_id, chat_run_id, "chat", "single_agent", "queue", "running",
+                summary="请求已进入交互队列",
+                metadata=execution_metadata(
+                    "chat", runner="agent", model=self.model, toolset="chat-default",
+                ),
+            )
+            trace_events: list[dict] = []
+            first_token_ms: float | None = None
+            outcome = "error"
+            answer = ""
+
+            def _record_event(event: dict) -> None:
+                at_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                trace_events.append({
+                    **event,
+                    "at_ms": at_ms,
+                })
+                self._persist_chat_event(thread_id, chat_run_id, event, at_ms)
+
+            def _on_token(token: str) -> None:
+                nonlocal first_token_ms
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if first_token_ms is None:
+                    first_token_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                    _record_event({"type": "first_token"})
+                if on_token:
+                    on_token(token)
+
+            force_research_document_save = should_force_research_document_save(user_input)
+            if force_research_document_save:
+                allowed_tool_names = {"save_research_document"}
+                _record_event({"type": "tool_policy", "policy": "forced_research_document_save"})
+            else:
+                allowed_tool_names = set() if should_answer_without_tools(user_input) else None
+            if allowed_tool_names is not None and not force_research_document_save:
+                _record_event({"type": "tool_policy", "policy": "direct_engineering_answer"})
+            app = None
             try:
+                if allowed_tool_names is None:
+                    # Preserve the long-standing default call shape so custom
+                    # integrations and lightweight test doubles do not need
+                    # to accept a no-op policy argument.
+                    app = self._build_app(
+                        usage, _on_token if on_token else None, _record_event,
+                        cancel_event=cancel_event, run_id=chat_run_id, session_id=thread_id,
+                    )
+                else:
+                    app = self._build_app(
+                        usage, _on_token if on_token else None, _record_event,
+                        cancel_event=cancel_event, allowed_tool_names=allowed_tool_names,
+                        force_tool_name="save_research_document" if force_research_document_save else None,
+                        run_id=chat_run_id, session_id=thread_id,
+                    )
                 result = app.invoke(
-                    state, config={"configurable": {"thread_id": thread_id}}
+                    state,
+                    config={
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": MAX_AGENT_GRAPH_STEPS,
+                    },
                 )
                 messages = result.get("messages", [])
                 if not messages:
-                    return "⚠️ Agent 未返回任何消息。"
+                    answer = "⚠️ Agent 未返回任何消息。"
+                    outcome = "empty_response"
+                    return answer
                 last = messages[-1]
-                return last.get("content", "") or ""
+                answer = last.get("content", "") or ""
+                outcome = "success"
+                return answer
+            except RequestCancelledError:
+                answer = "⏹️ 请求已取消。"
+                outcome = "cancelled"
+                _record_event({"type": "request_cancelled"})
+                return answer
             except LLMClientError as e:
-                return f"⚠️ {e}"
+                answer = f"⚠️ {e}"
+                outcome = "llm_error"
+                return answer
             except requests.RequestException as e:
-                return f"❌ 网络请求失败: {e}\n   请检查网络和 API Key。"
+                answer = f"❌ 网络请求失败: {e}\n   请检查网络和 API Key。"
+                outcome = "network_error"
+                return answer
             except Exception as e:
-                return f"❌ Agent 错误: {type(e).__name__}: {e}"
+                if type(e).__name__ == "GraphRecursionError":
+                    answer = (
+                        "⚠️ 本轮 Agent 已达到工具调用上限，已停止继续执行。"
+                        "请缩小问题范围后重试。"
+                    )
+                    outcome = "agent_limit"
+                    return answer
+                answer = f"❌ Agent 错误: {type(e).__name__}: {e}"
+                outcome = "agent_error"
+                return answer
             finally:
-                # 成功完成后不在状态栏残留“模型响应中”；流中断提示则保留给用户。
-                if not str(usage.get("api_status", "")).startswith("⚠️"):
-                    usage.pop("api_status", None)
+                # Status-bar text describes only the live request.  Completed
+                # interruptions and optional verification failures are visible
+                # in the answer/run timeline, not as stale session-wide alerts.
+                usage.pop("api_status", None)
+                usage.pop("verify_status", None)
                 self.sessions.touch(thread_id, user_input)
                 self.sessions.save_usage(thread_id, usage)
                 self._close_app(app)
+                tool_events = [event for event in trace_events if event.get("type") == "tool_finished"]
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                run_status = {
+                    "success": "completed",
+                    "cancelled": "cancelled",
+                }.get(outcome, "failed")
+                self.sessions.update_chat_run(
+                    chat_run_id,
+                    status=run_status,
+                    answer=answer,
+                    duration_ms=duration_ms,
+                    metrics={
+                        "model_calls": usage.get("calls", 0) - usage_before.get("calls", 0),
+                        "tool_count": len(tool_events),
+                        "event_count": len(trace_events),
+                    },
+                    error_type="" if run_status == "completed" else outcome,
+                )
+                terminal_summaries = {
+                    "completed": "本轮对话已完成",
+                    "cancelled": "本轮对话已取消",
+                    "failed": "本轮对话未完成，可重试",
+                }
+                self.sessions.add_run_event(
+                    thread_id, chat_run_id, "chat", "single_agent", "run", run_status,
+                    summary=terminal_summaries[run_status],
+                    metrics={"duration_ms": duration_ms},
+                    error_type="" if run_status == "completed" else outcome,
+                    event_type="done",
+                )
+                self._last_traces[thread_id] = {
+                    "chat_run_id": chat_run_id,
+                    "session_id": thread_id,
+                    "model": self.model,
+                    "outcome": outcome,
+                    "duration_ms": duration_ms,
+                    "first_token_ms": first_token_ms,
+                    "tool_trace": tool_events,
+                    "events": trace_events,
+                    "usage_delta": {
+                        key: usage.get(key, 0) - usage_before.get(key, 0)
+                        for key in ("prompt", "completion", "total", "calls")
+                    },
+                    "answer_chars": len(answer),
+                }
+        finally:
+            session_lock.release()
+
+    def research(
+        self,
+        query: str = "",
+        *,
+        scope: str = "both",
+        context: str | None = None,
+        session_id: str | None = None,
+        resume: bool = False,
+        run_id: str | None = None,
+        cancel_event: threading.Event | None = None,
+        on_progress=None,
+    ) -> str:
+        """Run the bounded multi-agent research loop for one explicit session."""
+        thread_id = session_id or self._thread_id
+        session_lock = self._lock_for(thread_id)
+        while not session_lock.acquire(timeout=0.2):
+            try:
+                raise_if_cancelled(cancel_event, "等待会话操作时已取消")
+            except RequestCancelledError:
+                return "⚠️ 深度研究已取消。"
+        try:
+            if not self.sessions.get(thread_id):
+                return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
+            usage = self.get_usage(thread_id)
+            usage_before = dict(usage)
+            started_at = time.perf_counter()
+            events: list[dict] = []
+
+            def _record_progress(event: dict) -> None:
+                events.append({
+                    **event,
+                    "at_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                })
+                if on_progress:
+                    on_progress(event)
+
+            orchestrator = ResearchOrchestrator(
+                session_store=self.sessions,
+                api_key=self.api_key,
+                model=self.model,
+                paper_store=self._paper_store,
+                vision_model=self.cfg.vision_model,
+                llm_client=self.llm_client,
+                verify_timeout_seconds=self.cfg.verify_timeout_seconds,
+            )
+            result = orchestrator.run(
+                query,
+                thread_id=thread_id,
+                scope=scope,
+                context=context,
+                resume=resume,
+                run_id=run_id,
+                cancel_event=cancel_event,
+                on_progress=_record_progress,
+            )
+            for key in ("prompt", "completion", "total", "calls"):
+                usage[key] = usage.get(key, 0) + result.usage.get(key, 0)
+            usage["last_round_cost"] = 0
+            visible_query = "继续上次深度研究" if resume else query
+            self.sessions.touch(thread_id, visible_query)
+            self.sessions.save_usage(thread_id, usage)
+            self._append_research_turn(
+                thread_id,
+                visible_query,
+                result.answer,
+            )
+            self._last_traces[thread_id] = {
+                "session_id": thread_id,
+                "model": self.model,
+                "outcome": result.status,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                "events": events,
+                "research_run_id": result.run_id,
+                "evidence_quality": result.trace.get("evidence_quality") or {},
+                "usage_delta": {
+                    key: usage.get(key, 0) - usage_before.get(key, 0)
+                    for key in ("prompt", "completion", "total", "calls")
+                },
+                "answer_chars": len(result.answer),
+            }
+            return result.answer
+        except RequestCancelledError:
+            return "⚠️ 深度研究已取消。"
+        except ValueError as exc:
+            return f"⚠️ {exc}"
+        except Exception as exc:
+            return f"❌ 深度研究错误: {type(exc).__name__}: {exc}"
+        finally:
+            session_lock.release()
+
+    def _append_research_turn(self, thread_id: str, query: str, answer: str) -> None:
+        """Persist only the user-visible research turn, never worker messages."""
+        app = self._build_app(self.get_usage(thread_id))
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            app.update_state(
+                config,
+                {
+                    "messages": [
+                        {"role": "user", "content": query},
+                        {"role": "assistant", "content": answer},
+                    ],
+                    "metadata": {"session_id": thread_id},
+                },
+            )
+        finally:
+            self._close_app(app)
 
     def chat(self, user_input: str):
         """打印格式化回复"""
@@ -322,6 +647,16 @@ class ResearchAgent:
         thread_id = thread_id or self._thread_id
         if thread_id not in self._usage_cache:
             stored = self.sessions.get_usage(thread_id)
+            # ``api_status`` and ``verify_status`` describe in-flight work only.
+            # Older versions persisted them, so discard any stale value on first
+            # loading a session after restart.
+            transient_removed = False
+            for key in ("api_status", "verify_status"):
+                if key in stored:
+                    stored.pop(key, None)
+                    transient_removed = True
+            if transient_removed:
+                self.sessions.save_usage(thread_id, stored)
             usage = self._new_usage()
             usage.update(stored)
             self._usage_cache[thread_id] = usage
@@ -330,6 +665,11 @@ class ResearchAgent:
     def get_retry_input(self, thread_id: str | None = None) -> dict | None:
         """返回本进程内最后一个模型请求，用于 UI 的 `/retry`。"""
         return self._retry_inputs.get(thread_id or self._thread_id)
+
+    def get_last_trace(self, thread_id: str | None = None) -> dict | None:
+        """返回最近一轮的脱敏链路追踪，供评测和诊断使用。"""
+        trace = self._last_traces.get(thread_id or self._thread_id)
+        return json.loads(json.dumps(trace, ensure_ascii=False)) if trace else None
 
     @property
     def token_usage(self) -> dict:
@@ -374,20 +714,99 @@ class ResearchAgent:
             "last_prompt": 0, "context_limit": limit,
         }
 
-    def _build_app(self, usage: dict, on_token=None):
+    def _persist_chat_event(
+        self,
+        thread_id: str,
+        run_id: str,
+        event: dict,
+        at_ms: float,
+    ) -> None:
+        """Project graph traces onto an intentionally small, non-content event schema."""
+        event_type = str(event.get("type") or "")
+        metrics = {"at_ms": at_ms}
+        if isinstance(event.get("duration_ms"), (int, float)):
+            metrics["duration_ms"] = event["duration_ms"]
+
+        event_map = {
+            "llm_request_started": ("single_agent", "model", "running", "模型请求已开始"),
+            "llm_response_headers": ("single_agent", "model", "running", "模型服务已响应"),
+            "llm_request_finished": ("single_agent", "model", "completed", "模型请求已完成"),
+            "llm_request_failed": ("single_agent", "model", "failed", "模型请求失败，可重试"),
+            "llm_status": ("single_agent", "model", "waiting", "模型请求正在排队或重试"),
+            "first_token": ("single_agent", "model", "streaming", "已收到首个输出片段"),
+            "request_cancelled": ("single_agent", "run", "cancelled", "请求已取消"),
+            "verify_request_started": ("verifier", "verify", "running", "事实核验已开始"),
+            "verify_request_finished": ("verifier", "verify", "completed", "事实核验已完成"),
+            "verify_request_cancelled": ("verifier", "verify", "cancelled", "事实核验已取消"),
+            "verify_request_skipped": ("verifier", "verify", "skipped", "事实核验暂时跳过"),
+            "verify_request_failed": ("verifier", "verify", "failed", "事实核验失败，已继续生成回复"),
+            "verify_status": ("verifier", "verify", "waiting", "事实核验正在等待服务"),
+        }
+        if event_type in {"tool_started", "tool_finished", "tool_failed"}:
+            tool_name = str(event.get("tool") or "")
+            tool_definition = get_tool_definition(tool_name)
+            label = tool_definition.label if tool_definition else "工具调用"
+            status = {
+                "tool_started": "running",
+                "tool_finished": "completed",
+                "tool_failed": "failed",
+            }[event_type]
+            message = {
+                "tool_started": f"{label}已开始",
+                "tool_finished": f"{label}已完成",
+                "tool_failed": f"{label}失败，可重试",
+            }[event_type]
+            agent, stage, summary = "single_agent", "tool", message
+        elif event_type in event_map:
+            agent, stage, status, summary = event_map[event_type]
+        else:
+            return
+
+        self.sessions.add_run_event(
+            thread_id, run_id, "chat", agent, stage, status,
+            summary=summary,
+            metrics=metrics,
+            error_type=str(event.get("error_type") or "")[:120],
+            event_type=(
+                "tool" if event_type in {"tool_started", "tool_finished", "tool_failed"}
+                else "error" if event_type in {"llm_request_failed", "verify_request_failed"}
+                else None
+            ),
+        )
+
+    def _build_app(
+        self, usage: dict, on_token=None, event_callback=None, cancel_event=None,
+        allowed_tool_names: set[str] | None = None,
+        force_tool_name: str | None = None,
+        run_id: str = "",
+        session_id: str = "",
+    ):
         return build_graph(
             api_key=self.api_key,
             model=self.model,
             paper_store=self._paper_store,
             token_usage=usage,
             checkpoint_db=self.cfg.checkpoint_db,
-            glm_api_key=self.cfg.glm_key,
+            vision_model=self.cfg.vision_model,
             stream_callback=on_token,
+            event_callback=event_callback,
+            cancel_event=cancel_event,
             profile_manager=self.profile,
             memory_store=self.memory,
             verify_timeout_seconds=self.cfg.verify_timeout_seconds,
             verify_guard=self.verify_guard,
             llm_client=self.llm_client,
+            allowed_tool_names=allowed_tool_names,
+            force_tool_name=force_tool_name,
+            tool_context=ToolExecutionContext(
+                run_kind="chat",
+                run_id=run_id,
+                session_id=session_id,
+                allowed_tool_names=(
+                    frozenset(allowed_tool_names) if allowed_tool_names is not None else None
+                ),
+                cancel_event=cancel_event,
+            ),
         )
 
     @staticmethod
@@ -449,7 +868,7 @@ def print_help():
 📦 **数据存储**
   runtime/primary/papers/  PDF 缓存
   runtime/derived/chroma/  RAG 向量库（可重建）
-  runtime/primary/db/      对话、笔记、记忆和每日检索数据
+  runtime/primary/db/      对话、记忆和每日检索数据
 """
     print(msg)
 

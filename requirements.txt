@@ -1,12 +1,16 @@
-# 🔬 科研助手 Agent 依赖
-# 安装：pip install -r requirements.txt
-
-requests>=2.28.0              # HTTP 请求（DeepSeek API + 学术搜索API）
-pdfplumber>=0.10.0            # PDF 解析（表格感知、双栏布局、章节标注）
-chromadb>=0.5                 # 向量数据库（含内置 ONNX Embedding，无需额外模型）
-langgraph>=0.2                # Agent 图编排（ReAct 循环 + Checkpoint）
-langgraph-checkpoint-sqlite    # SQLite 对话持久化（SqliteSaver）
-gradio>=5.0                    # Web UI（ChatInterface + MathJax 公式渲染）
-python-dotenv>=1.0.0          # .env 环境变量加载
-PyMuPDF                       # PDF 图片提取（describe_image 配合 GLM-4V 看图）
-PyYAML                         # 配置文件解析 (config.yaml)
+# Research Agent runtime dependencies
+requests>=2.28.0
+pdfplumber>=0.10.0
+chromadb>=0.5
+langgraph>=0.2
+langgraph-checkpoint-sqlite
+gradio>=5.0
+fastapi>=0.110
+python-multipart>=0.0.9
+uvicorn>=0.27
+python-dotenv>=1.0.0
+redis>=5.0,<7
+PyMuPDF
+PyYAML
+python-docx>=1.1,<2
+sentence-transformers>=5.6,<7
