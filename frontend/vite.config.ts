@@ -2,9 +2,9 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig(({ command }) => ({
-  // The production bundle is served by FastAPI under /app/. Vite's local
-  // development server stays at / so opening http://localhost:5173 is simple.
-  base: command === "build" ? "/app/" : "/",
+  // FastAPI serves the production bundle from the root path. Vite's local
+  // development server uses the same URLs, so links and assets stay portable.
+  base: "/",
   plugins: [react()],
   server: {
     port: 5173,

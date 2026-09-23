@@ -114,6 +114,7 @@ class PaperReader:
         with pymupdf.open(source) as text_pdf, table_context as table_pdf:
             total_pages = len(text_pdf)
             pages_to_read = min(total_pages, self.max_pages)
+            metadata = text_pdf.metadata or {}
             pages: list[dict[str, Any]] = []
             section = "未标注"
 
@@ -143,6 +144,7 @@ class PaperReader:
         return {
             "version": 1,
             "source_file": source.name,
+            "metadata_title": str(metadata.get("title") or "").strip(),
             "total_pages": total_pages,
             "processed_pages": pages_to_read,
             "pages": pages,

@@ -5,7 +5,7 @@
 
 用法:
   cfg = Config.load()
-  cfg.model          → "deepseek-v4-flash"
+  cfg.model          → "deepseek-flash"
   cfg.deepseek_key   → "sk-xxx"
   cfg.pdf_max_pages  → 15
 """
@@ -18,8 +18,8 @@ from runtime_paths import RuntimePaths
 
 # ── 默认值 ──
 _DFLT = {
-    "model": "deepseek-v4-flash",
-    "vision_model": "deepseek-v4-flash-vision-exp",
+    "model": "deepseek-flash",
+    "vision_model": "deepseek-flash",
     "pdf_max_pages": 15,
     "rag_enabled": True,
     "rag_reranker_enabled": False,
@@ -31,7 +31,7 @@ _DFLT = {
     "daily_request_timeout_seconds": 8,
     "daily_keyword_concurrency": 2,
     "daily_max_results_per_keyword": 3,
-    "daily_sources": ("openalex", "openaire", "dblp", "ieee"),
+    "daily_sources": ("openalex", "openaire", "dblp"),
     "api_max_concurrency": 4,
     "api_interactive_reserved_slots": 1,
     "api_queue_size": 20,
@@ -47,8 +47,8 @@ _DFLT = {
 
 @dataclass
 class Config:
-    model: str = "deepseek-chat"
-    vision_model: str = "deepseek-v4-flash-vision-exp"
+    model: str = "deepseek-flash"
+    vision_model: str = "deepseek-flash"
     deepseek_key: str = ""
     api_url: str = "https://api.deepseek.com/chat/completions"
     hf_endpoint: str = ""
@@ -68,7 +68,7 @@ class Config:
     daily_request_timeout_seconds: int = 8
     daily_keyword_concurrency: int = 2
     daily_max_results_per_keyword: int = 3
-    daily_sources: tuple[str, ...] = ("openalex", "openaire", "dblp", "ieee")
+    daily_sources: tuple[str, ...] = ("openalex", "openaire", "dblp")
     api_max_concurrency: int = 4
     api_interactive_reserved_slots: int = 1
     api_queue_size: int = 20
@@ -172,7 +172,7 @@ class Config:
                     )
                     configured_sources = yaml_cfg["daily_search"].get("sources")
                     if isinstance(configured_sources, list):
-                        allowed_sources = {"openalex", "openaire", "dblp", "ieee"}
+                        allowed_sources = {"openalex", "openaire", "dblp"}
                         sources = tuple(
                             str(source).strip().lower()
                             for source in configured_sources

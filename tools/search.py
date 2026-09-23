@@ -5,6 +5,7 @@
 import sys
 from pathlib import Path
 from paper_artifacts import load_document_map, related_context
+from paper_relations import relation_type_label
 from search_api import list_downloaded_papers, search_public_papers
 from runtime_paths import get_runtime_paths
 
@@ -24,8 +25,8 @@ def handle_search_papers(args: dict, **kw) -> str:
         return "❌ 请提供论文检索关键词。"
     source = str(args.get("source", "all") or "all").lower()
     limit = _bounded_int(args.get("limit", 5), 5, 1, 10)
-    if source not in {"all", "openalex", "arxiv", "ieee"}:
-        return "❌ source 仅支持 all、openalex、arxiv 或 ieee。"
+    if source not in {"all", "openalex", "arxiv"}:
+        return "❌ source 仅支持 all、openalex 或 arxiv；IEEE Xplore 暂时停用。"
     return search_public_papers(query, limit=limit, source=source)
 
 
@@ -75,6 +76,15 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
             metric = f"距离: {r['distance']}"
         location = f" · {locator}" if locator else ""
         lines.append(f"  {i}. [{r['title']}{location} · {sec}章节]  {metric}\n     {r['text']}")
+        relation_types = [
+            relation_type_label(str(relation_type))
+            for relation_type in (r.get("relation_types") or [])
+        ]
+        if relation_types:
+            lines.append(
+                "     关系增强候选（仅辅助检索，不构成论文事实）："
+                + "、".join(relation_types)
+            )
         if context:
             lines.append(f"     关联上下文：\n{context}")
     return "\n".join(lines)

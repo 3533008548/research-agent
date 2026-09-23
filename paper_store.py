@@ -42,6 +42,9 @@ HYBRID_CANDIDATE_LIMIT = 20
 RRF_K = 60
 DEFAULT_RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 _PDF_READER_PREAMBLE = "📄 **PDF 解析完成**"
+RELATION_EXPANSION_SEED_LIMIT = 3
+RELATION_EXPANSION_MAX_PAPERS = 8
+RELATION_EXPANSION_RRF_FACTOR = 0.5
 
 
 def clean_index_text(text: str) -> str:
@@ -231,6 +234,7 @@ class PaperStore:
         reranker_enabled: bool = False,
         reranker_model: str = DEFAULT_RERANKER_MODEL,
         reranker_candidate_limit: int = HYBRID_CANDIDATE_LIMIT,
+        relation_store: Any | None = None,
     ):
         if chromadb is None or embedding_functions is None:
             raise ImportError(
@@ -278,6 +282,9 @@ class PaperStore:
         self._reranker = None
         self._reranker_load_attempted = False
         self._reranker_lock = threading.Lock()
+        # A lightweight, user-confirmed relation store.  It is deliberately
+        # optional so the vector store stays usable in isolation and in tests.
+        self.relation_store = relation_store
 
     # ── 公开接口 ──
 
@@ -333,6 +340,13 @@ class PaperStore:
             start = int(chunk.get("char_start", char_pos))
             end = int(chunk.get("char_end", start + len(text)))
             page = chunk.get("page")
+            page_value = int(page) if isinstance(page, int) and page > 0 else -1
+            chunk_page_end = chunk.get("page_end", page)
+            page_end_value = (
+                int(chunk_page_end)
+                if isinstance(chunk_page_end, int) and chunk_page_end >= page_value > 0
+                else page_value
+            )
             metadatas.append({
                 "paper_id": resolved_id,
                 "title": title,
@@ -340,7 +354,8 @@ class PaperStore:
                 "chunk_index": index,
                 "char_start": start,
                 "char_end": end,
-                "page": int(page) if isinstance(page, int) and page > 0 else -1,
+                "page": page_value,
+                "page_end": page_end_value,
                 "element_id": str(chunk.get("id") or ""),
                 "element_kind": str(chunk.get("kind") or "text"),
                 "indexed_at": datetime.now().isoformat(),
@@ -418,6 +433,7 @@ class PaperStore:
                     "char_start": meta.get("char_start", 0),
                     "char_end": meta.get("char_end", 0),
                     "page": meta.get("page", -1),
+                    "page_end": meta.get("page_end", meta.get("page", -1)),
                     "element_id": meta.get("element_id", ""),
                     "element_kind": meta.get("element_kind", "text"),
                     "distance": round(max(dist - weight_penalty, 0), 4),
@@ -429,6 +445,33 @@ class PaperStore:
             results,
             key=lambda item: (item["distance"], item["title"], item["chunk_index"]),
         )[:top_k]
+
+    def start_embedding_warmup(self) -> Future | None:
+        """Start loading the local query encoder before the worker handles runs.
+
+        The same one-worker executor and active-future marker are used by
+        interactive retrieval.  While startup warming is underway, requests
+        retain the existing lexical fallback instead of competing for a second
+        encoder initialization.
+        """
+        with self._query_lock:
+            active = self._active_query
+            if active is not None and not active.done():
+                return None
+            future = self._query_executor.submit(self._warm_embedding)
+            self._active_query = future
+
+            def _clear_finished(done: Future) -> None:
+                with self._query_lock:
+                    if self._active_query is done:
+                        self._active_query = None
+
+            future.add_done_callback(_clear_finished)
+            return future
+
+    def _warm_embedding(self) -> None:
+        """Force the first encoder call without querying or mutating papers."""
+        self._embed_fn(["Research Agent startup embedding warmup."])
 
     def query_with_timeout(
         self,
@@ -551,6 +594,147 @@ class PaperStore:
             ),
         )
 
+    @staticmethod
+    def _sort_hybrid_results(results: list[dict]) -> list[dict]:
+        return sorted(
+            results,
+            key=lambda item: (
+                -float(item.get("hybrid_score", 0.0)),
+                min(item.get("semantic_rank", 99_999), item.get("keyword_rank", 99_999)),
+                item.get("title", ""),
+                item.get("chunk_index", 0),
+            ),
+        )
+
+    @staticmethod
+    def _relation_seed_ids(ranked: list[dict]) -> list[str]:
+        """Use only already relevant first-pass papers as one-hop relation seeds."""
+        seeds = []
+        for item in ranked:
+            paper_id = str(item.get("paper_id") or "").strip()
+            if paper_id and paper_id not in seeds:
+                seeds.append(paper_id)
+            if len(seeds) >= RELATION_EXPANSION_SEED_LIMIT:
+                break
+        return seeds
+
+    @staticmethod
+    def _attach_relation_hint(item: dict, hint: dict[str, Any]) -> None:
+        """Expose an auditable retrieval hint without changing paper content."""
+        item["relation_boost"] = round(float(hint.get("boost") or 0.0), 6)
+        item["relation_ids"] = list(hint.get("relation_ids") or [])
+        item["relation_types"] = list(hint.get("relation_types") or [])
+        item["relation_seed_paper_ids"] = list(hint.get("seed_paper_ids") or [])
+
+    def _expand_relation_candidates(
+        self,
+        query_text: str,
+        fused: dict[tuple[str, str, int], dict],
+        ranked: list[dict],
+        *,
+        candidate_k: int,
+        section: Optional[str],
+    ) -> None:
+        """Add only one-hop, topic-matched candidates from confirmed relations.
+
+        Relation traversal never replaces retrieval: a related paper contributes
+        only chunks that also score in semantic or lexical retrieval.  The
+        semantic cutoff is the first-pass candidate boundary, so a disconnected
+        paper's merely "least bad" chunk cannot enter because of a relation.
+        """
+        relation_store = getattr(self, "relation_store", None)
+        if relation_store is None or not ranked:
+            return
+        seeds = self._relation_seed_ids(ranked)
+        if not seeds:
+            return
+        try:
+            hints = relation_store.related_paper_boosts(seeds)
+        except Exception as exc:
+            print(
+                f"      ⚠️ 论文关系检索已跳过（{type(exc).__name__}: {exc}）",
+                file=sys.stderr,
+            )
+            return
+        hints = {
+            paper_id: hint for paper_id, hint in hints.items()
+            if paper_id not in set(seeds)
+        }
+        if not hints:
+            return
+        related_ids = sorted(hints)[:RELATION_EXPANSION_MAX_PAPERS]
+        if not related_ids:
+            return
+
+        # Existing results can receive the small, explainable tie-break signal.
+        for item in fused.values():
+            hint = hints.get(str(item.get("paper_id") or ""))
+            if hint:
+                self._attach_relation_hint(item, hint)
+                item["hybrid_score"] = round(
+                    float(item.get("hybrid_score", 0.0)) + float(hint["boost"]), 6,
+                )
+                item["_relation_score_applied"] = True
+
+        try:
+            related_semantic = self.query(
+                query_text, candidate_k, paper_ids=related_ids, section=section,
+            )
+            related_lexical = self.query_lexical(
+                query_text, candidate_k, paper_ids=related_ids, section=section,
+            )
+        except Exception as exc:
+            print(
+                f"      ⚠️ 论文关系候选扩展已跳过（{type(exc).__name__}: {exc}）",
+                file=sys.stderr,
+            )
+            return
+
+        semantic_distances = [
+            float(item["distance"]) for item in ranked
+            if item.get("distance") is not None
+        ]
+        semantic_cutoff = max(semantic_distances) if semantic_distances else None
+
+        def merge_related(source: str, candidates: list[dict]) -> None:
+            for rank, candidate in enumerate(candidates, start=1):
+                if source == "semantic" and semantic_cutoff is not None:
+                    distance = candidate.get("distance")
+                    if distance is None or float(distance) > semantic_cutoff:
+                        continue
+                paper_id = str(candidate.get("paper_id") or "")
+                hint = hints.get(paper_id)
+                if hint is None:
+                    continue
+                key = self._result_key(candidate)
+                item = fused.setdefault(key, {
+                    **candidate,
+                    "hybrid_score": 0.0,
+                    "retrieval": "hybrid",
+                })
+                # This is a secondary retrieval source, not an extra normal
+                # RRF vote.  It cannot dominate a directly retrieved answer.
+                extra_score = RELATION_EXPANSION_RRF_FACTOR / (RRF_K + rank)
+                item["hybrid_score"] = round(
+                    float(item.get("hybrid_score", 0.0)) + extra_score, 6,
+                )
+                item[f"relation_{source}_rank"] = rank
+                self._attach_relation_hint(item, hint)
+
+        merge_related("semantic", related_semantic)
+        merge_related("keyword", related_lexical)
+        for item in fused.values():
+            hint = hints.get(str(item.get("paper_id") or ""))
+            if hint is not None and "relation_boost" in item:
+                # New candidates get their one bounded relation adjustment here;
+                # existing candidates were adjusted before candidate expansion.
+                if "_relation_score_applied" not in item:
+                    item["hybrid_score"] = round(
+                        float(item.get("hybrid_score", 0.0)) + float(hint["boost"]), 6,
+                    )
+                    item["_relation_score_applied"] = True
+            item.pop("_relation_score_applied", None)
+
     def query_hybrid(
         self,
         query_text: str,
@@ -615,15 +799,15 @@ class PaperStore:
         for item in fused.values():
             item["retrieval"] = "hybrid"
             results.append(item)
-        ranked = sorted(
-            results,
-            key=lambda item: (
-                -item["hybrid_score"],
-                min(item.get("semantic_rank", 99_999), item.get("keyword_rank", 99_999)),
-                item.get("title", ""),
-                item.get("chunk_index", 0),
-            ),
-        )
+        ranked = self._sort_hybrid_results(results)
+        # Paper relations are a post-hybrid one-hop expansion.  Explicitly
+        # scoped retrieval must remain scoped, so it never walks outside its
+        # supplied paper IDs.
+        if paper_ids is None:
+            self._expand_relation_candidates(
+                query_text, fused, ranked, candidate_k=candidate_k, section=section,
+            )
+            ranked = self._sort_hybrid_results(list(fused.values()))
         rerank_limit = (
             getattr(self, "_reranker_candidate_limit", 0)
             if getattr(self, "_reranker_enabled", False) else 0
@@ -662,6 +846,7 @@ class PaperStore:
                 "char_start": meta.get("char_start", 0),
                 "char_end": meta.get("char_end", 0),
                 "page": meta.get("page", -1),
+                "page_end": meta.get("page_end", meta.get("page", -1)),
                 "element_id": meta.get("element_id", ""),
                 "element_kind": meta.get("element_kind", "text"),
                 "retrieval": "keyword",
@@ -730,6 +915,15 @@ class PaperStore:
         ids_to_delete = raw.get("ids", [])
         if ids_to_delete:
             self._collection.delete(ids=ids_to_delete)
+        relation_store = getattr(self, "relation_store", None)
+        if relation_store is not None:
+            try:
+                relation_store.remove_paper(paper_id)
+            except Exception as exc:
+                print(
+                    f"      ⚠️ 已删除论文，但未能清理关系边（{type(exc).__name__}: {exc}）",
+                    file=sys.stderr,
+                )
         return len(ids_to_delete)
 
     def get_paper_chunks(self, paper_id: str) -> list[dict]:
@@ -748,6 +942,7 @@ class PaperStore:
                     "char_end": meta.get("char_end", 0),
                     "chunk_index": meta.get("chunk_index", 0),
                     "page": meta.get("page", -1),
+                    "page_end": meta.get("page_end", meta.get("page", -1)),
                     "element_id": meta.get("element_id", ""),
                     "element_kind": meta.get("element_kind", "text"),
                 })
@@ -774,6 +969,7 @@ class NoOpStore:
     def query(self, *a, **kw): return []
     def query_hybrid(self, *a, **kw): return []
     def query_with_timeout(self, *a, **kw): return [], None
+    def start_embedding_warmup(self): return None
     def index_paper(self, *a, **kw): return ""
     def index_document_map(self, *a, **kw): return ""
     def list_papers(self): return []

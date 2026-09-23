@@ -1,4 +1,4 @@
-"""Browser regression tests for Gradio mounted as a FastAPI HTTP client.
+"""Browser regression tests for the React workbench served by FastAPI.
 
 Run locally after installing the optional browser dependency:
 
@@ -39,7 +39,7 @@ except ImportError:
 
 @unittest.skipUnless(sync_playwright, "安装 requirements-dev.txt 后运行浏览器 E2E")
 class TestMountedFastAPIClientE2E(unittest.TestCase):
-    """Gradio must create and cancel runs through mounted FastAPI routes."""
+    """React must create and cancel runs through the FastAPI run contract."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

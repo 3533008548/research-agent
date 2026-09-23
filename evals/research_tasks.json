@@ -107,13 +107,13 @@
       "id": "T09",
       "capability": "模型请求韧性",
       "title": "超时后只重试同一模型",
-      "fixture": {"model": "deepseek-v4-flash", "failure": "ReadTimeout before first token"},
+      "fixture": {"model": "deepseek-flash", "failure": "ReadTimeout before first token"},
       "prompt": "模拟 DeepSeek 首 token 前读取超时，说明系统的重试、熔断和用户提示应如何表现。",
       "expected": {
         "tool_trace_contains": ["llm_client"],
-        "state_assertions": {"model": "deepseek-v4-flash", "fallback_model_used": false},
+        "state_assertions": {"model": "deepseek-flash", "fallback_model_used": false},
         "answer_checks": [
-          {"label": "同模型", "any_of": ["同一模型", "deepseek-v4-flash", "不降级"]},
+          {"label": "同模型", "any_of": ["同一模型", "deepseek-flash", "不降级"]},
           {"label": "恢复提示", "any_of": ["重试", "熔断", "/retry"]}
         ],
         "performance": {"max_duration_ms": 55000},

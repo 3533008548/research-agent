@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "科研助手系统架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [910, 450]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [10, 60],
+    "cols": 6,
+    "gapX": 15,
+    "gapY": 100,
+    "cellW": 135,
+    "cellH": 66
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "用户",
+      "sublabel": "浏览器",
+      "row": 0,
+      "col": 0
+    },
+    {
+      "id": "gradio",
+      "type": "frontend",
+      "label": "Gradio 工作台",
+      "sublabel": "会话、任务与研究界面",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "fastapi",
+      "type": "backend",
+      "label": "FastAPI 服务",
+      "sublabel": "/sessions · /runs · SSE",
+      "row": 0,
+      "col": 2
+    },
+    {
+      "id": "redis",
+      "type": "messagebus",
+      "label": "Redis Streams",
+      "sublabel": "三类任务队列与脱敏 SSE 事件",
+      "row": 0,
+      "col": 3
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "API Worker",
+      "sublabel": "chat · research · daily",
+      "row": 0,
+      "col": 4
+    },
+    {
+      "id": "agent",
+      "type": "backend",
+      "label": "ResearchAgent",
+      "sublabel": "LangGraph、工具、RAG 与研究编排",
+      "row": 0,
+      "col": 5
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "SQLite",
+      "sublabel": "会话、Run 记录与审计事件",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "chroma",
+      "type": "database",
+      "label": "ChromaDB RAG",
+      "sublabel": "页面元素块、混合检索与重排",
+      "row": 1,
+      "col": 4
+    },
+    {
+      "id": "deepseek",
+      "type": "external",
+      "label": "DeepSeek API",
+      "sublabel": "文本推理与视觉图片描述",
+      "row": 1,
+      "col": 5
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "本地部署运行时",
+      "wraps": ["gradio", "fastapi", "redis", "worker", "agent", "sqlite", "chroma"]
+    }
+  ],
+  "connections": [
+    {"id": "user-ui", "from": "user", "to": "gradio", "label": "交互界面", "variant": "emphasis", "labelAt": [145, 134]},
+    {"id": "ui-api", "from": "gradio", "to": "fastapi", "label": "HTTP / SSE", "labelAt": [295, 134]},
+    {"id": "api-sqlite", "from": "fastapi", "to": "sqlite", "label": "Run 持久化", "labelAt": [370, 30]},
+    {"id": "api-redis", "from": "fastapi", "to": "redis", "label": "任务入队 / SSE / 取消", "labelAt": [445, 134]},
+    {"id": "redis-worker", "from": "redis", "to": "worker", "label": "消费任务；事件回写", "labelAt": [595, 134]},
+    {"id": "worker-agent", "from": "worker", "to": "agent", "label": "执行任务", "labelAt": [745, 30]},
+    {"id": "agent-chroma", "from": "agent", "to": "chroma", "label": "RAG 索引与混合检索"},
+    {"id": "agent-deepseek", "from": "agent", "to": "deepseek", "label": "文本 / 视觉请求", "labelAt": [820, 134]}
+  ]
+}

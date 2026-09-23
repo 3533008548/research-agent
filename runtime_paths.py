@@ -52,6 +52,16 @@ class RuntimePaths:
         return self.primary_dir / "research_documents"
 
     @property
+    def experiment_projects_dir(self) -> Path:
+        """User-owned paper reproduction projects, kept outside chat/session state."""
+        return self.primary_dir / "experiment_projects"
+
+    @property
+    def paper_relations_file(self) -> Path:
+        """Explicit, user-confirmed relations between locally indexed papers."""
+        return self.primary_dir / "paper_relations.json"
+
+    @property
     def derived_dir(self) -> Path:
         return self.root / "derived"
 
@@ -107,6 +117,7 @@ class RuntimePaths:
             self.database_dir,
             self.papers_dir,
             self.research_documents_dir,
+            self.experiment_projects_dir,
             self.chroma_dir,
             self.images_dir,
             self.paper_artifacts_dir,

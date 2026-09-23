@@ -18,12 +18,12 @@
 
 | 功能 | 说明 |
 |------|------|
-| 🔍 **论文搜索** | OpenAlex 通用检索 + arXiv 预印本检索 + 可选 IEEE Xplore 元数据检索；结果统一去重 |
+| 🔍 **论文搜索** | OpenAlex 通用检索 + arXiv 预印本检索；结果统一去重 |
 | 📄 **PDF 阅读** | PyMuPDF 文本块双栏重排 + pdfplumber 表格 + 图注感知图片提取 |
 | 💬 **多会话管理** | 新建、切换、加载和永久删除会话；历史、摘要、Token 统计互相隔离 |
-| 🧠 **RAG 检索** | 章节感知切块 + 语义/BM25 RRF + 可选本地重排 + 公式保护 |
+| 🧠 **RAG 检索** | 章节与跨页续段感知切块 + 语义/BM25 RRF + 可选本地重排 + 公式保护 |
 | 🖼 **多模态看图** | DeepSeek 视觉模型描述 + 图注附带 + 描述缓存（省 token） |
-| 📰 **每日速递** | OpenAlex + OpenAIRE + DBLP 并行限时的后台推送；配置 IEEE Key 后自动纳入 IEEE Xplore，支持重试和待读清单管理 |
+| 📰 **每日速递** | OpenAlex + OpenAIRE + DBLP 并行限时的后台推送，支持重试和待读清单管理 |
 | 📁 **研究档案** | 将研究方案、假设或决策记录保存为可检索 Markdown 与可下载 Word 文档；按需读取，不注入会话摘要或用户画像 |
 | 👤 **用户画像** | Markdown 自动维护，Agent 从对话中学习偏好 |
 | 🧩 **辅助记忆** | 当前会话摘要自动压缩注入；论文方法/结果以全局三元组按需检索，会话之间严格隔离 |
@@ -50,71 +50,73 @@ pip install -r requirements.txt
 # OpenAlex 只填写原始 Key；不加 Bearer 前缀，也不要提交 .env
 OPENALEX_API_KEY=your-openalex-key
 
-# 可选：IEEE Xplore Metadata API Key。只查询元数据；仅对明确标记为
-# Open Access 的记录展示直接 PDF 链接。
+# IEEE Xplore 暂时停用；保留 Key 占位，恢复前不会发起该来源请求。
 IEEE_API_KEY=your-ieee-api-key
 ```
 
-每日推送默认使用 OpenAlex、OpenAIRE 与 DBLP；配置 `IEEE_API_KEY` 后自动加入 IEEE Xplore。`/daily search` 和“深度研究”的公开文献部分默认合并 OpenAlex 与 arXiv，同样会在配置 IEEE Key 后加入 IEEE 元数据。OpenAlex Key 未配置时接口仍可尝试匿名请求，但生产使用应配置该变量以获得稳定额度与可观测的限流响应。IEEE 的受限内容只保留落地页链接，不会被当作可下载全文。
+每日推送默认使用 OpenAlex、OpenAIRE 与 DBLP；`/daily search` 和“深度研究”的公开文献部分默认合并 OpenAlex 与 arXiv。IEEE Xplore 因 API 暂时不可用已被禁用，即使配置 `IEEE_API_KEY` 也不会发起请求。OpenAlex Key 未配置时接口仍可尝试匿名请求，但生产使用应配置该变量以获得稳定额度与可观测的限流响应。
 
 ```env
 DEEPSEEK_API_KEY=sk-***
-DEEPSEEK_VISION_MODEL=deepseek-v4-flash-vision-exp  # 可选，默认值
+DEEPSEEK_MODEL=deepseek-flash          # DeepSeek V4.1 Flash 的官方模型名
+DEEPSEEK_VISION_MODEL=deepseek-flash  # 可选，默认值；DeepSeek V4.1 Flash 原生支持视觉输入
 ```
 
 `DEEPSEEK_API_URL` 默认为官方 DeepSeek 地址；仅在自建兼容网关或本地测试模拟服务时覆盖，正常使用无需设置。
 
-### 3. 启动（Web UI）
+### 3. 启动（浏览器工作台）
 
-```bash
-python web_ui.py                # 浏览器打开 http://localhost:7860
-python web_ui.py -m deepseek-chat --port 8080
+```powershell
+docker compose up -d --build
 ```
 
-终端版：`python research_agent.py`
+浏览器打开 `http://localhost:7860/`，API 文档位于 `http://localhost:7860/docs`。
+终端版仍可使用：`python research_agent.py`。
 
-不传 `-m` 时，Web UI 和 CLI 都遵循统一配置优先级：命令行 > 环境变量 > `runtime/primary/settings.json` > `config.yaml` > 默认值。
+浏览器工作台和 CLI 都遵循统一配置优先级：命令行 > 环境变量 > `runtime/primary/settings.json` > `config.yaml` > 默认值。
 
-### React 前端（渐进迁移）
+Docker 的 `api-worker` 会在开始消费任务前预热本地 RAG 嵌入模型；因此首次用户检索不会承担 ONNX 模型加载或下载的等待。预热异常时服务仍可启动，并暂时使用本地关键词检索回退。
+
+### React 前端
 
 `frontend/` 是独立的 React + TypeScript + Vite 客户端；它只调用 FastAPI 的版本化接口，
 不直接访问 SQLite、Redis 或 Agent 实现。当前它覆盖会话、对话、深度研究（来源范围选择、继续未完成任务）、SSE 流式输出、
 取消任务、PDF/图片上传、研究档案、论文库、每日检索（执行、重试、继续、阅读状态、
-按次报告标签页）和运行中心 / Badcase。运行中心还显示当前会话的持久化 Token 统计。
-Gradio 仍保留在根路径，作为旧工作流的回退入口。
+按次报告标签页）、论文代码复现、用户画像和运行中心 / Badcase。运行中心还显示当前会话的持久化 Token 统计。
+失败或取消的普通对话可在运行检查器中重新发送；对任务的新补充会在下一编排节点生效。
 
-本地开发时先启动 API 服务，再启动 Vite。若只验证页面和普通对话，可只启动 API；深度研究和
-每日任务还需要 Redis 与独立 worker（最省事的方式仍是 `docker compose up -d`）。不使用 Docker
-时，在两个终端中分别运行：
+生产构建由 FastAPI 从根路径 `/` 托管。深度研究、每日检索、论文复现和跨进程可恢复的对话需要 Redis 与独立 worker；没有 Redis 时仅保留进程内普通对话，不适合作为标准部署。最简部署方式为上面的 Docker Compose。前端开发时，在三个终端中运行：
 
 ```powershell
+# 终端 1：任务 worker
 $env:REDIS_URL = "redis://127.0.0.1:6379/0"
 python api_worker.py
 
-# 另开一个终端
+# 终端 2：FastAPI
 $env:REDIS_URL = "redis://127.0.0.1:6379/0"
 python -m uvicorn api_server:app --host 127.0.0.1 --port 7860
+
+# 终端 3：React 热更新开发服务器
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
 浏览器访问 `http://localhost:5173/`。Vite 会把 `/api` 请求转发到 FastAPI；如果启用了
 `API_AUTH_REQUIRED=1`，在左下角填写本地 `.env` 中的 `API_AUTH_TOKEN`。该值仅保存在当前
-浏览器标签页的 `sessionStorage`。执行 `npm run build` 后，FastAPI 会在 `http://localhost:7860/app/`
-提供同一套前端；Docker 镜像构建会自动完成此步骤。原 Gradio UI 继续位于根路径 `/`，可用于
-尚未迁移的功能和回退。
+浏览器标签页的 `sessionStorage`。执行 `npm run build` 后，FastAPI 会在 `http://localhost:7860/`
+提供同一套前端；Docker 镜像构建会自动完成此步骤。
 
 ### 运行时数据目录
 
 代码、静态配置和用户数据相互隔离。默认数据目录为项目下的 `runtime/`，也可通过环境变量或启动参数改为其他位置：
 
-```bash
-APP_DATA_DIR=/path/to/research-agent-data python web_ui.py
-python web_ui.py --data-dir ./runtime
+```powershell
+$env:APP_DATA_DIR = "D:\\research-agent-data"
+python -m uvicorn api_server:app --host 127.0.0.1 --port 7860
 ```
 
-`runtime/primary/` 保存 SQLite、论文 PDF、用户画像与设置；`runtime/derived/` 保存可由原始数据重建的 Chroma 索引和 PDF 图片。`runtime/primary/db/badcases.db` 是本地 Badcase 候选池，只保存脱敏运行快照和人工分类。旧版根目录数据不会自动移动，可先预览再迁移：
+`runtime/primary/` 保存 SQLite、论文 PDF、用户画像、研究档案、复现实验项目、已确认论文关系与设置；`runtime/derived/` 保存可由原始数据重建的 Chroma 索引和 PDF 图片。`runtime/primary/paper_relations.json` 是小型、可审阅的论文关系索引；`runtime/primary/db/badcases.db` 是本地 Badcase 候选池，只保存脱敏运行快照和人工分类。旧版根目录数据不会自动移动，可先预览再迁移：
 
 ```bash
 python scripts/migrate_runtime.py
@@ -128,7 +130,9 @@ PDF 阅读器或分块规则升级后，重建本地索引：
 python scripts/reindex_local_papers.py --data-dir runtime --max-pages 20
 ```
 
-重建会为每篇论文生成页面级 `document_map.json`：正文、表格、图片、图注和相邻正文保留在同一页的关联中。`query_papers` 命中表或图时，会额外返回图表说明与必要的邻近正文；旧索引仍可查询，但不会具备这项补充上下文能力。
+重建会为每篇论文生成页面级 `document_map.json`：原始正文、表格、图片、图注和相邻正文始终保留页级关联；另会派生仅供检索的跨页逻辑正文块。只有相邻页、同一章节、下一页未从标题开始且前页未以完整句末结束的正文才会合并；一次最多跨两页，避免将连续页面链式拼接成难以审计的宽范围证据。逻辑块以 1,200 字符为目标、1,320 字符为软硬边界继续切分，并保留起止页与全部源元素 ID，因此引用会显示为 `p.3–4`，仍可回查原页。`query_papers` 命中表或图时，会额外返回图表说明与必要的邻近正文；旧索引仍可查询，但不会具备这项补充上下文能力。PDF 阅读器或切块规则升级后，应执行上面的重建命令以应用新规则。
+
+本地论文还可建立轻量“论文关系增强检索”：只保存用户确认且带页码或 chunk 锚点的**一跳**关系（方法相似/改进、实验可比、结果冲突、明确引用）。关系不构成论文事实，也不会自动由模型猜测生成；检索先完成语义 + BM25 RRF，再从已有相关论文的一跳关系中补充仍能匹配当前问题的候选，并给予有限加分，最后交给可选 reranker。它不引入图数据库、图遍历或 GraphRAG；删除论文会同步删除相关关系边。
 
 可选的中文/英文本地重排器首次下载和自检后，才在 `config.yaml` 中开启 `rag.reranker.enabled`：
 
@@ -142,7 +146,7 @@ Docker Desktop 启动后，先根据示例创建本地密钥文件，再构建�
 
 ```powershell
 Copy-Item .env.example .env
-# 编辑 .env，填入 DEEPSEEK_API_KEY；如需 IEEE 检索，再填 IEEE_API_KEY
+# 编辑 .env，填入 DEEPSEEK_API_KEY；IEEE_API_KEY 当前无需填写
 docker compose up --build -d
 ```
 
@@ -196,7 +200,11 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 
 普通对话中可以明确要求“为这篇论文生成证据卡”。它会读取已索引的本地 PDF，生成 `paper-card.md` 与 `source_map.json`；卡片中的论文事实以 `【论文 p.N · Sxxx】` 定位到提取块，模型推断会标记为 `【分析】`。PDF 文本不足或模型暂不可用时，系统会保留可追溯的证据草稿，而不会补写未提取到的实验或页码。
 
-需要把暂定研究方案留在对话之外时，直接说“把这份方案保存为研究文档”。Agent 会生成自包含的 Markdown 原稿和同版本 `.docx`，放入 `runtime/primary/research_documents/`；页面左侧的“研究档案”面板可预览原稿并下载 Word 文档。之后说“查一下之前保存的 TSN 方案”即可按关键词检索，只有选中的文档会被读取，不会自动塞入会话摘要或用户画像。文档保存的是工作草稿，不能替代论文证据或引用。
+需要把暂定研究方案留在对话之外时，直接说“把这份方案保存为研究文档”。Agent 会生成 Markdown 原稿和同版本 `.docx`，放入 `runtime/primary/research_documents/`；新档案固定使用“研究背景与研究现状、研究内容与创新、研究方案与可行性、研究展望与计划”四个章节。已有档案不能整篇覆盖：修改时 Agent 必须先读取目标章节，再以修订号和内容哈希校验提交局部补丁；写入前会保存完整历史快照，冲突会拒绝写入并要求重新读取。
+
+每份档案还带有独立的 `research_ledger.json`“证据与假设账本”。它保存研究问题、假设、创新候选或决策，以及支持/冲突/适用条件论文定位和可证伪条件；它不复制论文正文，也不会直接改写档案。账本中 `supported` 必须有可定位证据，正文变更导致的旧关联会显示为“待复核”。档案页不再堆叠“安全修改、比对论文、证据与假设、创新性审查”等预设按钮：直接输入自然语言请求即可。规则路由会把明显的修改、论文比对、账本梳理和创新性审查请求关联到当前档案并给出流程提示；其中“新导入论文 + 修改档案”会固定进入一次性的综合影响审查，先给出重叠/借鉴、可行性影响、创新性候选和逐章节拟修改项，待你确认后才允许写入。论文标题或 ID 不明确时不会猜测“最新一篇”，而会要求你指定。路由不是写入授权，Agent 仍须在写入前获得你的明确确认。
+
+在 React 工作台的“论文库”中，可对已解析论文点击“复现实验”。系统会以页面级解析证据为边界，提取可追溯的实验规格、待确认项和 Python 代码骨架，并保存到独立的 `runtime/primary/experiment_projects/` 项目页；它不会自动下载数据、运行训练或把未验证结果称为论文复现成功。项目页的“代码来源”可按论文标题检索 GitHub 候选，或直接连接用户提供的 GitHub 地址；候选永远不会被自动表述为官方实现。连接后点击“同步并分析上游代码”，系统会将记录的 commit 克隆到项目独立目录，并生成 README、依赖文件和训练入口清单；该步骤仍不会安装依赖、下载数据或执行仓库。若没有可用代码且你主动选择“按论文方法还原”，系统会创建单独的运行任务，基于论文页面级证据和已确认事实生成可编辑参考实现，并记录方法组件的证据定位、工程假设和待确认项；该产物始终标为近似方法还原，不是原作者代码复现，也不代表论文指标已复现。
 
 ### 标记 Badcase，形成可维护的回归样例
 
@@ -210,21 +218,7 @@ python scripts/export_badcase_template.py --candidate-id bc-xxxxxxxxxxxx
 
 删除会话时，关联的 Badcase 候选也会一并删除；如需长期保留某个问题，应先将其转写为合成评测样例。
 
-常用 Web UI 命令：
-
-| 命令 | 说明 |
-|------|------|
-| `/model` `/tokens` `/profile` | 查看模型、当前会话用量和用户画像 |
-| `/retry` | 重发当前进程中最后一个模型请求；流式中断后可用 |
-| `/indexed` | 查看已索引论文 |
-| `/daily add <关键词>` | 添加每日检索关键词 |
-| `/daily search <关键词>` | 立即执行一次不落库的 OpenAlex + arXiv 临时检索；配置 IEEE Key 后加上 IEEE Xplore |
-| `/daily retry` | 清除当日检索记录后重新检索已启用关键词 |
-| `/daily resume` | 从上次停止或失败时已保存的候选继续，不重复访问来源 API |
-| `/daily unread` | 查看最近三天的待读清单 |
-| `/research <问题>` | 以默认的本地 + 公开来源启动深度研究 |
-| `/research --sources=local <问题>` | 只检索已索引的本地论文（也可用 `public`） |
-| `/research continue` | 在当前会话中继续上次未完成的深度研究 |
+浏览器中的“科研档案”“用户画像”“论文库”“论文复现”“每日检索关键词”和“设置”均在左侧折叠区打开；论文库会显示每篇论文的已确认关系数，点击“关系审查”会把带源论文 ID 的只读审查指令放入对话框。研究档案、每日检索报告和实验项目会在中间工作台中以标签页打开。普通对话、深度研究、每日检索和论文复现均进入统一运行中心，可暂停、查看事件和在适用时重试或继续。
 
 ---
 
@@ -235,17 +229,18 @@ python tests/test_core.py
 python -m evals.release_gate --strict
 ```
 
-核心回归测试覆盖 PDF 提取、分块/RAG、图结构构建、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订、Badcase 脱敏快照/会话删除，以及取消令牌从浏览器到模型/工具节点的传播。
+核心回归测试覆盖 PDF 提取、分块/RAG、论文关系的确认/锚点/一跳检索约束、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订、Badcase 脱敏快照/会话删除，以及取消令牌从浏览器到模型/工具节点的传播。
 
-浏览器回归测试覆盖两类场景：会话隔离测试会启动本地 SSE 模拟服务，复现“旧会话流式输出中，新建会话并发送第一条命令”的竞态；挂载 API 测试会启动临时 FastAPI + Gradio 服务，确认 Gradio 通过 HTTP 创建运行任务、消费 SSE，并在切换会话时取消旧任务。两者都不读取用户 `runtime/`，也不访问真实模型。首次运行需安装 Chromium：
+浏览器回归测试会启动临时 FastAPI + React 服务，确认浏览器通过统一运行接口创建任务、消费 SSE，并在切换会话时取消旧任务。它不读取用户 `runtime/`，也不访问真实模型。首次运行需安装 Chromium，并先构建前端：
 
 ```bash
 pip install -r requirements-dev.txt
 python -m playwright install chromium
-python -m unittest tests.test_session_e2e tests.test_mounted_api_e2e
+cd frontend && npm ci && npm run build && cd ..
+python -m unittest tests.test_mounted_api_e2e
 ```
 
-GitHub Actions 会分别运行核心回归和两类浏览器回归测试。
+GitHub Actions 会分别运行核心回归和该浏览器端到端测试。
 
 FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文本端点，用于
 监控 Redis 队列积压、各类 worker 心跳和运行状态计数。指标只包含固定标签与聚合数字，
@@ -267,10 +262,10 @@ LangGraph ReAct 循环 (graph_builder.py)
 研究运行记录与会话共用 checkpoint.db，以 thread_id 关联；删除会话会同步删除可恢复的计划、证据、质检结果和最终报告。
 
 每日检索闭环 (daily_orchestrator.py)
-  Rule Planner → OpenAlex Scout ∥ OpenAIRE Scout ∥ DBLP Scout ∥ IEEE Scout（配置 Key 时）
+  Rule Planner → OpenAlex Scout ∥ OpenAIRE Scout ∥ DBLP Scout
   → Normalizer/Deduper → Quality Gate → Curator(整次任务一次) → Conditional Critic → Delivery
 
-每日运行记录保存在 daily.db；来源请求按域名限流，任务停止或失败时可从保存的候选恢复。Curator 使用共享 LLMClient 的低优先级请求，模型暂不可用时只保留可解释的规则排序，不切换模型。公开论文检索默认合并 OpenAlex 与 arXiv；配置 IEEE Key 后加入 IEEE Xplore 元数据。系统按 DOI、arXiv ID、标题相似度去重，并保留每条记录的来源、相关性依据和部分来源失败信息。IEEE 记录只有 `accessType=Open Access` 时才会额外展示直接 PDF 链接。
+每日运行记录保存在 daily.db；来源请求按域名限流，任务停止或失败时可从保存的候选恢复。Curator 使用共享 LLMClient 的低优先级请求，模型暂不可用时只保留可解释的规则排序，不切换模型。公开论文检索默认合并 OpenAlex 与 arXiv。系统按 DOI、arXiv ID、标题相似度去重，并保留每条记录的来源、相关性依据和部分来源失败信息。IEEE Xplore 因 API 暂时不可用而被禁用。
 
 Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过或达到重试上限后自动清理，避免影响后续对话。
 
@@ -278,6 +273,8 @@ Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过�
   primary/db/          → checkpoint、memory、daily、badcases SQLite 数据
   primary/papers/      → 原始论文 PDF
   primary/research_documents/ → 用户研究档案：Markdown 原稿与 Word 导出
+  primary/experiment_projects/ → 论文复现实验：证据规格、代码文件与版本快照
+  primary/paper_relations.json → 用户确认的论文关系：一跳检索提示与证据锚点
   primary/profile.md   → 用户画像
   primary/settings.json→ Web UI 用户设置
   derived/chroma/      → 论文向量库（可重建）
@@ -292,17 +289,18 @@ Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过�
 ```
 research_agent/
 ├── prompts.py            # 系统提示词 + 少样本范例
-├── tool_schemas.py       # 12 个工具 JSON Schema
+├── tool_schemas.py       # Agent 工具 JSON Schema
 ├── tool_catalog.py       # 工具声明目录：名称、Schema、展示名与结果限长
 ├── tool_runtime.py       # 工具授权/取消/限长/脱敏事件的统一执行边界
 ├── graph_builder.py      # LangGraph 图定义 + verify 分级
 ├── pdf_reader.py         # PDF 页面级元素提取（正文/表格/图片/图注/相邻关系）
-├── paper_store.py        # ChromaDB RAG（页面元素块、语义+BM25 RRF、可选重排）
-├── paper_artifacts.py    # 页面映射、关联上下文、证据卡与锚点审计
-├── research_documents.py # 用户研究档案：可检索 Markdown + Word 导出
+├── paper_store.py        # ChromaDB RAG（跨页逻辑块、语义+BM25 RRF、可选重排）
+├── paper_relations.py    # 用户确认的论文关系存储与一跳检索提示
+├── paper_artifacts.py    # 页面映射、跨页逻辑块、关联上下文、证据卡与锚点审计
+├── research_documents.py # 用户研究档案：四章节、局部补丁、历史快照、证据与假设账本 + Word 导出
 ├── paper_records.py      # 公开检索/每日检索共用的论文规范化与去重
-├── search_api.py         # OpenAlex / arXiv / IEEE Xplore 交互式与深度研究检索 API
-├── ieee_xplore.py        # IEEE Xplore Metadata API 参数与响应规范化（含访问权限边界）
+├── search_api.py         # OpenAlex / arXiv 交互式与深度研究检索 API
+├── ieee_xplore.py        # IEEE Xplore Metadata API 参数与响应规范化（当前禁用，保留恢复路径）
 ├── scheduler.py          # 每日论文检索调度器（自动/临时/重试）
 ├── daily_orchestrator.py # 每日多 Agent 编排、候选质量门控与恢复
 ├── user_profile.py       # 用户画像 (Markdown)
@@ -320,15 +318,16 @@ research_agent/
 ├── tools/                # 工具实现
 │   ├── search.py         # 搜索/查询/列表/删除
 │   ├── read_pdf.py       # 下载+提取+图片+索引+摘要
-│   ├── research_documents.py # 保存/检索/读取研究档案
+│   ├── research_documents.py # 创建/分节读取/安全补丁/版本恢复/账本/论文、创新性与新论文综合审查
 │   ├── describe.py       # DeepSeek 视觉模型看图 (缓存+图注)
 │   └── profile_tool.py   # 画像更新
 │
 ├── research_agent.py     # 终端 CLI 入口
 ├── research_orchestrator.py # 有边界的 Planner / Researcher / Critic 闭环
 ├── session_store.py       # 会话目录、研究运行记录、Token 统计与 checkpoint 联动删除
-├── web_ui.py             # Web UI：受控 Chatbot 状态，深度研究进度/停止/继续
-├── frontend/             # React + TypeScript 客户端（/app/，仅经 FastAPI 调用后端）
+├── api_server.py         # FastAPI 入口与 React 生产构建托管
+├── api_worker.py         # Redis 队列消费者：对话、研究、每日检索、论文复现
+├── frontend/             # React + TypeScript 客户端（根路径 /，仅经 FastAPI 调用后端）
 ├── scripts/              # 数据迁移、索引重建、重排器预热、备份和 Badcase 夹具导出
 ├── tests/                # 核心回归 + Playwright 浏览器会话隔离测试
 ├── .github/workflows/    # CI 自动测试

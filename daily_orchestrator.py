@@ -21,7 +21,7 @@ from typing import Any, Callable
 import requests
 
 from cancellation import RequestCancelledError, raise_if_cancelled
-from ieee_xplore import IEEE_METADATA_URL, ieee_records, ieee_search_params
+from ieee_xplore import IEEE_METADATA_URL, IEEE_XPLORE_ENABLED, ieee_records, ieee_search_params
 from llm_client import RequestPolicy, RequestPriority
 from paper_records import (
     deduplicate_paper_records,
@@ -57,7 +57,7 @@ class DailyResearchOrchestrator:
         request_timeout_seconds: int = 8,
         max_keyword_concurrency: int = 2,
         max_results_per_keyword: int = 3,
-        daily_sources: tuple[str, ...] | list[str] = ("openalex", "openaire", "dblp", "ieee"),
+        daily_sources: tuple[str, ...] | list[str] = ("openalex", "openaire", "dblp"),
         openalex_api_key: str = "",
         ieee_api_key: str = "",
     ) -> None:
@@ -69,17 +69,14 @@ class DailyResearchOrchestrator:
         self.max_results_per_keyword = max(1, min(5, int(max_results_per_keyword)))
         self.openalex_api_key = str(openalex_api_key or "").strip()
         self.ieee_api_key = str(ieee_api_key or "").strip()
-        allowed_daily_sources = {"openalex", "openaire", "dblp", "ieee"}
+        allowed_daily_sources = {"openalex", "openaire", "dblp"}
         configured_sources = tuple(
             str(source).strip().lower()
             for source in daily_sources
             if str(source).strip().lower() in allowed_daily_sources
-            and (str(source).strip().lower() != "ieee" or self.ieee_api_key)
         )
         self.daily_sources = configured_sources or ("openalex", "openaire", "dblp")
-        self.temporary_sources = (
-            ("openalex", "arxiv", "ieee") if self.ieee_api_key else ("openalex", "arxiv")
-        )
+        self.temporary_sources = ("openalex", "arxiv")
         # Source-level permits are stricter than keyword-level parallelism.
         # This prevents a burst of active keywords from tripping one provider.
         self._source_slots = {
@@ -394,7 +391,7 @@ class DailyResearchOrchestrator:
         self, keyword: str, cancel_event: threading.Event | None,
     ) -> list[dict[str, Any]]:
         """Search IEEE metadata only; full text remains opt-in and access-aware."""
-        if not self.ieee_api_key:
+        if not IEEE_XPLORE_ENABLED or not self.ieee_api_key:
             return []
         response = self._request_source(
             "ieee", IEEE_METADATA_URL, cancel_event,

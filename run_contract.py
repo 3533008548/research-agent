@@ -14,8 +14,8 @@ from typing import Any
 RUN_EVENT_SCHEMA_VERSION = 1
 RUN_EVENT_PROTOCOL = "run-event/v1"
 
-# The SSE contract is public.  Keep it small enough for Gradio, CLI clients
-# and future clients to share without exposing internal graph events.
+# The SSE contract is public. Keep it small enough for browser, CLI and future
+# clients to share without exposing internal graph events.
 SSE_EVENT_TYPES = frozenset({"status", "token", "tool", "done", "error"})
 
 # Token chunks are intentionally ephemeral Redis data.  Durable audit events
@@ -23,7 +23,7 @@ SSE_EVENT_TYPES = frozenset({"status", "token", "tool", "done", "error"})
 PERSISTED_EVENT_TYPES = frozenset({"status", "tool", "done", "error"})
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "partial_failed"})
 TERMINAL_EVENT_STAGES = frozenset({"run", "completed", "cancelled", "failed", "delivery", "orchestrator"})
-RUN_KINDS = frozenset({"chat", "research", "daily"})
+RUN_KINDS = frozenset({"chat", "research", "daily", "experiment"})
 RESEARCH_SCOPES = frozenset({"both", "local", "public"})
 
 
@@ -37,6 +37,9 @@ _SAFE_METRIC_KEYS = frozenset({
     "candidate_count",
     "source_failures",
     "event_count",
+    "file_count",
+    "unknown_count",
+    "validation_errors",
 })
 _SAFE_METADATA_KEYS = frozenset({"protocol", "run_kind", "model", "runner", "scope", "toolset"})
 

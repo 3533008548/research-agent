@@ -19,7 +19,10 @@ from runtime_paths import RuntimePaths
 
 
 SOURCE_MAP_VERSION = 2
-DOCUMENT_MAP_VERSION = 1
+DOCUMENT_MAP_VERSION = 3
+DEFAULT_CHUNK_MAX_CHARS = 1_200
+_CHUNK_SOFT_OVERFLOW = 120
+_MIN_TEXT_CHUNK_CHARS = 160
 CARD_HEADINGS = (
     "研究问题与贡献",
     "方法与关键模块",
@@ -32,7 +35,22 @@ CARD_HEADINGS = (
     "可验证的后续想法",
     "阅读结论",
 )
+# WHY / HOW / WHAT 专为跨篇横向比较设计：单篇卡片适合理解，三段式适合比较。
+CARD_COMPARISON_HEADING = "跨文献比较槽（WHY / HOW / WHAT）"
+CARD_COMPARISON_SLOTS = (
+    ("WHY", "这篇要解决什么问题、为什么重要（动机与缺口）"),
+    ("HOW", "用什么策略、方法或技术路线"),
+    ("WHAT", "得到了什么结果，留下了什么没解决"),
+)
 _PAGE_MARKER = re.compile(r"━━━ 第\s*(\d+)\s*页 ━━━")
+_TERMINAL_SENTENCE = re.compile(r"[。！？.!?][”’'\")\]）】〕》]*\s*$")
+_REFERENCE_SECTION = re.compile(r"reference|bibliograph|参考文献|引用文献", re.IGNORECASE)
+_CAPTION_LIKE = re.compile(r"^(?:table|tab\.?|figure|fig\.?|表|图)\s*\d+", re.IGNORECASE)
+_UNTAGGED_SECTION_HEADING = re.compile(
+    r"^(?:(?:[IVXLCDM]+|\d+)(?:\.\d+)*\.\s+[A-Z][A-Z0-9\s,&:/()\-]{2,}|"
+    r"[A-Z]\.\s+[A-Z][A-Za-z0-9\s,&:/()\-]{2,}|"
+    r"(?:第[一二三四五六七八九十百]+章|[一二三四五六七八九十]+、|\d+(?:\.\d+)+\s+).{2,80})$"
+)
 
 
 def _safe_artifact_key(value: str) -> str:
@@ -65,71 +83,269 @@ def build_document_map(
         "source_file": source_file,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
+    document_map["logical_blocks"] = build_logical_text_blocks(document_map)
     document_map["chunks"] = build_retrieval_chunks(document_map)
     return document_map
 
 
-def build_retrieval_chunks(document_map: dict[str, Any], *, max_chars: int = 1_200) -> list[dict[str, Any]]:
-    """Build bounded single-page RAG chunks while retaining their source elements."""
+def build_logical_text_blocks(document_map: dict[str, Any]) -> list[dict[str, Any]]:
+    """Join only high-confidence adjacent-page body continuations before chunking.
+
+    Page elements remain the audit source of truth.  This intermediate layer
+    prevents a page-break fragment from becoming an isolated embedding while
+    keeping every contributing element ID and page range visible downstream.
+    """
+    _annotate_text_structure(document_map)
+    runs: list[dict[str, Any]] = []
+    for page_record in document_map.get("pages") or []:
+        if not isinstance(page_record, dict):
+            continue
+        page = page_record.get("page")
+        if not isinstance(page, int) or page <= 0:
+            continue
+        current_section = "未标注"
+        members: list[dict[str, Any]] = []
+        next_run_starts_after_heading = False
+        run_starts_after_heading = False
+
+        def flush() -> None:
+            nonlocal members, run_starts_after_heading
+            if not members:
+                return
+            text = "\n\n".join(str(item["text"]).strip() for item in members if str(item.get("text") or "").strip())
+            if text:
+                runs.append({
+                    "page_start": page,
+                    "page_end": page,
+                    "section": current_section or "未标注",
+                    "text": text,
+                    "source_element_ids": [str(item.get("id") or "") for item in members if str(item.get("id") or "")],
+                    "related_ids": [
+                        str(related_id)
+                        for item in members
+                        for related_id in list(item.get("related_ids") or [])
+                        if str(related_id)
+                    ],
+                    "starts_after_heading": run_starts_after_heading,
+                })
+            members = []
+            run_starts_after_heading = False
+
+        for element in list(page_record.get("elements") or []):
+            if not isinstance(element, dict) or str(element.get("kind") or "text") != "text":
+                continue
+            if element.get("is_caption") or element.get("is_boilerplate"):
+                continue
+            if element.get("is_heading"):
+                flush()
+                current_section = str(element.get("section") or element.get("text") or "未标注")
+                next_run_starts_after_heading = True
+                continue
+            text = str(element.get("text") or "").strip()
+            if not text:
+                continue
+            section = str(element.get("section") or current_section or "未标注")
+            if members and section != current_section:
+                flush()
+            current_section = section
+            if not members:
+                run_starts_after_heading = next_run_starts_after_heading
+                next_run_starts_after_heading = False
+            members.append(element)
+        flush()
+
+    merged: list[dict[str, Any]] = []
+    for run in runs:
+        previous = merged[-1] if merged else None
+        if previous is not None and _is_cross_page_continuation(previous, run):
+            _append_logical_run(previous, run)
+        else:
+            merged.append(run)
+
+    blocks: list[dict[str, Any]] = []
+    for index, run in enumerate(merged, start=1):
+        start = int(run["page_start"])
+        end = int(run["page_end"])
+        pages = list(range(start, end + 1))
+        blocks.append({
+            "id": f"logical-p{start:03d}-{index:03d}",
+            "kind": "text",
+            "page_start": start,
+            "page_end": end,
+            "source_pages": pages,
+            "section": str(run.get("section") or "未标注"),
+            "text": str(run.get("text") or "").strip(),
+            "source_element_ids": list(dict.fromkeys(run.get("source_element_ids") or [])),
+            "related_ids": list(dict.fromkeys(run.get("related_ids") or [])),
+            "continuation_confidence": "high" if end > start else "page_local",
+        })
+    return blocks
+
+
+def _is_cross_page_continuation(previous: dict[str, Any], following: dict[str, Any]) -> bool:
+    """Prefer false negatives: unrelated adjacent pages must never be stitched."""
+    # This layer repairs one page break, not arbitrary multi-page chains.  A
+    # three-page paragraph is rare; a broad p.3–8 citation is much harder to
+    # audit and more likely to contain a missed structural boundary.
+    if int(previous.get("page_start") or 0) != int(previous.get("page_end") or 0):
+        return False
+    if int(following.get("page_start") or 0) != int(previous.get("page_end") or 0) + 1:
+        return False
+    if following.get("starts_after_heading"):
+        return False
+    section = str(previous.get("section") or "未标注")
+    if section != str(following.get("section") or "未标注") or _REFERENCE_SECTION.search(section):
+        return False
+    tail = str(previous.get("text") or "").rstrip()
+    head = str(following.get("text") or "").lstrip()
+    if not tail or not head or _CAPTION_LIKE.match(tail) or _CAPTION_LIKE.match(head):
+        return False
+    # A completed sentence is a stronger negative signal than proximity alone.
+    return not bool(_TERMINAL_SENTENCE.search(tail))
+
+
+def _annotate_text_structure(document_map: dict[str, Any]) -> None:
+    """Mark captions, repeating headers and missed section headings in-place.
+
+    The parser's element list remains intact.  These are conservative labels
+    for the derived text path only, so a reader can still inspect every raw
+    page element in the document map.
+    """
+    pages = [page for page in document_map.get("pages") or [] if isinstance(page, dict)]
+    caption_ids = {
+        str(element.get("caption_element_id") or "")
+        for page in pages
+        for element in page.get("elements") or []
+        if isinstance(element, dict) and str(element.get("caption_element_id") or "")
+    }
+    header_pages: dict[str, set[int]] = {}
+    for page in pages:
+        page_number = page.get("page")
+        for element in page.get("elements") or []:
+            if not isinstance(element, dict) or str(element.get("kind") or "") != "text":
+                continue
+            if int(element.get("order") or 0) > 2 or not isinstance(page_number, int):
+                continue
+            normalized = _boilerplate_signature(str(element.get("text") or ""))
+            if normalized:
+                header_pages.setdefault(normalized, set()).add(page_number)
+    repeated_headers = {
+        signature for signature, seen_pages in header_pages.items() if len(seen_pages) >= 2
+    }
+
+    current_section = "未标注"
+    for page in pages:
+        for element in page.get("elements") or []:
+            if not isinstance(element, dict) or str(element.get("kind") or "") != "text":
+                continue
+            element_id = str(element.get("id") or "")
+            text = str(element.get("text") or "").strip()
+            if element_id in caption_ids:
+                element["is_caption"] = True
+                continue
+            if _boilerplate_signature(text) in repeated_headers:
+                element["is_boilerplate"] = True
+                continue
+            if element.get("is_heading") or _looks_like_section_heading(text):
+                element["is_heading"] = True
+                current_section = text or str(element.get("section") or "未标注")
+                element["section"] = current_section
+                continue
+            if current_section != "未标注":
+                # A parser can miss a Roman-numeral heading, leaving every
+                # following element with the preceding section's stale label.
+                element["section"] = current_section
+            elif str(element.get("section") or "").strip():
+                current_section = str(element.get("section") or "未标注")
+
+
+def _looks_like_section_heading(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value or len(value) > 100 or _TERMINAL_SENTENCE.search(value):
+        return False
+    return bool(_UNTAGGED_SECTION_HEADING.match(value))
+
+
+def _boilerplate_signature(text: str) -> str:
+    value = re.sub(r"\d+", "#", str(text or "").upper())
+    value = re.sub(r"\s+", " ", value).strip(" -–—")
+    return value if len(value) >= 16 else ""
+
+
+def _append_logical_run(target: dict[str, Any], following: dict[str, Any]) -> None:
+    left = str(target.get("text") or "").rstrip()
+    right = str(following.get("text") or "").lstrip()
+    # Preserve English words split by a page break without inventing a space.
+    if left.endswith("-") and right[:1].islower():
+        target["text"] = left[:-1] + right
+    else:
+        target["text"] = f"{left}\n\n{right}".strip()
+    target["page_end"] = int(following["page_end"])
+    for field in ("source_element_ids", "related_ids"):
+        target[field] = list(dict.fromkeys([
+            *[str(value) for value in target.get(field) or [] if str(value)],
+            *[str(value) for value in following.get(field) or [] if str(value)],
+        ]))
+
+
+def build_retrieval_chunks(
+    document_map: dict[str, Any], *, max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
+) -> list[dict[str, Any]]:
+    """Build RAG chunks from logical text runs while retaining page-level evidence."""
     chunks: list[dict[str, Any]] = []
 
     def add_chunk(
         page: int | None,
+        page_end: int | None,
         kind: str,
         section: str,
         text: str,
         source_element_ids: list[str],
         related_ids: list[str],
+        *,
+        logical_block_id: str = "",
     ) -> None:
         content = str(text or "").strip()
         if not content:
             return
-        chunk_id = f"p{page:03d}-c{sum(1 for item in chunks if item.get('page') == page) + 1:02d}" if isinstance(page, int) else f"c{len(chunks) + 1:03d}"
+        start_page = page if isinstance(page, int) and page > 0 else None
+        end_page = page_end if isinstance(page_end, int) and start_page is not None and page_end >= start_page else start_page
+        chunk_id = f"p{start_page:03d}-c{sum(1 for item in chunks if item.get('page') == start_page) + 1:02d}" if start_page is not None else f"c{len(chunks) + 1:03d}"
         chunks.append({
             "id": chunk_id,
             "kind": kind,
-            "page": page,
+            "page": start_page,
+            "page_end": end_page,
             "section": section or "未标注",
             "text": content,
             "source_element_ids": list(dict.fromkeys(source_element_ids)),
             "related_ids": list(dict.fromkeys(related_ids)),
         })
+        if logical_block_id:
+            chunks[-1]["logical_block_id"] = logical_block_id
+
+    logical_blocks = [
+        block for block in list(document_map.get("logical_blocks") or [])
+        if isinstance(block, dict) and str(block.get("text") or "").strip()
+    ] or build_logical_text_blocks(document_map)
+    for block in logical_blocks:
+        page = block.get("page_start")
+        page_end = block.get("page_end")
+        for part in _split_logical_text(str(block.get("text") or ""), target_chars=max_chars):
+            add_chunk(
+                page if isinstance(page, int) else None,
+                page_end if isinstance(page_end, int) else page if isinstance(page, int) else None,
+                "text",
+                str(block.get("section") or "未标注"),
+                part,
+                [str(value) for value in block.get("source_element_ids") or []],
+                [str(value) for value in block.get("related_ids") or []],
+                logical_block_id=str(block.get("id") or ""),
+            )
 
     for page_record in document_map.get("pages") or []:
         page = page_record.get("page")
-        text_buffer: list[str] = []
-        source_ids: list[str] = []
-        relation_ids: list[str] = []
-        section = "未标注"
-
-        def flush_text() -> None:
-            nonlocal text_buffer, source_ids, relation_ids
-            if text_buffer:
-                for part in _split_bounded_text("\n\n".join(text_buffer), max_chars):
-                    add_chunk(page, "text", section, part, source_ids, relation_ids)
-            text_buffer, source_ids, relation_ids = [], [], []
-
         elements = list(page_record.get("elements") or [])
-        for element in elements:
-            kind = str(element.get("kind") or "text")
-            if kind != "text":
-                continue
-            if element.get("is_heading"):
-                flush_text()
-                section = str(element.get("section") or "未标注")
-                continue
-            element_text = str(element.get("text") or "").strip()
-            if not element_text:
-                continue
-            element_section = str(element.get("section") or section or "未标注")
-            if text_buffer and (element_section != section or len("\n\n".join(text_buffer)) + len(element_text) + 2 > max_chars):
-                flush_text()
-            section = element_section
-            text_buffer.append(element_text)
-            source_ids.append(str(element.get("id") or ""))
-            relation_ids.extend(str(value) for value in element.get("related_ids") or [])
-        flush_text()
-
         for element in elements:
             kind = str(element.get("kind") or "")
             if kind not in {"table", "figure"}:
@@ -143,30 +359,45 @@ def build_retrieval_chunks(document_map: dict[str, Any], *, max_chars: int = 1_2
                 parts = ["\n".join(part for part in (label, caption) if part)]
             for part in parts:
                 add_chunk(
-                    page, kind, str(element.get("section") or "未标注"), part,
+                    page, page, kind, str(element.get("section") or "未标注"), part,
                     [str(element.get("id") or "")],
                     [str(value) for value in element.get("related_ids") or []],
                 )
     return chunks
 
 
-def _split_bounded_text(text: str, max_chars: int) -> list[str]:
-    """Split only when necessary and favour paragraph or sentence boundaries."""
+def _split_logical_text(text: str, *, target_chars: int) -> list[str]:
+    """Split a logical paragraph with a soft maximum and no orphan tail chunk."""
     remaining = str(text or "").strip()
     parts: list[str] = []
-    while len(remaining) > max_chars:
-        window = remaining[:max_chars]
-        candidates = [window.rfind(marker) for marker in ("\n\n", "。", ". ", "; ", "；")]
-        cut = max(candidates)
-        if cut < max_chars // 2:
-            cut = max_chars
-        else:
-            cut += 1
+    target = max(200, int(target_chars))
+    hard_max = target + min(_CHUNK_SOFT_OVERFLOW, max(20, target // 10))
+    while len(remaining) > hard_max:
+        cut = _preferred_text_cut(remaining, target=target, hard_max=hard_max)
+        tail_length = len(remaining) - cut
+        if 0 < tail_length < _MIN_TEXT_CHUNK_CHARS:
+            cut = _preferred_text_cut(
+                remaining,
+                target=min(target, len(remaining) - _MIN_TEXT_CHUNK_CHARS),
+                hard_max=len(remaining) - _MIN_TEXT_CHUNK_CHARS,
+            )
+        cut = max(1, min(cut, len(remaining) - 1))
         parts.append(remaining[:cut].strip())
         remaining = remaining[cut:].strip()
     if remaining:
         parts.append(remaining)
     return parts
+
+
+def _preferred_text_cut(text: str, *, target: int, hard_max: int) -> int:
+    upper = min(len(text), max(1, hard_max))
+    lower = max(1, min(target // 2, upper))
+    candidates = []
+    for match in re.finditer(r"\n\n|[。！？!?]|\.\s|;\s|；", text[lower:upper]):
+        candidates.append(lower + match.end())
+    if candidates:
+        return min(candidates, key=lambda position: (abs(position - target), -position))
+    return min(max(1, target), upper)
 
 
 def _split_table_text(text: str, max_chars: int) -> list[str]:
@@ -311,7 +542,14 @@ def related_context(
         None,
     )
     target_label = str((primary or {}).get("label") or target.get("kind") or "正文")
-    locator = f"p.{target.get('page')} · {target_label}"
+    page_start = target.get("page")
+    page_end = target.get("page_end", page_start)
+    page_locator = f"p.{page_start}–{page_end}" if (
+        isinstance(page_start, int)
+        and isinstance(page_end, int)
+        and page_end > page_start
+    ) else f"p.{page_start}"
+    locator = f"{page_locator} · {target_label}"
     return "\n".join(rows), locator
 
 
@@ -466,6 +704,7 @@ def paper_card_prompt(source_map: dict[str, Any], evidence: list[dict]) -> str:
         for item in evidence
     ]
     headings = "\n".join(f"## {index}. {heading}" for index, heading in enumerate(CARD_HEADINGS, 1))
+    slots = "\n".join(f"- {key}：{hint}" for key, hint in CARD_COMPARISON_SLOTS)
     return (
         "你是严谨的科研论文阅读助手。仅依据下方证据块生成中文 Markdown 论文证据卡。"
         "不得补写未提供的方法、实验、数据或外部背景。每条来自论文的具体事实都必须紧随"
@@ -476,6 +715,9 @@ def paper_card_prompt(source_map: dict[str, Any], evidence: list[dict]) -> str:
         f"定位模式：{coverage.get('locator_mode') or '未知'}。\n\n"
         "请严格使用以下十个标题，内容简洁、具体；不要写引用列表或宣传性措辞：\n"
         f"{headings}\n\n"
+        f"最后必须另起一段 `{CARD_COMPARISON_HEADING}`，按下面三行输出（供多篇论文横向比较；"
+        "无法判断时写“无法从已解析内容判断”）：\n"
+        f"{slots}\n\n"
         "证据块 JSON：\n"
         + json.dumps(records, ensure_ascii=False)
     )
@@ -494,6 +736,10 @@ def fallback_paper_card(source_map: dict[str, Any], evidence: list[dict], reason
     ]
     for index, heading in enumerate(CARD_HEADINGS, 1):
         lines.extend([f"## {index}. {heading}", "无法从已解析内容自动完成判断。", ""])
+    lines.extend([f"## {CARD_COMPARISON_HEADING}", ""])
+    for key, _hint in CARD_COMPARISON_SLOTS:
+        lines.append(f"- {key}：无法从已解析内容自动完成判断。")
+    lines.append("")
     if evidence:
         lines.extend(["## 附：可用证据摘录", ""])
         for item in evidence[:8]:
@@ -520,13 +766,20 @@ def audit_paper_card(card: str, source_map: dict[str, Any]) -> dict[str, Any]:
         elif page_text and block.get("page") != int(page_text):
             invalid.append(f"页码与块不一致: p.{page_text} / {block_id}")
     missing_headings = [heading for heading in CARD_HEADINGS if heading not in card]
+    # WHY/HOW/WHAT 是可审计的增强项，缺失不影响卡片有效性，只作提示。
+    missing_slots = [
+        key for key, _hint in CARD_COMPARISON_SLOTS
+        if not re.search(rf"^-\s*{key}\s*[：:]", card, re.MULTILINE)
+    ]
     return {
-        "version": 1,
+        "version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "valid": not invalid and not missing_headings,
         "anchors_found": len(anchors),
         "invalid_anchors": invalid,
         "missing_headings": missing_headings,
+        "comparison_slots_present": not missing_slots,
+        "missing_comparison_slots": missing_slots,
         "evidence_blocks_available": len(known),
     }
 

@@ -68,6 +68,19 @@ class ChatRunManager:
             if token and not active.cancel_event.is_set():
                 active.append({"type": "token", "text": token})
 
+        def consume_steers(stage: str) -> list[dict[str, Any]]:
+            return self.agent.sessions.consume_run_steers(
+                active.run_id, active.session_id, stage=stage,
+            )
+
+        def on_steer(_stage: str, _count: int) -> None:
+            # Steering content stays out of the event stream.  The client only
+            # receives its fixed-vocabulary lifecycle update.
+            active.append({
+                "type": "status", "status": "running", "stage": "steer_consumed",
+                "run_id": active.run_id,
+            })
+
         try:
             answer = self.agent.step(
                 message,
@@ -75,6 +88,8 @@ class ChatRunManager:
                 run_id=active.run_id,
                 cancel_event=active.cancel_event,
                 on_token=on_token,
+                steer_provider=consume_steers,
+                on_steer=on_steer,
             )
             trace = self.agent.get_last_trace(active.session_id) or {}
             status = self._status_from_trace(trace, active.cancel_event)
@@ -115,6 +130,16 @@ class ChatRunManager:
 
     def list_for_session(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
         return self.agent.sessions.list_chat_runs(session_id, limit=limit)
+
+    def emit_status(self, run_id: str, status: str, *, stage: str = "") -> None:
+        """Append a safe lifecycle update for the in-process SSE stream."""
+        with self._lock:
+            active = self._active.get(run_id)
+        if active is not None:
+            event = {"type": "status", "status": status, "run_id": run_id}
+            if stage:
+                event["stage"] = stage
+            active.append(event)
 
     def cancel(self, run_id: str) -> dict[str, Any] | None:
         run = self.get(run_id)

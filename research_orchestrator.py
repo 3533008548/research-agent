@@ -20,6 +20,17 @@ from llm_client import (
     RequestPolicy,
     RequestPriority,
 )
+from research_evidence import (
+    analysis_metrics,
+    attach_evidence_units,
+    audit_citations,
+    build_evidence_analysis,
+    compact_analysis_for_prompt,
+    format_boundary_ledger,
+    format_evidence_matrix,
+    split_tool_evidence,
+    strip_citation_markers,
+)
 from run_contract import execution_metadata
 from tool_runtime import ToolExecutionContext
 
@@ -28,6 +39,62 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 # Researchers only collect evidence. The synthesizer owns prose generation, so
 # end after the first tool turn and preserve all evidence from that turn.
 RESEARCH_WORKER_MAX_TOOL_ROUNDS = 1
+
+# --- P0-1: citation-existence iron rule -------------------------------------
+# "Hard to verify" is a FAIL, not a softer kind of pass.  Without an explicit
+# action, "do not fabricate sources" degrades into hedged fabrication: the model
+# keeps the citation and wraps it in "有研究显示".
+CITATION_EXISTENCE_RULE = (
+    "Iron rule on citation existence: a citation whose existence you cannot confirm "
+    "counts as FAIL, not as uncertainty. Do not keep it as a hedged claim and do not "
+    "replace it with a vague attribution such as 'studies show' or '有研究显示'. When a "
+    "source cannot be located, the only two allowed actions are (a) drop the claim, or "
+    "(b) state explicitly that no verifiable source was found for it."
+)
+
+# --- P0-3: two-layer citation emission ---------------------------------------
+# Visible layer: 「[E1]」. Hidden layer: an HTML comment carrying the evidence id
+# and the position inside the source, so "conclusion -> evidence -> position" is
+# mechanically checkable. Comments stay invisible after Markdown rendering.
+CITATION_EMISSION_RULE = (
+    "Two-layer citation emission: after every visible [E#] marker, append a hidden "
+    "annotation on the same sentence in exactly this form:\n"
+    "<!--ref:E1--><!--anchor:page:7-->\n"
+    "anchor kind must be one of page | section | paragraph | quote | none. Emit "
+    "`none` only when the supplied evidence has no resolvable in-source position; "
+    "emitting `none` does not bypass the gate, it triggers it. Never emit a page or "
+    "quote anchor for evidence whose anchor is weak."
+)
+
+# --- P0-4: phase boundary clauses --------------------------------------------
+# Each stage owns exactly one deliverable. Crossing the boundary is the cheapest
+# way to lose the audit trail: a researcher that concludes, a critic that
+# rewrites, a revision that smuggles in new claims.
+PHASE_BOUNDARY = {
+    "researcher": (
+        "Phase boundary: you are the evidence-collection stage only. Deliver evidence "
+        "cards (source, verbatim excerpt, locator). Do not draw conclusions, do not rank "
+        "or weigh evidence, do not write synthesis prose, and do not emit report sections. "
+        "Do not simulate the synthesizer's or the critic's output. Evidence you cannot "
+        "locate inside a source must be reported as unlocatable, not paraphrased into a finding."
+    ),
+    "synthesis": (
+        "Phase boundary: you are the synthesis stage only. Deliver the report draft with "
+        "Conclusions, Applicable Conditions and Limitations. Do not re-run retrieval, do "
+        "not introduce evidence IDs absent from the supplied list, and do not audit or "
+        "declare your own draft verified -- verification belongs to the next stage."
+    ),
+    "critic": (
+        "Phase boundary: you are the critique stage only. Return the JSON verdict and "
+        "issues. Do not rewrite the draft, do not add claims or evidence, and do not "
+        "produce a revised report."
+    ),
+    "revision": (
+        "Phase boundary: you are the revision stage only. Remove or hedge claims that the "
+        "supplied evidence IDs do not support, and preserve limitations. Do not introduce "
+        "new claims, new evidence IDs or new sections, and do not re-argue the critique."
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -59,7 +126,7 @@ class ResearchOrchestrator:
         paper_store,
         llm_client,
         verify_timeout_seconds: int,
-        vision_model: str = "deepseek-v4-flash-vision-exp",
+        vision_model: str = "deepseek-flash",
     ) -> None:
         self.sessions = session_store
         self.api_key = api_key
@@ -80,6 +147,8 @@ class ResearchOrchestrator:
         run_id: str | None = None,
         cancel_event: threading.Event | None = None,
         on_progress: ProgressCallback | None = None,
+        steer_provider: Callable[[str], list[dict[str, Any]]] | None = None,
+        on_steer: Callable[[str, int], None] | None = None,
     ) -> ResearchResult:
         query = (query or "").strip()
         if run_id:
@@ -145,6 +214,7 @@ class ResearchOrchestrator:
                 "resume": ("orchestrator", "基于已保存证据恢复运行"),
                 "planner": ("planner", "研究规划阶段"),
                 "researchers": ("researcher", "并行证据收集阶段"),
+                "evidence_analysis": ("orchestrator", "结构化证据与边界分析阶段"),
                 "synthesis": ("synthesis", "证据综合阶段"),
                 "critic": ("critic", "证据质检阶段"),
                 "revision": ("revision", "基于质检结果修订"),
@@ -184,18 +254,47 @@ class ResearchOrchestrator:
             "workers": [],
             "resumed": reuse_evidence,
         }
+        evidence_analysis: dict[str, Any] = {}
+
+        def consume_running_steers(stage: str) -> str:
+            if steer_provider is None:
+                return ""
+            try:
+                supplied = steer_provider(stage) or []
+            except Exception:
+                return ""
+            notes = [
+                str(item.get("content") if isinstance(item, dict) else item).strip()
+                for item in supplied
+            ]
+            notes = [note for note in notes if note]
+            if not notes:
+                return ""
+            trace.setdefault("steers", []).append({"stage": stage, "count": len(notes)})
+            self.sessions.add_run_event(
+                thread_id, run_id, "research", "user", "steer", "consumed",
+                summary="运行中补充已在下一节点使用", event_type="status",
+            )
+            if on_steer:
+                try:
+                    on_steer(stage, len(notes))
+                except Exception:
+                    pass
+            return self._steer_context(notes)
 
         try:
             self._ensure_active(cancel_event)
             if not reuse_evidence:
+                planner_steers = consume_running_steers("planner")
                 self._progress(on_progress, "planner", "running", "正在规划研究问题")
                 plan_text = self._call_model(
                     stage="planner",
                     system=(
                         "You are a research planner. Return JSON only. Split the user's question "
-                        "into at most two complementary evidence-gathering tasks. Do not answer the question."
+                        "into at most three complementary evidence-gathering tasks. One task must actively "
+                        "seek counterevidence, failure modes, or limits of generalization. Do not answer the question."
                     ),
-                    user=self._planner_input(query, context),
+                    user=self._planner_input(query, self._merge_context(context, planner_steers)),
                     policy=RequestPolicy(
                         purpose="research_planner", priority=RequestPriority.RESEARCH,
                     ),
@@ -209,6 +308,7 @@ class ResearchOrchestrator:
                 self._progress(on_progress, "planner", "completed", "研究计划已生成")
 
                 self._ensure_active(cancel_event)
+                worker_steers = consume_running_steers("researchers")
                 worker_specs = self._worker_specs(scope)
                 self._progress(
                     on_progress, "researchers", "running",
@@ -216,7 +316,7 @@ class ResearchOrchestrator:
                 )
                 worker_results = self._run_workers(
                     worker_specs, query, plan, cancel_event, on_progress,
-                    run_id=run_id,
+                    run_id=run_id, steer_context=worker_steers,
                 )
                 completed = 0
                 for result in worker_results:
@@ -230,31 +330,49 @@ class ResearchOrchestrator:
                         f"{result['label']}：{result['message']}（{completed}/{len(worker_specs)}）",
                     )
 
-                evidence = self._renumber_evidence(evidence)
+                self._progress(on_progress, "evidence_analysis", "running", "正在结构化来源并检查反证线索")
+                evidence = self._structure_evidence(self._renumber_evidence(evidence))
+                evidence_analysis = build_evidence_analysis(evidence)
                 trace["evidence_quality"] = self._evidence_quality_metrics(evidence)
+                trace["evidence_structure"] = analysis_metrics(evidence_analysis)
                 self.sessions.update_research_run(
                     run_id, evidence=evidence, trace=trace,
                 )
                 if not evidence:
                     raise RuntimeError("研究员未获得可用证据")
+                self._progress(
+                    on_progress, "evidence_analysis", "completed",
+                    f"已形成 {len(evidence)} 条可追溯证据与边界检查结果",
+                )
             else:
-                evidence = self._renumber_evidence(evidence)
+                self._progress(on_progress, "evidence_analysis", "running", "正在重建已保存证据的结构化视图")
+                evidence = self._structure_evidence(self._renumber_evidence(evidence))
+                evidence_analysis = build_evidence_analysis(evidence)
                 trace["evidence_quality"] = self._evidence_quality_metrics(evidence)
+                trace["evidence_structure"] = analysis_metrics(evidence_analysis)
                 self.sessions.update_research_run(run_id, evidence=evidence, trace=trace)
+                self._progress(
+                    on_progress, "evidence_analysis", "completed",
+                    f"已恢复 {len(evidence)} 条可追溯证据与边界检查结果",
+                )
 
             self._ensure_active(cancel_event)
+            synthesis_steers = consume_running_steers("synthesis")
             self._progress(on_progress, "synthesis", "running", "正在综合证据")
             try:
                 draft = self._call_model(
                     stage="synthesis",
                     system=(
                         "You are a scientific research synthesizer. Write concise Chinese Markdown. "
-                        "Every factual conclusion must cite one or more supplied evidence IDs such as [E1]. "
+                        "Every factual conclusion must cite one or more supplied evidence IDs such as [E1], "
+                        "followed by the hidden ref/anchor annotation defined in the user message. "
                         "Do not invent sources. Use explicit sections for Conclusions, Applicable Conditions, "
                         "and Limitations. Address each material condition named in the research question; "
                         "when the evidence does not establish a condition, say so explicitly rather than inferring it."
                     ),
-                    user=self._synthesis_input(query, plan, evidence),
+                    user=self._synthesis_input(
+                        query, plan, evidence, evidence_analysis, steer_context=synthesis_steers,
+                    ),
                     policy=RequestPolicy(
                         purpose="research_synthesis", priority=RequestPriority.RESEARCH,
                     ),
@@ -284,6 +402,7 @@ class ResearchOrchestrator:
                 trace["stages"].append({"stage": "synthesis", "status": "completed"})
 
                 self._ensure_active(cancel_event)
+                critic_steers = consume_running_steers("critic")
                 self._progress(on_progress, "critic", "running", "正在检查证据与局限")
                 try:
                     critique_text = self._call_model(
@@ -293,7 +412,9 @@ class ResearchOrchestrator:
                             "(pass or revise) and issues (a short list). Check whether factual claims in "
                             "the draft are supported by the provided evidence IDs."
                         ),
-                        user=self._critic_input(query, draft, evidence),
+                        user=self._critic_input(
+                            query, draft, evidence, evidence_analysis, steer_context=critic_steers,
+                        ),
                         policy=RequestPolicy(
                             purpose="research_critic", priority=RequestPriority.VERIFY,
                             deadline_seconds=self.verify_timeout_seconds, max_retries=0,
@@ -325,6 +446,7 @@ class ResearchOrchestrator:
             final_text = draft
             if critique["verdict"] == "revise":
                 self._ensure_active(cancel_event)
+                revision_steers = consume_running_steers("revision")
                 self._progress(on_progress, "revision", "running", "正在根据质检意见修订一次")
                 final_text = self._call_model(
                     stage="revision",
@@ -332,7 +454,9 @@ class ResearchOrchestrator:
                         "Revise the Chinese research report once. Keep only claims supported by the "
                         "provided evidence IDs. Preserve explicit limitations and do not invent sources."
                     ),
-                    user=self._revision_input(query, draft, critique, evidence),
+                    user=self._revision_input(
+                        query, draft, critique, evidence, evidence_analysis, steer_context=revision_steers,
+                    ),
                     policy=RequestPolicy(
                         purpose="research_revision", priority=RequestPriority.RESEARCH,
                     ),
@@ -342,7 +466,11 @@ class ResearchOrchestrator:
                 )
                 trace["stages"].append({"stage": "revision", "status": "completed"})
 
-            answer = self._render_answer(final_text, evidence, critique, run_id)
+            citation_audit = audit_citations(final_text, evidence)
+            trace["citation_audit"] = citation_audit
+            answer = self._render_answer(
+                final_text, evidence, critique, run_id, evidence_analysis, citation_audit,
+            )
             trace["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
             trace["usage"] = dict(usage)
             self.sessions.update_research_run(
@@ -382,11 +510,12 @@ class ResearchOrchestrator:
         on_progress: ProgressCallback | None,
         *,
         run_id: str = "",
+        steer_context: str = "",
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=min(2, len(specs)), thread_name_prefix="research-worker") as pool:
+        with ThreadPoolExecutor(max_workers=min(3, len(specs)), thread_name_prefix="research-worker") as pool:
             futures = {
-                pool.submit(self._run_worker, spec, query, plan, cancel_event, run_id): spec
+                pool.submit(self._run_worker, spec, query, plan, cancel_event, run_id, steer_context): spec
                 for spec in specs
             }
             for future in as_completed(futures):
@@ -412,6 +541,7 @@ class ResearchOrchestrator:
         plan: dict[str, Any],
         cancel_event: threading.Event | None,
         run_id: str = "",
+        steer_context: str = "",
     ) -> dict[str, Any]:
         self._ensure_active(cancel_event)
         usage = self._empty_usage()
@@ -457,7 +587,7 @@ class ResearchOrchestrator:
                 {
                     "messages": [{
                         "role": "user",
-                        "content": self._worker_input(query, plan, spec),
+                        "content": self._worker_input(query, plan, spec, steer_context=steer_context),
                     }],
                     "metadata": {"session_id": worker_id},
                 },
@@ -534,13 +664,29 @@ class ResearchOrchestrator:
             specs.append(_WorkerSpec(
                 role="local", label="本地证据研究员",
                 allowed_tools={"query_papers", "list_papers", "list_indexed_papers"},
-                instruction="Prioritize uploaded and indexed local papers. Extract methods, results, and exact limitations.",
+                instruction=(
+                    "Prioritize uploaded and indexed local papers. Extract methods, results, applicable "
+                    "conditions, and exact limitations; keep a limitation visible even when no public search is allowed."
+                ),
             ))
         if scope in {"both", "public"}:
             specs.append(_WorkerSpec(
                 role="public", label="文献与反例研究员",
                 allowed_tools={"search_papers"},
-                instruction="Search public academic literature. Look for recent work, conflicting findings, and limits of generalization.",
+                instruction=(
+                    "Search public academic literature for direct, source-specific evidence. "
+                    "Record the paper, its abstract or result, and the stated setting; do not turn a title into a finding."
+                ),
+            ))
+            specs.append(_WorkerSpec(
+                role="boundary", label="反证与边界研究员",
+                allowed_tools={"search_papers"},
+                instruction=(
+                    "Actively search for counterevidence, negative findings, failure modes, and limits of "
+                    "generalization relevant to the question. Search by the user's conditions plus terms such as "
+                    "limitation, failure, robustness, boundary, or comparison when useful. If no counterevidence "
+                    "is found, report that as an evidence gap rather than claiming the main view is universal."
+                ),
             ))
         return specs
 
@@ -550,9 +696,14 @@ class ResearchOrchestrator:
             "objective": query,
             "subtasks": [
                 {"id": "local", "focus": "检索本地论文中的直接证据"},
-                {"id": "public", "focus": "检索公开文献、反例与局限"},
+                {"id": "public", "focus": "检索公开文献中的直接证据、方法、结果与适用条件"},
+                {"id": "boundary", "focus": "主动检索反例、负面结果、失效模式和适用边界"},
             ],
-            "completion_criteria": ["给出带来源编号的结论", "明确证据不足之处"],
+            "completion_criteria": [
+                "给出带来源编号的结论",
+                "明确证据不足之处",
+                "主动核查反例、负面结果或适用边界",
+            ],
         }
 
     def _parse_plan(self, text: str, query: str) -> dict[str, Any]:
@@ -567,10 +718,18 @@ class ResearchOrchestrator:
             "subtasks": [
                 {"id": str(item.get("id") or f"task-{index + 1}"),
                  "focus": str(item.get("focus") or item.get("task") or "收集证据")[:500]}
-                for index, item in enumerate(subtasks[:2]) if isinstance(item, dict)
+                for index, item in enumerate(subtasks[:3]) if isinstance(item, dict)
             ] or self._fallback_plan(query)["subtasks"],
-            "completion_criteria": [str(item)[:300] for item in data.get("completion_criteria", [])[:4]],
+            "completion_criteria": self._completion_criteria(data.get("completion_criteria")),
         }
+
+    @staticmethod
+    def _completion_criteria(value: Any) -> list[str]:
+        criteria = [str(item)[:300] for item in value[:4]] if isinstance(value, list) else []
+        required = "主动核查反例、负面结果或适用边界"
+        if required not in criteria:
+            criteria.append(required)
+        return criteria[:5]
 
     def _parse_critique(self, text: str) -> dict[str, Any]:
         data = self._parse_json_object(text)
@@ -608,6 +767,12 @@ class ResearchOrchestrator:
             if not content or content.startswith(("❌", "📭", "⏳")):
                 continue
             tool = tool_names.get(str(message.get("tool_call_id", "")), "tool")
+            structured_cards = split_tool_evidence(
+                content, researcher=role, source_type=tool,
+            )
+            if structured_cards:
+                cards.extend(structured_cards)
+                continue
             card = {
                 "id": "",
                 "researcher": role,
@@ -670,16 +835,39 @@ class ResearchOrchestrator:
     @staticmethod
     def _renumber_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen: set[tuple[str, str]] = set()
-        normalized: list[dict[str, Any]] = []
+        unique: list[dict[str, Any]] = []
         for item in evidence:
             key = (str(item.get("source", "")), str(item.get("excerpt", ""))[:200])
             if key in seen:
                 continue
             seen.add(key)
             card = dict(item)
-            card["id"] = f"E{len(normalized) + 1}"
-            normalized.append(card)
-        return normalized[:10]
+            unique.append(card)
+
+        # A dedicated boundary worker should not disappear merely because a
+        # direct-evidence worker completed first. Round-robin roles before the
+        # bounded prompt cap to preserve the planned comparison dimensions.
+        role_order = ("local", "public", "boundary")
+        grouped = {
+            role: [item for item in unique if str(item.get("researcher") or "") == role]
+            for role in role_order
+        }
+        grouped["other"] = [
+            item for item in unique if str(item.get("researcher") or "") not in set(role_order)
+        ]
+        selected: list[dict[str, Any]] = []
+        while len(selected) < 12 and any(grouped.values()):
+            for role in (*role_order, "other"):
+                if grouped[role] and len(selected) < 12:
+                    selected.append(grouped[role].pop(0))
+        for index, card in enumerate(selected, 1):
+            card["id"] = f"E{index}"
+        return selected
+
+    @staticmethod
+    def _structure_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Attach reviewable source anchors and keyword-level facet clues."""
+        return attach_evidence_units(evidence)
 
     @staticmethod
     def _evidence_quality_metrics(evidence: list[dict[str, Any]]) -> dict[str, int | float | None]:
@@ -712,6 +900,18 @@ class ResearchOrchestrator:
         )
 
     @staticmethod
+    def _merge_context(context: str | None, steer_context: str) -> str:
+        return "\n\n".join(part.strip() for part in (context or "", steer_context) if part and part.strip())
+
+    @staticmethod
+    def _steer_context(notes: list[str]) -> str:
+        return (
+            "[运行中用户补充]\n"
+            + "\n".join(f"- {note}" for note in notes)
+            + "\n将其视为任务约束或待核验线索；若与证据冲突，必须说明冲突。"
+        )
+
+    @staticmethod
     def _is_network_tsn_question(query: str) -> bool:
         normalized = query.casefold()
         network_markers = (
@@ -732,12 +932,12 @@ class ResearchOrchestrator:
         """Keep an ambiguous TSN acronym inside the user's networking domain.
 
         The LLM can still emit a tool call that contradicts its prompt. The
-        public-search worker is the only worker that can call ``search_papers``,
-        so normalize just that call and only for an explicitly networking TSN
-        question. This is intentionally narrow and does not change ordinary
-        chat or other research topics.
+        Public direct-evidence and boundary workers can call ``search_papers``,
+        so normalize only those calls and only for an explicitly networking TSN
+        question. This is intentionally narrow and does not change ordinary chat
+        or other research topics.
         """
-        if spec.role != "public" or not cls._is_network_tsn_question(query):
+        if spec.role not in {"public", "boundary"} or not cls._is_network_tsn_question(query):
             return None
 
         protected_query = "DiffTSN Time-Sensitive Networking scheduling bursty traffic"
@@ -764,7 +964,9 @@ class ResearchOrchestrator:
         return normalize
 
     @staticmethod
-    def _worker_input(query: str, plan: dict[str, Any], spec: _WorkerSpec) -> str:
+    def _worker_input(
+        query: str, plan: dict[str, Any], spec: _WorkerSpec, *, steer_context: str = "",
+    ) -> str:
         subtasks = plan.get("subtasks") or []
         focus = next(
             (item.get("focus") for item in subtasks if item.get("id") == spec.role),
@@ -779,7 +981,9 @@ class ResearchOrchestrator:
             )
         return (
             f"Research question: {query}\nYour focus: {focus}\n"
-            f"Collect evidence before answering.{domain_guard}"
+            f"Collect evidence before answering.{domain_guard}\n\n"
+            f"{PHASE_BOUNDARY['researcher']}"
+            + (f"\n\n{steer_context}" if steer_context else "")
         )
 
     @staticmethod
@@ -814,39 +1018,110 @@ class ResearchOrchestrator:
 
     @staticmethod
     def _evidence_context(evidence: list[dict[str, Any]]) -> str:
-        return "\n\n".join(
-            f"[{item['id']}] source={item['source']} ({item['source_type']})\n"
-            f"excerpt={item['excerpt'][:700]}\n"
-            f"relevance={ResearchOrchestrator._relevance_summary(item, prefix=False)}\n"
-            f"uncertainty={item['uncertainty']}"
-            for item in evidence
-        )
+        entries = []
+        for item in evidence:
+            unit = item.get("evidence_unit") if isinstance(item.get("evidence_unit"), dict) else {}
+            anchor = unit.get("source_anchor") or item.get("source_anchor") or {}
+            entries.append(
+                f"[{item['id']}] source={item['source']} ({item['source_type']})\n"
+                f"anchor={json.dumps(anchor, ensure_ascii=False)}\n"
+                f"excerpt={item['excerpt'][:700]}\n"
+                f"facets={','.join(unit.get('facets') or [])}\n"
+                f"condition_clues={unit.get('condition_clues') or []}\n"
+                f"boundary_clues={unit.get('boundary_clues') or []}\n"
+                f"relevance={ResearchOrchestrator._relevance_summary(item, prefix=False)}\n"
+                f"uncertainty={item['uncertainty']}"
+            )
+        return "\n\n".join(entries)
 
-    def _synthesis_input(self, query: str, plan: dict[str, Any], evidence: list[dict[str, Any]]) -> str:
+    def _synthesis_input(
+        self,
+        query: str,
+        plan: dict[str, Any],
+        evidence: list[dict[str, Any]],
+        evidence_analysis: dict[str, Any] | None = None,
+        *,
+        steer_context: str = "",
+    ) -> str:
         return (
             f"Question: {query}\nPlan: {json.dumps(plan, ensure_ascii=False)}\n\n"
-            f"Evidence:\n{self._evidence_context(evidence)}"
+            f"Evidence:\n{self._evidence_context(evidence)}\n\n"
+            f"{compact_analysis_for_prompt(evidence_analysis or {})}\n\n"
+            "The matrix is a navigation aid only. Do not infer a result from a checkmark. "
+            "State whether boundary evidence is absent, weak, or conflicts with the direct evidence; "
+            "cite the relevant [E#] in every such statement.\n\n"
+            f"{CITATION_EXISTENCE_RULE}\n\n{CITATION_EMISSION_RULE}\n\n"
+            f"{PHASE_BOUNDARY['synthesis']}"
+            + (f"\n\n{steer_context}" if steer_context else "")
         )
 
-    def _critic_input(self, query: str, draft: str, evidence: list[dict[str, Any]]) -> str:
+    def _critic_input(
+        self,
+        query: str,
+        draft: str,
+        evidence: list[dict[str, Any]],
+        evidence_analysis: dict[str, Any] | None = None,
+        *,
+        steer_context: str = "",
+    ) -> str:
         return (
             f"Question: {query}\nDraft:\n{draft[:5000]}\n\n"
             f"Evidence IDs:\n{self._evidence_context(evidence)}\n\n"
-            "Return {\"verdict\": \"pass\"|\"revise\", \"issues\": [..]}."
+            f"{compact_analysis_for_prompt(evidence_analysis or {})}\n\n"
+            "Return {\"verdict\": \"pass\"|\"revise\", \"issues\": [..]}. Check unsupported "
+            "generalization, and flag a draft that ignores material boundary clues or treats their absence as proof. "
+            f"{PHASE_BOUNDARY['critic']}"
+            + (f"\n\n{steer_context}" if steer_context else "")
         )
 
     def _revision_input(
-        self, query: str, draft: str, critique: dict[str, Any], evidence: list[dict[str, Any]],
+        self,
+        query: str,
+        draft: str,
+        critique: dict[str, Any],
+        evidence: list[dict[str, Any]],
+        evidence_analysis: dict[str, Any] | None = None,
+        *, steer_context: str = "",
     ) -> str:
         return (
             f"Question: {query}\nDraft:\n{draft[:5000]}\n"
             f"Critique: {json.dumps(critique, ensure_ascii=False)}\n\n"
-            f"Allowed evidence:\n{self._evidence_context(evidence)}"
+            f"Allowed evidence:\n{self._evidence_context(evidence)}\n\n"
+            f"{compact_analysis_for_prompt(evidence_analysis or {})}\n\n"
+            f"{PHASE_BOUNDARY['revision']}"
+            + (f"\n\n{steer_context}" if steer_context else "")
         )
 
     @staticmethod
+    def _citation_audit_line(audit: dict[str, Any] | None) -> str:
+        """Render a short, human-readable traceability summary for the report."""
+        if not audit:
+            return "- 未生成引用溯源审计。"
+        emitted = int(audit.get("emitted_markers") or 0)
+        if not emitted:
+            return "- 报告未发射机读引用标记；请人工核对每条 [E#] 与证据索引的对应关系。"
+        lines = [f"- 机读引用标记 {emitted} 处，覆盖证据 {len(audit.get('covered_evidence_ids') or [])} 条。"]
+        if audit.get("unknown_refs"):
+            lines.append(f"- 引用了不存在的证据编号：{'、'.join(audit['unknown_refs'])}。")
+        if audit.get("anchor_upgraded_refs"):
+            lines.append(
+                f"- 定位被升级（声称精确锚点但证据未解析出位置）：{'、'.join(audit['anchor_upgraded_refs'])}。"
+            )
+        if audit.get("weak_anchor_refs"):
+            lines.append(
+                f"- 仅弱定位引用（无页内位置）：{'、'.join(audit['weak_anchor_refs'])}；"
+                "可引用但不得作为量化数值的唯一依据。"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
     def _render_answer(
-        report: str, evidence: list[dict[str, Any]], critique: dict[str, Any], run_id: str,
+        report: str,
+        evidence: list[dict[str, Any]],
+        critique: dict[str, Any],
+        run_id: str,
+        evidence_analysis: dict[str, Any] | None = None,
+        citation_audit: dict[str, Any] | None = None,
     ) -> str:
         index = "\n".join(
             f"- [{item['id']}] {item['source']}（{item['researcher']} / {item['source_type']}）"
@@ -855,7 +1130,12 @@ class ResearchOrchestrator:
         )
         issues = "；".join(critique.get("issues") or []) or "未发现需要修订的问题。"
         return (
-            f"# 深度研究报告\n\n{report.strip()}\n\n"
+            f"# 深度研究报告\n\n{strip_citation_markers(report).strip()}\n\n"
+            f"## 引用溯源\n{ResearchOrchestrator._citation_audit_line(citation_audit)}\n\n"
+            f"## 跨来源证据矩阵\n"
+            "✓ 仅表示对应来源片段含有该类线索；不是对论文结论的替代。\n\n"
+            f"{format_evidence_matrix(evidence_analysis or {})}\n\n"
+            f"## 反证与适用边界\n{format_boundary_ledger(evidence_analysis or {})}\n\n"
             f"## 证据索引\n{index}\n\n"
             f"## 质量检查\n{issues}\n\n"
             f"---\n研究运行：`{run_id}`。可输入 `/research continue` 基于已保存证据继续。"

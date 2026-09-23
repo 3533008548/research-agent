@@ -14,7 +14,7 @@ from collections import Counter
 from typing import Any
 
 
-QUALITY_VERSION = 1
+QUALITY_VERSION = 2
 DEFAULT_CHUNK_MAX_CHARS = 1_200
 _CHUNK_TOLERANCE = 120
 _FRAGMENT_MAX_CHARS = 24
@@ -124,7 +124,13 @@ def assess_document_map(
 
     missing_sources = []
     invalid_chunk_pages = []
+    invalid_page_ranges = []
     oversized_chunks = []
+    element_pages = {
+        str(element.get("id") or ""): element.get("page")
+        for element in elements
+        if str(element.get("id") or "")
+    }
     for chunk in usable_chunks:
         chunk_sources = [str(value or "") for value in list(chunk.get("source_element_ids") or [])]
         if not chunk_sources or any(not value or value not in source_ids for value in chunk_sources):
@@ -132,12 +138,27 @@ def assess_document_map(
         page = chunk.get("page")
         if not isinstance(page, int) or page not in set(numeric_pages):
             invalid_chunk_pages.append(str(chunk.get("id") or "未命名块"))
+            continue
+        page_end = chunk.get("page_end", page)
+        if (
+            not isinstance(page_end, int)
+            or page_end < page
+            or page_end not in set(numeric_pages)
+            or any(
+                isinstance(element_pages.get(source_id), int)
+                and not page <= int(element_pages[source_id]) <= page_end
+                for source_id in chunk_sources
+            )
+        ):
+            invalid_page_ranges.append(str(chunk.get("id") or "未命名块"))
         if str(chunk.get("kind") or "text") == "text" and len(str(chunk.get("text") or "")) > max_chunk_chars + _CHUNK_TOLERANCE:
             oversized_chunks.append(str(chunk.get("id") or "未命名块"))
     if missing_sources:
         issue("error", "untraceable_chunks", "部分检索块缺少有效的源元素引用。", count=len(missing_sources))
     if invalid_chunk_pages:
         issue("error", "chunk_page_mismatch", "部分检索块未关联到有效页面。", count=len(invalid_chunk_pages))
+    if invalid_page_ranges:
+        issue("error", "chunk_page_range_mismatch", "部分检索块的跨页范围与源元素不一致。", count=len(invalid_page_ranges))
     if oversized_chunks:
         issue("error", "oversized_text_chunks", "部分正文块超过允许长度，可能没有按边界切分。", count=len(oversized_chunks))
 
@@ -146,6 +167,8 @@ def assess_document_map(
         for element in elements
         if element.get("kind") == "text"
         and not element.get("is_heading")
+        and not element.get("is_caption")
+        and not element.get("is_boilerplate")
         and str(element.get("text") or "").strip()
     }
     covered_ids = {
@@ -181,6 +204,13 @@ def assess_document_map(
     if text_chars < 80 and not any(str(chunk.get("kind") or "") in {"table", "figure"} for chunk in usable_chunks):
         issue("error", "insufficient_text", "可检索正文不足 80 个字符。")
 
+    cross_page_chunks = [
+        chunk for chunk in usable_chunks
+        if isinstance(chunk.get("page"), int)
+        and isinstance(chunk.get("page_end", chunk.get("page")), int)
+        and chunk.get("page_end", chunk.get("page")) > chunk.get("page")
+    ]
+
     return {
         "version": QUALITY_VERSION,
         "status": "failed" if errors else "passed",
@@ -194,6 +224,7 @@ def assess_document_map(
             "retrieval_chunks": len(usable_chunks),
             "text_characters": text_chars,
             "orphan_text_fragments": len(fragments),
+            "cross_page_chunks": len(cross_page_chunks),
         },
     }
 

@@ -13,7 +13,13 @@ from pathlib import Path
 
 import requests
 
-from paper_artifacts import attach_image_assets, build_document_map, remove_document_map, write_document_map
+from paper_artifacts import (
+    attach_image_assets,
+    build_document_map,
+    load_document_map,
+    remove_document_map,
+    write_document_map,
+)
 from paper_quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
 from pdf_reader import PaperReader, extract_images
 from runtime_paths import get_runtime_paths
@@ -23,6 +29,16 @@ MAX_PDF_DOWNLOAD_BYTES = 50 * 1024 * 1024
 MAX_PDF_PAGES = 100
 PDF_DOWNLOAD_TIMEOUT = (3.05, 20)
 MAX_REDIRECTS = 3
+_ARXIV_IDENTIFIER_TITLE = re.compile(r"^(?:arxiv\s*:\s*)?\d{4}\.\d{4,5}(?:v\d+)?$", re.IGNORECASE)
+_TITLE_STOP_MARKERS = re.compile(
+    r"^(?:abstract|keywords?|index\s+terms?|arxiv\s*:|doi\s*:|if\s+you\s+cite|"
+    r"received\b|accepted\b|copyright\b|proceedings\b|\d{4}\s+\d+(?:st|nd|rd|th)\s+international\s+conference)",
+    re.IGNORECASE,
+)
+_TITLE_NON_CONTENT_MARKERS = re.compile(
+    r"(?:@|\b(?:university|college|school|department|institute|email|e-mail|china|germany|france)\b)",
+    re.IGNORECASE,
+)
 
 
 class PDFDownloadError(RuntimeError):
@@ -89,6 +105,112 @@ def _download_filename(url: str) -> str:
             return safe_name[:120]
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
     return f"paper_{digest}.pdf"
+
+
+def _clean_title(value: object) -> str:
+    """Normalise display titles without deriving semantics from a file name."""
+    title = " ".join(str(value or "").replace("\u00ad", "").split())
+    # PDF text blocks often split a word at a visual line break (``Time- Sensitive``).
+    title = re.sub(r"(?<=\w)-\s+(?=\w)", "", title)
+    return title.strip(" -_\t\r\n")[:300]
+
+
+def _is_usable_paper_title(value: object) -> bool:
+    title = _clean_title(value)
+    if len(title) < 6 or not any(char.isalpha() for char in title):
+        return False
+    if _ARXIV_IDENTIFIER_TITLE.fullmatch(title) or _TITLE_STOP_MARKERS.match(title):
+        return False
+    return title.casefold() not in {"untitled", "unknown", "none", "null"}
+
+
+def _first_page_title(parsed_document: dict) -> str:
+    """Infer a title from early first-page blocks when PDF metadata is absent.
+
+    This is intentionally conservative: it never treats an abstract, affiliation
+    or arXiv identifier as a title.  A supplied catalog title or PDF metadata
+    always wins over this layout-based fallback.
+    """
+    pages = parsed_document.get("pages") if isinstance(parsed_document, dict) else []
+    first_page = pages[0] if isinstance(pages, list) and pages else {}
+    elements = first_page.get("elements") if isinstance(first_page, dict) else []
+    blocks = [
+        _clean_title(item.get("text"))
+        for item in (elements if isinstance(elements, list) else [])[:16]
+        if isinstance(item, dict) and item.get("kind") == "text"
+    ]
+    candidates: list[tuple[int, str]] = []
+    for index, block in enumerate(blocks):
+        if not block:
+            continue
+        if _TITLE_STOP_MARKERS.match(block):
+            # The title normally precedes the abstract; later blocks are body
+            # text and must not become a display name.
+            break
+        # Full-stop terminated blocks in the title area are overwhelmingly
+        # abstract/body sentences.  Treating them as titles also prevents a
+        # parser fixture or a malformed PDF without an "Abstract" marker from
+        # replacing an existing paper under a random first paragraph.
+        if block.endswith((".", "!", "?")):
+            continue
+        if not _is_usable_paper_title(block) or _TITLE_NON_CONTENT_MARKERS.search(block):
+            continue
+        options = [block]
+        if index + 1 < len(blocks):
+            following = blocks[index + 1]
+            if (
+                following
+                and not _TITLE_STOP_MARKERS.match(following)
+                and not _TITLE_NON_CONTENT_MARKERS.search(following)
+            ):
+                joined = _clean_title(f"{block} {following}")
+                if _is_usable_paper_title(joined):
+                    options.append(joined)
+        for candidate in options:
+            # Earlier, title-like blocks win.  A joined visual line is preferred
+            # when it stays within a normal paper-title length.
+            score = 400 - index * 20 + min(len(candidate), 180)
+            if candidate != block:
+                score += 24
+            if "." in candidate or ";" in candidate:
+                score -= 40
+            candidates.append((score, candidate))
+    return max(candidates, default=(0, ""), key=lambda item: item[0])[1]
+
+
+def resolve_paper_title(
+    requested_title: object,
+    parsed_document: dict,
+    fallback_stem: object,
+) -> tuple[str, str]:
+    """Return a stable display title and its evidence source for one import."""
+    supplied = _clean_title(requested_title)
+    if _is_usable_paper_title(supplied):
+        return supplied, "调用方提供的论文名"
+    metadata_title = _clean_title(parsed_document.get("metadata_title") if isinstance(parsed_document, dict) else "")
+    if _is_usable_paper_title(metadata_title):
+        return metadata_title, "PDF 元数据"
+    first_page = _first_page_title(parsed_document)
+    if _is_usable_paper_title(first_page):
+        return first_page, "PDF 首页"
+    fallback_title = _clean_title(str(fallback_stem or "").replace("_", " "))
+    return fallback_title or "未命名论文", "文件名兜底"
+
+
+def _existing_paper_ids(paper_store, paths, title: str, source_file: str) -> list[str]:
+    """Find replacements by title or persisted source file, not only filename text."""
+    found: list[str] = []
+    for paper in paper_store.list_papers():
+        paper_id = str(paper.get("paper_id") or "")
+        if not paper_id:
+            continue
+        if _clean_title(paper.get("title")).casefold() == title.casefold():
+            found.append(paper_id)
+            continue
+        document_map = load_document_map(paths, paper_id)
+        if str((document_map or {}).get("source_file") or "") == source_file:
+            found.append(paper_id)
+    return list(dict.fromkeys(found))
 
 
 def _download_pdf(url: str, destination: Path) -> int:
@@ -183,6 +305,7 @@ def _quality_checked_document_map(
 
 def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) -> str:
     raw_input = str(args.get("url_or_path", "") or "").strip()
+    requested_title = args.get("title", "")
     if not raw_input or len(raw_input) > 2048:
         return "❌ 请提供有效的 PDF 链接或运行时论文目录中的文件名。"
     try:
@@ -214,14 +337,8 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         except ValueError as exc:
             return f"❌ {exc}"
 
-    title = pdf_path.stem.replace("_", " ")
-    existing_ids = [
-        str(paper.get("paper_id") or "")
-        for paper in (paper_store.list_papers() if paper_store else [])
-        if str(paper.get("title") or "") == title and str(paper.get("paper_id") or "")
-    ]
     paper_id = f"paper_{uuid.uuid4().hex[:12]}"
-    selected: tuple[PaperReader, dict, dict, dict, str] | None = None
+    selected: tuple[PaperReader, dict, dict, dict, str, str, str] | None = None
     failed_attempts: list[str] = []
 
     # A second pass must use a materially different strategy. Re-running the
@@ -232,6 +349,9 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
             parsed_document = (
                 reader.parse_document(str(pdf_path))
                 if table_aware else reader.parse_document(str(pdf_path), extract_tables=False)
+            )
+            title, title_source = resolve_paper_title(
+                requested_title, parsed_document, pdf_path.stem,
             )
             document_map, quality = _quality_checked_document_map(
                 parsed_document,
@@ -247,7 +367,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
             failed_attempts.append(f"{label}: {type(exc).__name__}: {exc}")
             continue
         if quality["accepted"]:
-            selected = (reader, parsed_document, document_map, quality, label)
+            selected = (reader, parsed_document, document_map, quality, label, title, title_source)
             break
         failed_attempts.append(f"{label}: {quality_failure_summary(quality)}")
 
@@ -255,7 +375,8 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         detail = "；".join(failed_attempts[:2]) or "未获得可用解析结果"
         return f"❌ PDF 未索引：切块质量检查失败，已使用备用解析策略重试。{detail}"
 
-    reader, parsed_document, document_map, quality, parser_label = selected
+    reader, parsed_document, document_map, quality, parser_label, title, title_source = selected
+    existing_ids = _existing_paper_ids(paper_store, paths, title, pdf_path.name) if paper_store else []
     images: list[str] = []
     try:
         images = extract_images(
@@ -314,7 +435,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
             )
             result += (
                 "\n\n---\n"
-                f"📌 已索引论文 ID：`{paper_id}`。{quality_note}；解析策略：{parser_label}。\n"
+                f"📌 已按{title_source}命名为：**{title}**。论文 ID：`{paper_id}`。{quality_note}；解析策略：{parser_label}。\n"
                 f"页面元素映射：`{document_map_path}`。\n"
                 "如需完整的可追溯精读，请明确要求“生成论文证据卡”；"
                 "系统会把结论保存为带页码、图表和来源块锚点的本地 Markdown 文件。"
@@ -331,7 +452,6 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         try:
             from memory import MemoryStore
 
-            title = pdf_path.stem.replace("_", " ")
             owns_memory_store = memory_store is None
             store = memory_store or MemoryStore(str(paths.memory_db))
             methods = re.findall(

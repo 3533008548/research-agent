@@ -13,6 +13,8 @@ from api.auth import APIKeyAuthenticator
 from api.routes import router
 from api.run_manager import ChatRunManager
 from badcase_store import BadcaseStore
+from experiment_projects import ExperimentProjectStore
+from paper_relations import PaperRelationStore
 from research_documents import ResearchDocumentStore
 from scheduler import Scheduler
 from workspace_uploads import WorkspaceUploadStore
@@ -37,6 +39,7 @@ def create_app(
     chat_run_manager=None,
     research_run_manager=None,
     daily_run_manager=None,
+    experiment_run_manager=None,
     badcase_store=None,
     api_key: str | None = None,
     require_api_key: bool = False,
@@ -51,17 +54,19 @@ def create_app(
     # unavailable run kind instead of silently starting local background work.
     app.state.research_run_manager = research_run_manager
     app.state.daily_run_manager = daily_run_manager
+    app.state.experiment_run_manager = experiment_run_manager
     app.state.badcase_store = badcase_store or _default_badcase_store(agent)
     app.state.api_authenticator = APIKeyAuthenticator(api_key, required=require_api_key)
-    # The React workbench needs the same local, user-owned data that the
-    # legacy Gradio panels use.  Test doubles and API-only embeddings may not
-    # expose Config, so leave these optional instead of manufacturing a second
-    # runtime directory for them.
+    # The React workbench needs the same local, user-owned data as the agent.
+    # Test doubles and API-only embeddings may not expose Config, so leave
+    # these optional instead of manufacturing a second runtime directory.
     cfg = getattr(agent, "cfg", None)
     paths = getattr(cfg, "runtime_paths", None)
     app.state.workspace_paths = paths
     app.state.workspace_uploads = WorkspaceUploadStore(paths) if paths else None
     app.state.research_document_store = ResearchDocumentStore(paths) if paths else None
+    app.state.experiment_project_store = ExperimentProjectStore(paths) if paths else None
+    app.state.paper_relation_store = PaperRelationStore(paths) if paths else None
     app.state.workspace_scheduler = (
         getattr(daily_run_manager, "scheduler", None)
         if daily_run_manager is not None
@@ -71,8 +76,8 @@ def create_app(
     return app
 
 
-def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str = "/app") -> bool:
-    """Serve a built React client beside the legacy Gradio route when present.
+def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str = "") -> bool:
+    """Serve the built React client, including client-side routes.
 
     Source-only checkouts intentionally keep working: the Python API can start
     before Node has produced ``frontend/dist``.  The container build creates
@@ -83,17 +88,18 @@ def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str 
     if not index.is_file():
         return False
 
-    normalized_path = "/" + mount_path.strip("/")
+    suffix = mount_path.strip("/")
+    normalized_path = f"/{suffix}" if suffix else ""
     assets = dist / "assets"
     if assets.is_dir():
         app.mount(
-            f"{normalized_path}/assets",
+            f"{normalized_path}/assets" or "/assets",
             StaticFiles(directory=assets),
             name="react-assets",
         )
 
-    @app.get(normalized_path, include_in_schema=False)
-    @app.get(f"{normalized_path}/{{client_path:path}}", include_in_schema=False)
+    @app.get(normalized_path or "/", include_in_schema=False)
+    @app.get(f"{normalized_path}/{{client_path:path}}" if normalized_path else "/{client_path:path}", include_in_schema=False)
     def react_client(client_path: str = "") -> FileResponse:
         # A client-side route should receive the SPA shell.  Static assets are
         # matched by the earlier mount and therefore never reach this handler.

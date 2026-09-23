@@ -15,7 +15,13 @@ from typing import Any
 
 import requests
 
-from ieee_xplore import IEEE_METADATA_URL, ieee_records, ieee_search_params
+from ieee_xplore import (
+    IEEE_METADATA_URL,
+    IEEE_XPLORE_DISABLED_MESSAGE,
+    IEEE_XPLORE_ENABLED,
+    ieee_records,
+    ieee_search_params,
+)
 from paper_records import deduplicate_paper_records, normalize_arxiv_id, normalize_doi
 
 
@@ -214,6 +220,8 @@ def _fetch_ieee_records(
     api_key: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Retrieve IEEE Xplore metadata; do not request article full text here."""
+    if not IEEE_XPLORE_ENABLED:
+        return [], IEEE_XPLORE_DISABLED_MESSAGE
     key = (api_key if api_key is not None else os.getenv("IEEE_API_KEY", "")).strip()
     if not key:
         return [], "IEEE Xplore API Key 未配置"
@@ -315,10 +323,7 @@ def search_ieee(
 
 def search_public_papers(query: str, limit: int = 5, source: str = "all") -> str:
     """Merge public metadata sources and report provider failures safely."""
-    has_ieee_key = bool(os.getenv("IEEE_API_KEY", "").strip())
-    selected = (
-        ("openalex", "arxiv", "ieee") if has_ieee_key else ("openalex", "arxiv")
-    ) if source == "all" else (source,)
+    selected = ("openalex", "arxiv") if source == "all" else (source,)
     records: list[dict[str, Any]] = []
     failures: list[str] = []
     total = rejected = 0

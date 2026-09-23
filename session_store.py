@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -73,6 +74,24 @@ class SessionStore:
                 FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
                     ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS agent_session_context (
+                thread_id TEXT PRIMARY KEY,
+                reference_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
+                    ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS agent_session_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_session_messages_thread_created
+                ON agent_session_messages(thread_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated_at
                 ON agent_sessions(updated_at DESC);
             CREATE TABLE IF NOT EXISTS research_runs (
@@ -109,6 +128,24 @@ class SessionStore:
             );
             CREATE INDEX IF NOT EXISTS idx_chat_runs_thread_updated
                 ON chat_runs(thread_id, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS experiment_runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT 'reproduce',
+                status TEXT NOT NULL,
+                summary_text TEXT NOT NULL DEFAULT '',
+                duration_ms REAL,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                error_type TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_experiment_runs_thread_updated
+                ON experiment_runs(thread_id, updated_at DESC);
             CREATE TABLE IF NOT EXISTS agent_run_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
@@ -131,6 +168,20 @@ class SessionStore:
                 ON agent_run_events(run_id, id);
             CREATE INDEX IF NOT EXISTS idx_agent_run_events_thread_created
                 ON agent_run_events(thread_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS run_steers (
+                steer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                consumed_stage TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                consumed_at TEXT,
+                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_steers_run_status
+                ON run_steers(run_id, status, steer_id);
             """
         )
         # Existing runtime databases predate the API run-result endpoint.
@@ -146,6 +197,17 @@ class SessionStore:
         ):
             if not self._table_has_column("agent_run_events", column):
                 self._conn.execute(f"ALTER TABLE agent_run_events ADD COLUMN {column} {definition}")
+        self._session_message_fts_available = False
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS agent_session_messages_fts "
+                "USING fts5(thread_id UNINDEXED, role UNINDEXED, content, tokenize='unicode61')"
+            )
+            self._session_message_fts_available = True
+        except sqlite3.OperationalError:
+            # FTS5 is present in CPython's bundled SQLite, but a system build
+            # may omit it.  The bounded lexical fallback below remains correct.
+            self._session_message_fts_available = False
         self._conn.commit()
 
     @staticmethod
@@ -292,6 +354,130 @@ class SessionStore:
                 (thread_id, encoded, now),
             )
 
+    @_synchronized
+    def get_reference_state(self, thread_id: str) -> dict[str, Any]:
+        """Return bounded session working state used to resolve later references.
+
+        The caller owns the schema for this small JSON document.  Keeping it
+        separate from LangGraph's checkpoint means it survives transcript
+        compaction and can be upgraded without rewriting messages.
+        """
+        row = self._conn.execute(
+            "SELECT reference_json FROM agent_session_context WHERE thread_id=?", (thread_id,)
+        ).fetchone()
+        if not row:
+            return {}
+        value = self._decode_json(row["reference_json"], {})
+        return value if isinstance(value, dict) else {}
+
+    @_synchronized
+    def save_reference_state(self, thread_id: str, state: dict[str, Any]) -> None:
+        """Atomically persist per-session reference working memory."""
+        if not self.get(thread_id):
+            raise KeyError(f"会话不存在: {thread_id}")
+        now = self._now()
+        encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO agent_session_context(thread_id, reference_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(thread_id) DO UPDATE SET reference_json=excluded.reference_json, "
+                "updated_at=excluded.updated_at",
+                (thread_id, encoded, now),
+            )
+
+    @_synchronized
+    def append_session_message(self, thread_id: str, role: str, content: str) -> None:
+        """Index one visible chat message for later, on-demand session recall."""
+        if role not in {"user", "assistant"}:
+            raise ValueError(f"不支持索引的会话消息角色: {role}")
+        if not self.get(thread_id):
+            raise KeyError(f"会话不存在: {thread_id}")
+        text = str(content or "").strip()
+        if not text:
+            return
+        now = self._now()
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO agent_session_messages(thread_id, role, content, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (thread_id, role, text[:20_000], now),
+            )
+            if self._session_message_fts_available:
+                try:
+                    self._conn.execute(
+                        "INSERT INTO agent_session_messages_fts(rowid, thread_id, role, content) "
+                        "VALUES (?, ?, ?, ?)",
+                        (int(cursor.lastrowid), thread_id, role, text[:20_000]),
+                    )
+                except sqlite3.OperationalError:
+                    self._session_message_fts_available = False
+
+    @_synchronized
+    def search_session_messages(
+        self, thread_id: str, query: str, *, limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Find bounded prior visible messages without exposing tool payloads."""
+        text = " ".join(str(query or "").split())[:500]
+        if not text:
+            return []
+        capped_limit = max(1, min(int(limit), 10))
+        rows: list[sqlite3.Row] = []
+        if self._session_message_fts_available:
+            fts_query = self._fts_query(text)
+            if fts_query:
+                try:
+                    rows = self._conn.execute(
+                        "SELECT rowid AS id, thread_id, role, content "
+                        "FROM agent_session_messages_fts "
+                        "WHERE thread_id=? AND agent_session_messages_fts MATCH ? "
+                        "ORDER BY rank LIMIT ?",
+                        (thread_id, fts_query, capped_limit),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    self._session_message_fts_available = False
+        if not rows:
+            rows = self._conn.execute(
+                "SELECT id, thread_id, role, content FROM agent_session_messages "
+                "WHERE thread_id=? ORDER BY id DESC LIMIT 80",
+                (thread_id,),
+            ).fetchall()
+            ranked = sorted(
+                (dict(row) for row in rows),
+                key=lambda item: (
+                    self._lexical_score(text, str(item["content"])), int(item["id"]),
+                ),
+                reverse=True,
+            )
+            return [
+                item for item in ranked
+                if self._lexical_score(text, str(item["content"])) > 0
+            ][:capped_limit]
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _fts_query(text: str) -> str:
+        return " OR ".join(f'"{term}"' for term in SessionStore._search_terms(text)[:8])
+
+    @staticmethod
+    def _search_terms(text: str) -> list[str]:
+        terms: list[str] = []
+        for token in re.findall(r"[A-Za-z0-9_.:/+\-]+|[\u4e00-\u9fff]+", text.casefold()):
+            if len(token) <= 1:
+                continue
+            terms.append(token)
+            if all('\u4e00' <= char <= '\u9fff' for char in token):
+                terms.extend(token[index:index + 2] for index in range(len(token) - 1))
+        return list(dict.fromkeys(term for term in terms if len(term) > 1))
+
+    @staticmethod
+    def _lexical_score(query: str, content: str) -> int:
+        query_folded = query.casefold()
+        content_folded = content.casefold()
+        score = 20 if query_folded in content_folded else 0
+        terms = SessionStore._search_terms(query_folded)
+        score += sum(content_folded.count(term) for term in terms)
+        return score
+
     @staticmethod
     def _decode_json(value: str, fallback: Any) -> Any:
         try:
@@ -314,6 +500,13 @@ class SessionStore:
         item = dict(row)
         item["metrics"] = cls._decode_json(item.pop("metrics_json", "{}"), {})
         item["answer"] = item.pop("answer_text", "")
+        return item
+
+    @classmethod
+    def _experiment_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["metrics"] = cls._decode_json(item.pop("metrics_json", "{}"), {})
+        item["answer"] = item.pop("summary_text", "")
         return item
 
     @staticmethod
@@ -392,15 +585,129 @@ class SessionStore:
         return [self._chat_row(row) for row in rows]
 
     @_synchronized
+    def create_experiment_run(
+        self,
+        thread_id: str,
+        project_id: str,
+        *,
+        action: str = "reproduce",
+        status: str = "queued",
+    ) -> dict[str, Any]:
+        if not self.get(thread_id):
+            raise KeyError(f"会话不存在: {thread_id}")
+        if status not in {"queued", "running", "cancelling"}:
+            raise ValueError(f"实验复现运行的初始状态无效: {status}")
+        now = self._now()
+        run_id = f"experiment-{uuid.uuid4().hex[:12]}"
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO experiment_runs "
+                "(run_id, thread_id, project_id, action, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (run_id, thread_id, str(project_id)[:120], str(action)[:40], status, now, now),
+            )
+        return self.get_experiment_run(run_id) or {}
+
+    @_synchronized
+    def get_experiment_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM experiment_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return self._experiment_row(row) if row else None
+
+    @_synchronized
+    def list_experiment_runs(self, thread_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM experiment_runs WHERE thread_id=? "
+            "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?",
+            (thread_id, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [self._experiment_row(row) for row in rows]
+
+    @_synchronized
+    def has_active_experiment_run(self, project_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM experiment_runs WHERE project_id=? "
+            "AND status NOT IN ('completed', 'failed', 'cancelled', 'partial_failed') LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        return bool(row)
+
+    @_synchronized
+    def delete_experiment_runs_for_project(self, project_id: str) -> int:
+        """Remove terminal run metadata after the user deletes its project files."""
+        rows = self._conn.execute(
+            "SELECT run_id FROM experiment_runs WHERE project_id=?", (project_id,)
+        ).fetchall()
+        run_ids = [str(row["run_id"]) for row in rows]
+        if not run_ids:
+            return 0
+        placeholders = ",".join("?" for _ in run_ids)
+        with self._conn:
+            self._conn.execute(
+                f"DELETE FROM agent_run_events WHERE run_id IN ({placeholders})", run_ids,
+            )
+            self._conn.execute(f"DELETE FROM run_steers WHERE run_id IN ({placeholders})", run_ids)
+            cursor = self._conn.execute(
+                "DELETE FROM experiment_runs WHERE project_id=?", (project_id,)
+            )
+        return int(cursor.rowcount)
+
+    @_synchronized
     def run_status_counts(self) -> dict[str, dict[str, int]]:
         """Return global, payload-free operational counts for API metrics."""
-        counts: dict[str, dict[str, int]] = {"chat": {}, "research": {}}
-        for kind, table in (("chat", "chat_runs"), ("research", "research_runs")):
+        counts: dict[str, dict[str, int]] = {"chat": {}, "research": {}, "experiment": {}}
+        for kind, table in (
+            ("chat", "chat_runs"), ("research", "research_runs"), ("experiment", "experiment_runs"),
+        ):
             rows = self._conn.execute(
                 f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
             ).fetchall()
             counts[kind] = {str(row["status"]): int(row["count"]) for row in rows}
         return counts
+
+    @_synchronized
+    def update_experiment_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        summary: str | None = None,
+        duration_ms: float | None = None,
+        metrics: dict[str, Any] | None = None,
+        error_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        existing = self.get_experiment_run(run_id)
+        if not existing:
+            return None
+        now = self._now()
+        values: dict[str, Any] = {"run_id": run_id, "updated_at": now}
+        sets = ["updated_at=:updated_at"]
+        if status is not None:
+            values["status"] = str(status)[:40]
+            sets.append("status=:status")
+            if status in {"completed", "failed", "cancelled", "partial_failed"}:
+                values["completed_at"] = now
+                sets.append("completed_at=:completed_at")
+        if summary is not None:
+            values["summary"] = str(summary)[:2_000]
+            sets.append("summary_text=:summary")
+        if duration_ms is not None:
+            values["duration_ms"] = round(float(duration_ms), 1)
+            sets.append("duration_ms=:duration_ms")
+        if metrics is not None:
+            values["metrics_json"] = json.dumps(
+                self._safe_event_metrics(metrics), ensure_ascii=False, separators=(",", ":"),
+            )
+            sets.append("metrics_json=:metrics_json")
+        if error_type is not None:
+            values["error_type"] = str(error_type)[:120]
+            sets.append("error_type=:error_type")
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE experiment_runs SET {', '.join(sets)} WHERE run_id=:run_id", values,
+            )
+        return self.get_experiment_run(run_id)
 
     @_synchronized
     def update_chat_run(
@@ -459,7 +766,73 @@ class SessionStore:
             f"DELETE FROM agent_run_events WHERE thread_id=? AND run_id IN ({placeholders})",
             [thread_id, *run_ids],
         )
+        self._conn.execute(f"DELETE FROM run_steers WHERE run_id IN ({placeholders})", run_ids)
         self._conn.execute(f"DELETE FROM chat_runs WHERE run_id IN ({placeholders})", run_ids)
+
+    @staticmethod
+    def _run_steer_row(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    @_synchronized
+    def create_run_steer(self, run_id: str, thread_id: str, content: str) -> dict[str, Any]:
+        """Persist a user steering message without adding it to normal chat history."""
+        if not self.get(thread_id):
+            raise KeyError(f"会话不存在: {thread_id}")
+        text = str(content or "").strip()
+        if not text:
+            raise ValueError("运行中补充不能为空")
+        now = self._now()
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO run_steers (run_id, thread_id, content, status, created_at) "
+                "VALUES (?, ?, ?, 'pending', ?)",
+                (str(run_id), thread_id, text[:12_000], now),
+            )
+        row = self._conn.execute(
+            "SELECT * FROM run_steers WHERE steer_id=?", (int(cursor.lastrowid),)
+        ).fetchone()
+        return self._run_steer_row(row) if row else {}
+
+    @_synchronized
+    def list_run_steers(self, run_id: str, thread_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM run_steers WHERE run_id=?"
+        values: list[str] = [str(run_id)]
+        if thread_id:
+            query += " AND thread_id=?"
+            values.append(thread_id)
+        query += " ORDER BY steer_id"
+        return [self._run_steer_row(row) for row in self._conn.execute(query, values).fetchall()]
+
+    @_synchronized
+    def consume_run_steers(
+        self, run_id: str, thread_id: str, *, stage: str,
+    ) -> list[dict[str, Any]]:
+        """Atomically hand pending steering messages to the next agent node."""
+        rows = self._conn.execute(
+            "SELECT * FROM run_steers WHERE run_id=? AND thread_id=? AND status='pending' "
+            "ORDER BY steer_id",
+            (str(run_id), thread_id),
+        ).fetchall()
+        if not rows:
+            return []
+        now = self._now()
+        steer_ids = [int(row["steer_id"]) for row in rows]
+        placeholders = ",".join("?" for _ in steer_ids)
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE run_steers SET status='consumed', consumed_stage=?, consumed_at=? "
+                f"WHERE steer_id IN ({placeholders}) AND status='pending'",
+                [str(stage)[:80], now, *steer_ids],
+            )
+        return [
+            {
+                **self._run_steer_row(row),
+                "status": "consumed",
+                "consumed_stage": str(stage)[:80],
+                "consumed_at": now,
+            }
+            for row in rows
+        ]
 
     @_synchronized
     def add_run_event(
@@ -479,7 +852,7 @@ class SessionStore:
     ) -> None:
         if not self.get(thread_id):
             return
-        if run_kind not in {"chat", "research"}:
+        if run_kind not in {"chat", "research", "experiment"}:
             raise ValueError(f"未知运行类型: {run_kind}")
         compact_summary = " ".join(str(summary or "").split())[:240]
         safe_event_type = infer_persisted_event_type(
@@ -626,7 +999,14 @@ class SessionStore:
                     f"DELETE FROM [{table}] "
                     "WHERE thread_id NOT IN (SELECT thread_id FROM agent_sessions)"
                 )
-                deleted[table] = cursor.rowcount
+                # Keep this compatibility report stable for the legacy
+                # checkpoint cleanup command. Experiment rows are cleaned by
+                # the same transaction but are not checkpoint diagnostics.
+                if table not in {
+                    "experiment_runs", "run_steers", "agent_session_context",
+                    "agent_session_messages", "agent_session_messages_fts",
+                }:
+                    deleted[table] = cursor.rowcount
         return deleted
 
     @_synchronized

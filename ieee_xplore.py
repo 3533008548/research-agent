@@ -12,6 +12,11 @@ from typing import Any
 
 
 IEEE_METADATA_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
+# The provider has been deliberately disabled while its API is unavailable.
+# Keep the normalizer and key plumbing so re-enabling it is a one-line, reviewed
+# change rather than a rushed reimplementation.
+IEEE_XPLORE_ENABLED = False
+IEEE_XPLORE_DISABLED_MESSAGE = "IEEE Xplore 数据源暂时停用"
 # IEEE documents the access type, but only the explicit ``Open Access`` value
 # is treated as permission to expose a direct PDF link.  In particular,
 # ``Ephemera`` is metadata rather than a blanket full-text permission.

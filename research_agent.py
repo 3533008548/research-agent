@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from datetime import datetime
 
 import requests
@@ -47,8 +47,18 @@ except ImportError:
 
 # ── 项目模块 ──
 from cancellation import RequestCancelledError, raise_if_cancelled
+from conversation_reference import (
+    observe_assistant_message,
+    observe_user_message,
+    render_reference_context,
+)
+from conversation_recall import render_session_recall, should_recall_session_history
 from graph_builder import build_graph
 from llm_client import LLMClient, LLMClientError
+from research_document_routing import (
+    allowed_tools_for_routed_request,
+    routed_research_document_intent,
+)
 from user_profile import ProfileManager
 from research_orchestrator import ResearchOrchestrator
 from resilience import CircuitBreaker
@@ -63,6 +73,12 @@ from tool_runtime import ToolExecutionContext
 # A graph "round" contains several internal nodes, so this still leaves room for
 # multiple search/read calls while preventing an accidental unbounded cost loop.
 MAX_AGENT_GRAPH_STEPS = 16
+# A document-scoped confirmed patch can legitimately need one list, up to four
+# section reads, and one atomic patch.  It has a narrow tool scope, so giving
+# this workflow a little more graph budget does not loosen the normal chat
+# loop's cost guard.
+RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS = 28
+RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS = 8
 
 
 _DIRECT_ENGINEERING_MARKERS = (
@@ -77,6 +93,7 @@ _EXPLICIT_EVIDENCE_MARKERS = (
 _RESEARCH_DOCUMENT_TERMS = ("科研档案", "研究档案")
 _RESEARCH_DOCUMENT_ACTIONS = ("保存", "存档", "导出", "生成")
 _RESEARCH_DOCUMENT_CONTENT_TERMS = ("方案", "计划", "假设", "决策记录")
+_EXPERIMENT_CONFIRMATION_MARKER = "【复现实验项目确认】"
 
 
 def should_force_research_document_save(user_input: str) -> bool:
@@ -95,6 +112,12 @@ def should_force_research_document_save(user_input: str) -> bool:
     return any(term in text for term in _RESEARCH_DOCUMENT_TERMS) or any(
         term in text for term in _RESEARCH_DOCUMENT_CONTENT_TERMS
     )
+
+
+def should_force_experiment_project_update(user_input: str) -> bool:
+    """The workbench inserts this marker only after the user edits a confirmation draft."""
+    text = str(user_input or "")
+    return _EXPERIMENT_CONFIRMATION_MARKER in text and "project_id=experiment-" in text
 
 
 def should_answer_without_tools(user_input: str) -> bool:
@@ -176,12 +199,14 @@ class ResearchAgent:
         if cfg.rag_enabled:
             try:
                 from paper_store import PaperStore
+                from paper_relations import PaperRelationStore
                 print("      📚 初始化论文向量库...", file=sys.stderr, flush=True)
                 self._paper_store = PaperStore(
                     persist_dir=cfg.chroma_dir,
                     reranker_enabled=cfg.rag_reranker_enabled,
                     reranker_model=cfg.rag_reranker_model,
                     reranker_candidate_limit=cfg.rag_reranker_candidate_limit,
+                    relation_store=PaperRelationStore(cfg.runtime_paths),
                 )
                 print(
                     f"      ✅ 已加载 {self._paper_store.paper_count} 篇论文, "
@@ -226,6 +251,8 @@ class ResearchAgent:
         session_id: str | None = None,
         cancel_event: threading.Event | None = None,
         run_id: str | None = None,
+        steer_provider: Callable[[str], list[dict]] | None = None,
+        on_steer: Callable[[str, int], None] | None = None,
     ) -> str:
         """单轮推理：输入用户消息，返回 Agent 回复文本。
 
@@ -236,8 +263,6 @@ class ResearchAgent:
         except RequestCancelledError:
             return "⏹️ 请求已取消。"
         thread_id = session_id or self._thread_id
-        state = {"messages": [], "metadata": {"session_id": thread_id}}
-        state["messages"].append({"role": "user", "content": user_input})
 
         # 同一会话的对话和删除互斥；不同会话仍可并行执行。等待锁时也响应取消。
         session_lock = self._lock_for(thread_id)
@@ -249,6 +274,32 @@ class ResearchAgent:
         try:
             if not self.sessions.get(thread_id):
                 return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
+            reference_state, reference_resolution = observe_user_message(
+                self.sessions.get_reference_state(thread_id), user_input,
+            )
+            # This write is deliberately synchronous.  A correction such as
+            # "not paper A, paper B" must survive even if the following model
+            # request is cancelled or a later transcript compaction happens.
+            self.sessions.save_reference_state(thread_id, reference_state)
+            reference_context = render_reference_context(reference_state, reference_resolution)
+            session_recall = ""
+            if should_recall_session_history(user_input):
+                try:
+                    session_recall = render_session_recall(
+                        self.sessions.search_session_messages(thread_id, user_input),
+                    )
+                except Exception:
+                    # Recall is supplementary: a local index problem must not
+                    # prevent the foreground turn from using its checkpoint.
+                    session_recall = ""
+            state = {
+                "messages": [{"role": "user", "content": user_input}],
+                "metadata": {
+                    "session_id": thread_id,
+                    "reference_context": reference_context,
+                    "session_recall": session_recall,
+                },
+            }
             self._retry_inputs[thread_id] = {"user_input": user_input}
             usage = self.get_usage(thread_id)
             usage_before = dict(usage)
@@ -292,13 +343,61 @@ class ResearchAgent:
                 if on_token:
                     on_token(token)
 
+            def _consume_running_steers(stage: str) -> list[str]:
+                if steer_provider is None:
+                    return []
+                try:
+                    supplied = steer_provider(stage) or []
+                except Exception:
+                    return []
+                notes = [
+                    str(item.get("content") if isinstance(item, dict) else item).strip()
+                    for item in supplied
+                ]
+                notes = [note for note in notes if note]
+                if not notes:
+                    return []
+                _record_event({"type": "run_steer_consumed", "stage": stage, "count": len(notes)})
+                if on_steer:
+                    try:
+                        on_steer(stage, len(notes))
+                    except Exception:
+                        pass
+                return notes
+
+            force_experiment_project_update = should_force_experiment_project_update(user_input)
             force_research_document_save = should_force_research_document_save(user_input)
-            if force_research_document_save:
+            routed_tool_scope = allowed_tools_for_routed_request(user_input)
+            routed_document_intent = routed_research_document_intent(user_input)
+            graph_step_limit = (
+                RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS
+                if routed_document_intent == "full_patch"
+                else RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS
+                if routed_document_intent == "safe_patch" else MAX_AGENT_GRAPH_STEPS
+            )
+            full_document_patch = routed_document_intent == "full_patch"
+            forced_tool_name = ""
+            if force_experiment_project_update:
+                allowed_tool_names = {"update_experiment_project"}
+                forced_tool_name = "update_experiment_project"
+                _record_event({"type": "tool_policy", "policy": "forced_experiment_project_update"})
+            elif force_research_document_save:
                 allowed_tool_names = {"save_research_document"}
+                forced_tool_name = "save_research_document"
                 _record_event({"type": "tool_policy", "policy": "forced_research_document_save"})
+            elif routed_tool_scope is not None:
+                allowed_tool_names = set(routed_tool_scope)
+                _record_event({
+                    "type": "tool_policy",
+                    "policy": f"research_document_{routed_document_intent}_scope",
+                })
             else:
                 allowed_tool_names = set() if should_answer_without_tools(user_input) else None
-            if allowed_tool_names is not None and not force_research_document_save:
+            if (
+                allowed_tool_names is not None
+                and not force_research_document_save
+                and routed_tool_scope is None
+            ):
                 _record_event({"type": "tool_policy", "policy": "direct_engineering_answer"})
             app = None
             try:
@@ -309,19 +408,23 @@ class ResearchAgent:
                     app = self._build_app(
                         usage, _on_token if on_token else None, _record_event,
                         cancel_event=cancel_event, run_id=chat_run_id, session_id=thread_id,
+                        steer_provider=_consume_running_steers,
                     )
                 else:
                     app = self._build_app(
                         usage, _on_token if on_token else None, _record_event,
                         cancel_event=cancel_event, allowed_tool_names=allowed_tool_names,
-                        force_tool_name="save_research_document" if force_research_document_save else None,
+                        force_tool_name=forced_tool_name or None,
                         run_id=chat_run_id, session_id=thread_id,
+                        steer_provider=_consume_running_steers,
+                        enable_verify=not full_document_patch,
+                        max_tool_rounds=2 if full_document_patch else None,
                     )
                 result = app.invoke(
                     state,
                     config={
                         "configurable": {"thread_id": thread_id},
-                        "recursion_limit": MAX_AGENT_GRAPH_STEPS,
+                        "recursion_limit": graph_step_limit,
                     },
                 )
                 messages = result.get("messages", [])
@@ -331,6 +434,16 @@ class ResearchAgent:
                     return answer
                 last = messages[-1]
                 answer = last.get("content", "") or ""
+                if last.get("role") == "assistant" and answer:
+                    reference_state = observe_assistant_message(reference_state, answer)
+                    self.sessions.save_reference_state(thread_id, reference_state)
+                    try:
+                        self.sessions.append_session_message(thread_id, "user", user_input)
+                        self.sessions.append_session_message(thread_id, "assistant", answer)
+                    except Exception:
+                        # The checkpoint and reference state are already
+                        # durable; search indexing is an optional recall aid.
+                        pass
                 outcome = "success"
                 return answer
             except RequestCancelledError:
@@ -425,6 +538,8 @@ class ResearchAgent:
         run_id: str | None = None,
         cancel_event: threading.Event | None = None,
         on_progress=None,
+        steer_provider: Callable[[str], list[dict]] | None = None,
+        on_steer: Callable[[str, int], None] | None = None,
     ) -> str:
         """Run the bounded multi-agent research loop for one explicit session."""
         thread_id = session_id or self._thread_id
@@ -437,6 +552,25 @@ class ResearchAgent:
         try:
             if not self.sessions.get(thread_id):
                 return "⚠️ 当前会话不存在或已被删除，请新建一个会话。"
+            reference_state, reference_resolution = observe_user_message(
+                self.sessions.get_reference_state(thread_id), query,
+            )
+            self.sessions.save_reference_state(thread_id, reference_state)
+            research_context_parts = [
+                render_reference_context(reference_state, reference_resolution),
+            ]
+            if should_recall_session_history(query):
+                try:
+                    research_context_parts.append(render_session_recall(
+                        self.sessions.search_session_messages(thread_id, query),
+                    ))
+                except Exception:
+                    pass
+            if context:
+                research_context_parts.append(context)
+            research_context = "\n\n".join(
+                part.strip() for part in research_context_parts if part and part.strip()
+            )
             usage = self.get_usage(thread_id)
             usage_before = dict(usage)
             started_at = time.perf_counter()
@@ -463,11 +597,13 @@ class ResearchAgent:
                 query,
                 thread_id=thread_id,
                 scope=scope,
-                context=context,
+                context=research_context or None,
                 resume=resume,
                 run_id=run_id,
                 cancel_event=cancel_event,
                 on_progress=_record_progress,
+                steer_provider=steer_provider,
+                on_steer=on_steer,
             )
             for key in ("prompt", "completion", "total", "calls"):
                 usage[key] = usage.get(key, 0) + result.usage.get(key, 0)
@@ -480,6 +616,13 @@ class ResearchAgent:
                 visible_query,
                 result.answer,
             )
+            reference_state = observe_assistant_message(reference_state, result.answer)
+            self.sessions.save_reference_state(thread_id, reference_state)
+            try:
+                self.sessions.append_session_message(thread_id, "user", visible_query)
+                self.sessions.append_session_message(thread_id, "assistant", result.answer)
+            except Exception:
+                pass
             self._last_traces[thread_id] = {
                 "session_id": thread_id,
                 "model": self.model,
@@ -565,7 +708,7 @@ class ResearchAgent:
         if "reasoner" in self.model:
             context_limit = 65536
         elif "flash" in self.model:
-            context_limit = 1000000  # deepseek-v4-flash 官方 1M
+            context_limit = 1000000  # DeepSeek Flash 系列的项目上下文上限
         usage["prompt"] = est_tokens
         usage["total"] = est_tokens
         usage["last_prompt"] = est_tokens
@@ -663,7 +806,7 @@ class ResearchAgent:
         return self._usage_cache[thread_id]
 
     def get_retry_input(self, thread_id: str | None = None) -> dict | None:
-        """返回本进程内最后一个模型请求，用于 UI 的 `/retry`。"""
+        """返回本进程内最后一个模型请求，供兼容调用方重试。"""
         return self._retry_inputs.get(thread_id or self._thread_id)
 
     def get_last_trace(self, thread_id: str | None = None) -> dict | None:
@@ -673,11 +816,11 @@ class ResearchAgent:
 
     @property
     def token_usage(self) -> dict:
-        """兼容 CLI 旧调用；Web UI 请用 ``get_usage(session_id)``。"""
+        """兼容 CLI 旧调用；浏览器客户端应使用 ``get_usage(session_id)``。"""
         return self.get_usage(self._thread_id)
 
     def get_history(self, thread_id: str) -> list[dict]:
-        """返回可直接交给 Gradio Chatbot 的用户/助手消息。"""
+        """返回浏览器和 CLI 均可消费的用户/助手消息。"""
         with self._lock_for(thread_id):
             if not self.sessions.get(thread_id):
                 return []
@@ -699,6 +842,27 @@ class ResearchAgent:
     def paper_store(self):
         """PaperStore 实例（可能为 None）"""
         return self._paper_store
+
+    def start_rag_warmup(self):
+        """Prime the local encoder before a worker begins serving user runs."""
+        starter = getattr(self._paper_store, "start_embedding_warmup", None)
+        if not callable(starter):
+            return None
+        future = starter()
+        if future is None:
+            return None
+        self.runtime_status["rag_warmup"] = "running"
+
+        def _mark_finished(done) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                self.runtime_status["rag_warmup"] = f"failed:{type(exc).__name__}"
+            else:
+                self.runtime_status["rag_warmup"] = "ready"
+
+        future.add_done_callback(_mark_finished)
+        return future
 
     # ── 内部 ──
 
@@ -741,6 +905,7 @@ class ResearchAgent:
             "verify_request_skipped": ("verifier", "verify", "skipped", "事实核验暂时跳过"),
             "verify_request_failed": ("verifier", "verify", "failed", "事实核验失败，已继续生成回复"),
             "verify_status": ("verifier", "verify", "waiting", "事实核验正在等待服务"),
+            "run_steer_consumed": ("user", "steer", "consumed", "运行中补充已在下一节点使用"),
         }
         if event_type in {"tool_started", "tool_finished", "tool_failed"}:
             tool_name = str(event.get("tool") or "")
@@ -780,6 +945,9 @@ class ResearchAgent:
         force_tool_name: str | None = None,
         run_id: str = "",
         session_id: str = "",
+        steer_provider: Callable[[str], list[str]] | None = None,
+        enable_verify: bool = True,
+        max_tool_rounds: int | None = None,
     ):
         return build_graph(
             api_key=self.api_key,
@@ -798,6 +966,8 @@ class ResearchAgent:
             llm_client=self.llm_client,
             allowed_tool_names=allowed_tool_names,
             force_tool_name=force_tool_name,
+            enable_verify=enable_verify,
+            max_tool_rounds=max_tool_rounds,
             tool_context=ToolExecutionContext(
                 run_kind="chat",
                 run_id=run_id,
@@ -807,6 +977,7 @@ class ResearchAgent:
                 ),
                 cancel_event=cancel_event,
             ),
+            steer_provider=steer_provider,
         )
 
     @staticmethod

@@ -22,7 +22,7 @@ WORKDIR /app
 
 # ChromaDB's ONNX runtime requires libgomp.
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y libgomp1 \
+    && apt-get install --no-install-recommends -y libgomp1 git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && addgroup --system --gid 10001 app \
     && adduser --system --uid 10001 --ingroup app app

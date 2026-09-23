@@ -1,4 +1,4 @@
-"""Temporary mounted-UI server used only by the browser E2E test.
+"""Temporary React/API server used only by the browser E2E test.
 
 It deliberately avoids external model services and user runtime data.  When
 ``E2E_REDIS_URL`` is supplied (as it is in CI), it also starts a test-only
@@ -21,24 +21,23 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import gradio as gr
 import uvicorn
 
-from api.app import create_app
+from api.app import create_app, mount_react_frontend
 from api.redis_runs import RedisChatRunBroker, RedisChatRunManager, RedisChatRunWorker
 from config import Config
 from session_store import SessionStore
-from web_ui import UI_CSS, UI_JS, UI_THEME, build_ui
 
 
 class _E2EAgent:
-    """Minimal deterministic agent surface required by the mounted Gradio UI."""
+    """Minimal deterministic agent surface required by the React workbench."""
 
     model = "e2e-fake-model"
     paper_store = None
 
-    def __init__(self, checkpoint_db: str) -> None:
-        self.sessions = SessionStore(checkpoint_db)
+    def __init__(self, cfg) -> None:
+        self.cfg = cfg
+        self.sessions = SessionStore(cfg.checkpoint_db)
         self._thread_id = str(self.sessions.create("浏览器 E2E 会话")["thread_id"])
         self._traces: dict[str, dict] = {}
         self.calls: list[dict[str, str]] = []
@@ -70,7 +69,7 @@ class _E2EAgent:
 
     @staticmethod
     def get_usage(_session_id: str) -> dict[str, int | float]:
-        return {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "cost": 0.0}
+        return {"prompt": 0, "completion": 0, "total": 0, "calls": 0, "cost": 0.0, "context_limit": 131072}
 
     @staticmethod
     def get_retry_input(_session_id: str):
@@ -97,12 +96,10 @@ class _E2EAgent:
         return f"{prefix}{message}"
 
 
-def create_e2e_app(data_dir: str, public_url: str, redis_url: str = ""):
-    """Build an ASGI app whose mounted Gradio client is forced through HTTP."""
-    os.environ["API_RUN_CLIENT_ENABLED"] = "1"
-    os.environ["INTERNAL_API_URL"] = public_url
+def create_e2e_app(data_dir: str, redis_url: str = ""):
+    """Build an ASGI app serving the real React client against a fake agent."""
     cfg = Config.load({"data_dir": data_dir, "rag_enabled": False})
-    agent = _E2EAgent(cfg.checkpoint_db)
+    agent = _E2EAgent(cfg)
     manager = None
     if redis_url:
         broker = RedisChatRunBroker(redis_url, prefix=f"research-agent-e2e-{uuid.uuid4().hex}")
@@ -125,8 +122,10 @@ def create_e2e_app(data_dir: str, public_url: str, redis_url: str = ""):
                 })
         return {"calls": list(agent.calls), "runs": runs, "uses_redis": app.state.e2e_uses_redis}
 
-    ui = build_ui(cfg=cfg, agent=agent, launch=False)
-    return gr.mount_gradio_app(app, ui, path="/", theme=UI_THEME, css=UI_CSS, js=UI_JS)
+    dist = ROOT / "frontend" / "dist"
+    if not mount_react_frontend(app, dist):
+        raise RuntimeError("请先执行: cd frontend && npm run build")
+    return app
 
 
 def main() -> None:
@@ -136,7 +135,7 @@ def main() -> None:
     parser.add_argument("--redis-url", default=os.getenv("E2E_REDIS_URL", ""))
     args = parser.parse_args()
     Path(args.data_dir).mkdir(parents=True, exist_ok=True)
-    app = create_e2e_app(args.data_dir, f"http://127.0.0.1:{args.port}", args.redis_url)
+    app = create_e2e_app(args.data_dir, args.redis_url)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 

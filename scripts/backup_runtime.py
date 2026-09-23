@@ -62,6 +62,7 @@ def main() -> int:
             _backup_sqlite(source, staging / relative)
         for source, relative in (
             (paths.profile_path, "primary/profile.md"),
+            (paths.paper_relations_file, "primary/paper_relations.json"),
             (paths.settings_file, "primary/settings.json"),
             (paths.state_file, "meta/state.json"),
         ):
@@ -73,6 +74,8 @@ def main() -> int:
             shutil.copytree(paths.papers_dir, staging / "primary/papers")
         if paths.research_documents_dir.exists():
             shutil.copytree(paths.research_documents_dir, staging / "primary/research_documents")
+        if paths.experiment_projects_dir.exists():
+            shutil.copytree(paths.experiment_projects_dir, staging / "primary/experiment_projects")
         if args.include_derived:
             for source, relative in (
                 (paths.chroma_dir, "derived/chroma"),

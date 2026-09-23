@@ -9,7 +9,7 @@ from runtime_paths import get_runtime_paths
 
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-DEFAULT_VISION_MODEL = "deepseek-v4-flash-vision-exp"
+DEFAULT_VISION_MODEL = "deepseek-flash"
 
 
 def handle_describe_image(

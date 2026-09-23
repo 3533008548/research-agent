@@ -5,11 +5,28 @@
 from tools.search import handle_search_papers, handle_query_papers, handle_list_papers, handle_list_indexed, handle_delete_paper
 from tools.read_pdf import handle_read_pdf
 from tools.paper_card import handle_generate_paper_card
+from tools.paper_relations import (
+    handle_delete_paper_relation,
+    handle_list_paper_relations,
+    handle_save_paper_relation,
+)
 from tools.research_documents import (
+    handle_apply_research_document_patch,
+    handle_apply_research_document_ledger_patch,
+    handle_compare_papers_to_research_document,
+    handle_list_research_document_sections,
+    handle_list_research_document_versions,
+    handle_prepare_research_document_patch_context,
     handle_read_research_document,
+    handle_read_research_document_ledger,
+    handle_read_research_document_section,
+    handle_review_new_paper_impact_on_research_document,
+    handle_review_research_document_innovation,
+    handle_restore_research_document_version,
     handle_save_research_document,
     handle_search_research_documents,
 )
+from tools.experiment_projects import handle_update_experiment_project
 from tools.describe import handle_describe_image
 from tools.profile_tool import handle_update_profile
 from cancellation import raise_if_cancelled
@@ -20,9 +37,24 @@ _TOOL_HANDLERS = {
     "search_papers": handle_search_papers,
     "read_pdf": handle_read_pdf,
     "generate_paper_card": handle_generate_paper_card,
+    "list_paper_relations": handle_list_paper_relations,
+    "save_paper_relation": handle_save_paper_relation,
+    "delete_paper_relation": handle_delete_paper_relation,
     "save_research_document": handle_save_research_document,
     "search_research_documents": handle_search_research_documents,
     "read_research_document": handle_read_research_document,
+    "list_research_document_sections": handle_list_research_document_sections,
+    "read_research_document_section": handle_read_research_document_section,
+    "prepare_research_document_patch_context": handle_prepare_research_document_patch_context,
+    "apply_research_document_patch": handle_apply_research_document_patch,
+    "read_research_document_ledger": handle_read_research_document_ledger,
+    "apply_research_document_ledger_patch": handle_apply_research_document_ledger_patch,
+    "list_research_document_versions": handle_list_research_document_versions,
+    "restore_research_document_version": handle_restore_research_document_version,
+    "compare_papers_to_research_document": handle_compare_papers_to_research_document,
+    "review_research_document_innovation": handle_review_research_document_innovation,
+    "review_new_paper_impact_on_research_document": handle_review_new_paper_impact_on_research_document,
+    "update_experiment_project": handle_update_experiment_project,
     "describe_image": handle_describe_image,
     "query_papers": handle_query_papers,
     "list_papers": handle_list_papers,

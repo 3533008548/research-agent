@@ -26,7 +26,7 @@ class ProfileManager:
                 "# 用户画像\n\n"
                 "## 研究方向\n\n"
                 "## 偏好设置\n"
-                "- 模型: deepseek-v4-flash\n"
+                "- 模型: deepseek-flash\n"
                 "- 论文源: OpenAlex（通用）+ arXiv（预印本）\n"
                 "- 语言: 中文\n\n"
                 "## 活跃问题\n\n"

@@ -86,10 +86,16 @@ class TestFastAPIService(unittest.TestCase):
         def get_history(self, session_id):
             return list(self._histories.get(session_id, []))
 
-        def step(self, message, *, session_id, run_id, cancel_event, on_token):
+        def step(
+            self, message, *, session_id, run_id, cancel_event, on_token,
+            steer_provider=None, on_steer=None,
+        ):
             if cancel_event.is_set():
                 answer, outcome, status = "已取消", "cancelled", "cancelled"
             else:
+                steers = steer_provider("llm") if steer_provider else []
+                if steers and on_steer:
+                    on_steer("llm", len(steers))
                 on_token("API")
                 on_token(" 回复")
                 answer, outcome, status = f"已收到：{message}", "success", "completed"
@@ -287,9 +293,9 @@ class TestFastAPIService(unittest.TestCase):
             app = FastAPI()
             self.assertTrue(mount_react_frontend(app, dist))
             client = TestClient(app)
-            self.assertIn("React client", client.get("/app/").text)
-            self.assertIn("React client", client.get("/app/sessions/example").text)
-            self.assertIn("console.log", client.get("/app/assets/app.js").text)
+            self.assertIn("React client", client.get("/").text)
+            self.assertIn("React client", client.get("/sessions/example").text)
+            self.assertIn("console.log", client.get("/assets/app.js").text)
             self.assertFalse(mount_react_frontend(FastAPI(), dist / "missing"))
 
     def test_workspace_routes_keep_documents_keywords_and_settings_outside_chat_state(self):
@@ -310,6 +316,7 @@ class TestFastAPIService(unittest.TestCase):
         self.agent.paper_store = SimpleNamespace(list_papers=lambda: [{
             "paper_id": "paper-1", "title": "本地论文", "chunks": 3, "indexed_at": "2026-09-05",
         }])
+        self.agent.profile = SimpleNamespace(read=lambda: "# 用户画像\n\n- 语言：中文")
         app = create_app(agent=self.agent)
         try:
             client = TestClient(app)
@@ -318,9 +325,31 @@ class TestFastAPIService(unittest.TestCase):
             listed = client.get("/api/v1/workspace/research-documents")
             self.assertEqual(listed.status_code, 200)
             self.assertEqual(listed.json()[0]["document_id"], document["document_id"])
+            profile = client.get("/api/v1/workspace/profile")
+            self.assertEqual(profile.status_code, 200)
+            self.assertIn("语言：中文", profile.json()["content"])
             detail = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}")
             self.assertEqual(detail.status_code, 200)
             self.assertIn("方案正文", detail.json()["content"])
+            self.assertEqual(len(detail.json()["sections"]), 4)
+            self.assertEqual(detail.json()["versions"][0]["revision"], 1)
+            self.assertEqual(detail.json()["ledger"]["ledger_revision"], 0)
+            sections = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/sections")
+            self.assertEqual(sections.status_code, 200)
+            self.assertEqual(sections.json()[0]["section_id"], "background")
+            versions = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/versions")
+            self.assertEqual(versions.status_code, 200)
+            self.assertTrue(versions.json()[0]["current"])
+            ledger = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/ledger")
+            self.assertEqual(ledger.status_code, 200)
+            self.assertEqual(ledger.json()["summary"]["items"], 0)
+            routed = client.post(
+                f"/api/v1/workspace/research-documents/{document['document_id']}/route",
+                json={"message": "请补充研究方案中的可行性分析"},
+            )
+            self.assertEqual(routed.status_code, 200)
+            self.assertEqual(routed.json()["intent"], "safe_patch")
+            self.assertIn(document["document_id"], routed.json()["message"])
             self.assertEqual(
                 client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/download").status_code,
                 200,
@@ -329,6 +358,21 @@ class TestFastAPIService(unittest.TestCase):
             papers = client.get("/api/v1/workspace/papers")
             self.assertEqual(papers.status_code, 200)
             self.assertEqual(papers.json()[0]["title"], "本地论文")
+            self.assertEqual(papers.json()[0]["relation_count"], 0)
+            app.state.paper_relation_store.upsert(
+                source_paper={"paper_id": "paper-1", "title": "本地论文"},
+                target_paper={"paper_id": "paper-2", "title": "关联论文"},
+                relation_type="method_similar",
+                note="用于验证工作台关系索引。",
+                evidence=[{
+                    "paper_id": "paper-1", "title": "本地论文", "page": 1,
+                    "chunk_index": 0, "note": "方法描述。",
+                }],
+            )
+            relations = client.get("/api/v1/workspace/paper-relations")
+            self.assertEqual(relations.status_code, 200)
+            self.assertEqual(relations.json()[0]["relation_type"], "method_similar")
+            self.assertEqual(client.get("/api/v1/workspace/papers").json()[0]["relation_count"], 1)
 
             uploaded = client.post(
                 "/api/v1/workspace/uploads",
@@ -625,6 +669,46 @@ class TestFastAPIService(unittest.TestCase):
         manager.cancel(cancelled["run_id"])
         self.assertTrue(worker.run_once(block_ms=1))
         self.assertEqual(manager.get(cancelled["run_id"])["status"], "cancelled")
+
+    def test_running_guidance_is_durable_consumed_and_absent_from_event_log(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+        from api.redis_runs import RedisChatRunManager, RedisChatRunWorker
+
+        broker = self._FakeRunBroker()
+        manager = RedisChatRunManager(self.agent, broker)
+        client = TestClient(create_app(agent=self.agent, chat_run_manager=manager))
+        session_id = client.post("/api/v1/sessions", json={"title": "运行中补充"}).json()["thread_id"]
+        started = client.post("/api/v1/runs", json={
+            "kind": "chat", "session_id": session_id, "message": "先检索 TSN 调度方法",
+        }).json()
+        guidance = "补充：只把未经核验的内容标为待确认。"
+
+        queued = client.post(
+            f"/api/v1/runs/{started['run_id']}/steers", json={"message": guidance},
+        )
+        self.assertEqual(queued.status_code, 202)
+        self.assertEqual(queued.json()["status"], "pending")
+        self.assertEqual(queued.json()["message"], guidance)
+        before = client.get(f"/api/v1/runs/{started['run_id']}").json()
+        self.assertEqual(before["steers"][0]["status"], "pending")
+
+        worker = RedisChatRunWorker(self.agent, broker, consumer="steer-test-worker")
+        self.assertTrue(worker.run_once(block_ms=1))
+        completed = client.get(f"/api/v1/runs/{started['run_id']}").json()
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["steers"][0]["status"], "consumed")
+        self.assertEqual(completed["steers"][0]["consumed_stage"], "llm")
+        self.assertIn("steer_queued", [event.get("stage") for event in broker.events[started["run_id"]]])
+        self.assertIn("steer_consumed", [event.get("stage") for event in broker.events[started["run_id"]]])
+        stored_events = self.store.get_run_events(started["run_id"], session_id)
+        self.assertNotIn(guidance, str(stored_events))
+        self.assertEqual(
+            client.post(
+                f"/api/v1/runs/{started['run_id']}/steers", json={"message": "太晚了"},
+            ).status_code,
+            409,
+        )
 
     def test_durable_worker_executes_queued_research_run(self):
         from api.redis_runs import RedisResearchRunManager, RedisResearchRunWorker
@@ -966,6 +1050,26 @@ class TestToolResponsiveness(unittest.TestCase):
         finally:
             store._query_executor.shutdown(wait=False, cancel_futures=True)
 
+    def test_startup_warmup_primes_embedding_without_querying_or_mutating_papers(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from paper_store import PaperStore
+
+        calls = []
+        store = PaperStore.__new__(PaperStore)
+        store._query_executor = ThreadPoolExecutor(max_workers=1)
+        store._query_lock = threading.RLock()
+        store._active_query = None
+        store._embed_fn = lambda values: calls.append(values) or [[0.0]]
+        try:
+            future = store.start_embedding_warmup()
+            self.assertIsNotNone(future)
+            future.result(timeout=1)
+            self.assertEqual(calls, [["Research Agent startup embedding warmup."]])
+            self.assertIsNone(store._active_query)
+        finally:
+            store._query_executor.shutdown(wait=False, cancel_futures=True)
+
     def test_query_tool_returns_without_waiting_for_embedding_initialization(self):
         from tools.search import handle_query_papers
 
@@ -1124,6 +1228,143 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertGreater(results[0]["keyword_score"], 0)
 
 
+class TestPaperRelations(unittest.TestCase):
+    """Explicit paper relations stay auditable and only assist retrieval."""
+
+    def test_store_persists_directed_relation_and_one_hop_hints(self):
+        from paper_relations import PaperRelationStore
+        from runtime_paths import RuntimePaths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PaperRelationStore(RuntimePaths.from_root(Path(tmp) / "runtime"))
+            relation, action = store.upsert(
+                source_paper={"paper_id": "paper-a", "title": "Baseline"},
+                target_paper={"paper_id": "paper-b", "title": "Improved Method"},
+                relation_type="method_improves",
+                note="Improved Method explicitly reports an extension of the baseline mechanism.",
+                evidence=[{
+                    "paper_id": "paper-b", "title": "Improved Method", "page": 3,
+                    "chunk_index": 4, "note": "Method section names the baseline and the extension.",
+                }],
+            )
+
+            self.assertEqual(action, "created")
+            self.assertTrue(relation["relation_id"].startswith("paper-rel-"))
+            self.assertEqual(len(store.list("paper-a")), 1)
+            self.assertEqual(store.counts(["paper-a", "paper-b"]), {"paper-a": 1, "paper-b": 1})
+            forward = store.related_paper_boosts(["paper-a"])
+            reverse = store.related_paper_boosts(["paper-b"])
+            self.assertIn("paper-b", forward)
+            self.assertIn("paper-a", reverse)
+            self.assertGreater(forward["paper-b"]["boost"], reverse["paper-a"]["boost"])
+
+            reopened = PaperRelationStore(RuntimePaths.from_root(Path(tmp) / "runtime"))
+            self.assertEqual(reopened.list()[0]["note"], relation["note"])
+            self.assertEqual(reopened.remove_paper("paper-a"), 1)
+            self.assertEqual(reopened.list(), [])
+
+    def test_handler_requires_user_confirmation_and_anchors(self):
+        from paper_relations import PaperRelationStore
+        from runtime_paths import RuntimePaths
+        from tools.paper_relations import (
+            handle_delete_paper_relation,
+            handle_list_paper_relations,
+            handle_save_paper_relation,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            relation_store = PaperRelationStore(RuntimePaths.from_root(Path(tmp) / "runtime"))
+
+            class _PaperStore:
+                def __init__(self, store):
+                    self.relation_store = store
+
+                @staticmethod
+                def list_papers():
+                    return [
+                        {"paper_id": "paper-a", "title": "Paper A"},
+                        {"paper_id": "paper-b", "title": "Paper B"},
+                    ]
+
+            paper_store = _PaperStore(relation_store)
+
+            args = {
+                "source_paper_id_or_title": "paper-a",
+                "target_paper_id_or_title": "paper-b",
+                "relation_type": "method_similar",
+                "note": "Both papers use the same scheduling formulation.",
+                "evidence": [{
+                    "paper_id": "paper-a", "page": 2, "chunk_index": 1,
+                    "note": "Method defines the scheduling formulation.",
+                }],
+            }
+            self.assertIn("明确确认", handle_save_paper_relation(args, paper_store=paper_store))
+            saved = handle_save_paper_relation(
+                {**args, "confirmed_by_user": True}, paper_store=paper_store,
+            )
+            self.assertIn("已保存", saved)
+            listed = handle_list_paper_relations({"paper_id_or_title": "Paper A"}, paper_store=paper_store)
+            self.assertIn("方法相似", listed)
+            relation_id = relation_store.list()[0]["relation_id"]
+            self.assertIn("明确确认", handle_delete_paper_relation(
+                {"relation_id": relation_id}, paper_store=paper_store,
+            ))
+            self.assertIn("已删除", handle_delete_paper_relation(
+                {"relation_id": relation_id, "confirmed_by_user": True}, paper_store=paper_store,
+            ))
+
+    def test_relation_expansion_requires_a_topic_matched_chunk(self):
+        from paper_store import PaperStore
+
+        class _Relations:
+            @staticmethod
+            def related_paper_boosts(_seed_ids):
+                return {
+                    "paper-b": {
+                        "boost": 0.004,
+                        "relation_ids": ["paper-rel-123456789abc"],
+                        "relation_types": ["method_similar"],
+                        "seed_paper_ids": ["paper-a"],
+                    },
+                }
+
+        store = PaperStore.__new__(PaperStore)
+        store.relation_store = _Relations()
+        base = {
+            "paper_id": "paper-a", "title": "Direct hit", "chunk_index": 0,
+            "text": "directly relevant scheduling evidence", "distance": 0.1,
+            "hybrid_score": 0.03,
+        }
+        fused = {store._result_key(base): dict(base)}
+        related_semantic = {
+            "paper_id": "paper-b", "title": "Related paper", "chunk_index": 0,
+            "text": "unrelated semantic candidate", "distance": 0.9,
+        }
+        related_keyword = {
+            "paper_id": "paper-b", "title": "Related paper", "chunk_index": 1,
+            "text": "scheduling formulation matches the query", "keyword_score": 2.0,
+        }
+        store.query = lambda *_args, **_kwargs: [related_semantic]
+        store.query_lexical = lambda *_args, **_kwargs: [related_keyword]
+
+        store._expand_relation_candidates(
+            "scheduling formulation", fused, [base], candidate_k=4, section=None,
+        )
+
+        expanded = list(fused.values())
+        self.assertEqual(len(expanded), 2)
+        relation_result = next(item for item in expanded if item["paper_id"] == "paper-b")
+        self.assertEqual(relation_result["relation_types"], ["method_similar"])
+        self.assertIn("relation_boost", relation_result)
+
+        fused = {store._result_key(base): dict(base)}
+        store.query_lexical = lambda *_args, **_kwargs: []
+        store._expand_relation_candidates(
+            "scheduling formulation", fused, [base], candidate_k=4, section=None,
+        )
+        self.assertEqual(len(fused), 1, "关系本身不能注入没有主题匹配的论文")
+
+
 class TestVerifyNode(unittest.TestCase):
     """测试3: verify 节点边界不崩溃"""
 
@@ -1203,6 +1444,181 @@ class TestVerifyNode(unittest.TestCase):
             or message.get("tool_calls")
             for message in sanitized
         ))
+
+    def test_deepseek_sanitizer_drops_legacy_tool_turn_without_reasoning_content(self):
+        from graph_builder import sanitize_model_messages
+
+        messages = [
+            {"role": "user", "content": "旧任务"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "legacy-call", "function": {"name": "list_papers", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "legacy-call", "content": "旧工具结果"},
+            {"role": "assistant", "content": "旧任务完成"},
+            {"role": "user", "content": "继续"},
+            {"role": "assistant", "content": None, "reasoning_content": "需要读取新章节", "tool_calls": [{
+                "id": "current-call", "function": {"name": "list_research_document_sections", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "current-call", "content": "当前章节"},
+        ]
+
+        sanitized = sanitize_model_messages(
+            messages, require_reasoning_content_for_tools=True,
+        )
+        self.assertEqual(
+            [message["role"] for message in sanitized],
+            ["user", "assistant", "user", "assistant", "tool"],
+        )
+        self.assertEqual(sanitized[-2]["reasoning_content"], "需要读取新章节")
+        self.assertNotIn("legacy-call", str(sanitized))
+
+    def test_graph_preserves_reasoning_content_across_tool_turns(self):
+        from graph_builder import build_graph
+        from llm_client import LLMClient
+
+        responses = [
+            self._FakeResponse({
+                "content": None,
+                "reasoning_content": "先查看论文列表。",
+                "tool_calls": [{
+                    "id": "paper-list-1", "type": "function",
+                    "function": {"name": "list_papers", "arguments": "{}"},
+                }],
+            }),
+            self._FakeResponse({
+                "content": "已完成。",
+                "reasoning_content": "工具结果足够回答。",
+            }),
+        ]
+        with patch("llm_client.requests.post", side_effect=responses) as post, \
+             patch("graph_builder.execute_tool", return_value="论文列表"):
+            app = build_graph(
+                api_key="test-key", model="deepseek-flash", checkpoint_db=":memory:",
+                enable_verify=False, allowed_tool_names={"list_papers"},
+                llm_client=LLMClient("test-key", "https://example.test/chat"),
+            )
+            try:
+                result = app.invoke(
+                    {"messages": [{"role": "user", "content": "列出论文"}], "metadata": {}},
+                    config={"configurable": {"thread_id": "reasoning-roundtrip"}},
+                )
+            finally:
+                app.checkpointer.conn.close()
+
+        second_payload = post.call_args_list[1].kwargs["json"]
+        tool_turn = next(
+            message for message in second_payload["messages"]
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        )
+        self.assertEqual(tool_turn["reasoning_content"], "先查看论文列表。")
+        self.assertEqual(result["messages"][-1]["reasoning_content"], "工具结果足够回答。")
+
+    def test_stream_preserves_reasoning_content_without_scope_error(self):
+        """流式 reasoning delta 不能因闭包作用域而中断对话。"""
+        from graph_builder import build_graph
+
+        class _StreamingResponse:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self):
+                return None
+
+            @staticmethod
+            def iter_lines(decode_unicode=True):
+                return iter([
+                    'data: {"choices":[{"delta":{"reasoning_content":"先梳理问题。"}}]}',
+                    'data: {"choices":[{"delta":{"content":"已完成。"}}]}',
+                    "data: [DONE]",
+                ])
+
+        class _Budget:
+            @staticmethod
+            def metrics():
+                return {
+                    "purpose": "chat", "priority": "interactive",
+                    "queue_wait_ms": 0, "attempts": 1, "retries_used": 0,
+                }
+
+        class _Client:
+            def new_request_budget(self, *_args, **_kwargs):
+                return _Budget()
+
+            @staticmethod
+            def prepare_stream_read(*_args, **_kwargs):
+                return True
+
+            @staticmethod
+            def post(_payload, *, stream, on_status, budget):
+                self.assertTrue(stream)
+                return _StreamingResponse()
+
+            @staticmethod
+            def finish_stream(_response, *, success):
+                self.assertTrue(success)
+
+        streamed = []
+        app = build_graph(
+            api_key="test-key", checkpoint_db=":memory:", llm_client=_Client(),
+            stream_callback=streamed.append, enable_verify=False,
+        )
+        try:
+            result = app.invoke(
+                {"messages": [{"role": "user", "content": "你好"}], "metadata": {}},
+                config={"configurable": {"thread_id": "stream-reasoning-scope"}},
+            )
+        finally:
+            app.checkpointer.conn.close()
+
+        self.assertEqual("".join(streamed), "已完成。")
+        self.assertEqual(result["messages"][-1]["reasoning_content"], "先梳理问题。")
+
+    def test_bounded_tool_rounds_ignore_previous_turn_tool_history(self):
+        from graph_builder import build_graph
+        from llm_client import LLMClient
+
+        responses = [
+            self._FakeResponse({
+                "content": None,
+                "tool_calls": [{
+                    "id": "current-read", "type": "function",
+                    "function": {"name": "list_papers", "arguments": "{}"},
+                }],
+            }),
+            self._FakeResponse({
+                "content": None,
+                "tool_calls": [{
+                    "id": "current-write", "type": "function",
+                    "function": {"name": "list_papers", "arguments": "{}"},
+                }],
+            }),
+        ]
+        previous_turn = [
+            {"role": "user", "content": "旧任务"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "old-call", "function": {"name": "list_papers", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "old-call", "content": "旧结果"},
+            {"role": "assistant", "content": "旧任务完成"},
+            {"role": "user", "content": "提交本轮修改"},
+        ]
+        with patch("llm_client.requests.post", side_effect=responses) as post, \
+             patch("graph_builder.execute_tool", side_effect=["完整上下文", "✅ 已提交"]):
+            app = build_graph(
+                api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
+                max_tool_rounds=2, allowed_tool_names={"list_papers"},
+                llm_client=LLMClient("test-key", "https://example.test/chat"),
+            )
+            try:
+                result = app.invoke(
+                    {"messages": previous_turn, "metadata": {}},
+                    config={"configurable": {"thread_id": "current-turn-bound"}},
+                )
+            finally:
+                app.checkpointer.conn.close()
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(result["messages"][-1]["content"], "✅ 已提交")
 
     def test_graph_builds_correctly(self):
         """图结构正常编译（不调用 API）"""
@@ -1479,18 +1895,6 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(result["messages"][-1]["content"], "恢复输出")
         self.assertEqual("".join(streamed), "恢复输出")
 
-    def test_tools_module_imports(self):
-        """所有工具模块可正常导入"""
-        from search_api import search_arxiv, search_openalex, list_downloaded_papers
-        from pdf_reader import read_pdf_enhanced, extract_images
-        from paper_store import PaperStore, chunk_text
-        from user_profile import ProfileManager
-        self.assertTrue(callable(search_arxiv))
-        self.assertTrue(callable(search_openalex))
-        self.assertTrue(callable(read_pdf_enhanced))
-        self.assertTrue(callable(chunk_text))
-
-
 class TestScheduler(unittest.TestCase):
     """每日检索的本地命令路径，不调用外部论文 API。"""
 
@@ -1552,6 +1956,186 @@ class TestScheduler(unittest.TestCase):
 
 class TestPaperArtifacts(unittest.TestCase):
     """Evidence cards remain local, source-bounded and independently auditable."""
+
+    def test_card_prompt_and_draft_require_why_how_what_slots(self):
+        """P0-5: WHY/HOW/WHAT makes a card comparable across papers."""
+        from paper_artifacts import (
+            CARD_COMPARISON_HEADING,
+            audit_paper_card,
+            fallback_paper_card,
+            paper_card_prompt,
+        )
+
+        source_map = {
+            "paper_id": "paper-1", "title": "Sample",
+            "coverage": {"processed_pages": 1, "total_pages": 1, "locator_mode": "page-grounded"},
+            "blocks": [{"id": "S001", "page": 1, "section": "Abstract", "text": "claim"}],
+        }
+        prompt = paper_card_prompt(source_map, source_map["blocks"])
+        self.assertIn(CARD_COMPARISON_HEADING, prompt)
+        for slot in ("WHY", "HOW", "WHAT"):
+            self.assertIn(f"- {slot}：", prompt)
+
+        draft = fallback_paper_card(source_map, source_map["blocks"], "reason")
+        self.assertIn(CARD_COMPARISON_HEADING, draft)
+        audit = audit_paper_card(draft, source_map)
+        self.assertTrue(audit["comparison_slots_present"])
+        self.assertEqual(audit["missing_comparison_slots"], [])
+
+    def test_missing_comparison_slots_are_reported_without_failing_the_card(self):
+        from paper_artifacts import CARD_HEADINGS, audit_paper_card
+
+        source_map = {"paper_id": "paper-1", "blocks": [{"id": "S001", "page": 1, "text": "x"}]}
+        card = "\n".join(
+            ["# Sample"]
+            + [f"## {i}. {h}\n内容【论文 p.1 · S001】" for i, h in enumerate(CARD_HEADINGS, 1)]
+        )
+        audit = audit_paper_card(card, source_map)
+        self.assertTrue(audit["valid"])
+        self.assertFalse(audit["comparison_slots_present"])
+        self.assertEqual(audit["missing_comparison_slots"], ["WHY", "HOW", "WHAT"])
+
+    def test_cross_page_continuation_is_one_logical_chunk_with_page_range(self):
+        from paper_artifacts import build_document_map, related_context
+        from paper_quality import assess_document_map
+        from paper_store import PaperStore
+
+        parsed = {
+            "source_file": "sample.pdf", "total_pages": 4, "processed_pages": 4,
+            "pages": [
+                {"page": 1, "elements": []},
+                {"page": 2, "elements": []},
+                {"page": 3, "elements": [{
+                    "id": "p003-t01", "kind": "text", "page": 3, "section": "Method",
+                    "is_heading": False, "text": "therefore", "related_ids": [],
+                }]},
+                {"page": 4, "elements": [{
+                    "id": "p004-t01", "kind": "text", "page": 4, "section": "Method",
+                    "is_heading": False, "text": "x" * 1200, "related_ids": [],
+                }]},
+            ],
+        }
+
+        document_map = build_document_map(
+            parsed, paper_id="cross-page", title="Sample", source_file="sample.pdf",
+        )
+        text_chunks = [chunk for chunk in document_map["chunks"] if chunk["kind"] == "text"]
+        context, locator = related_context(document_map, text_chunks[0]["id"])
+        report = assess_document_map(document_map, requested_pages=4)
+
+        class _Collection:
+            payload = None
+
+            def add(self, **kwargs):
+                self.payload = kwargs
+
+        collection = _Collection()
+        store = PaperStore.__new__(PaperStore)
+        store._collection = collection
+        store._index_chunks(text_chunks, title="Sample", paper_id="cross-page")
+
+        self.assertEqual(len(document_map["logical_blocks"]), 1)
+        self.assertEqual(len(text_chunks), 1)
+        self.assertEqual(text_chunks[0]["page"], 3)
+        self.assertEqual(text_chunks[0]["page_end"], 4)
+        self.assertLessEqual(len(text_chunks[0]["text"]), 1320)
+        self.assertEqual(text_chunks[0]["source_element_ids"], ["p003-t01", "p004-t01"])
+        self.assertEqual(context, "")
+        self.assertEqual(locator, "p.3–4 · text")
+        self.assertEqual(collection.payload["metadatas"][0]["page"], 3)
+        self.assertEqual(collection.payload["metadatas"][0]["page_end"], 4)
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["stats"]["cross_page_chunks"], 1)
+
+    def test_cross_page_join_requires_an_unfinished_body_paragraph(self):
+        from paper_artifacts import build_document_map
+
+        parsed = {
+            "source_file": "sample.pdf", "total_pages": 4, "processed_pages": 4,
+            "pages": [
+                {"page": 3, "elements": [{
+                    "id": "p003-t01", "kind": "text", "page": 3, "section": "Method",
+                    "is_heading": False, "text": "The first paragraph ends here.", "related_ids": [],
+                }]},
+                {"page": 4, "elements": [{
+                    "id": "p004-t01", "kind": "text", "page": 4, "section": "Method",
+                    "is_heading": False, "text": "A distinct paragraph starts on the next page.", "related_ids": [],
+                }]},
+            ],
+        }
+
+        document_map = build_document_map(
+            parsed, paper_id="separate-pages", title="Sample", source_file="sample.pdf",
+        )
+        text_chunks = [chunk for chunk in document_map["chunks"] if chunk["kind"] == "text"]
+
+        self.assertEqual(len(document_map["logical_blocks"]), 2)
+        self.assertEqual([(chunk["page"], chunk["page_end"]) for chunk in text_chunks], [(3, 3), (4, 4)])
+
+    def test_cross_page_blocks_do_not_chain_past_two_pages_or_missed_heading(self):
+        from paper_artifacts import build_document_map
+
+        parsed = {
+            "source_file": "sample.pdf", "total_pages": 5, "processed_pages": 5,
+            "pages": [
+                {"page": 3, "elements": [{
+                    "id": "p003-t01", "kind": "text", "page": 3, "section": "II. RELATED WORK",
+                    "is_heading": False, "text": "This paragraph continues", "related_ids": [],
+                }]},
+                {"page": 4, "elements": [{
+                    "id": "p004-t01", "kind": "text", "page": 4, "section": "II. RELATED WORK",
+                    "is_heading": False, "text": "across one page break", "related_ids": [],
+                }]},
+                {"page": 5, "elements": [
+                    {
+                        "id": "p005-t01", "kind": "text", "page": 5, "section": "II. RELATED WORK",
+                        "is_heading": False, "text": "III. SYSTEM MODEL", "related_ids": [],
+                    },
+                    {
+                        "id": "p005-t02", "kind": "text", "page": 5, "section": "II. RELATED WORK",
+                        "is_heading": False, "text": "The new section begins here.", "related_ids": [],
+                    },
+                ]},
+            ],
+        }
+
+        document_map = build_document_map(
+            parsed, paper_id="bounded-cross-page", title="Sample", source_file="sample.pdf",
+        )
+        text_chunks = [chunk for chunk in document_map["chunks"] if chunk["kind"] == "text"]
+
+        self.assertTrue(document_map["pages"][2]["elements"][0]["is_heading"])
+        self.assertEqual(document_map["pages"][2]["elements"][1]["section"], "III. SYSTEM MODEL")
+        self.assertEqual([(chunk["page"], chunk["page_end"]) for chunk in text_chunks], [(3, 4), (5, 5)])
+
+    def test_cross_page_long_logical_block_splits_without_an_orphan_tail(self):
+        from paper_artifacts import build_document_map
+
+        parsed = {
+            "source_file": "sample.pdf", "total_pages": 4, "processed_pages": 4,
+            "pages": [
+                {"page": 3, "elements": [{
+                    "id": "p003-t01", "kind": "text", "page": 3, "section": "Method",
+                    "is_heading": False, "text": "therefore", "related_ids": [],
+                }]},
+                {"page": 4, "elements": [{
+                    "id": "p004-t01", "kind": "text", "page": 4, "section": "Method",
+                    "is_heading": False,
+                    "text": "Recoverable continuation sentence. " * 100,
+                    "related_ids": [],
+                }]},
+            ],
+        }
+
+        document_map = build_document_map(
+            parsed, paper_id="long-cross-page", title="Sample", source_file="sample.pdf",
+        )
+        text_chunks = [chunk for chunk in document_map["chunks"] if chunk["kind"] == "text"]
+
+        self.assertGreater(len(text_chunks), 1)
+        self.assertTrue(all(len(chunk["text"]) <= 1320 for chunk in text_chunks))
+        self.assertTrue(all(len(chunk["text"]) >= 160 for chunk in text_chunks))
+        self.assertTrue(all((chunk["page"], chunk["page_end"]) == (3, 4) for chunk in text_chunks))
 
     def test_document_map_keeps_table_figure_and_nearby_text_on_the_same_page(self):
         from paper_artifacts import (
@@ -1721,6 +2305,41 @@ class TestPaperArtifacts(unittest.TestCase):
             self.assertIsNotNone(_Store.indexed)
             self.assertEqual(_Store.indexed["chunks"][0]["page"], 1)
             self.assertIn("页面元素映射", result)
+
+    def test_paper_import_title_prefers_catalog_then_pdf_evidence(self):
+        from tools.read_pdf import resolve_paper_title
+
+        parsed = {
+            "metadata_title": "",
+            "pages": [{"elements": [
+                {"kind": "text", "text": "2504.05793v3"},
+                {"kind": "text", "text": "Negotiating strict latency limits for dynamic real-time services"},
+                {"kind": "text", "text": "in vehicular time-sensitive networks"},
+                {"kind": "text", "text": "Alice Example, Bob Example"},
+                {"kind": "text", "text": "Abstract"},
+            ]}],
+        }
+
+        title, source = resolve_paper_title("", parsed, "2504.05793v3")
+        self.assertEqual(
+            title,
+            "Negotiating strict latency limits for dynamic real-time services in vehicular time-sensitive networks",
+        )
+        self.assertEqual(source, "PDF 首页")
+
+        title, source = resolve_paper_title(
+            "Flow-Aware Scheduling for Time-Sensitive Networking",
+            {"metadata_title": "2504.05793v3", "pages": []},
+            "2504.05793v3",
+        )
+        self.assertEqual(title, "Flow-Aware Scheduling for Time-Sensitive Networking")
+        self.assertEqual(source, "调用方提供的论文名")
+
+        title, source = resolve_paper_title(
+            "", {"metadata_title": "A Metadata Title", "pages": []}, "2504.05793v3",
+        )
+        self.assertEqual(title, "A Metadata Title")
+        self.assertEqual(source, "PDF 元数据")
 
     def test_quality_gate_merges_an_orphan_formula_fragment_without_losing_sources(self):
         from paper_quality import prepare_document_map
@@ -2001,10 +2620,122 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertFalse(client.calls[0][1]["policy"].counts_toward_circuit)
 
 
+class TestResearchDocumentRouting(unittest.TestCase):
+    def test_explicit_document_phrases_select_a_non_authoritative_workflow_hint(self):
+        from research_document_routing import route_research_document_request
+
+        document = {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"}
+        cases = {
+            "新导入了一篇论文，请修改一下科研档案": "new_paper_impact_review",
+            "我新引入了一篇论文，更新研究档案": "new_paper_impact_review",
+            "请补充研究方案中的可行性分析": "safe_patch",
+            "请将以上所有修改全部写入": "full_patch",
+            "将新导入论文与这份方案比对，看看研究内容是否重叠": "paper_comparison",
+            "梳理这份方案的证据与假设，并列出可证伪条件": "ledger",
+            "请做一次创新性审查，看看是否有新颖性": "innovation_review",
+            "这份方案最大的风险是什么": "consult",
+        }
+        for request, expected in cases.items():
+            routed = route_research_document_request(document, request)
+            self.assertEqual(routed["intent"], expected)
+            self.assertIn(document["document_id"], routed["message"])
+            self.assertIn(request, routed["message"])
+
+    def test_new_paper_route_exposes_only_read_only_assessment_tools(self):
+        from research_document_routing import allowed_tools_for_routed_request
+
+        envelope = (
+            "【科研档案路由】\n"
+            "document_id=research-doc-abcdef123456\n"
+            "route=new_paper_impact_review\n\n"
+            "用户请求：新导入了一篇论文，请修改科研档案"
+        )
+        self.assertEqual(
+            allowed_tools_for_routed_request(envelope),
+            frozenset({
+                "list_indexed_papers",
+                "review_new_paper_impact_on_research_document",
+            }),
+        )
+        self.assertIsNone(allowed_tools_for_routed_request("没有路由标记的普通对话"))
+
+    def test_safe_patch_route_exposes_only_document_patch_tools(self):
+        from research_document_routing import allowed_tools_for_routed_request
+
+        envelope = (
+            "【科研档案路由】\n"
+            "document_id=research-doc-abcdef123456\n"
+            "route=safe_patch\n\n"
+            "用户请求：将以上所有修改全部写入"
+        )
+        self.assertEqual(
+            allowed_tools_for_routed_request(envelope),
+            frozenset({
+                "list_research_document_sections",
+                "read_research_document_section",
+                "apply_research_document_patch",
+            }),
+        )
+
+    def test_full_patch_route_exposes_the_two_step_commit_tools(self):
+        from research_document_routing import allowed_tools_for_routed_request
+
+        envelope = (
+            "【科研档案路由】\n"
+            "document_id=research-doc-abcdef123456\n"
+            "route=full_patch\n\n"
+            "用户请求：请将以上所有修改全部写入"
+        )
+        self.assertEqual(
+            allowed_tools_for_routed_request(envelope),
+            frozenset({
+                "prepare_research_document_patch_context",
+                "apply_research_document_patch",
+            }),
+        )
+
+
 class TestResearchDocuments(unittest.TestCase):
     """Research plans are durable artifacts, not hidden conversation memory."""
 
-    def test_store_updates_and_searches_markdown_with_word_export(self):
+    def test_full_patch_context_reads_four_sections_without_partial_output(self):
+        import re
+        from tools import execute_tool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
+                saved = execute_tool("save_research_document", {
+                    "title": "TSN 方案",
+                    "content": (
+                        "## 研究背景与研究现状\n背景。\n\n"
+                        "## 研究内容与创新\n创新。\n\n"
+                        "## 研究方案与可行性\n方案。\n\n"
+                        "## 研究展望与计划\n计划。"
+                    ),
+                })
+                document_id = re.search(r"`(research-doc-[a-f0-9]{12})`", saved).group(1)
+                context = execute_tool("prepare_research_document_patch_context", {
+                    "document_id": document_id,
+                })
+
+        self.assertIn("完整补丁上下文", context)
+        self.assertIn("研究背景与研究现状", context)
+        self.assertIn("研究内容与创新", context)
+        self.assertIn("研究方案与可行性", context)
+        self.assertIn("研究展望与计划", context)
+        self.assertEqual(context.count("哈希：`"), 4)
+
+    def test_analysis_units_ignore_standalone_bibliography_for_content_matching(self):
+        from tools.research_documents import _analysis_units
+
+        units = _analysis_units(
+            "验证 GCL 容量约束与训练成本。\n\n"
+            "1. Smith A. TSN scheduling. 2024.\n2. Lee B. DRL routing. 2025."
+        )
+        self.assertEqual(units, ["验证 GCL 容量约束与训练成本。"])
+
+    def test_store_uses_fixed_sections_and_checked_patches_with_history(self):
         from docx import Document
         from research_documents import ResearchDocumentStore
         from runtime_paths import RuntimePaths
@@ -2022,15 +2753,66 @@ class TestResearchDocuments(unittest.TestCase):
             self.assertTrue(Path(created["docx_path"]).is_file())
             self.assertEqual(Document(created["docx_path"]).core_properties.title, "TSN 扩散调度验证方案")
             self.assertEqual(store.search("PPO")[0]["document_id"], created["document_id"])
-
-            updated = store.save(
-                "TSN 扩散调度验证方案",
-                "## 更新后的计划\n增加分布偏移和消融实验。",
-                document_id=created["document_id"],
+            loaded = store.read(created["document_id"])
+            self.assertEqual(
+                [section["heading"] for section in loaded["sections"]],
+                ["研究背景与研究现状", "研究内容与创新", "研究方案与可行性", "研究展望与计划"],
+            )
+            target = store.read_section(created["document_id"], "outlook_plan")
+            updated = store.apply_patch(
+                created["document_id"],
+                base_revision=target["revision"],
+                operations=[{
+                    "op": "append_to_section",
+                    "section_id": "outlook_plan",
+                    "expected_hash": target["content_hash"],
+                    "content": "增加分布偏移和消融实验。",
+                }],
             )
             loaded = store.read(created["document_id"])
             self.assertEqual(updated["revision"], 2)
             self.assertIn("分布偏移", loaded["content"])
+            self.assertIn("突发流量", loaded["content"])
+            self.assertEqual(store.list_versions(created["document_id"])[1]["revision"], 1)
+            background = store.read_section(created["document_id"], "background")
+            ledger = store.apply_ledger_patch(
+                created["document_id"],
+                base_revision=0,
+                operations=[{
+                    "op": "upsert_item",
+                    "section_id": "background",
+                    "expected_section_hash": background["content_hash"],
+                    "kind": "hypothesis",
+                    "status": "hypothesis",
+                    "statement": "突发流量下该方案可能减少截止期违例。",
+                    "falsification": "若在相同负载下未优于基线，则否定该假设。",
+                    "evidence": [],
+                }],
+            )
+            self.assertEqual(ledger["ledger_revision"], 1)
+            self.assertEqual(store.read_ledger(created["document_id"])["summary"]["stale_links"], 0)
+            with self.assertRaisesRegex(ValueError, "至少需要一条"):
+                store.apply_ledger_patch(
+                    created["document_id"], base_revision=1,
+                    operations=[{
+                        "op": "upsert_item", "section_id": "background",
+                        "expected_section_hash": background["content_hash"], "kind": "hypothesis",
+                        "status": "supported", "statement": "不应无证据支持", "evidence": [],
+                    }],
+                )
+            with self.assertRaisesRegex(ValueError, "重新读取"):
+                store.apply_patch(
+                    created["document_id"], base_revision=1,
+                    operations=[{
+                        "op": "replace_section", "section_id": "outlook_plan",
+                        "expected_hash": target["content_hash"], "content": "不应写入",
+                    }],
+                )
+            restored = store.restore_version(created["document_id"], base_revision=2, revision=1)
+            self.assertEqual(restored["revision"], 3)
+            self.assertNotIn("分布偏移", store.read(created["document_id"])["content"])
+            with self.assertRaisesRegex(ValueError, "整篇覆盖"):
+                store.save("TSN 扩散调度验证方案", "不应覆盖", document_id=created["document_id"])
             self.assertTrue(str(Path(loaded["markdown_path"])).startswith(str(paths.research_documents_dir)))
 
     def test_tool_handlers_keep_research_documents_outside_profile_and_memory(self):
@@ -2052,6 +2834,65 @@ class TestResearchDocuments(unittest.TestCase):
             self.assertIn("截止期违例", loaded)
             self.assertTrue((runtime / "primary" / "research_documents" / document_id / "document.docx").is_file())
             self.assertFalse((runtime / "primary" / "profile.md").exists())
+
+    def test_document_tool_patch_and_global_paper_comparison_are_safe_and_read_only(self):
+        import re
+        from tools import execute_tool
+
+        class _Store:
+            def list_papers(self):
+                return [{"paper_id": "paper-tsn", "title": "TSN Scheduling", "chunks": 2}]
+
+            def get_paper_chunks(self, paper_id):
+                return [
+                    {"paper_id": paper_id, "chunk_index": 0, "page": 3, "section": "Method", "text": "TSN scheduling handles burst traffic and deadline violations."},
+                    {"paper_id": paper_id, "chunk_index": 1, "page": 4, "section": "Experiment", "text": "PPO baseline measures end-to-end delay."},
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
+                saved = execute_tool("save_research_document", {
+                    "title": "TSN 方案",
+                    "content": "## 研究背景与研究现状\nTSN burst traffic\n\n## 研究方案与可行性\nPPO baseline",
+                })
+                document_id = re.search(r"`(research-doc-[a-f0-9]{12})`", saved).group(1)
+                section = execute_tool("read_research_document_section", {
+                    "document_id": document_id, "section_id": "background",
+                })
+                revision = int(re.search(r"第 (\d+) 版", section).group(1))
+                content_hash = re.search(r"哈希：`([^`]+)`", section).group(1)
+                patched = execute_tool("apply_research_document_patch", {
+                    "document_id": document_id,
+                    "base_revision": revision,
+                    "operations": [{
+                        "op": "append_to_section", "section_id": "background",
+                        "expected_hash": content_hash, "content": "补充研究问题。",
+                    }],
+                })
+                before_compare = (runtime / "primary" / "research_documents" / document_id / "document.md").read_text(encoding="utf-8")
+                compared = execute_tool("compare_papers_to_research_document", {
+                    "document_id": document_id, "paper_ids_or_titles": ["paper-tsn"],
+                }, paper_store=_Store())
+                innovation = execute_tool("review_research_document_innovation", {
+                    "document_id": document_id, "paper_ids_or_titles": ["paper-tsn"],
+                }, paper_store=_Store())
+                impact = execute_tool("review_new_paper_impact_on_research_document", {
+                    "document_id": document_id, "paper_id_or_title": "paper-tsn",
+                }, paper_store=_Store())
+                after_compare = (runtime / "primary" / "research_documents" / document_id / "document.md").read_text(encoding="utf-8")
+
+            self.assertIn("安全更新", patched)
+            self.assertIn("4 个固定章节", compared)
+            self.assertIn("第 3 页", compared)
+            self.assertIn("五个审查维度", innovation)
+            self.assertIn("研究问题", innovation)
+            self.assertIn("综合影响审查", impact)
+            self.assertIn("研究内容重叠与可借鉴", impact)
+            self.assertIn("研究方案与可行性影响", impact)
+            self.assertIn("创新性候选（五维）", impact)
+            self.assertIn("不会修改档案、账本或版本", impact)
+            self.assertEqual(before_compare, after_compare)
 
 
 class TestPaperRecordNormalization(unittest.TestCase):
@@ -2138,40 +2979,16 @@ class TestPaperRecordNormalization(unittest.TestCase):
         self.assertIn("[openalex]", result)
         self.assertIn("未完成来源", result)
 
-    def test_ieee_search_sends_key_without_displaying_it(self):
+    def test_ieee_search_is_disabled_without_request(self):
         from search_api import search_ieee
 
-        class _Response:
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {"articles": [{
-                    "title": "Time-Sensitive Networking Scheduling for Bursty Traffic",
-                    "abstract": "A scheduling method for TSN under bursty traffic.",
-                    "publication_year": "2026",
-                    "article_number": "12345678",
-                    "accessType": "Open Access",
-                    "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=12345678",
-                }]}
-
-            def close(self):
-                return None
-
-        with patch("search_api.requests.get", return_value=_Response()) as request_get:
+        with patch("search_api.requests.get") as request_get:
             result = search_ieee(
                 "TSN scheduling under bursty traffic", limit=3, api_key="ieee-test-key",
             )
 
-        self.assertEqual(request_get.call_args.kwargs["params"], {
-            "querytext": "TSN scheduling under bursty traffic",
-            "max_records": 3,
-            "format": "json",
-            "apikey": "ieee-test-key",
-        })
-        self.assertIn("IEEE Xplore 搜索结果", result)
-        self.assertIn("IEEE 获取权限: Open Access", result)
-        self.assertIn("IEEE 开放全文 PDF", result)
+        request_get.assert_not_called()
+        self.assertIn("IEEE Xplore 数据源暂时停用", result)
         self.assertNotIn("ieee-test-key", result)
 
 
@@ -2299,12 +3116,12 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                     scheduler=scheduler,
                     ieee_api_key="ieee-test-key",
                 )
-                self.assertEqual(ieee_enabled.daily_sources, ("openalex", "openaire", "dblp", "ieee"))
-                self.assertEqual(ieee_enabled.temporary_sources, ("openalex", "arxiv", "ieee"))
+                self.assertEqual(ieee_enabled.daily_sources, ("openalex", "openaire", "dblp"))
+                self.assertEqual(ieee_enabled.temporary_sources, ("openalex", "arxiv"))
             finally:
                 scheduler.close()
 
-    def test_ieee_scout_preserves_access_metadata(self):
+    def test_ieee_scout_is_disabled_without_request(self):
         from daily_orchestrator import DailyResearchOrchestrator
         from scheduler import Scheduler
 
@@ -2334,10 +3151,8 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 with patch("daily_orchestrator.requests.get", return_value=_Response()) as request_get:
                     candidates = orchestrator._ieee_scout("TSN scheduling", None)
 
-                self.assertEqual(request_get.call_args.kwargs["params"]["apikey"], "ieee-test-key")
-                self.assertEqual(candidates[0]["sources"], ["ieee"])
-                self.assertEqual(candidates[0]["access_type"], "Open Access")
-                self.assertTrue(candidates[0]["open_access_pdf_url"])
+                request_get.assert_not_called()
+                self.assertEqual(candidates, [])
             finally:
                 scheduler.close()
 
@@ -2727,7 +3542,6 @@ class TestSessionStore(unittest.TestCase):
 
     def test_daily_timeline_adapter_hides_daily_event_messages(self):
         """Daily data stays in its own DB and raw keyword messages are never rendered."""
-        from run_timeline import RunTimelineService
         from scheduler import Scheduler
         from session_store import SessionStore
 
@@ -2745,10 +3559,6 @@ class TestSessionStore(unittest.TestCase):
                 self.assertEqual(events[0]["event_type"], "status")
                 self.assertEqual(events[0]["details"], {"candidate_count": 3})
                 self.assertNotIn("PRIVATE_KEYWORD", json.dumps(events[0], ensure_ascii=False))
-                html = RunTimelineService(sessions, scheduler).render_daily_runs()
-                self.assertIn("多来源检索阶段", html)
-                self.assertNotIn("PRIVATE_KEYWORD", html)
-                self.assertNotIn("candidate title", html)
             finally:
                 scheduler.close()
                 sessions.close()
@@ -3159,46 +3969,6 @@ class TestResearchOrchestration(unittest.TestCase):
                 self.assertFalse(no_model.called)
             finally:
                 store.close()
-
-
-class TestBrowserRunGuard(unittest.TestCase):
-    """切换会话必须使旧流式回调失效。"""
-
-    def test_new_request_and_invalidation_supersede_old_request(self):
-        from ui_request_guard import BrowserRunGuard
-
-        guard = BrowserRunGuard()
-        first = guard.begin("browser-a")
-        self.assertTrue(guard.is_current("browser-a", first))
-
-        second = guard.begin("browser-a")
-        self.assertFalse(guard.is_current("browser-a", first))
-        self.assertTrue(guard.is_current("browser-a", second))
-
-        guard.invalidate("browser-a")
-        self.assertFalse(guard.is_current("browser-a", second))
-
-    def test_invalidation_signals_the_active_agent_request(self):
-        from ui_request_guard import BrowserRunGuard
-
-        guard = BrowserRunGuard()
-        generation = guard.begin("browser-a")
-        cancel_event = guard.cancellation_event("browser-a", generation)
-        self.assertFalse(cancel_event.is_set())
-
-        guard.invalidate("browser-a")
-        self.assertTrue(cancel_event.wait(0.05))
-
-    def test_finishing_old_request_cannot_remove_new_request(self):
-        from ui_request_guard import BrowserRunGuard
-
-        guard = BrowserRunGuard()
-        first = guard.begin("browser-a")
-        second = guard.begin("browser-a")
-        guard.finish("browser-a", first)
-        self.assertTrue(guard.is_current("browser-a", second))
-        guard.finish("browser-a", second)
-        self.assertFalse(guard.is_current("browser-a", second))
 
 
 class TestLLMClient(unittest.TestCase):
@@ -3803,6 +4573,39 @@ class TestBadcaseStore(unittest.TestCase):
                 store.close()
 
 
+class TestDailyWorkerStartup(unittest.TestCase):
+    def test_enabled_daily_search_queues_resume_or_today_run(self):
+        from api_worker import enqueue_enabled_daily_run
+
+        class _Scheduler:
+            def __init__(self, resumable):
+                self.resumable = resumable
+
+            def get_latest_resumable_run(self, _kind):
+                return {"run_id": "daily-old"} if self.resumable else None
+
+        class _Manager:
+            def __init__(self, resumable):
+                self.scheduler = _Scheduler(resumable)
+                self.started: list[str] = []
+
+            def start(self, kind):
+                self.started.append(kind)
+                return {"run_id": f"daily-{kind}"}
+
+        disabled = _Manager(False)
+        self.assertIsNone(enqueue_enabled_daily_run(SimpleNamespace(daily_search_enabled=False), disabled))
+        self.assertEqual(disabled.started, [])
+
+        fresh = _Manager(False)
+        self.assertEqual(enqueue_enabled_daily_run(SimpleNamespace(daily_search_enabled=True), fresh), "daily-daily")
+        self.assertEqual(fresh.started, ["daily"])
+
+        resumed = _Manager(True)
+        self.assertEqual(enqueue_enabled_daily_run(SimpleNamespace(daily_search_enabled=True), resumed), "daily-resume")
+        self.assertEqual(resumed.started, ["resume"])
+
+
 class TestRuntimePaths(unittest.TestCase):
     """运行时数据必须与代码目录隔离，并允许通过环境/CLI 改根目录。"""
 
@@ -3858,7 +4661,7 @@ class TestRuntimePaths(unittest.TestCase):
             cfg = Config.load({"data_dir": tmp})
             self.assertEqual(cfg.openalex_api_key, "oa-test-key")
             self.assertEqual(cfg.ieee_api_key, "ieee-test-key")
-            self.assertEqual(cfg.daily_sources, ("openalex", "openaire", "dblp", "ieee"))
+            self.assertEqual(cfg.daily_sources, ("openalex", "openaire", "dblp"))
 
     def test_vision_model_uses_a_dedicated_environment_variable(self):
         from config import Config
@@ -3920,6 +4723,7 @@ class TestRuntimePaths(unittest.TestCase):
             finally:
                 badcases.close()
             paths.profile_path.write_text("# 用户画像\n", encoding="utf-8")
+            paths.paper_relations_file.write_text('{"version": 1, "relations": []}\n', encoding="utf-8")
             (paths.papers_dir / "paper.pdf").write_bytes(b"%PDF-test")
             (paths.research_documents_dir / "research-doc-backup").mkdir()
             (paths.research_documents_dir / "research-doc-backup" / "document.md").write_text(
@@ -3941,6 +4745,7 @@ class TestRuntimePaths(unittest.TestCase):
                 self.assertIn("runtime/primary/db/notes.db", archive.namelist())
                 self.assertIn("runtime/primary/db/badcases.db", archive.namelist())
                 self.assertIn("runtime/primary/profile.md", archive.namelist())
+                self.assertIn("runtime/primary/paper_relations.json", archive.namelist())
                 self.assertIn("runtime/primary/papers/paper.pdf", archive.namelist())
                 self.assertIn("runtime/primary/research_documents/research-doc-backup/document.md", archive.namelist())
 
@@ -4383,37 +5188,6 @@ class TestRuntimeReplay(unittest.TestCase):
             compare_reports(report, {"suite_version": "other", "summary": {}})
 
 
-class TestWebRendering(unittest.TestCase):
-    def test_chatbot_enables_inline_and_display_latex_delimiters(self):
-        from web_ui import CHAT_LATEX_DELIMITERS
-
-        self.assertIn({"left": "$", "right": "$", "display": False}, CHAT_LATEX_DELIMITERS)
-        self.assertIn({"left": "$$", "right": "$$", "display": True}, CHAT_LATEX_DELIMITERS)
-        self.assertIn({"left": "\\(", "right": "\\)", "display": False}, CHAT_LATEX_DELIMITERS)
-        self.assertIn({"left": "\\[", "right": "\\]", "display": True}, CHAT_LATEX_DELIMITERS)
-
-    def test_mounted_ui_keeps_theme_and_avoids_background_polling(self):
-        root = Path(__file__).resolve().parents[1]
-        source = root.joinpath("web_ui.py").read_text(encoding="utf-8")
-        server_source = root.joinpath("api_server.py").read_text(encoding="utf-8")
-
-        self.assertIn("theme=UI_THEME", server_source)
-        self.assertIn("css=UI_CSS", server_source)
-        self.assertIn("js=UI_JS", server_source)
-        self.assertIn('font-family: "Microsoft YaHei UI"', source)
-        self.assertIn("API_RUN_CLIENT_ENABLED", source)
-        self.assertNotIn("gr.Timer(", source)
-
-    def test_workbench_layout_keeps_conversation_primary(self):
-        source = Path(__file__).resolve().parents[1].joinpath("web_ui.py").read_text(encoding="utf-8")
-
-        self.assertIn('elem_classes=["app-shell"]', source)
-        self.assertIn('elem_classes=["workspace-sidebar"]', source)
-        self.assertIn('elem_classes=["workspace-inspector"]', source)
-        self.assertIn("show_label=False", source)
-        self.assertNotIn("with gr.Tabs():", source)
-
-
 class TestAuditRegressionFixes(unittest.TestCase):
     """Regression coverage for correctness and boundary issues found in code audit."""
 
@@ -4472,6 +5246,127 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 with patch.object(agent, "_build_app", return_value=app):
                     self.assertEqual(agent.step("请检索一个问题"), "完成")
                 self.assertEqual(app.config["recursion_limit"], MAX_AGENT_GRAPH_STEPS)
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_new_paper_route_denies_document_write_tools_on_first_pass(self):
+        from config import Config
+        from research_agent import ResearchAgent
+        from research_document_routing import route_research_document_request
+
+        class _FakeApp:
+            def invoke(self, _state, config):
+                return {"messages": [{"role": "assistant", "content": "请确认拟修改项。"}]}
+
+        envelope = route_research_document_request(
+            {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"},
+            "新导入了一篇论文，请修改一下科研档案",
+        )["message"]
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+            captured = {}
+
+            def fake_build(_usage, *_args, **kwargs):
+                captured.update(kwargs)
+                return _FakeApp()
+
+            try:
+                with patch.object(agent, "_build_app", side_effect=fake_build):
+                    self.assertEqual(agent.step(envelope), "请确认拟修改项。")
+                self.assertEqual(
+                    captured["allowed_tool_names"],
+                    {"list_indexed_papers", "review_new_paper_impact_on_research_document"},
+                )
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_safe_patch_route_uses_document_only_tools_and_extra_bounded_budget(self):
+        from config import Config
+        from research_agent import RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS, ResearchAgent
+        from research_document_routing import route_research_document_request
+
+        class _FakeApp:
+            config = None
+
+            def invoke(self, _state, config):
+                self.config = config
+                return {"messages": [{"role": "assistant", "content": "已写入。"}]}
+
+        envelope = route_research_document_request(
+            {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"},
+            "请补充研究方案中的可行性分析",
+        )["message"]
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+            app = _FakeApp()
+            captured = {}
+
+            def fake_build(_usage, *_args, **kwargs):
+                captured.update(kwargs)
+                return app
+
+            try:
+                with patch.object(agent, "_build_app", side_effect=fake_build):
+                    self.assertEqual(agent.step(envelope), "已写入。")
+                self.assertEqual(
+                    captured["allowed_tool_names"],
+                    {
+                        "list_research_document_sections",
+                        "read_research_document_section",
+                        "apply_research_document_patch",
+                    },
+                )
+                self.assertEqual(app.config["recursion_limit"], RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS)
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_full_patch_route_uses_two_round_commit_without_verification(self):
+        from config import Config
+        from research_agent import RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS, ResearchAgent
+        from research_document_routing import route_research_document_request
+
+        class _FakeApp:
+            config = None
+
+            def invoke(self, _state, config):
+                self.config = config
+                return {"messages": [{"role": "tool", "content": "✅ 已安全更新研究档案"}]}
+
+        envelope = route_research_document_request(
+            {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"},
+            "请将以上所有修改全部写入",
+        )["message"]
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+            app = _FakeApp()
+            captured = {}
+
+            def fake_build(_usage, *_args, **kwargs):
+                captured.update(kwargs)
+                return app
+
+            try:
+                with patch.object(agent, "_build_app", side_effect=fake_build):
+                    self.assertEqual(agent.step(envelope), "✅ 已安全更新研究档案")
+                self.assertEqual(
+                    captured["allowed_tool_names"],
+                    {
+                        "prepare_research_document_patch_context",
+                        "apply_research_document_patch",
+                    },
+                )
+                self.assertFalse(captured["enable_verify"])
+                self.assertEqual(captured["max_tool_rounds"], 2)
+                self.assertEqual(app.config["recursion_limit"], RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS)
             finally:
                 agent.memory.close()
                 agent.sessions.close()

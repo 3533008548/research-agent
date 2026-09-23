@@ -26,6 +26,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from cancellation import RequestCancelledError, raise_if_cancelled
+from context_engine import prepare_model_context
 from conversation_memory import context_usage_ratio, maybe_store_conversation_summary
 from llm_client import (
     LLMCircuitOpenError,
@@ -49,8 +50,17 @@ class AgentState(TypedDict):
     metadata: dict
 
 
-def sanitize_model_messages(messages: list[dict]) -> list[dict]:
-    """Return a payload-safe history without mutating persisted checkpoints."""
+def sanitize_model_messages(
+    messages: list[dict], *, require_reasoning_content_for_tools: bool = False,
+) -> list[dict]:
+    """Return a payload-safe history without mutating persisted checkpoints.
+
+    DeepSeek Flash thinking-mode tool turns require the model's complete
+    ``reasoning_content`` to be echoed in later requests.  Checkpoints created
+    before that field was preserved cannot be reconstructed, so their tool
+    calls/results are removed from the *model view* rather than repeatedly
+    sending an invalid request.  User and final assistant prose remain intact.
+    """
     result_ids = {
         message.get("tool_call_id")
         for message in messages
@@ -66,6 +76,10 @@ def sanitize_model_messages(messages: list[dict]) -> list[dict]:
         role = message.get("role")
 
         if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            has_reasoning = isinstance(reasoning, str) and bool(reasoning)
+            if not has_reasoning:
+                message.pop("reasoning_content", None)
             calls = [
                 call for call in (message.get("tool_calls") or [])
                 if isinstance(call, dict)
@@ -74,6 +88,8 @@ def sanitize_model_messages(messages: list[dict]) -> list[dict]:
                 and isinstance(call.get("function"), dict)
                 and call["function"].get("name")
             ]
+            if require_reasoning_content_for_tools and not has_reasoning:
+                calls = []
             if calls:
                 message["tool_calls"] = calls
                 usable_tool_ids.update(call["id"] for call in calls)
@@ -111,7 +127,7 @@ def build_graph(
     paper_store = None,
     token_usage: dict = None,
     checkpoint_db: str | None = None,
-    vision_model: str = "deepseek-v4-flash-vision-exp",
+    vision_model: str = "deepseek-flash",
     stream_callback = None,
     event_callback = None,
     cancel_event: threading.Event | None = None,
@@ -128,6 +144,7 @@ def build_graph(
     tool_argument_normalizer: Callable[[str, dict], dict] | None = None,
     tool_context: ToolExecutionContext | None = None,
     force_tool_name: str | None = None,
+    steer_provider: Callable[[str], list[str]] | None = None,
 ):
     # A graph must use the process-wide client owned by ResearchAgent. Creating
     # one here would silently defeat shared admission control in multi-agent
@@ -160,6 +177,27 @@ def build_graph(
         if cancel_event is not None and cancel_event.is_set():
             emit("request_cancelled", stage=stage)
         raise_if_cancelled(cancel_event, f"请求已在 {stage} 取消")
+
+    def inject_running_guidance(messages: list[dict], stage: str) -> None:
+        """Add user steering only at an LLM boundary, never mid-request."""
+        if steer_provider is None:
+            return
+        try:
+            notes = [str(note).strip() for note in steer_provider(stage) if str(note).strip()]
+        except Exception:
+            return
+        if not notes:
+            return
+        joined = "\n".join(f"- {note}" for note in notes)
+        messages.append({
+            "role": "system",
+            "content": (
+                "[运行中用户补充]\n"
+                f"{joined}\n"
+                "将其视为新的任务约束或待核验线索；若与已知证据冲突，指出冲突，"
+                "不要将未经核验的补充表述为已证实事实。"
+            ),
+        })
 
     runtime_context = tool_context or ToolExecutionContext(
         run_kind="research" if allowed_tool_names is not None else "chat",
@@ -196,7 +234,15 @@ def build_graph(
 
     def llm_node(state: AgentState) -> dict:
         ensure_active("llm")
-        messages = sanitize_model_messages(list(state.get("messages", [])))
+        messages = sanitize_model_messages(
+            list(state.get("messages", [])),
+            # DeepSeek Flash enables thinking by default.  Its tool protocol
+            # rejects a historical tool turn that lacks the returned CoT.
+            require_reasoning_content_for_tools=(
+                model == "deepseek-flash" and bool(tool_schemas)
+            ),
+        )
+        inject_running_guidance(messages, "llm")
 
         # 清理孤儿 tool_calls
         valid_ids = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
@@ -210,11 +256,42 @@ def build_graph(
                     messages[i] = dict(m)
                     del messages[i]["tool_calls"]
 
+        metadata = state.get("metadata", {})
+        context_limit = 131_072
+        if token_usage:
+            try:
+                context_limit = max(1, int(token_usage.get("context_limit", context_limit)))
+            except (TypeError, ValueError):
+                pass
+        prepared_context = prepare_model_context(messages, context_limit=context_limit)
+        messages = prepared_context.messages
+        if prepared_context.compacted:
+            if token_usage is not None:
+                token_usage["context_compacted"] = True
+                token_usage["context_estimated_before"] = prepared_context.original_tokens
+                token_usage["context_estimated_after"] = prepared_context.prepared_tokens
+            emit(
+                "context_compacted",
+                before_tokens=prepared_context.original_tokens,
+                after_tokens=prepared_context.prepared_tokens,
+            )
+
         # 对话上下文不会替代核心约束提示词。
         profile_text = profile_manager.summary() if profile_manager else ""
         prompt = system_prompt or SYSTEM_PROMPT
         if profile_text:
             prompt = f"[用户画像] {profile_text}\n\n{prompt}"
+        if prepared_context.archive_context:
+            prompt = f"{prompt}\n\n{prepared_context.archive_context}"
+        session_recall = metadata.get("session_recall", "")
+        if isinstance(session_recall, str) and session_recall.strip():
+            prompt = f"{prompt}\n\n{session_recall.strip()}"
+        reference_context = metadata.get("reference_context", "")
+        if isinstance(reference_context, str) and reference_context.strip():
+            # Session reference state is small, explicit and refreshed before
+            # every user turn.  Unlike a lossy conversation summary it remains
+            # valid after old message checkpoints are compacted.
+            prompt = f"{prompt}\n\n{reference_context.strip()}"
         messages.insert(0, {"role": "system", "content": prompt})
 
         verify_fb = state.get("metadata", {}).get("verify_feedback", "")
@@ -222,7 +299,6 @@ def build_graph(
             messages.append({"role": "system", "content": verify_fb})
 
         if memory_store:
-            metadata = state.get("metadata", {})
             thread_id = metadata.get("session_id", "research-main")
             recent = memory_store.get_recent_summary(thread_id)
             if recent:
@@ -287,10 +363,15 @@ def build_graph(
         if stream_callback:
             import json as _json
             full_text = ""
+            reasoning_content = ""
             tool_calls_acc = {}
 
             def _consume_stream(response) -> bool:
-                nonlocal full_text
+                # ``+=`` rebinds both strings in this nested function.  They
+                # must therefore be declared nonlocal; otherwise a stream
+                # containing DeepSeek's first reasoning delta fails before
+                # any visible answer is emitted.
+                nonlocal full_text, reasoning_content
                 lines = iter(response.iter_lines(decode_unicode=True))
                 while True:
                     ensure_active("stream_read")
@@ -324,6 +405,9 @@ def build_graph(
                     if token:
                         full_text += token
                         stream_callback(token)
+                    reasoning_delta = delta.get("reasoning_content", "")
+                    if reasoning_delta:
+                        reasoning_content += reasoning_delta
                     for tc in delta.get("tool_calls", []):
                         idx = tc.get("index", 0)
                         if idx not in tool_calls_acc:
@@ -424,6 +508,11 @@ def build_graph(
                 finally:
                     stop_watch()
             assistant_msg = {"role": "assistant", "content": full_text or None}
+            if reasoning_content:
+                # Keep this in the durable graph state only.  It is never
+                # streamed to the user, but DeepSeek requires it on every
+                # subsequent request that carries the tools parameter.
+                assistant_msg["reasoning_content"] = reasoning_content
             if tool_calls_acc:
                 assistant_msg["tool_calls"] = [
                     {"id": v["id"], "type": "function", "function": v["function"]}
@@ -453,6 +542,9 @@ def build_graph(
             token_usage["cost"] = token_usage.get("cost", 0) + cost
             token_usage["last_round_cost"] = cost
         assistant_msg = {"role": "assistant", "content": msg.get("content") or None}
+        reasoning_content = msg.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            assistant_msg["reasoning_content"] = reasoning_content
         if msg.get("tool_calls"):
             assistant_msg["tool_calls"] = [
                 {"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
@@ -487,9 +579,15 @@ def build_graph(
         losing them to a graph recursion error when a model keeps searching.
         """
         if max_tool_rounds is not None:
+            current_turn_start = max(
+                (index for index, message in enumerate(state.get("messages", []))
+                 if message.get("role") == "user"),
+                default=-1,
+            )
             rounds = sum(
-                1 for message in state.get("messages", [])
+                1 for index, message in enumerate(state.get("messages", []))
                 if message.get("role") == "assistant" and message.get("tool_calls")
+                and index > current_turn_start
             )
             if rounds >= max_tool_rounds:
                 emit("tool_round_limit_reached", limit=max_tool_rounds)

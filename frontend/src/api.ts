@@ -7,17 +7,23 @@ import {
   type DailyRunDetail,
   type DailyPaperStatus,
   type DailyRunKind,
+  type ExperimentFileContent,
+  type ExperimentProject,
+  type ExperimentProjectDetail,
   type Message,
   type Paper,
   type ResearchDocument,
   type ResearchDocumentDetail,
+  type ResearchDocumentRoute,
   type Run,
   type RunEvent,
   type RunKind,
   type RunStart,
+  type RunSteer,
   type ResearchScope,
   type Session,
   type SessionUsage,
+  type UserProfile,
   type WorkspaceUpload,
   type WorkspaceSettings,
 } from "./types";
@@ -83,6 +89,10 @@ export function getSessionUsage(apiKey: string, sessionId: string): Promise<Sess
   return request(`/sessions/${encodeURIComponent(sessionId)}/usage`, apiKey);
 }
 
+export function getWorkspaceProfile(apiKey: string): Promise<UserProfile> {
+  return request("/workspace/profile", apiKey);
+}
+
 export function listSessionRuns(apiKey: string, sessionId: string): Promise<Run[]> {
   return request(`/sessions/${encodeURIComponent(sessionId)}/runs`, apiKey);
 }
@@ -93,6 +103,17 @@ export function listResearchDocuments(apiKey: string): Promise<ResearchDocument[
 
 export function getResearchDocument(apiKey: string, documentId: string): Promise<ResearchDocumentDetail> {
   return request(`/workspace/research-documents/${encodeURIComponent(documentId)}`, apiKey);
+}
+
+export function routeResearchDocumentRequest(
+  apiKey: string,
+  documentId: string,
+  message: string,
+): Promise<ResearchDocumentRoute> {
+  return request(`/workspace/research-documents/${encodeURIComponent(documentId)}/route`, apiKey, {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
 }
 
 export async function uploadWorkspaceFile(apiKey: string, file: File): Promise<WorkspaceUpload> {
@@ -125,6 +146,49 @@ export async function downloadResearchDocument(apiKey: string, document: Researc
 
 export function listPapers(apiKey: string): Promise<Paper[]> {
   return request("/workspace/papers", apiKey);
+}
+
+export function listExperimentProjects(apiKey: string): Promise<ExperimentProject[]> {
+  return request("/workspace/experiments", apiKey);
+}
+
+export function getExperimentProject(apiKey: string, projectId: string): Promise<ExperimentProjectDetail> {
+  return request(`/workspace/experiments/${encodeURIComponent(projectId)}`, apiKey);
+}
+
+export function getExperimentFile(
+  apiKey: string,
+  projectId: string,
+  relativePath: string,
+): Promise<ExperimentFileContent> {
+  return request(
+    `/workspace/experiments/${encodeURIComponent(projectId)}/files/${relativePath.split("/").map(encodeURIComponent).join("/")}`,
+    apiKey,
+  );
+}
+
+export function deleteExperimentProject(apiKey: string, projectId: string): Promise<void> {
+  return request(`/workspace/experiments/${encodeURIComponent(projectId)}`, apiKey, { method: "DELETE" });
+}
+
+export function searchExperimentRepositoryCandidates(apiKey: string, projectId: string): Promise<ExperimentProjectDetail> {
+  return request(`/workspace/experiments/${encodeURIComponent(projectId)}/repository-candidates`, apiKey, { method: "POST" });
+}
+
+export function connectExperimentRepository(
+  apiKey: string,
+  projectId: string,
+  repositoryUrl: string,
+  relationship: "user_provided" | "official_confirmed" | "community" | "candidate_unverified" = "user_provided",
+): Promise<ExperimentProjectDetail> {
+  return request(`/workspace/experiments/${encodeURIComponent(projectId)}/repository`, apiKey, {
+    method: "PUT",
+    body: JSON.stringify({ repository_url: repositoryUrl, relationship }),
+  });
+}
+
+export function useExperimentMethodReconstruction(apiKey: string, projectId: string): Promise<ExperimentProjectDetail> {
+  return request(`/workspace/experiments/${encodeURIComponent(projectId)}/method-reconstruction`, apiKey, { method: "POST" });
 }
 
 export function listDailyKeywords(apiKey: string): Promise<DailyKeyword[]> {
@@ -237,8 +301,32 @@ export function createDailyRun(
   });
 }
 
+export function createExperimentRun(
+  apiKey: string,
+  sessionId: string,
+  paperId: string,
+  projectId?: string,
+  action: "generate" | "prepare_repository" | "reconstruct_method" = "generate",
+): Promise<RunStart> {
+  return request("/runs", apiKey, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "experiment", session_id: sessionId, paper_id: paperId,
+      project_id: projectId || undefined,
+      experiment_action: action === "generate" ? undefined : action,
+    }),
+  });
+}
+
 export function cancelRun(apiKey: string, runId: string): Promise<{ run_id: string; status: string }> {
   return request(`/runs/${encodeURIComponent(runId)}/cancel`, apiKey, { method: "POST" });
+}
+
+export function createRunSteer(apiKey: string, runId: string, message: string): Promise<RunSteer> {
+  return request(`/runs/${encodeURIComponent(runId)}/steers`, apiKey, {
+    method: "POST",
+    body: JSON.stringify({ message: message.trim() }),
+  });
 }
 
 function parseFrame(frame: string): RunEvent | null {
