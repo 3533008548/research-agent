@@ -27,6 +27,9 @@ daily.db-*
 # 下载的论文 PDF
 data/papers/
 
+# Agent 工作日志（仅本机保留，不进版本库）
+.workbuddy/
+
 # 本地项目规划、面试与交接材料
 工程化与多Agent实施方案.md
 Agent开发岗位项目面试题库.md
