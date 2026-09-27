@@ -11,6 +11,20 @@ Measured facts behind the defaults (see ``scripts/bench_embedding.py``):
   silently cut, which is why ``max_length`` is part of the contract.
 * Chinese tokenises at roughly 1 token/character for this model, so a
   1000-character Chinese chunk loses about three quarters of its content.
+
+ChromaDB's ``DefaultEmbeddingFunction`` is deliberately *not* called on the hot
+path.  Two measured costs make it unusable per request (see
+``scripts/profile_retrieval.py``):
+
+* ``DefaultEmbeddingFunction.__call__`` constructs a **new** ``ONNXMiniLM_L6_V2``
+  every time, re-reading the 90 MB graph and re-running graph optimisation:
+  ~530 ms per call, on top of ~96 ms of actual inference.
+* Its tokenizer is pinned to ``enable_padding(length=256)``, so a 12-token query
+  is still computed over 256 positions — a ~20× waste on every search.
+
+:class:`MiniLMOnnxEncoder` keeps one session and pads only to the longest
+sequence *in each batch*, which is arithmetically identical (padding positions
+carry ``attention_mask = 0`` and are excluded from mean pooling).
 """
 
 from __future__ import annotations
@@ -18,6 +32,7 @@ from __future__ import annotations
 import inspect
 import pathlib
 import sys
+import threading
 from typing import Any, Protocol, Sequence
 
 # The ONNX backend stores its tokenizer beside the weights, so token counts for
@@ -34,6 +49,9 @@ _MINILM_TOKENIZER_PATH = (
 _MINILM_TOKENIZER: Any = None
 # False caches "known unusable" so a missing download does not turn into a disk
 # probe on every chunk.
+
+# The ONNX weights live beside the tokenizer, so both are resolved together.
+_MINILM_ONNX_DIR = _MINILM_TOKENIZER_PATH.parent
 
 # Used when ``rag.embedding.model`` is absent from config.yaml.
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
@@ -106,6 +124,119 @@ class Embedder(Protocol):
         """Serializable configuration for this backend."""
 
 
+class MiniLMOnnxEncoder:
+    """A single ONNX session for all-MiniLM-L6-v2 that pads to the batch maximum.
+
+    ChromaDB's wrapper pads every input to 256 positions and rebuilds its
+    inference session on every call.  This wrapper keeps one session alive and
+    pads only to the longest sequence in the current batch, which removes both
+    costs without changing the arithmetic: padded positions have
+    ``attention_mask = 0``, so they contribute nothing to mean pooling.
+
+    Falls back to the caller by raising; :class:`MiniLMEmbedder` catches that and
+    uses ChromaDB's own wrapper instead.
+    """
+
+    MAX_LENGTH = 256
+
+    def __init__(self, batch_size: int = 32, threads: int = 0) -> None:
+        import numpy as np
+        import onnxruntime
+        from tokenizers import Tokenizer
+
+        tokenizer = Tokenizer.from_file(str(_MINILM_TOKENIZER_PATH))
+        # Same bounds ChromaDB uses: truncate at 256, then pad per batch below.
+        tokenizer.enable_truncation(max_length=self.MAX_LENGTH)
+        tokenizer.no_padding()
+        self._tokenizer = tokenizer
+        self._np = np
+        self._batch_size = max(1, int(batch_size or 32))
+
+        options = onnxruntime.SessionOptions()
+        options.log_severity_level = 3
+        options.graph_optimization_level = (
+            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+        threads = int(threads or 0)
+        if threads > 0:
+            options.intra_op_num_threads = threads
+            options.inter_op_num_threads = 1
+        self._session = onnxruntime.InferenceSession(
+            str(_MINILM_ONNX_DIR / "model.onnx"),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+
+    def __call__(self, texts: Sequence[str]) -> list[list[float]]:
+        np = self._np
+        documents = list(texts)
+        if not documents:
+            return []
+
+        encoded = [self._tokenizer.encode(text) for text in documents]
+        # Longest-first keeps the tail batches (the short ones) cheap; sorting
+        # also groups similar lengths so padding inside a batch stays minimal.
+        order = sorted(range(len(documents)), key=lambda i: len(encoded[i].ids))
+        vectors: list[list[float] | None] = [None] * len(documents)
+
+        for start in range(0, len(order), self._batch_size):
+            positions = order[start:start + self._batch_size]
+            width = max(len(encoded[i].ids) for i in positions)
+            input_ids = np.zeros((len(positions), width), dtype=np.int64)
+            attention_mask = np.zeros((len(positions), width), dtype=np.int64)
+            for row, index in enumerate(positions):
+                ids = encoded[index].ids
+                input_ids[row, :len(ids)] = ids
+                attention_mask[row, :len(ids)] = encoded[index].attention_mask
+
+            hidden = self._session.run(
+                None,
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "token_type_ids": np.zeros((len(positions), width), dtype=np.int64),
+                },
+            )[0]
+
+            mask = np.broadcast_to(np.expand_dims(attention_mask, -1), hidden.shape)
+            pooled = np.sum(hidden * mask, 1) / np.clip(mask.sum(1), a_min=1e-9, a_max=None)
+            norms = np.clip(
+                np.linalg.norm(pooled, axis=1, keepdims=True), a_min=1e-9, a_max=None
+            )
+            normalized = (pooled / norms).astype(np.float32)
+            for row, index in enumerate(positions):
+                vectors[index] = [float(value) for value in normalized[row]]
+
+        return [vector for vector in vectors if vector is not None]
+
+
+# One process-wide pipeline: building the session costs about half a second, so
+# every store in the process shares it.  ``False`` caches "construction failed"
+# so an offline host does not retry on every call.
+_MINILM_ONNX: Any = None
+_MINILM_ONNX_LOCK = threading.Lock()
+
+
+def _load_minilm_onnx(batch_size: int = 32, threads: int = 0) -> Any:
+    """Return the shared fast encoder, or ``False`` when it cannot be built."""
+    global _MINILM_ONNX
+    if _MINILM_ONNX is None:
+        with _MINILM_ONNX_LOCK:
+            if _MINILM_ONNX is None:
+                try:
+                    _MINILM_ONNX = MiniLMOnnxEncoder(
+                        batch_size=batch_size, threads=threads
+                    )
+                except Exception as exc:  # noqa: BLE001 - no weights, no runtime
+                    print(
+                        f"      [Embedding] 快速 ONNX 通道不可用"
+                        f"（{type(exc).__name__}: {exc}），改用 ChromaDB 默认通道",
+                        file=sys.stderr,
+                    )
+                    _MINILM_ONNX = False
+    return _MINILM_ONNX
+
+
 class MiniLMEmbedder:
     """ChromaDB's built-in ONNX all-MiniLM-L6-v2 (384-d, CPU only).
 
@@ -114,10 +245,15 @@ class MiniLMEmbedder:
     unavailable.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, batch_size: int = 32, threads: int = 0) -> None:
         from chromadb.utils import embedding_functions
 
+        # Kept as the compatibility surface: ChromaDB persists "default" as the
+        # collection's embedding-function name, and unknown attributes such as
+        # ``is_legacy`` / ``default_space`` are delegated to it.
         self._fn = embedding_functions.DefaultEmbeddingFunction()
+        self._batch_size = max(1, int(batch_size or 32))
+        self._threads = max(0, int(threads or 0))
 
     @property
     def model_name(self) -> str:
@@ -133,7 +269,17 @@ class MiniLMEmbedder:
         return 256
 
     def __call__(self, input: Sequence[str]) -> list[list[float]]:
-        return self._fn(list(input))
+        model = _load_minilm_onnx(self._batch_size, self._threads)
+        if model is False:
+            return self._fn(list(input))
+        try:
+            return model(list(input))
+        except Exception:  # noqa: BLE001 - a bad session must not break indexing
+            return self._fn(list(input))
+
+    def embed_query(self, input: Sequence[str]) -> list[list[float]]:
+        """Encode search queries through the same shared session."""
+        return self(list(input))
 
     def tokenize(self, text: str) -> list[int] | None:
         """Token ids from the bundled WordPiece tokenizer (offline, no network).

@@ -411,6 +411,13 @@ class PaperStore:
 
     COLLECTION_NAME = "papers"
 
+    # Lexical cache defaults, so a partially constructed store (tests, protocol
+    # stubs) can still call ``query_lexical``.
+    _lexical_index: dict | None = None
+    _lexical_revision = 0
+    _lexical_signature: tuple[int, int] | None = None
+    _lexical_lock = threading.Lock()
+
     def __init__(
         self,
         persist_dir: str | None = None,
@@ -489,6 +496,13 @@ class PaperStore:
         self.relation_store = relation_store
         # Injected at agent startup; None means relation review stays disabled.
         self.relation_reviewer = None
+        # Lexical retrieval used to re-read and re-tokenize the whole corpus on
+        # every request (~160 ms of the ~840 ms hybrid query).  A postings index
+        # is built once and reused until the corpus changes.  Declared on the
+        # class so partially constructed stores (tests, protocol stubs) work.
+        self._lexical_index: dict | None = None
+        self._lexical_revision = 0
+        self._lexical_signature: tuple[int, int] | None = None
 
     # ── 公开接口 ──
 
@@ -625,6 +639,7 @@ class PaperStore:
             char_pos = end + 2
 
         self._collection.add(ids=chunk_ids, documents=texts, metadatas=metadatas)
+        self._invalidate_lexical_index()
         return resolved_id
 
     def query(
@@ -1086,6 +1101,141 @@ class PaperStore:
         reranked = self._rerank(query_text, ranked[:rerank_limit]) if rerank_limit else ranked
         return reranked[:top_k]
 
+    def _invalidate_lexical_index(self) -> None:
+        """Drop the cached BM25 structures after any corpus mutation."""
+        self._lexical_revision += 1
+        with self._lexical_lock:
+            self._lexical_index = None
+            self._lexical_signature = None
+
+    def _build_lexical_index(self) -> dict:
+        """Build postings once so a query only touches the terms it asks for.
+
+        Scanning and tokenizing every chunk per request measured ~160 ms on the
+        1158-chunk corpus, which is most of the hybrid latency once the encoder
+        is fast.  The postings map a term to ``{position: term frequency}``.
+        """
+        raw = self._collection.get(include=["documents", "metadatas"])
+        entries: list[dict] = []
+        lengths: list[int] = []
+        postings: dict[str, dict[int, int]] = {}
+        for doc, meta in zip(raw.get("documents") or [], raw.get("metadatas") or []):
+            meta = meta or {}
+            tokens = self._lexical_tokens(doc or "")
+            position = len(entries)
+            lengths.append(len(tokens))
+            entries.append({
+                "text": doc or "",
+                "section": meta.get("section", "未标注"),
+                "title": meta.get("title", "Unknown"),
+                "paper_id": meta.get("paper_id", ""),
+                "chunk_index": meta.get("chunk_index", 0),
+                "char_start": meta.get("char_start", 0),
+                "char_end": meta.get("char_end", 0),
+                "page": meta.get("page", -1),
+                "page_end": meta.get("page_end", meta.get("page", -1)),
+                "element_id": meta.get("element_id", ""),
+                "element_kind": meta.get("element_kind", "text"),
+                "retrieval": "keyword",
+            })
+            frequencies: dict[str, int] = {}
+            for token in tokens:
+                frequencies[token] = frequencies.get(token, 0) + 1
+            for term, count in frequencies.items():
+                postings.setdefault(term, {})[position] = count
+        return {"entries": entries, "lengths": lengths, "postings": postings}
+
+    def _get_lexical_index(self) -> dict | None:
+        """Return the cached postings index, rebuilding it after a corpus change.
+
+        ``None`` means the corpus is past the interactive scan budget, so the
+        caller keeps the original streaming behaviour instead.
+        """
+        if self._collection.count() > HYBRID_LEXICAL_MAX_CHUNKS:
+            return None
+        signature = (self._collection.count(), self._lexical_revision)
+        if self._lexical_index is not None and self._lexical_signature == signature:
+            return self._lexical_index
+        with self._lexical_lock:
+            signature = (self._collection.count(), self._lexical_revision)
+            if self._lexical_index is not None and self._lexical_signature == signature:
+                return self._lexical_index
+            index = self._build_lexical_index()
+            self._lexical_index = index
+            self._lexical_signature = signature
+            return index
+
+    def _query_lexical_indexed(
+        self,
+        index: dict,
+        terms: list[str],
+        top_k: int,
+        paper_ids: Optional[list[str]],
+        section: Optional[str],
+    ) -> list[dict]:
+        """Score only the chunks the query terms actually occur in."""
+        entries = index["entries"]
+        lengths = index["lengths"]
+        postings = index["postings"]
+
+        if paper_ids or section:
+            allowed = {
+                position
+                for position, entry in enumerate(entries)
+                if (not paper_ids or entry["paper_id"] in paper_ids)
+                and (not section or entry["section"] == section)
+            }
+        else:
+            allowed = set(range(len(entries)))
+        if not allowed:
+            return []
+
+        # BM25 statistics stay scoped to the candidate set, exactly as the
+        # pre-index implementation did, so scores are unchanged.
+        document_count = len(allowed)
+        average_length = sum(lengths[position] for position in allowed) / document_count
+
+        scores: dict[int, float] = {}
+        for term in terms:
+            hits = postings.get(term)
+            if not hits:
+                continue
+            document_frequency = (
+                len(hits) if len(allowed) == len(entries)
+                else len(hits.keys() & allowed)
+            )
+            idf = math.log(
+                1 + (document_count - document_frequency + 0.5) / (document_frequency + 0.5)
+            )
+            for position, frequency in hits.items():
+                if position not in allowed:
+                    continue
+                denominator = frequency + BM25_K1 * (
+                    1 - BM25_B + BM25_B * lengths[position] / average_length
+                )
+                scores[position] = (
+                    scores.get(position, 0.0) + idf * frequency * BM25_SCALE / denominator
+                )
+
+        ranked = []
+        for position, score in scores.items():
+            value = round(score, 6)
+            if value <= 0:
+                continue
+            ranked.append((position, value))
+        ranked.sort(
+            key=lambda item: (
+                -item[1], entries[item[0]]["title"], entries[item[0]]["chunk_index"],
+            )
+        )
+
+        results = []
+        for position, value in ranked[:top_k]:
+            item = dict(entries[position])
+            item["keyword_score"] = value
+            results.append(item)
+        return results
+
     def query_lexical(
         self,
         query_text: str,
@@ -1099,7 +1249,19 @@ class PaperStore:
         terms = self._query_terms(query_text)
         if not terms:
             return []
+        index = self._get_lexical_index()
+        if index is not None:
+            return self._query_lexical_indexed(index, terms, top_k, paper_ids, section)
+        return self._query_lexical_scan(terms, top_k, paper_ids, section)
 
+    def _query_lexical_scan(
+        self,
+        terms: list[str],
+        top_k: int,
+        paper_ids: Optional[list[str]],
+        section: Optional[str],
+    ) -> list[dict]:
+        """Full-corpus fallback for collections past the interactive budget."""
         raw = self._collection.get(include=["documents", "metadatas"])
         candidates = []
         for doc, meta in zip(raw.get("documents") or [], raw.get("metadatas") or []):
@@ -1188,6 +1350,7 @@ class PaperStore:
         ids_to_delete = raw.get("ids", [])
         if ids_to_delete:
             self._collection.delete(ids=ids_to_delete)
+            self._invalidate_lexical_index()
         relation_store = getattr(self, "relation_store", None)
         if relation_store is not None:
             try:

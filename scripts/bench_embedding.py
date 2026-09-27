@@ -9,6 +9,14 @@ guesswork:
   2. What throughput does this machine actually sustain?
   3. How does that convert into "papers per hour"?
 
+Two channels are compared side by side, because paper_store.py no longer calls
+ChromaDB's wrapper directly:
+
+* ``MiniLMEmbedder`` — the production path.  One ONNX session, padding to the
+  longest sequence in each batch.
+* ``DefaultEmbeddingFunction`` — ChromaDB's own wrapper.  It rebuilds the
+  session on every call and always pads to 256 positions.
+
 Run:  python scripts/bench_embedding.py
 """
 
@@ -20,8 +28,12 @@ import time
 import numpy as np
 from chromadb.utils import embedding_functions
 
-# The exact embedder used by paper_store.py: DefaultEmbeddingFunction().
-fn = embedding_functions.DefaultEmbeddingFunction()
+from embeddings import MiniLMEmbedder
+
+# The embedder paper_store.py actually uses.
+fn = MiniLMEmbedder()
+# ChromaDB's wrapper, kept only to show what the production path avoids.
+legacy_fn = embedding_functions.DefaultEmbeddingFunction()
 
 
 def report_model() -> None:
@@ -105,6 +117,27 @@ def token_report(tokenize) -> None:
         cos = float(e_full @ e_head / (np.linalg.norm(e_full) * np.linalg.norm(e_head)))
         print(f"\n  截断验证(中文 1500 字符): 全文 vs 仅前 256 token 的余弦相似度 = {cos:.4f}")
         print("  → 接近 1.0 即证明超出上限的部分被直接丢弃（静默截断）" if cos > 0.999 else "  → 未观察到完全截断")
+
+
+def channel_comparison() -> None:
+    print("\n=== 2b. 两条通道对比（真实查询长度 vs 块长度）===")
+    # A query is a sentence; a chunk is what the token guard produced.
+    short = ["What benchmark does the paper evaluate on?"]
+    chunk = [make_text(1000, "en")]
+    print(f"  {'场景':<22}{'ChromaDB 默认':>14}{'本项目通道':>14}{'提速':>10}")
+    for label, texts, repeats in (("单条查询（短句）", short, 5), ("单个块（1000 字符）", chunk, 3)):
+        timings = {}
+        for name, channel in (("legacy", legacy_fn), ("fast", fn)):
+            channel(texts)  # warm the session / tokenizer
+            t0 = time.perf_counter()
+            for _ in range(repeats):
+                channel(texts)
+            timings[name] = (time.perf_counter() - t0) / repeats
+        speedup = timings["legacy"] / max(timings["fast"], 1e-9)
+        print(
+            f"  {label:<22}{timings['legacy'] * 1000:>12.1f} ms"
+            f"{timings['fast'] * 1000:>12.1f} ms{speedup:>9.1f}x"
+        )
 
 
 def throughput() -> float:

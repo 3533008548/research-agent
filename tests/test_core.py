@@ -5748,5 +5748,188 @@ class TestQwen3TokenizerCompatibility(unittest.TestCase):
         self.assertIsNone(self._embedder_with(None).tokenize("x"))
 
 
+class TestLexicalPostingsIndex(unittest.TestCase):
+    """The cached BM25 index must score exactly like the full-corpus scan.
+
+    Retrieval quality is unchanged by construction: the postings path is only
+    allowed to skip chunks that contain none of the query terms.
+    """
+
+    DOCUMENTS = [
+        "The introduction describes a generic network problem in scheduling.",
+        "Branch-and-Bound is the exact optimization algorithm used for MILP.",
+        "We report latency and throughput on several public benchmarks.",
+        "分支定界算法在整数规划中被广泛使用，并给出最优性证明。",
+    ]
+
+    @staticmethod
+    def _store():
+        from paper_store import PaperStore
+
+        class _Collection:
+            @staticmethod
+            def count():
+                return len(TestLexicalPostingsIndex.DOCUMENTS)
+
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "documents": list(TestLexicalPostingsIndex.DOCUMENTS),
+                    "metadatas": [
+                        {
+                            "paper_id": "p1" if i < 2 else "p2",
+                            "title": "Scheduling Study",
+                            "chunk_index": i,
+                            "section": "Method" if i % 2 else "Intro",
+                        }
+                        for i in range(len(TestLexicalPostingsIndex.DOCUMENTS))
+                    ],
+                }
+
+        store = PaperStore.__new__(PaperStore)
+        store._collection = _Collection()
+        store._lexical_index = None
+        store._lexical_revision = 0
+        store._lexical_signature = None
+        return store
+
+    def test_index_matches_full_scan(self):
+        store = self._store()
+        for query in (
+            "Which exact optimization algorithm is used?",
+            "latency throughput benchmarks",
+            "分支定界 最优性",
+            "network scheduling introduction",
+        ):
+            terms = store._query_terms(query)
+            expected = store._query_lexical_scan(terms, 4, None, None)
+            actual = store.query_lexical(query, top_k=4)
+            self.assertEqual(
+                [(item["chunk_index"], item["keyword_score"]) for item in expected],
+                [(item["chunk_index"], item["keyword_score"]) for item in actual],
+                f"查询不一致: {query}",
+            )
+
+    def test_scoped_query_keeps_bm25_statistics_scoped(self):
+        store = self._store()
+        query = "optimization algorithm benchmarks"
+        terms = store._query_terms(query)
+        expected = store._query_lexical_scan(terms, 4, ["p1"], None)
+        actual = store.query_lexical(query, top_k=4, paper_ids=["p1"])
+        self.assertEqual(
+            [item["chunk_index"] for item in expected],
+            [item["chunk_index"] for item in actual],
+        )
+        self.assertTrue(all(item["paper_id"] == "p1" for item in actual))
+
+        expected = store._query_lexical_scan(terms, 4, None, "Intro")
+        actual = store.query_lexical(query, top_k=4, section="Intro")
+        self.assertEqual(
+            [item["chunk_index"] for item in expected],
+            [item["chunk_index"] for item in actual],
+        )
+
+    def test_index_is_rebuilt_after_mutation(self):
+        store = self._store()
+        first = store._get_lexical_index()
+        self.assertIs(first, store._get_lexical_index(), "未变更时不应重建")
+
+        store._invalidate_lexical_index()
+        second = store._get_lexical_index()
+        self.assertIsNot(first, second)
+
+    def test_corpus_past_the_scan_budget_falls_back_to_streaming(self):
+        store = self._store()
+
+        class _BigCollection:
+            @staticmethod
+            def count():
+                return 5_001
+
+            @staticmethod
+            def get(**_kwargs):
+                return {
+                    "documents": ["only one chunk lives here"],
+                    "metadatas": [{"paper_id": "p", "title": "T", "chunk_index": 0}],
+                }
+
+        store._collection = _BigCollection()
+        self.assertIsNone(store._get_lexical_index())
+        results = store.query_lexical("chunk", top_k=1)
+        self.assertEqual(len(results), 1)
+
+
+class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
+    """The fast ONNX path must produce the vectors ChromaDB would have."""
+
+    @staticmethod
+    def _weights_available() -> bool:
+        from embeddings import _MINILM_ONNX_DIR
+
+        return (_MINILM_ONNX_DIR / "model.onnx").exists()
+
+    def test_matches_chromadb_default_channel(self):
+        if not self._weights_available():
+            self.skipTest("ONNX 权重未下载（离线环境）")
+
+        import numpy as np
+        from chromadb.utils import embedding_functions
+        from embeddings import MiniLMOnnxEncoder
+
+        texts = [
+            "Transformer models rely on self-attention.",
+            "分支定界算法在整数规划中被广泛使用。",
+            "x",
+        ]
+        reference = np.asarray(
+            embedding_functions.DefaultEmbeddingFunction()(texts), dtype=np.float32
+        )
+        fast = np.asarray(MiniLMOnnxEncoder()(texts), dtype=np.float32)
+
+        self.assertEqual(reference.shape, fast.shape)
+        # Identical arithmetic, so only float32 rounding may differ.
+        self.assertLess(float(np.abs(reference - fast).max()), 1e-5)
+
+    def test_output_is_unit_length(self):
+        if not self._weights_available():
+            self.skipTest("ONNX 权重未下载（离线环境）")
+
+        import numpy as np
+        from embeddings import MiniLMOnnxEncoder
+
+        vectors = np.asarray(MiniLMOnnxEncoder()(["unit length check"]), dtype=np.float32)
+        self.assertAlmostEqual(float(np.linalg.norm(vectors[0])), 1.0, places=5)
+
+    def test_batch_padding_does_not_change_results(self):
+        if not self._weights_available():
+            self.skipTest("ONNX 权重未下载（离线环境）")
+
+        import numpy as np
+        from embeddings import MiniLMOnnxEncoder
+
+        encoder = MiniLMOnnxEncoder(batch_size=2)
+        texts = ["short", "a considerably longer sentence used to widen the batch"]
+        single = [np.asarray(encoder([text]), dtype=np.float32)[0] for text in texts]
+        batched = np.asarray(encoder(texts), dtype=np.float32)
+        self.assertLess(float(np.abs(np.asarray(single) - batched).max()), 1e-5)
+
+    def test_embedder_falls_back_when_the_fast_channel_is_unusable(self):
+        from embeddings import MiniLMEmbedder
+
+        embedder = MiniLMEmbedder.__new__(MiniLMEmbedder)
+        embedder._batch_size = 32
+        embedder._threads = 0
+        embedder._fn = lambda texts: [[0.0, 1.0] for _ in texts]
+
+        import embeddings
+
+        original = embeddings._MINILM_ONNX
+        embeddings._MINILM_ONNX = False
+        try:
+            self.assertEqual([[0.0, 1.0]], embedder(["anything"]))
+        finally:
+            embeddings._MINILM_ONNX = original
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
