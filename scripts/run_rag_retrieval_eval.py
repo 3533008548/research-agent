@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reranker", action="store_true", help="启用本地 cross-encoder 重排后评测")
     parser.add_argument("--reranker-model", help="覆盖默认的本地重排模型")
     parser.add_argument("--data-dir", help="运行时根目录；默认使用当前 APP_DATA_DIR/runtime")
+    parser.add_argument(
+        "--collection",
+        default="",
+        help="要评测的集合名；留空沿用 config.yaml 的 rag.embedding.collection"
+             "（模型对比时用它指向探针集合，例如 papers_qwen3_probe）",
+    )
     parser.add_argument("--output", help="报告 JSON 路径；默认写入被 Git 忽略的 evals/reports/")
     parser.add_argument("--no-write", action="store_true", help="只打印摘要，不保存报告")
     return parser
@@ -60,10 +66,15 @@ def main(argv: list[str] | None = None) -> int:
         persist_dir = None
         if args.data_dir:
             persist_dir = Path(args.data_dir).expanduser().resolve() / "derived" / "chroma"
+        options: dict[str, object] = {
+            "reranker_enabled": args.reranker,
+            "reranker_model": args.reranker_model or "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        }
+        if args.collection:
+            options["collection_name"] = args.collection
         store = PaperStore(
             persist_dir=str(persist_dir) if persist_dir else None,
-            reranker_enabled=args.reranker,
-            reranker_model=args.reranker_model or "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+            **options,
         )
         try:
             if args.reranker and store._get_reranker() is None:

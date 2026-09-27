@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-length", type=int, default=0, help="目标 token 上限；0 用模型默认")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 篇，便于试跑")
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="跳过目标集合里已存在的论文，用于中断后续跑（否则会重算一遍）",
+    )
     return parser
 
 
@@ -95,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
         embedding_device=args.device,
     )
 
+    existing_ids = set()
+    if args.skip_existing:
+        existing_ids = {str(item.get("paper_id") or "") for item in target.list_papers()}
+
     print(f"源集合: {args.source} ({source.paper_count} 篇 / {source.chunk_count} 块)")
     print(f"目标集合: {args.target}")
     print("-" * 60)
@@ -104,6 +113,9 @@ def main(argv: list[str] | None = None) -> int:
     for index, paper in enumerate(papers, start=1):
         paper_id = str(paper.get("paper_id") or "")
         title = str(paper.get("title") or "Unknown")
+        if paper_id in existing_ids:
+            print(f"  [skip] {title[:52]:<54} 已在目标集合中", flush=True)
+            continue
         chunks = source.get_paper_chunks(paper_id)
         if not chunks:
             continue
@@ -115,8 +127,9 @@ def main(argv: list[str] | None = None) -> int:
               f"{len(chunks):>4} 块  ({rate:.1f} 篇/秒)", flush=True)
 
     elapsed = time.perf_counter() - started
+    migrated = len(papers) - len(existing_ids)
     print("-" * 60)
-    print(f"完成: {len(papers)} 篇 / {total_chunks} 块源输入，用时 {elapsed:.1f} 秒")
+    print(f"完成: 本次迁移 {migrated} 篇 / {total_chunks} 块，用时 {elapsed:.1f} 秒")
     print(f"目标集合现有: {target.paper_count} 篇 / {target.chunk_count} 块")
     print()
     print("验证建议:")
