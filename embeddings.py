@@ -32,11 +32,35 @@ _MINILM_TOKENIZER_PATH = (
     / "tokenizer.json"
 )
 _MINILM_TOKENIZER: Any = None
+# False caches "known unusable" so a missing download does not turn into a disk
+# probe on every chunk.
 
 # Used when ``rag.embedding.model`` is absent from config.yaml.
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 # Kept in sync with DEFAULT_EMBEDDING_MODEL; only a documentation fallback.
 DEFAULT_EMBEDDING_DIMENSIONS = 384
+
+
+def _load_minilm_tokenizer() -> Any:
+    """Load the ONNX tokenizer, returning ``False`` when it is unavailable.
+
+    The weights are downloaded on first use, so a fresh install — or an offline
+    CI runner — has no tokenizer file yet.  Counting tokens is only used to size
+    chunks, so this must degrade instead of raising.
+    """
+    try:
+        from tokenizers import Tokenizer
+    except ImportError:
+        return False
+    try:
+        tokenizer = Tokenizer.from_file(str(_MINILM_TOKENIZER_PATH))
+        # tokenizer.json ships with truncation enabled (128 tokens), which would
+        # silently cap every count and defeat chunk sizing.
+        tokenizer.no_truncation()
+        tokenizer.no_padding()
+    except Exception:  # noqa: BLE001 - missing weights, corrupt file, no network
+        return False
+    return tokenizer
 
 
 class Embedder(Protocol):
@@ -112,22 +136,21 @@ class MiniLMEmbedder:
         return self._fn(list(input))
 
     def tokenize(self, text: str) -> list[int] | None:
-        """Token ids from the bundled WordPiece tokenizer (offline, no network)."""
+        """Token ids from the bundled WordPiece tokenizer (offline, no network).
+
+        Returns ``None`` when the tokenizer cannot be loaded; callers fall back
+        to character-based sizing rather than aborting the import.
+        """
         global _MINILM_TOKENIZER
         if _MINILM_TOKENIZER is None:
-            try:
-                from tokenizers import Tokenizer
-            except ImportError:
-                _MINILM_TOKENIZER = False
-            else:
-                _MINILM_TOKENIZER = Tokenizer.from_file(str(_MINILM_TOKENIZER_PATH))
-                # tokenizer.json ships with truncation enabled (128 tokens),
-                # which would silently cap every count and defeat chunk sizing.
-                _MINILM_TOKENIZER.no_truncation()
-                _MINILM_TOKENIZER.no_padding()
-        if _MINILM_TOKENIZER is False:
+            _MINILM_TOKENIZER = _load_minilm_tokenizer()
+        tokenizer = _MINILM_TOKENIZER
+        if tokenizer is False:
             return None
-        return _MINILM_TOKENIZER.encode(text).ids
+        try:
+            return tokenizer.encode(text).ids
+        except Exception:  # noqa: BLE001 - never let counting break indexing
+            return None
 
     @classmethod
     def name(cls) -> str:

@@ -112,6 +112,19 @@ def split_oversized_text(
     return pieces
 
 
+def _tokenize_is_unavailable(tokenize) -> bool:
+    """True when a backend exposes ``tokenize()`` but cannot actually count.
+
+    Some backends only ship a usable tokenizer once their weights are downloaded.
+    Until then the call returns None, and the guard must fall back to character
+    sizing instead of crashing every import.
+    """
+    try:
+        return tokenize("tokenizer availability probe") is None
+    except Exception:  # noqa: BLE001 - a broken tokenizer is the same as none
+        return True
+
+
 def limit_chunks_to_tokens(
     chunks: list[dict],
     tokenize,
@@ -123,6 +136,10 @@ def limit_chunks_to_tokens(
     tokenize 不可用或 max_tokens <= 0 时原样返回，保证降级路径安全。
     """
     if tokenize is None or max_tokens <= 0:
+        return list(chunks)
+    if not chunks:
+        return []
+    if _tokenize_is_unavailable(tokenize):
         return list(chunks)
     limited: list[dict] = []
     for chunk in chunks:

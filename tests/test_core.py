@@ -5583,15 +5583,26 @@ class TestPaperStoreProtocol(unittest.TestCase):
     """Both store implementations must satisfy the shared protocol."""
 
     def _protocol_members(self):
+        """Members declared by the Protocol, on both 3.11 and 3.12+ runtimes.
+
+        ``typing.get_protocol_members`` / ``__protocol_attrs__`` only exist on
+        CPython 3.12+, while CI still runs 3.11, so fall back to walking the MRO.
+        """
+        import typing
+        from typing import Protocol
+
         from paper_store import PaperStoreProtocol
 
-        members = set(PaperStoreProtocol.__protocol_attrs__)
-        # __protocol_attrs__ only lists members declared in the Protocol body.
+        members: set[str] = set()
+        getter = getattr(typing, "get_protocol_members", None)
+        if getter is not None:
+            members = set(getter(PaperStoreProtocol))
         if not members:
-            members = {
-                name for name in vars(PaperStoreProtocol)
-                if not name.startswith("_")
-            }
+            for klass in PaperStoreProtocol.__mro__:
+                if klass in (Protocol, object):
+                    continue
+                members |= {name for name in vars(klass) if not name.startswith("_")}
+                members |= set(getattr(klass, "__annotations__", {}))
         return members
 
     def test_paper_store_implements_protocol(self):
@@ -5638,22 +5649,39 @@ class TestPaperStoreProtocol(unittest.TestCase):
         """The tokenizer must not silently cap counts at its shipped truncation."""
         from embeddings import MiniLMEmbedder
 
-        tokenize = MiniLMEmbedder().tokenize
-        if tokenize is None:
-            self.skipTest("tokenizer 不可用")
         text = "alpha beta gamma delta epsilon zeta eta theta. " * 60
-        self.assertGreater(len(tokenize(text)), 128)
+        ids = MiniLMEmbedder().tokenize(text)
+        if ids is None:
+            self.skipTest("本地没有 MiniLM 的 ONNX 分词器权重")
+        self.assertGreater(len(ids), 128)
 
-    def test_oversized_chunks_are_split_to_the_token_ceiling(self):
-        """Character chunking cannot predict tokens, so oversize is re-split."""
+    def test_real_tokenizer_split_stays_under_the_ceiling(self):
+        """The guard must respect the real model's 256-token ceiling."""
         from embeddings import MiniLMEmbedder
         from paper_store import limit_chunks_to_tokens
 
         tokenize = MiniLMEmbedder().tokenize
-        if tokenize is None:
-            self.skipTest("tokenizer 不可用")
         long_text = "alpha beta gamma delta epsilon zeta eta theta. " * 60
-        self.assertGreater(len(tokenize(long_text)), 256)
+        if tokenize(long_text) is None:
+            self.skipTest("本地没有 MiniLM 的 ONNX 分词器权重")
+
+        chunks = [{"text": long_text, "char_start": 0, "char_end": len(long_text)}]
+        split = limit_chunks_to_tokens(chunks, tokenize, 256)
+        self.assertGreater(len(split), 1)
+        for item in split:
+            self.assertLessEqual(len(tokenize(item["text"])), 256)
+
+    def test_oversized_chunks_are_split_to_the_token_ceiling(self):
+        """Character chunking cannot predict tokens, so oversize is re-split."""
+        from paper_store import limit_chunks_to_tokens
+
+        # A deterministic tokenizer keeps this assertion runnable everywhere,
+        # including CI runners that never download the ONNX weights.
+        def tokenize(text: str) -> list[int]:
+            return list(range(len(text.split())))
+
+        long_text = " ".join(f"token{index}" for index in range(600))
+        self.assertEqual(600, len(tokenize(long_text)))
 
         chunks = [{"text": long_text, "char_start": 0, "char_end": len(long_text)}]
         split = limit_chunks_to_tokens(chunks, tokenize, 256)
@@ -5662,6 +5690,14 @@ class TestPaperStoreProtocol(unittest.TestCase):
             self.assertLessEqual(len(tokenize(item["text"])), 256)
         # No content is dropped: every piece is a slice of the original.
         self.assertTrue(all(item["text"] in long_text for item in split))
+
+    def test_token_guard_degrades_when_tokenizer_is_unusable(self):
+        """A backend whose weights are not downloaded yet must still index."""
+        from paper_store import limit_chunks_to_tokens
+
+        chunks = [{"text": "alpha beta gamma " * 100, "char_start": 0}]
+        self.assertEqual(chunks, limit_chunks_to_tokens(chunks, lambda _t: None, 256))
+        self.assertEqual(chunks, limit_chunks_to_tokens(chunks, lambda _t: [], 256))
 
     def test_token_guard_is_a_noop_when_tokenizer_missing(self):
         from paper_store import limit_chunks_to_tokens
