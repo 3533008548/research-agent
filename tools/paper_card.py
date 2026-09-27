@@ -13,6 +13,10 @@ from paper_artifacts import (
     load_document_map,
     paper_card_prompt,
     select_evidence_blocks,
+    TITLE_MATCH_THRESHOLD,
+    title_match_key,
+    title_match_score,
+    update_document_map_source_file,
     write_paper_artifact,
 )
 from runtime_paths import get_runtime_paths
@@ -26,26 +30,63 @@ def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
-def _find_paper(paper_store, query: str) -> dict | None:
-    normalized = query.casefold()
-    papers = paper_store.list_papers() if paper_store else []
-    exact = next((item for item in papers if query == item.get("paper_id")), None)
-    if exact:
-        return exact
-    matches = [
-        item for item in papers
-        if normalized in str(item.get("paper_id") or "").casefold()
-        or normalized in str(item.get("title") or "").casefold()
+def _find_paper(paper_store, query: str) -> tuple[dict | None, list[dict], str]:
+    """Locate one indexed paper by id or title.
+
+    Files are renamed for readability, so a literal title comparison fails on
+    punctuation, truncation or casing.  Candidates are scored instead, and the
+    best one wins: demanding a unique match made an already-indexed paper
+    unfindable whenever two similar titles existed.
+    """
+    papers = list(paper_store.list_papers() or []) if paper_store else []
+    if not papers:
+        return None, [], ""
+    needle = str(query or "").strip()
+    for item in papers:
+        if needle and needle == str(item.get("paper_id") or ""):
+            return item, papers, "paper_id"
+    scored = [
+        (
+            title_match_score(needle, str(item.get("title") or "")),
+            index,
+            item,
+        )
+        for index, item in enumerate(papers)
     ]
-    return matches[0] if len(matches) == 1 else None
+    scored.sort(key=lambda entry: (-entry[0], entry[1]))
+    best_score, _, best = scored[0]
+    if best_score < TITLE_MATCH_THRESHOLD:
+        return None, papers, ""
+    return best, papers, f"title(score={best_score:.2f})"
 
 
-def _find_source_pdf(papers_dir: Path, title: str) -> Path | None:
-    expected = title.replace(" ", "_").casefold()
-    for candidate in papers_dir.glob("*.pdf"):
-        if candidate.stem.casefold() == expected:
-            return candidate
-    return None
+def _find_source_pdf(paths, paper_id: str, title: str) -> tuple[Path | None, str]:
+    """Resolve the managed PDF for one paper.
+
+    The authoritative mapping is ``document_map.source_file``: it records the
+    exact file name at index time and survives later renames being recorded
+    incorrectly.  Only when that is missing or stale do we fall back to
+    comparing the normalised title against file names on disk.
+    """
+    document_map = load_document_map(paths, paper_id)
+    source_file = str((document_map or {}).get("source_file") or "").strip()
+    if source_file:
+        candidate = paths.papers_dir / source_file
+        if candidate.is_file():
+            return candidate, "document_map"
+    wanted = title_match_key(title)
+    if wanted:
+        best: tuple[float, str, Path] | None = None
+        for index, candidate in enumerate(sorted(paths.papers_dir.glob("*.pdf"))):
+            score = title_match_score(wanted, title_match_key(candidate.stem))
+            if score < TITLE_MATCH_THRESHOLD:
+                continue
+            entry = (score, str(candidate), candidate)
+            if best is None or entry[0] > best[0] or (entry[0] == best[0] and entry[1] < best[1]):
+                best = entry
+        if best is not None:
+            return best[2], f"file_name(score={best[0]:.2f})"
+    return None, ""
 
 
 def _call_card_model(llm_client, model: str, prompt: str, cancel_event) -> str:
@@ -89,14 +130,27 @@ def handle_generate_paper_card(
     selector = str(args.get("paper_id_or_title", "") or "").strip()
     if not selector:
         return "❌ 请提供已索引论文的标题或 paper_id。"
-    paper = _find_paper(paper_store, selector)
+    paper, available, match_kind = _find_paper(paper_store, selector)
     if paper is None:
-        return "❌ 未找到唯一的已索引论文；请先使用 read_pdf 阅读并索引，再提供完整标题或 paper_id。"
+        # Naming the real candidates lets the caller recover in one turn
+        # instead of guessing why an indexed paper "does not exist".
+        options = "；".join(
+            f"{item.get('title')}（{item.get('paper_id')}）" for item in available[:5]
+        )
+        hint = f"已索引论文：{options}" if options else "论文库为空；请先 read_pdf 阅读并索引。"
+        return f"❌ 未能匹配到已索引论文“{selector}”。{hint}"
 
     paths = get_runtime_paths()
-    source_pdf = _find_source_pdf(paths.papers_dir, str(paper.get("title") or ""))
+    paper_id = str(paper.get("paper_id") or "")
+    source_pdf, pdf_match_kind = _find_source_pdf(paths, paper_id, str(paper.get("title") or ""))
     if source_pdf is None:
-        return "❌ 未找到该论文对应的本地 PDF，无法建立可追溯证据卡。"
+        on_disk = "；".join(sorted(path.name for path in paths.papers_dir.glob("*.pdf"))[:5])
+        hint = f"papers 目录实际文件：{on_disk}" if on_disk else "papers 目录为空。"
+        return f"❌ 未找到该论文对应的本地 PDF，无法建立可追溯证据卡。{hint}"
+    if pdf_match_kind.startswith("file_name"):
+        # The recorded name went stale after a rename; repair it so later
+        # lookups do not have to fall back again.
+        update_document_map_source_file(paths, paper_id, source_pdf.name)
 
     max_pages = _bounded_int(args.get("max_pages"), 100, 1, 100)
     try:

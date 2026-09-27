@@ -590,6 +590,18 @@ def download_research_document(document_id: str, request: Request) -> FileRespon
     return FileResponse(path, filename=f"{document['title']}.docx")
 
 
+@router.delete(
+    "/workspace/research-documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_api_key)],
+)
+def delete_research_document(document_id: str, request: Request) -> Response:
+    """Delete a research dossier together with its Markdown, docx, ledger, and history."""
+    if not _research_documents(request).delete(document_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get(
     "/workspace/papers",
     response_model=list[PaperResponse],

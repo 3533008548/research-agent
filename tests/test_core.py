@@ -467,6 +467,50 @@ class TestFastAPIService(unittest.TestCase):
         finally:
             app.state.workspace_scheduler.close()
 
+    def test_delete_research_document_removes_dossier_and_files(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app
+        from runtime_paths import RuntimePaths
+
+        paths = RuntimePaths.from_root(Path(self.tmp) / "delete-runtime")
+        self.agent.cfg = SimpleNamespace(
+            runtime_paths=paths,
+            daily_db=str(paths.daily_db),
+            daily_request_timeout_seconds=8,
+            model="workspace-model",
+            rag_enabled=True,
+            pdf_max_pages=15,
+            daily_search_enabled=False,
+        )
+        app = create_app(agent=self.agent)
+        client = TestClient(app)
+        document = app.state.research_document_store.save("待删除档案", "# 待删除档案\n\n正文")
+
+        directory = paths.research_documents_dir / document["document_id"]
+        self.assertTrue(directory.is_dir())
+        listed_before = client.get("/api/v1/workspace/research-documents").json()
+        self.assertTrue(any(item["document_id"] == document["document_id"] for item in listed_before))
+
+        deleted = client.delete(f"/api/v1/workspace/research-documents/{document['document_id']}")
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(directory.is_dir())
+        self.assertEqual(
+            client.get(f"/api/v1/workspace/research-documents/{document['document_id']}").status_code,
+            404,
+        )
+        listed_after = client.get("/api/v1/workspace/research-documents").json()
+        self.assertFalse(any(item["document_id"] == document["document_id"] for item in listed_after))
+
+        # Deleting an unknown or already-removed dossier is a clean 404.
+        self.assertEqual(
+            client.delete(f"/api/v1/workspace/research-documents/{document['document_id']}").status_code,
+            404,
+        )
+        self.assertEqual(
+            client.delete("/api/v1/workspace/research-documents/not-a-doc-id").status_code,
+            404,
+        )
+
     def test_badcase_feedback_keeps_only_a_safe_run_snapshot_and_follows_session_delete(self):
         from fastapi.testclient import TestClient
         from api.app import create_app
@@ -1074,10 +1118,11 @@ class TestToolResponsiveness(unittest.TestCase):
         from tools.search import handle_query_papers
 
         class _WarmingStore:
-            def query_with_timeout(self, query, top_k, section):
+            def query_with_timeout(self, query, top_k, section, paper_ids=None):
                 self.query = query
                 self.top_k = top_k
                 self.section = section
+                self.paper_ids = paper_ids
                 return None, "嵌入模型仍在后台初始化，请稍后重试同一问题。"
 
         store = _WarmingStore()

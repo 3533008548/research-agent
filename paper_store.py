@@ -285,6 +285,8 @@ class PaperStore:
         # A lightweight, user-confirmed relation store.  It is deliberately
         # optional so the vector store stays usable in isolation and in tests.
         self.relation_store = relation_store
+        # Injected at agent startup; None means relation review stays disabled.
+        self.relation_reviewer = None
 
     # ── 公开接口 ──
 
@@ -316,7 +318,35 @@ class PaperStore:
         resolved_title = str(document_map.get("title") or title)
         resolved_id = str(document_map.get("paper_id") or paper_id or "") or None
         chunks = list(document_map.get("chunks") or [])
-        return self._index_chunks(chunks, title=resolved_title, paper_id=resolved_id)
+        resolved_id = self._index_chunks(chunks, title=resolved_title, paper_id=resolved_id)
+        self._queue_relation_review(resolved_id, resolved_title, document_map)
+        return resolved_id
+
+    def _queue_relation_review(
+        self, paper_id: str, title: str, document_map: dict[str, Any],
+    ) -> None:
+        """Ask the reviewer to examine only this newly indexed paper.
+
+        Queued after indexing so a failed index never leaves a job behind, and
+        deliberately fire-and-forget: review must not slow down or fail import.
+        """
+        reviewer = getattr(self, "relation_reviewer", None)
+        if reviewer is None or not paper_id:
+            return
+        try:
+            from paper_relation_review import paper_fingerprint
+
+            fingerprint = paper_fingerprint(
+                title=title,
+                chunk_count=len(list(document_map.get("chunks") or [])),
+                source_file=str(document_map.get("source_file") or ""),
+            )
+            reviewer.enqueue(paper_id, fingerprint)
+        except Exception as exc:  # noqa: BLE001 - review is best-effort
+            print(
+                f"      ⚠️ 论文关系审查未入队（{type(exc).__name__}: {exc}）",
+                file=sys.stderr,
+            )
 
     def _index_chunks(
         self,
@@ -625,6 +655,7 @@ class PaperStore:
         item["relation_ids"] = list(hint.get("relation_ids") or [])
         item["relation_types"] = list(hint.get("relation_types") or [])
         item["relation_seed_paper_ids"] = list(hint.get("seed_paper_ids") or [])
+        item["relation_seed_titles"] = list(hint.get("seed_titles") or [])
 
     def _expand_relation_candidates(
         self,
@@ -707,11 +738,16 @@ class PaperStore:
                 if hint is None:
                     continue
                 key = self._result_key(candidate)
+                # A chunk created here reached the results only through a
+                # relation, so it must stay distinguishable from a direct hit.
+                is_expansion_only = key not in fused
                 item = fused.setdefault(key, {
                     **candidate,
                     "hybrid_score": 0.0,
                     "retrieval": "hybrid",
                 })
+                if is_expansion_only:
+                    item["relation_expanded"] = True
                 # This is a secondary retrieval source, not an extra normal
                 # RRF vote.  It cannot dominate a directly retrieved answer.
                 extra_score = RELATION_EXPANSION_RRF_FACTOR / (RRF_K + rank)
@@ -803,7 +839,9 @@ class PaperStore:
         # Paper relations are a post-hybrid one-hop expansion.  Explicitly
         # scoped retrieval must remain scoped, so it never walks outside its
         # supplied paper IDs.
-        if paper_ids is None:
+        # An empty scope is still a scope: never widen it into an unscoped
+        # search that walks relations across the whole library.
+        if not paper_ids:
             self._expand_relation_candidates(
                 query_text, fused, ranked, candidate_k=candidate_k, section=section,
             )
@@ -922,6 +960,16 @@ class PaperStore:
             except Exception as exc:
                 print(
                     f"      ⚠️ 已删除论文，但未能清理关系边（{type(exc).__name__}: {exc}）",
+                    file=sys.stderr,
+                )
+        reviewer = getattr(self, "relation_reviewer", None)
+        if reviewer is not None:
+            try:
+                reviewer.store.cancel(paper_id)
+                reviewer.store.drop_paper(paper_id)
+            except Exception as exc:  # noqa: BLE001 - deletion must not fail on derived state
+                print(
+                    f"      ⚠️ 已删除论文，但未能清理关系审查状态（{type(exc).__name__}: {exc}）",
                     file=sys.stderr,
                 )
         return len(ids_to_delete)

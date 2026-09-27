@@ -208,6 +208,7 @@ class ResearchAgent:
                     reranker_candidate_limit=cfg.rag_reranker_candidate_limit,
                     relation_store=PaperRelationStore(cfg.runtime_paths),
                 )
+                self._attach_relation_reviewer(cfg.runtime_paths)
                 print(
                     f"      ✅ 已加载 {self._paper_store.paper_count} 篇论文, "
                     f"{self._paper_store.chunk_count} 个块",
@@ -241,6 +242,32 @@ class ResearchAgent:
             print(f"      💾 对话历史: {checkpoint_path.name} ({size / 1024:.0f} KB)", file=sys.stderr)
             self._load_context_from_checkpoint(self._thread_id)
             self._prune_checkpoint(max_snapshots=50)
+
+    def _attach_relation_reviewer(self, paths) -> None:
+        """Enable automatic relation review after each successful index.
+
+        Review runs on its own single worker so it never competes with
+        interactive retrieval for the query executor.
+        """
+        if getattr(self._paper_store, "relation_reviewer", None) is not None:
+            return
+        if self._paper_store.__class__.__name__ == "NoOpStore":
+            return
+        try:
+            from paper_relation_review import (
+                PaperRelationReviewer,
+                PaperRelationReviewStore,
+            )
+
+            self._paper_store.relation_reviewer = PaperRelationReviewer(
+                PaperRelationReviewStore(paths), self._paper_store,
+            )
+            print("      🔗 论文关系自动审查已启用", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - review is an optional enhancement
+            print(
+                f"      ⚠️ 论文关系自动审查未启用（{type(exc).__name__}: {exc}）",
+                file=sys.stderr,
+            )
 
     # ── 公开 API ──
 

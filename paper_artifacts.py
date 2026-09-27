@@ -11,6 +11,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -438,6 +439,30 @@ def load_document_map(paths: RuntimePaths, paper_id: str) -> dict[str, Any] | No
     return value if isinstance(value, dict) else None
 
 
+def update_document_map_source_file(
+    paths: RuntimePaths, paper_id: str, source_file: str,
+) -> bool:
+    """Repair a stale ``source_file`` after the managed PDF was renamed.
+
+    Renaming files for readability leaves the recorded name out of date.  The
+    mapping is silently rewritten once the real file is located, so lookups do
+    not keep falling back to fuzzy file-name matching.
+    """
+    if not paper_id or not source_file:
+        return False
+    document_map = load_document_map(paths, paper_id)
+    if not isinstance(document_map, dict):
+        return False
+    if str(document_map.get("source_file") or "") == source_file:
+        return False
+    document_map["source_file"] = source_file
+    _write_json(
+        paths.paper_artifacts_dir / _safe_artifact_key(paper_id) / "document_map.json",
+        document_map,
+    )
+    return True
+
+
 def remove_document_map(paths: RuntimePaths, paper_id: str) -> bool:
     """Remove one obsolete, rebuildable document map after a successful replacement."""
     directory = paths.paper_artifacts_dir / _safe_artifact_key(paper_id)
@@ -801,6 +826,58 @@ def write_paper_artifact(
     _write_text(card_path, card)
     _write_json(audit_path, audit)
     return card_path, source_map_path, audit
+
+
+# ---------------------------------------------------------------------------
+# Title matching
+#
+# Files are renamed for human readability, which breaks any exact comparison
+# between a paper title and its file name: titles contain characters that a
+# filesystem forbids (`:`, `/`, `?`), get truncated, and differ in case or
+# hyphenation.  Matching therefore has to be normalised and scored rather than
+# compared literally.
+# ---------------------------------------------------------------------------
+_TITLE_KEY_STRIP = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+# Callers may pass a full file name instead of a stem; a trailing extension
+# must not weigh on the comparison.
+_PDF_SUFFIX = re.compile(r"\s*\.\s*pdf\s*$")
+
+
+def title_match_key(value: object) -> str:
+    """Normalise a title (or file name) for comparison.
+
+    Case, punctuation, underscores, a trailing ``.pdf`` and repeated whitespace
+    are all ignored; CJK characters are preserved so Chinese titles keep their
+    discriminative power.
+    """
+    text = " ".join(str(value or "").replace("\u00ad", "").split()).casefold()
+    text = _PDF_SUFFIX.sub("", text)
+    return _TITLE_KEY_STRIP.sub(" ", text).strip()
+
+
+# Scores at or above this value identify the same paper.  Shared by every
+# caller so the threshold has exactly one place to tune.
+TITLE_MATCH_THRESHOLD = 0.70
+
+
+def title_match_score(query: object, candidate: object) -> float:
+    """Score how well ``query`` identifies ``candidate``, from 0.0 to 1.0.
+
+    Exact normalised equality wins outright.  A containment relation scores
+    next, scaled by how much of the longer string is covered.  Only then does a
+    fuzzy character-level ratio apply, capped below containment so that a real
+    substring match is never outranked by a coincidental fuzzy one.
+    """
+    left = title_match_key(query)
+    right = title_match_key(candidate)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if left in right or right in left:
+        shorter, longer = sorted((left, right), key=len)
+        return 0.70 + 0.25 * (len(shorter) / len(longer))
+    return min(SequenceMatcher(None, left, right).ratio(), 0.69)
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:

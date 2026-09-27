@@ -356,6 +356,24 @@ def _raw_tool_schemas() -> list[dict]:
         {
             "type": "function",
             "function": {
+                "name": "list_relation_candidates",
+                "description": (
+                    "查看论文入库时自动审查产生的、尚未确认的论文关系候选。"
+                    "候选只是待确认线索，不会参与检索；确认需走 save_paper_relation 并获得用户明确同意。"
+                    "用户问「有哪些待确认关系」「自动发现了什么关系」时使用。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paper_id_or_title": {"type": "string", "description": "可选：只看某一篇论文的候选"},
+                        "status": {"type": "string", "enum": ["pending", "accepted", "rejected"], "description": "候选状态，默认 pending"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "save_paper_relation",
                 "description": "保存用户明确确认的、带页码或片段锚点的论文关系。调用前必须先展示拟写入的方向、类型、说明和证据并获得确认；禁止根据模型猜测自动建关系。",
                 "parameters": {
@@ -404,13 +422,28 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "query_papers",
-                "description": "在已索引论文中语义检索方法细节/公式/实验数据。支持按章节过滤。",
+                "description": (
+                    "在已索引论文中语义检索方法细节/公式/实验数据。支持按章节过滤。"
+                    "当用户已指定论文时（如“论文A的…”“比较A和B”），用 paper_id_or_title 限定范围，"
+                    "此时不会跨论文扩展，结果只来自指定论文；"
+                    "开放式方法/主题提问（未指定论文）不要传该参数，以便借助论文关系召回相关论文。"
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "查询内容"},
                         "top_k": {"type": "integer", "description": "返回段落数"},
                         "section": {"type": "string", "description": "限定章节（如 Method/Experiments），可选"},
+                        "paper_id_or_title": {
+                            "description": (
+                                "限定检索范围的论文，可传标题/paper_id，或它们的数组（比较多篇时）。"
+                                "仅在用户明确指定论文时传；未指定时不要传。"
+                            ),
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ],
+                        },
                     },
                     "required": ["query"],
                 },

@@ -14,11 +14,23 @@ if str(PROJECT_ROOT) not in sys.path:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
-from paper_artifacts import attach_image_assets, build_document_map, remove_document_map, write_document_map
+from paper_artifacts import (
+    attach_image_assets,
+    build_document_map,
+    remove_document_map,
+    title_match_score,
+    write_document_map,
+)
 from paper_quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
+from paper_relations import PaperRelationStore
 from paper_store import PaperStore
 from pdf_reader import PaperReader, extract_images
 from runtime_paths import RuntimePaths
+from tools.read_pdf import resolve_paper_title
+
+# A title is the same paper above this score, even when a readable file name
+# differs in punctuation or truncation.
+TITLE_MATCH_THRESHOLD = 0.70
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,10 +52,15 @@ def main(argv: list[str] | None = None) -> int:
         print("没有可重建的本地 PDF。")
         return 0
 
-    store = PaperStore(persist_dir=str(paths.chroma_dir))
-    existing = {}
-    for item in store.list_papers():
-        existing.setdefault(str(item["title"]), []).append(str(item["paper_id"]))
+    relation_store = PaperRelationStore(paths)
+    # Passing the relation store lets delete_paper clear edges that were not
+    # carried over; remap runs first so valid ones survive the new paper_id.
+    store = PaperStore(persist_dir=str(paths.chroma_dir), relation_store=relation_store)
+    existing = [
+        (str(item.get("title") or ""), str(item.get("paper_id") or ""))
+        for item in store.list_papers()
+        if item.get("paper_id")
+    ]
     failures = []
     try:
         for pdf_path in pdf_files:
@@ -78,6 +95,10 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             parsed_document, document_map, quality, parser_label = selected
+            # The file name is only a fallback. Deriving the title from the PDF
+            # keeps reindexing consistent with read_pdf, and keeps a readable
+            # file name from silently becoming the paper title.
+            title, title_source = resolve_paper_title(None, parsed_document, pdf_path.stem)
             try:
                 images = extract_images(
                     str(pdf_path), max_pages=args.max_pages, output_dir=paths.images_dir,
@@ -106,11 +127,37 @@ def main(argv: list[str] | None = None) -> int:
                     store.delete_paper(paper_id)
                     raise RuntimeError("向量库入库后自检失败，已回滚新索引")
                 write_document_map(paths, paper_id=paper_id, document_map=document_map)
-                for existing_id in existing.get(title, []):
-                    if existing_id != paper_id:
-                        store.delete_paper(existing_id)
-                        remove_document_map(paths, existing_id)
-                print(f"已重建: {title} ({paper_id})，{quality['status']}")
+                # Replacing by exact title left duplicates behind whenever a
+                # readable file name differed by so much as a colon.
+                superseded = [
+                    existing_id
+                    for existing_title, existing_id in existing
+                    if existing_id != paper_id
+                    and title_match_score(title, existing_title) >= TITLE_MATCH_THRESHOLD
+                ]
+                # Carry relations across before deleting the old index: a new
+                # paper_id would otherwise orphan every edge it took part in.
+                moved = 0
+                if relation_store is not None:
+                    for existing_title, existing_id in existing:
+                        if existing_id == paper_id:
+                            continue
+                        if title_match_score(title, existing_title) < TITLE_MATCH_THRESHOLD:
+                            continue
+                        moved += relation_store.remap_paper_id(existing_title, paper_id, title)
+                for existing_id in superseded:
+                    store.delete_paper(existing_id)
+                    remove_document_map(paths, existing_id)
+                notes = []
+                if superseded:
+                    notes.append(f"替换 {len(superseded)} 条旧索引")
+                if moved:
+                    notes.append(f"迁移 {moved} 端关系")
+                note = "，".join(notes)
+                print(
+                    f"已重建: {title} ({paper_id})，{quality['status']}"
+                    f"{'，' + note if note else ''}｜标题来源：{title_source}"
+                )
             except Exception as exc:
                 try:
                     store.delete_paper(paper_id)

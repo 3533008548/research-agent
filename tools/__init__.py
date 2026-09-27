@@ -8,6 +8,7 @@ from tools.paper_card import handle_generate_paper_card
 from tools.paper_relations import (
     handle_delete_paper_relation,
     handle_list_paper_relations,
+    handle_list_relation_candidates,
     handle_save_paper_relation,
 )
 from tools.research_documents import (
@@ -38,6 +39,7 @@ _TOOL_HANDLERS = {
     "read_pdf": handle_read_pdf,
     "generate_paper_card": handle_generate_paper_card,
     "list_paper_relations": handle_list_paper_relations,
+    "list_relation_candidates": handle_list_relation_candidates,
     "save_paper_relation": handle_save_paper_relation,
     "delete_paper_relation": handle_delete_paper_relation,
     "save_research_document": handle_save_research_document,

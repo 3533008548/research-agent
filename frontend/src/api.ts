@@ -105,6 +105,17 @@ export function getResearchDocument(apiKey: string, documentId: string): Promise
   return request(`/workspace/research-documents/${encodeURIComponent(documentId)}`, apiKey);
 }
 
+export async function deleteResearchDocument(apiKey: string, documentId: string): Promise<void> {
+  const response = await fetch(`${API_PREFIX}/workspace/research-documents/${encodeURIComponent(documentId)}`, {
+    method: "DELETE",
+    headers: headers(apiKey),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({ detail: "删除科研档案失败" }));
+    throw new ApiError(data.detail || "删除科研档案失败", response.status);
+  }
+}
+
 export function routeResearchDocumentRequest(
   apiKey: string,
   documentId: string,

@@ -151,7 +151,10 @@ def _r02_tool_trace_sanitization(context: RuntimeContext) -> RuntimeCaseResult:
     from research_agent import ResearchAgent
 
     class _FixturePaperStore:
-        def query_with_timeout(self, _query: str, *, top_k: int, section: str | None = None):
+        def query_with_timeout(
+            self, _query: str, *, top_k: int, section: str | None = None,
+            paper_ids: list[str] | None = None,
+        ):
             return ([{
                 "retrieval": "keyword", "title": "Fixture local paper", "section": section or "Methods",
                 "keyword_score": 1.0, "text": "offline evidence",

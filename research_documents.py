@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -326,6 +327,22 @@ class ResearchDocumentStore:
             self._snapshot_current(directory, metadata, current)
             self._write_current(directory, updated, restored)
             return {**self._with_paths(updated), "restored_from_revision": target}
+
+    def delete(self, document_id: str) -> bool:
+        """Remove one dossier directory and all its persisted files.
+
+        Returns False for an unknown, malformed, or already-removed id so the
+        API layer can distinguish a clean 404 from a successful deletion.
+        """
+        with _store_lock:
+            document_id = str(document_id or "").strip()
+            if not _DOCUMENT_ID.fullmatch(document_id):
+                return False
+            directory = self.directory / document_id
+            if not directory.is_dir():
+                return False
+            shutil.rmtree(directory)
+            return True
 
     def _load_metadata(self, document_id: str) -> dict[str, Any] | None:
         document_id = str(document_id or "").strip()

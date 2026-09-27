@@ -4,7 +4,12 @@
 
 import sys
 from pathlib import Path
-from paper_artifacts import load_document_map, related_context
+from paper_artifacts import (
+    TITLE_MATCH_THRESHOLD,
+    load_document_map,
+    related_context,
+    title_match_score,
+)
 from paper_relations import relation_type_label
 from search_api import list_downloaded_papers, search_public_papers
 from runtime_paths import get_runtime_paths
@@ -30,6 +35,48 @@ def handle_search_papers(args: dict, **kw) -> str:
     return search_public_papers(query, limit=limit, source=source)
 
 
+def _resolve_scope(paper_store, raw) -> tuple[list[str] | None, str]:
+    """Resolve an explicit paper scope, refusing to silently widen it.
+
+    A scope the user stated must never degrade into an unscoped search: that
+    silently reintroduces cross-paper pollution, which is exactly what scoping
+    exists to prevent.  An unresolvable reference is therefore an error.
+    """
+    if raw is None:
+        return None, ""
+    values = raw if isinstance(raw, (list, tuple)) else [raw]
+    values = [str(item or "").strip() for item in values]
+    values = [item for item in values if item]
+    if not values:
+        return None, ""
+    papers = list(paper_store.list_papers() or [])
+    if not papers:
+        return None, "论文库为空，无法限定检索范围。"
+    resolved: list[str] = []
+    for needle in values:
+        by_id = next(
+            (item for item in papers if needle == str(item.get("paper_id") or "")), None,
+        )
+        if by_id is not None:
+            resolved.append(str(by_id.get("paper_id")))
+            continue
+        scored = sorted(
+            (
+                (title_match_score(needle, str(item.get("title") or "")), index, item)
+                for index, item in enumerate(papers)
+            ),
+            key=lambda entry: (-entry[0], entry[1]),
+        )
+        best_score, _, best = scored[0]
+        if best is None or best_score < TITLE_MATCH_THRESHOLD:
+            options = "；".join(
+                f"{item.get('title')}（{item.get('paper_id')}）" for item in papers[:5]
+            )
+            return None, f"无法限定到论文“{needle}”。已索引论文：{options or '无'}"
+        resolved.append(str(best.get("paper_id")))
+    return list(dict.fromkeys(resolved)), ""
+
+
 def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     if not paper_store:
         return "❌ RAG 功能未启用。"
@@ -40,8 +87,14 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     section_value = args.get("section")
     section = str(section_value).strip() if section_value is not None else None
     section = section or None
+    if "paper_id_or_title" in args:
+        scope, scope_error = _resolve_scope(paper_store, args.get("paper_id_or_title"))
+        if scope_error:
+            return f"❌ {scope_error}"
+    else:
+        scope = None
     results, pending = paper_store.query_with_timeout(
-        query, top_k=top_k, section=section,
+        query, top_k=top_k, paper_ids=scope, section=section,
     )
     if pending and results is None:
         return f"⏳ {pending}"
@@ -81,13 +134,56 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
             for relation_type in (r.get("relation_types") or [])
         ]
         if relation_types:
-            lines.append(
-                "     关系增强候选（仅辅助检索，不构成论文事实）："
-                + "、".join(relation_types)
-            )
+            seeds = "、".join(str(item) for item in (r.get("relation_seed_titles") or [])[:3])
+            if r.get("relation_expanded"):
+                # This chunk entered only because a related paper pointed at it.
+                # Saying so keeps it distinguishable from a direct hit.
+                origin = f"，来自相关论文：{seeds}" if seeds else ""
+                lines.append(
+                    f"     ↳ 关系扩展候选{origin}（"
+                    + "、".join(relation_types)
+                    + "；非直接命中，引用时请注明来源论文）"
+                )
+            else:
+                lines.append(
+                    "     关系增强候选（仅辅助检索，不构成论文事实）："
+                    + "、".join(relation_types)
+                )
         if context:
             lines.append(f"     关联上下文：\n{context}")
+    summary = _relation_summary(results)
+    if summary:
+        lines.append(f"\n{summary}")
     return "\n".join(lines)
+
+
+def _relation_summary(results: list[dict]) -> str:
+    """Report what relation expansion contributed, so its value is observable."""
+    if not results:
+        return ""
+    expanded = [item for item in results if item.get("relation_expanded")]
+    boosted = [
+        item for item in results
+        if item.get("relation_boost") and not item.get("relation_expanded")
+    ]
+    if not expanded and not boosted:
+        return ""
+    seed_ids = {
+        str(paper_id)
+        for item in expanded + boosted
+        for paper_id in (item.get("relation_seed_paper_ids") or [])
+    }
+    parts = ["🔗 关系扩展："]
+    details = []
+    if expanded:
+        details.append(f"经关系引入 {len(expanded)} 条")
+    if boosted:
+        details.append(f"加权已有 {len(boosted)} 条")
+    parts.append("、".join(details))
+    if seed_ids:
+        parts.append(f"；涉及相关论文 {len(seed_ids)} 篇")
+    parts.append("。扩展结果为辅助召回，不等同于原文直接命中。")
+    return "".join(parts)
 
 
 def handle_list_papers(args: dict, **kw) -> str:

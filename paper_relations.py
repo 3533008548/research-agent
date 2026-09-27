@@ -16,11 +16,15 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Iterable
 
+from paper_artifacts import title_match_key
 from runtime_paths import RuntimePaths
 
 
 _RELATION_ID = re.compile(r"paper-rel-[a-f0-9]{12}\Z")
 _LOCK = RLock()
+# Relation expansion reads the whole file on every retrieval.  Caching by file
+# identity keeps that hot path from re-parsing unchanged data.
+_READ_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
 _RELATION_TYPES = {
     "method_similar": {"label": "方法相似", "weight": 0.004, "symmetric": True},
     "method_improves": {"label": "方法改进", "weight": 0.006, "symmetric": False},
@@ -166,6 +170,40 @@ class PaperRelationStore:
                 self._write({"version": 1, "updated_at": _now(), "relations": retained})
             return removed
 
+    def remap_paper_id(
+        self, old_title: str, new_paper_id: str, new_title: str = "",
+    ) -> int:
+        """Point relations at a re-indexed paper instead of dropping them.
+
+        Re-indexing mints a fresh ``paper_id``, which would otherwise orphan
+        every relation the old id took part in.  Relations already store both
+        titles, so the title is enough to carry them over.
+        """
+        old_key = title_match_key(old_title)
+        new_id = str(new_paper_id or "").strip()
+        if not old_key or not new_id:
+            return 0
+        display = " ".join(str(new_title or old_title).split())
+        with _LOCK:
+            payload = self._read()
+            relations = list(payload.get("relations") or [])
+            changed = 0
+            for relation in relations:
+                for id_key, title_key in (
+                    ("source_paper_id", "source_title"),
+                    ("target_paper_id", "target_title"),
+                ):
+                    if title_match_key(relation.get(title_key)) != old_key:
+                        continue
+                    if str(relation.get(id_key) or "") == new_id:
+                        continue
+                    relation[id_key] = new_id
+                    relation[title_key] = display
+                    changed += 1
+            if changed:
+                self._write({"version": 1, "updated_at": _now(), "relations": relations})
+        return changed
+
     def counts(self, paper_ids: Iterable[str]) -> dict[str, int]:
         """Return a relation count for each requested paper ID."""
         requested = {str(paper_id or "").strip() for paper_id in paper_ids}
@@ -210,6 +248,7 @@ class PaperRelationStore:
                     "relation_ids": [],
                     "relation_types": [],
                     "seed_paper_ids": [],
+                    "seed_titles": [],
                 })
                 current["boost"] = max(float(current["boost"]), round(weight, 6))
                 if relation["relation_id"] not in current["relation_ids"]:
@@ -218,17 +257,35 @@ class PaperRelationStore:
                     current["relation_types"].append(relation["relation_type"])
                 if seed_id not in current["seed_paper_ids"]:
                     current["seed_paper_ids"].append(seed_id)
+                    seed_title = (
+                        str(relation.get("source_title") or "")
+                        if seed_id == source_id
+                        else str(relation.get("target_title") or "")
+                    )
+                    if seed_title and seed_title not in current["seed_titles"]:
+                        current["seed_titles"].append(seed_title)
         return hints
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
             return {"version": 1, "updated_at": "", "relations": []}
         try:
+            stamp = self.path.stat().st_mtime_ns
+        except OSError:
+            stamp = -1
+        cached = _READ_CACHE.get(str(self.path))
+        if cached is not None and stamp >= 0 and cached[0] == stamp:
+            return cached[1]
+        try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("无法读取论文关系数据；请从运行时备份恢复") from exc
         if not isinstance(value, dict) or not isinstance(value.get("relations", []), list):
             raise ValueError("论文关系数据格式无效；请从运行时备份恢复")
+        if stamp >= 0:
+            # Callers copy the relations list before mutating it, so the cached
+            # payload stays read-only.
+            _READ_CACHE[str(self.path)] = (stamp, value)
         return value
 
     def _write(self, payload: dict[str, Any]) -> None:
@@ -239,6 +296,7 @@ class PaperRelationStore:
             encoding="utf-8",
         )
         os.replace(temporary, self.path)
+        _READ_CACHE.pop(str(self.path), None)
 
 
 def _paper_id(paper: dict[str, Any]) -> str:

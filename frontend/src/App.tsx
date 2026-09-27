@@ -14,6 +14,7 @@ import {
   deleteExperimentProject,
   deleteSession,
   downloadResearchDocument,
+  deleteResearchDocument,
   getDailyRunDetail,
   getExperimentFile,
   getExperimentProject,
@@ -946,6 +947,20 @@ export function App() {
     }
   }
 
+  async function removeResearchDocument(document: ResearchDocument) {
+    if (!window.confirm(`删除科研档案“${document.title}”？这会同时删除该档案的正文、证据与假设账本及历史版本文件，且不可恢复。`)) {
+      return;
+    }
+    try {
+      await deleteResearchDocument(apiKey, document.document_id);
+      setDocuments((current) => current.filter((item) => item.document_id !== document.document_id));
+      closeWorkbenchTab(`document:${document.document_id}`);
+      setNotice({ kind: "info", text: "科研档案已删除。" });
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    }
+  }
+
   async function uploadAttachment(file: File) {
     if (isUploading || isSending) {
       return;
@@ -1487,6 +1502,12 @@ export function App() {
     ? methodReconstruction(activeWorkbenchTab.project)
     : null;
 
+  const documentActive = activeWorkbenchTab?.kind === "document";
+  const runInProgress =
+    isSending ||
+    ["running", "queued", "cancelling"].includes(currentRun?.status ?? "");
+  const docFocusMode = documentActive && !runInProgress;
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -1497,7 +1518,7 @@ export function App() {
         <p>论文证据、研究推理与可追溯运行</p>
       </header>
 
-      <div className="workspace">
+      <div className={`workspace ${docFocusMode ? "workspace-doc-focus" : ""}`}>
         <aside className="session-sidebar" aria-label="会话列表">
           <div className="sidebar-heading">
             <div><p className="eyebrow">工作区</p><h2>会话</h2></div>
@@ -1531,16 +1552,28 @@ export function App() {
               ) : documents.length ? (
                 <div className="workspace-list">
                   {documents.map((document) => (
-                    <button
+                    <div
                       key={document.document_id}
-                      className={`workspace-list-item ${selectedDocumentId === document.document_id ? "selected" : ""}`}
-                      type="button"
-                      onClick={() => void selectResearchDocument(document.document_id)}
-                      title={document.title}
+                      className={`workspace-list-item document-item ${selectedDocumentId === document.document_id ? "selected" : ""}`}
                     >
-                      <strong>{document.title}</strong>
-                      <span>{document.summary || "未填写摘要"}</span>
-                    </button>
+                      <button
+                        className="workspace-list-button"
+                        type="button"
+                        onClick={() => void selectResearchDocument(document.document_id)}
+                        title={document.title}
+                      >
+                        <strong>{document.title}</strong>
+                        <span>{document.summary || "未填写摘要"}</span>
+                      </button>
+                      <button
+                        className="text-button danger document-delete"
+                        type="button"
+                        onClick={() => void removeResearchDocument(document)}
+                        title="删除档案"
+                      >
+                        删除
+                      </button>
+                    </div>
                   ))}
                 </div>
               ) : (
@@ -1732,7 +1765,7 @@ export function App() {
           </div>
         </aside>
 
-        <section className="conversation" aria-label="研究工作台">
+        <section className={`conversation ${documentActive ? "conversation-doc" : ""}`} aria-label="研究工作台">
           <div className="workbench-tabs" role="tablist" aria-label="工作台页面">
             {workbenchTabs.map((tab) => (
               <div className={`workbench-tab ${tab.id === activeWorkbenchTab?.id ? "active" : ""}`} key={tab.id}>
@@ -1784,7 +1817,7 @@ export function App() {
               </div>
             </article>
           ) : activeWorkbenchTab?.kind === "document" ? (
-            <article className="document-page" aria-label={`科研档案：${activeWorkbenchTab.document.title}`}>
+            <article className="document-page document-reading" aria-label={`科研档案：${activeWorkbenchTab.document.title}`}>
               <header className="document-page-heading">
                 <div>
                   <p className="eyebrow">科研档案</p>
@@ -1797,101 +1830,105 @@ export function App() {
                   <button className="button button-secondary" type="button" onClick={() => void downloadDocument(activeWorkbenchTab.document)}>
                     下载 Word
                   </button>
+                  <button className="button button-danger" type="button" onClick={() => void removeResearchDocument(activeWorkbenchTab.document)}>
+                    删除档案
+                  </button>
                 </div>
               </header>
-              <section className="document-safety-note" aria-label="科研档案安全编辑说明">
-                <strong>安全编辑已启用</strong>
-                <span>Agent 只能在读取过的章节内提交带版本校验的局部补丁；每次写入前会保留完整历史快照。</span>
-              </section>
-              <section className="document-request" aria-label="围绕当前科研档案提问">
-                <div>
-                  <p className="eyebrow">档案助手</p>
-                  <h2>直接描述你想做什么</h2>
-                  <p>例如“补充研究方案”“和新导入论文比对”“梳理证据与假设”或“审查创新性”。若要根据新论文更新档案，请带上论文标题或 ID；系统会先综合审查，再请求确认写入。</p>
-                </div>
-                <form onSubmit={(event) => void submitResearchDocumentRequest(event, activeWorkbenchTab.document)}>
-                  <textarea
-                    value={documentRequest}
-                    onChange={(event) => setDocumentRequest(event.target.value)}
-                    placeholder="围绕这份科研档案提出问题或修改要求…"
-                    rows={2}
-                    disabled={isSending || !activeSessionId}
-                  />
-                  <div>
-                    <span>会自动关联当前档案，不会把全文塞入对话上下文。</span>
-                    <button className="button button-primary" type="submit" disabled={!documentRequest.trim() || isSending || !activeSessionId}>
-                      发送给 Agent
-                    </button>
-                  </div>
-                </form>
-              </section>
-              <section className="document-outline" aria-label="科研档案章节目录">
+              <nav className="document-outline-strip" aria-label="科研档案章节目录">
                 {activeWorkbenchTab.document.sections.map((section) => (
-                  <div className="document-outline-item" key={section.section_id}>
+                  <span className="document-outline-chip" key={section.section_id} title={section.summary || "待补充"}>
                     <strong>{section.heading}</strong>
-                    <span>{section.content_length} 字符 · {section.summary || "待补充"}</span>
-                  </div>
+                    <span>{section.content_length} 字符</span>
+                  </span>
                 ))}
-              </section>
-              <div className="document-page-content">
-                <Suspense fallback={<p className="markdown-loading">{activeWorkbenchTab.document.content}</p>}>
-                  <MarkdownContent content={activeWorkbenchTab.document.content} />
-                </Suspense>
+              </nav>
+              <div className="document-body">
+                <div className="document-main">
+                  <div className="document-page-content">
+                    <Suspense fallback={<p className="markdown-loading">{activeWorkbenchTab.document.content}</p>}>
+                      <MarkdownContent content={activeWorkbenchTab.document.content} />
+                    </Suspense>
+                  </div>
+                  {activeWorkbenchTab.document.versions.length > 1 && (
+                    <section className="document-version-history" aria-label="版本历史">
+                      <h2>版本历史</h2>
+                      <p>当前内容及每个写入前的完整快照均可由 Agent 在你确认后恢复。</p>
+                      <ul>
+                        {activeWorkbenchTab.document.versions.map((version) => (
+                          <li key={`${version.revision}-${version.updated_at}`}>
+                            第 {version.revision} 版 · {version.current ? "当前版本" : "可恢复快照"} · {version.updated_at}
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  )}
+                </div>
+                <aside className="document-rail" aria-label="档案工具与索引">
+                  <section className="document-request" aria-label="围绕当前科研档案提问">
+                    <header className="document-request-heading">
+                      <h2>直接描述你想做什么</h2>
+                      <p>例如“补充研究方案”“和新导入论文比对”“梳理证据与假设”或“审查创新性”。</p>
+                    </header>
+                    <form onSubmit={(event) => void submitResearchDocumentRequest(event, activeWorkbenchTab.document)}>
+                      <textarea
+                        value={documentRequest}
+                        onChange={(event) => setDocumentRequest(event.target.value)}
+                        placeholder="例如：结合《论文标题》补充研究方案，或梳理证据与假设…"
+                        rows={3}
+                        disabled={isSending || !activeSessionId}
+                      />
+                      <div>
+                        <span>仅关联相关章节（不塞入全文），写入前保留完整快照。</span>
+                        <button className="button button-primary" type="submit" disabled={!documentRequest.trim() || isSending || !activeSessionId}>
+                          发送给 Agent
+                        </button>
+                      </div>
+                    </form>
+                    {isSending && (
+                      <p className="document-request-status" role="status">Agent 正在处理你的请求，可在「运行检查器」或会话中查看进度。</p>
+                    )}
+                  </section>
+                  <section className="research-ledger" aria-label="研究判断索引">
+                    <header className="research-ledger-heading">
+                      <h2>研究判断索引</h2>
+                      <span>账本修订 {activeWorkbenchTab.document.ledger.ledger_revision}</span>
+                    </header>
+                    <p className="research-ledger-summary">
+                      {activeWorkbenchTab.document.ledger.summary.items} 项判断 · 已支持 {activeWorkbenchTab.document.ledger.summary.supported} · 存在争议 {activeWorkbenchTab.document.ledger.summary.contested} · 待复核 {activeWorkbenchTab.document.ledger.summary.stale_links}
+                    </p>
+                    {activeWorkbenchTab.document.ledger.items.length ? (
+                      <div className="research-ledger-list">
+                        {activeWorkbenchTab.document.ledger.items.map((item) => (
+                          <article className={`research-ledger-item ${item.section_current ? "" : "stale"}`} key={item.item_id}>
+                            <div className="research-ledger-item-meta">
+                              <span>{item.heading}</span>
+                              <span>{ledgerKindLabel(item.kind)} · {ledgerStatusLabel(item.status)}</span>
+                              {!item.section_current && <span className="ledger-stale">正文已改动，需复核</span>}
+                            </div>
+                            <strong>{item.statement}</strong>
+                            {item.falsification && <p>可证伪条件：{item.falsification}</p>}
+                            {item.evidence.length > 0 && (
+                              <ul>
+                                {item.evidence.map((evidence, index) => (
+                                  <li key={`${item.item_id}-${index}`}>
+                                    {ledgerRelationLabel(evidence.relation)}：{evidence.title || evidence.paper_id || "未命名论文"}
+                                    {evidence.page ? ` · 第 ${evidence.page} 页` : ""}
+                                    {evidence.chunk_index !== null ? ` · 切块 ${evidence.chunk_index}` : ""}
+                                    {evidence.note ? ` · ${evidence.note}` : ""}
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </article>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="research-ledger-empty">尚未记录研究判断。可在上方直接要求梳理证据与假设；Agent 会先提出条目，只有你确认后才会写入。</p>
+                    )}
+                  </section>
+                </aside>
               </div>
-                {activeWorkbenchTab.document.versions.length > 1 && (
-                <section className="document-version-history" aria-label="版本历史">
-                  <h2>版本历史</h2>
-                  <p>当前内容及每个写入前的完整快照均可由 Agent 在你确认后恢复。</p>
-                  <ul>
-                    {activeWorkbenchTab.document.versions.map((version) => (
-                      <li key={`${version.revision}-${version.updated_at}`}>
-                        第 {version.revision} 版 · {version.current ? "当前版本" : "可恢复快照"} · {version.updated_at}
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )}
-              <section className="research-ledger" aria-label="证据与假设账本">
-                <header className="research-ledger-heading">
-                  <div>
-                    <p className="eyebrow">研究判断索引</p>
-                    <h2>证据与假设账本</h2>
-                  </div>
-                  <span>账本修订 {activeWorkbenchTab.document.ledger.ledger_revision}</span>
-                </header>
-                <p className="research-ledger-summary">
-                  {activeWorkbenchTab.document.ledger.summary.items} 项判断 · 已支持 {activeWorkbenchTab.document.ledger.summary.supported} · 存在争议 {activeWorkbenchTab.document.ledger.summary.contested} · 待复核 {activeWorkbenchTab.document.ledger.summary.stale_links}
-                </p>
-                {activeWorkbenchTab.document.ledger.items.length ? (
-                  <div className="research-ledger-list">
-                    {activeWorkbenchTab.document.ledger.items.map((item) => (
-                      <article className={`research-ledger-item ${item.section_current ? "" : "stale"}`} key={item.item_id}>
-                        <div className="research-ledger-item-meta">
-                          <span>{item.heading}</span>
-                          <span>{ledgerKindLabel(item.kind)} · {ledgerStatusLabel(item.status)}</span>
-                          {!item.section_current && <span className="ledger-stale">正文已改动，需复核</span>}
-                        </div>
-                        <strong>{item.statement}</strong>
-                        {item.falsification && <p>可证伪条件：{item.falsification}</p>}
-                        {item.evidence.length > 0 && (
-                          <ul>
-                            {item.evidence.map((evidence, index) => (
-                              <li key={`${item.item_id}-${index}`}>
-                                {ledgerRelationLabel(evidence.relation)}：{evidence.title || evidence.paper_id || "未命名论文"}
-                                {evidence.page ? ` · 第 ${evidence.page} 页` : ""}
-                                {evidence.chunk_index !== null ? ` · 切块 ${evidence.chunk_index}` : ""}
-                                {evidence.note ? ` · ${evidence.note}` : ""}
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                      </article>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="research-ledger-empty">尚未记录研究判断。可在上方直接要求梳理证据与假设；Agent 会先提出条目，只有你确认后才会写入。</p>
-                )}
-              </section>
             </article>
           ) : activeWorkbenchTab?.kind === "experiment" ? (
             <article className="document-page experiment-page" aria-label={`论文复现实验：${activeWorkbenchTab.project.paper_title}`}>
@@ -2529,14 +2566,16 @@ export function App() {
           )}
         </section>
 
-        <RunInspector
-          run={currentRun}
-          events={runEvents}
-          onCancel={() => void stopCurrentRun()}
-          onRetry={() => void retryCurrentChat()}
-          onOpenRunCenter={() => void openRunCenter()}
-          cancelling={isCancelling}
-        />
+        {!docFocusMode && (
+          <RunInspector
+            run={currentRun}
+            events={runEvents}
+            onCancel={() => void stopCurrentRun()}
+            onRetry={() => void retryCurrentChat()}
+            onOpenRunCenter={() => void openRunCenter()}
+            cancelling={isCancelling}
+          />
+        )}
       </div>
     </main>
   );

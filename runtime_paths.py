@@ -62,6 +62,11 @@ class RuntimePaths:
         return self.primary_dir / "paper_relations.json"
 
     @property
+    def paper_relation_review_file(self) -> Path:
+        """Derived review state: queued jobs plus relation candidates awaiting confirmation."""
+        return self.derived_dir / "paper_relation_review.json"
+
+    @property
     def derived_dir(self) -> Path:
         return self.root / "derived"
 

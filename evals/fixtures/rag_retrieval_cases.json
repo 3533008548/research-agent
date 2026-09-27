@@ -1,0 +1,414 @@
+{
+  "schema_version": 1,
+  "note": "依据当前已索引论文的真实 chunk 生成。每个 label 的 text_contains 均为对应 chunk 原文的连续子串，chunk_index 与检索结果元数据一致。查询采用中文表述 + 英文术语，贴近真实提问方式。",
+  "cases": [
+    {
+      "id": "C01",
+      "query": "A2P 方案在一个 BSS 内最多能支持多少个站点而不丢包",
+      "note": "考察容量类结论的召回",
+      "labels": [
+        {
+          "paper_title": "A2P: Scalable OFDMA Polling for Time-Sensitive Wi-Fi",
+          "chunk_index": 25,
+          "text_contains": "the number of STAs that we can support without experiencing packet loss"
+        }
+      ]
+    },
+    {
+      "id": "C02",
+      "query": "A2P 中 STA 侧 EDCA 禁用定时器的算法流程是怎样的",
+      "note": "考察机制流程图段落",
+      "labels": [
+        {
+          "paper_title": "A2P: Scalable OFDMA Polling for Time-Sensitive Wi-Fi",
+          "chunk_index": 20,
+          "text_contains": "Flow chart of the algorithmic procedure at the STA side"
+        }
+      ]
+    },
+    {
+      "id": "C03",
+      "query": "把 CBS 换成 ATS 调度器之后最大端到端时延有什么变化",
+      "note": "考察对比实验结论",
+      "labels": [
+        {
+          "paper_title": "ATS and Redundancy: Avoiding Unbounded Latencies",
+          "chunk_index": 39,
+          "text_contains": "we replace CBS with ATS schedulers after the stream recovery function"
+        }
+      ]
+    },
+    {
+      "id": "C04",
+      "query": "FRER 帧复制消除冗余机制造成的非 FIFO 行为对 ATS 有什么影响",
+      "note": "考察问题陈述与动机",
+      "labels": [
+        {
+          "paper_title": "ATS and Redundancy: Avoiding Unbounded Latencies",
+          "chunk_index": 1,
+          "text_contains": "Frame Replication and Elimination for Reliability (FRER)"
+        }
+      ]
+    },
+    {
+      "id": "C05",
+      "query": "DPMSS 场景下的调度问题如何建模，二部图是怎么构造的",
+      "note": "考察算法建模段落",
+      "labels": [
+        {
+          "paper_title": "A Deadline-Aware Scheduler for Smart Factory using WiFi 6",
+          "chunk_index": 28,
+          "text_contains": "we again construct the bipartite graph"
+        }
+      ]
+    },
+    {
+      "id": "C06",
+      "query": "这个面向截止期的工厂调度问题的复杂度是什么，近似算法能达到什么近似比",
+      "note": "考察理论贡献的定位",
+      "labels": [
+        {
+          "paper_title": "A Deadline-Aware Scheduler for Smart Factory using WiFi 6",
+          "chunk_index": 47,
+          "text_contains": "models the scheduling requirements using a system of packets"
+        }
+      ]
+    },
+    {
+      "id": "C07",
+      "query": "TSQ 机制分为哪两个阶段，交换机里的队列是怎么组织的",
+      "note": "考察机制定义",
+      "labels": [
+        {
+          "paper_title": "A Scalable Asynchronous Traffic Shaping Mechanism for TSN with Time Slot and Polling",
+          "chunk_index": 8,
+          "text_contains": "the allocation phase and the polling phase"
+        }
+      ]
+    },
+    {
+      "id": "C08",
+      "query": "TSQ 减少队列数量之后时延性能会变差吗",
+      "note": "考察可扩展性结论",
+      "labels": [
+        {
+          "paper_title": "A Scalable Asynchronous Traffic Shaping Mechanism for TSN with Time Slot and Polling",
+          "chunk_index": 17,
+          "text_contains": "reducing the number of queues and provides similar delay performance"
+        }
+      ]
+    },
+    {
+      "id": "C09",
+      "query": "ATS 的整形时延只施加在整形队列的哪个位置",
+      "note": "考察队首帧的处理细节",
+      "labels": [
+        {
+          "paper_title": "Constant Delay Switching: Asynchronous Traffic Shaping and Jitter Control",
+          "chunk_index": 24,
+          "text_contains": "f1 represents the head of the queue"
+        }
+      ]
+    },
+    {
+      "id": "C10",
+      "query": "周期流量如何用到达曲线参数描述，单跳上如何保证 ATS 时延界成立",
+      "note": "考察流量建模与逐跳约束",
+      "labels": [
+        {
+          "paper_title": "Constant Delay Switching: Asynchronous Traffic Shaping and Jitter Control",
+          "chunk_index": 18,
+          "text_contains": "at every bridge such that the requirements"
+        }
+      ]
+    },
+    {
+      "id": "C11",
+      "query": "IEEE 802.1 TSN 标准族的目标是什么",
+      "note": "考察背景定义",
+      "labels": [
+        {
+          "paper_title": "Data-Driven Optimization of IEEE 802.1Qcr Asynchronous Traffic Shaper Parameters for Automotive Networks",
+          "chunk_index": 8,
+          "text_contains": "deterministic data transmission with real-time requirements over"
+        }
+      ]
+    },
+    {
+      "id": "C12",
+      "query": "802.1Qcr 参数优化的目标函数是怎么定义的",
+      "note": "考察代价函数",
+      "labels": [
+        {
+          "paper_title": "Data-Driven Optimization of IEEE 802.1Qcr Asynchronous Traffic Shaper Parameters for Automotive Networks",
+          "chunk_index": 17,
+          "text_contains": "the following cost function"
+        }
+      ]
+    },
+    {
+      "id": "C13",
+      "query": "评估 rTWT 时用了哪几个性能指标",
+      "note": "考察评测指标定义",
+      "labels": [
+        {
+          "paper_title": "Dedicated Restricted Target Wake Time for Real-Time Applications in Wi-Fi 7",
+          "chunk_index": 21,
+          "text_contains": "We estimate the following 4 performance indicators"
+        }
+      ]
+    },
+    {
+      "id": "C14",
+      "query": "R-TWT 服务周期变长时平均时延和抖动如何变化，重传次数 R 有什么影响",
+      "note": "考察参数敏感性结论",
+      "labels": [
+        {
+          "paper_title": "Dedicated Restricted Target Wake Time for Real-Time Applications in Wi-Fi 7",
+          "chunk_index": 22,
+          "text_contains": "The average delay, jitter and 99.9% delay percentile increase with the R-TWT SP period"
+        }
+      ]
+    },
+    {
+      "id": "C15",
+      "query": "UASPP 相比标准 ATS 在高负载下把 P99 尾时延降低了多少",
+      "note": "考察量化实验结论",
+      "labels": [
+        {
+          "paper_title": "Differentiated Asynchronous Traffic Shaping with Emergency Scheduler Groups and Dynamic Priority Promotion for TSN",
+          "chunk_index": 17,
+          "text_contains": "UASPP drastically suppresses tail latency"
+        }
+      ]
+    },
+    {
+      "id": "C16",
+      "query": "现有 ATS 优化研究存在什么关键空白",
+      "note": "考察相关工作缺口",
+      "labels": [
+        {
+          "paper_title": "Differentiated Asynchronous Traffic Shaping with Emergency Scheduler Groups and Dynamic Priority Promotion for TSN",
+          "chunk_index": 4,
+          "text_contains": "existing research has a critical gap"
+        }
+      ]
+    },
+    {
+      "id": "C17",
+      "query": "这篇论文如何建模由多个 ATS 网桥组成的异步 TSN 网络",
+      "note": "考察网络模型假设",
+      "labels": [
+        {
+          "paper_title": "Flow Prioritization in Asynchronous TSN with Multiple ATS Instances",
+          "chunk_index": 15,
+          "text_contains": "asynchronous TSN network composed of a set of ATS-based TSN bridges"
+        }
+      ]
+    },
+    {
+      "id": "C18",
+      "query": "计算 ATS 最坏情况排队时延时，低优先级流的最大包长如何参与",
+      "note": "考察时延分析公式",
+      "labels": [
+        {
+          "paper_title": "Flow Prioritization in Asynchronous TSN with Multiple ATS Instances",
+          "chunk_index": 18,
+          "text_contains": "In the worst case, the frame of"
+        }
+      ]
+    },
+    {
+      "id": "C19",
+      "query": "InNetScheduler 的核心组件有哪些，各自解决什么问题",
+      "note": "考察方案结构设计",
+      "labels": [
+        {
+          "paper_title": "In-Network Scheduler (InNetScheduler), INFOCOM 2024",
+          "chunk_index": 7,
+          "text_contains": "Load-aware Optimizer"
+        }
+      ]
+    },
+    {
+      "id": "C20",
+      "query": "InNetScheduler 的测试床实验用了什么硬件和网络拓扑",
+      "note": "考察实验平台",
+      "labels": [
+        {
+          "paper_title": "In-Network Scheduler (InNetScheduler), INFOCOM 2024",
+          "chunk_index": 40,
+          "text_contains": "Testbed topology"
+        }
+      ]
+    },
+    {
+      "id": "C21",
+      "query": "这篇论文研究 OFDMA 的主要动机是什么，用了什么应用案例",
+      "note": "考察研究动机",
+      "labels": [
+        {
+          "paper_title": "Latency-Sensitive Networked Control over OFDMA (AIM 2024)",
+          "chunk_index": 11,
+          "text_contains": "we have demonstrated the dual-lift use case"
+        }
+      ]
+    },
+    {
+      "id": "C22",
+      "query": "802.11ax OFDMA 帧触发对时延敏感的实时控制应用有什么影响",
+      "note": "考察主要结论",
+      "labels": [
+        {
+          "paper_title": "Latency-Sensitive Networked Control over OFDMA (AIM 2024)",
+          "chunk_index": 32,
+          "text_contains": "performance impacts of 802.11ax OFDMA frame triggering"
+        }
+      ]
+    },
+    {
+      "id": "C23",
+      "query": "Specht 和 Samii 用什么方法计算优先级队列网络的包时延界",
+      "note": "考察相关工作中的方法对比",
+      "labels": [
+        {
+          "paper_title": "A Theory of Traffic Regulators for Deterministic Networks with Application to Interleaved Regulators",
+          "chunk_index": 4,
+          "text_contains": "Specht and Samii compute a bound on the packet delay"
+        }
+      ]
+    },
+    {
+      "id": "C24",
+      "query": "什么情况下单个流的最坏情况时延会小于系统统一的时延界",
+      "note": "考察时延界的细致区分",
+      "labels": [
+        {
+          "paper_title": "A Theory of Traffic Regulators for Deterministic Networks with Application to Interleaved Regulators",
+          "chunk_index": 40,
+          "text_contains": "may be less than for other"
+        }
+      ]
+    },
+    {
+      "id": "C25",
+      "query": "NIST 用什么测量方法判断 OFDMA 是否被激活",
+      "note": "考察测量方法论",
+      "labels": [
+        {
+          "paper_title": "NISTIR 8506: OFDMA Uplink Activation",
+          "chunk_index": 10,
+          "text_contains": "wireless captures were taken by a NUC"
+        }
+      ]
+    },
+    {
+      "id": "C26",
+      "query": "上行流量达到多大速率时 OFDMA 才会被激活，多个站点时规律是否一致",
+      "note": "考察阈值类实测结论",
+      "labels": [
+        {
+          "paper_title": "NISTIR 8506: OFDMA Uplink Activation",
+          "chunk_index": 11,
+          "text_contains": "the results show the same pattern of OFDMA activation"
+        }
+      ]
+    },
+    {
+      "id": "C27",
+      "query": "802.1Qbz 中 8.6.4 Egress 如何为帧选择输出端口",
+      "note": "考察标准条款细节",
+      "labels": [
+        {
+          "paper_title": "IEEE P802.1Qbz: 802.11 Bridge Ports (draft contribution)",
+          "chunk_index": 4,
+          "text_contains": "the vector of output ports that has been accompanying the frame"
+        }
+      ]
+    },
+    {
+      "id": "C28",
+      "query": "802.1Qbz 里一个 Queue Set 由哪些实体组成",
+      "note": "考察队列集合定义",
+      "labels": [
+        {
+          "paper_title": "IEEE P802.1Qbz: 802.11 Bridge Ports (draft contribution)",
+          "chunk_index": 5,
+          "text_contains": "A Queue Set is a group of"
+        }
+      ]
+    },
+    {
+      "id": "C29",
+      "query": "802.1Q-2022 中 Bridge Delay 对应的管理对象是什么",
+      "note": "考察管理对象与 MIB",
+      "labels": [
+        {
+          "paper_title": "IEEE P802.1Qee: TSN over Wireless (kickoff contribution)",
+          "chunk_index": 3,
+          "text_contains": "12.32 Stream reservation remote management"
+        }
+      ]
+    },
+    {
+      "id": "C30",
+      "query": "按 3GPP 标准，5G 系统如何充当逻辑 TSN 网桥",
+      "note": "考察 5G 与 TSN 桥接架构",
+      "labels": [
+        {
+          "paper_title": "IEEE P802.1Qee: TSN over Wireless (kickoff contribution)",
+          "chunk_index": 1,
+          "text_contains": "the 5G System (5GS) acts as a logical (virtual) TSN bridge"
+        }
+      ]
+    },
+    {
+      "id": "C31",
+      "query": "有 Wi-Fi 5 竞争流量时 OFDMA 相比 CSMA/CA 的时延表现如何",
+      "note": "考察对比实测结论",
+      "labels": [
+        {
+          "paper_title": "Wi-Fi 6: A First Look (SIGMETRICS 2023)",
+          "chunk_index": 40,
+          "text_contains": "compare OFDMA and CSMA/CA latency with various data rates"
+        }
+      ]
+    },
+    {
+      "id": "C32",
+      "query": "为什么客户端数量大时上行 CSMA/CA 时延会急剧上升，OFDMA 为什么更平缓",
+      "note": "考察上行竞争机制解释",
+      "labels": [
+        {
+          "paper_title": "Wi-Fi 6: A First Look (SIGMETRICS 2023)",
+          "chunk_index": 41,
+          "text_contains": "internal contentions among clients, which leads to backoff delay"
+        }
+      ]
+    },
+    {
+      "id": "C33",
+      "query": "WCB 在多跳网络中支持事件触发控制的效果如何",
+      "note": "考察主要贡献总结",
+      "labels": [
+        {
+          "paper_title": "Wireless Control Bus: Event-Triggered Control over Wireless",
+          "chunk_index": 14,
+          "text_contains": "enabling ETC in multi-hop networks"
+        }
+      ]
+    },
+    {
+      "id": "C34",
+      "query": "为什么需要做 CTX 通信与事件触发控制的协同设计",
+      "note": "考察方法论与动机",
+      "labels": [
+        {
+          "paper_title": "Wireless Control Bus: Event-Triggered Control over Wireless",
+          "chunk_index": 10,
+          "text_contains": "the use of CTX in control is hitherto largely unexplored"
+        }
+      ]
+    }
+  ]
+}

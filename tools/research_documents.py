@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from cancellation import raise_if_cancelled
+from paper_artifacts import TITLE_MATCH_THRESHOLD, title_match_score
 from research_documents import RESEARCH_DOSSIER_SECTIONS, ResearchDocumentStore
 from runtime_paths import get_runtime_paths
 
@@ -519,16 +520,38 @@ _SECTION_TEXT = {
 
 
 def _resolve_papers(paper_store, requested: list[str]) -> list[dict] | str:
+    """Resolve requested papers by id or title, tolerating renamed files.
+
+    A readable file name is not a reliable title, so matching is scored and the
+    best candidate wins.  Requiring exactly one match made an indexed paper
+    unresolvable whenever a near-duplicate title existed.
+    """
     available = list(paper_store.list_papers() or [])
     selected = []
     for needle in requested:
-        folded = needle.casefold()
-        exact = [item for item in available if str(item.get("paper_id") or "") == needle or str(item.get("title") or "").casefold() == folded]
-        matches = exact or [item for item in available if folded in str(item.get("paper_id") or "").casefold() or folded in str(item.get("title") or "").casefold()]
-        if len(matches) != 1:
-            options = "；".join(f"{item.get('title')}（{item.get('paper_id')}）" for item in matches[:5])
-            return f"❌ 无法唯一定位论文“{needle}”。{'候选：' + options if options else '请先调用 list_papers 获取论文 ID。'}"
-        selected.append(matches[0])
+        needle = str(needle or "").strip()
+        by_id = next(
+            (item for item in available if needle and needle == str(item.get("paper_id") or "")),
+            None,
+        )
+        if by_id is not None:
+            selected.append(by_id)
+            continue
+        scored = sorted(
+            (
+                (title_match_score(needle, str(item.get("title") or "")), index, item)
+                for index, item in enumerate(available)
+            ),
+            key=lambda entry: (-entry[0], entry[1]),
+        )
+        best_score, _, best = scored[0] if scored else (0.0, 0, None)
+        if best is None or best_score < TITLE_MATCH_THRESHOLD:
+            options = "；".join(
+                f"{item.get('title')}（{item.get('paper_id')}）" for item in available[:5]
+            )
+            hint = f"已索引论文：{options}" if options else "请先调用 list_papers 获取论文 ID。"
+            return f"❌ 未能匹配到论文“{needle}”。{hint}"
+        selected.append(best)
     return selected
 
 
