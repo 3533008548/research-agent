@@ -203,6 +203,12 @@ class ResearchAgent:
                 print("      📚 初始化论文向量库...", file=sys.stderr, flush=True)
                 self._paper_store = PaperStore(
                     persist_dir=cfg.chroma_dir,
+                    embedding_model=cfg.rag_embedding_model,
+                    embedding_dimensions=cfg.rag_embedding_dimensions,
+                    embedding_max_length=cfg.rag_embedding_max_length,
+                    embedding_batch_size=cfg.rag_embedding_batch_size,
+                    embedding_device=cfg.rag_embedding_device,
+                    collection_name=cfg.rag_embedding_collection,
                     reranker_enabled=cfg.rag_reranker_enabled,
                     reranker_model=cfg.rag_reranker_model,
                     reranker_candidate_limit=cfg.rag_reranker_candidate_limit,

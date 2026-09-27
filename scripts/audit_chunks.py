@@ -22,6 +22,10 @@ import pathlib
 import re
 import sys
 
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 
 CHROMA_DIR = pathlib.Path(__file__).resolve().parents[1] / "runtime" / "derived" / "chroma"
@@ -37,7 +41,21 @@ DIMS = [("当前 384 维", 384), ("bge-m3 / Qwen3-0.6B 1024 维", 1024), ("Qwen3
 BYTES_PER_DIM = 4 + 0.13
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default=os.getenv("APP_DATA_DIR", "runtime"))
+    parser.add_argument("--collection", default="papers",
+                        help="要审计的集合名，例如迁移后的 papers_v2")
+    args = parser.parse_args(argv)
+
+    from runtime_paths import RuntimePaths
+
+    paths = RuntimePaths.from_root(args.data_dir)
+    chroma_dir = str(paths.chroma_dir)
+
     try:
         from tokenizers import Tokenizer
         from chromadb.config import Settings
@@ -54,12 +72,12 @@ def main() -> int:
     tok.no_padding()
 
     client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR), settings=Settings(anonymized_telemetry=False)
+        path=chroma_dir, settings=Settings(anonymized_telemetry=False)
     )
     try:
-        docs = client.get_collection("papers").get(include=["documents"])["documents"]
+        docs = client.get_collection(args.collection).get(include=["documents"])["documents"]
     except Exception as exc:  # noqa: BLE001
-        print(f"读取集合失败: {exc}")
+        print(f"读取集合 {args.collection!r} 失败: {exc}")
         return 1
     if not docs:
         print("语料为空")
@@ -77,6 +95,7 @@ def main() -> int:
     r = np.array(ratios)
     zh = sum(1 for x in langs if x == "zh")
 
+    print(f"审计集合: {args.collection}")
     print("=== 1. 语料概况 ===")
     print(f"  切块总数        : {len(docs)}")
     print(f"  语言分布        : 英文 {len(docs) - zh} 块 / 中文 {zh} 块")

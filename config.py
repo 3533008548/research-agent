@@ -22,6 +22,12 @@ _DFLT = {
     "vision_model": "deepseek-flash",
     "pdf_max_pages": 15,
     "rag_enabled": True,
+    "rag_embedding_model": "all-MiniLM-L6-v2",
+    "rag_embedding_dimensions": 384,
+    "rag_embedding_max_length": 256,
+    "rag_embedding_batch_size": 32,
+    "rag_embedding_device": "cpu",
+    "rag_embedding_collection": "papers",
     "rag_reranker_enabled": False,
     "rag_reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
     "rag_reranker_candidate_limit": 20,
@@ -57,6 +63,12 @@ class Config:
 
     pdf_max_pages: int = 15
     rag_enabled: bool = True
+    rag_embedding_model: str = "all-MiniLM-L6-v2"
+    rag_embedding_dimensions: int = 384
+    rag_embedding_max_length: int = 256
+    rag_embedding_batch_size: int = 32
+    rag_embedding_device: str = "cpu"
+    rag_embedding_collection: str = "papers"
     rag_reranker_enabled: bool = False
     rag_reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     rag_reranker_candidate_limit: int = 20
@@ -146,6 +158,26 @@ class Config:
                 if "rag" in yaml_cfg:
                     rag_settings = yaml_cfg["rag"]
                     cfg["rag_enabled"] = rag_settings.get("enabled", cfg["rag_enabled"])
+                    embedding = rag_settings.get("embedding", {})
+                    if isinstance(embedding, dict):
+                        cfg["rag_embedding_model"] = embedding.get(
+                            "model", cfg["rag_embedding_model"],
+                        )
+                        cfg["rag_embedding_dimensions"] = embedding.get(
+                            "dimensions", cfg["rag_embedding_dimensions"],
+                        )
+                        cfg["rag_embedding_max_length"] = embedding.get(
+                            "max_length", cfg["rag_embedding_max_length"],
+                        )
+                        cfg["rag_embedding_batch_size"] = embedding.get(
+                            "batch_size", cfg["rag_embedding_batch_size"],
+                        )
+                        cfg["rag_embedding_device"] = embedding.get(
+                            "device", cfg["rag_embedding_device"],
+                        )
+                        cfg["rag_embedding_collection"] = embedding.get(
+                            "collection", cfg["rag_embedding_collection"],
+                        )
                     reranker = rag_settings.get("reranker", {})
                     if isinstance(reranker, dict):
                         cfg["rag_reranker_enabled"] = reranker.get(
@@ -243,6 +275,22 @@ class Config:
             ieee_api_key=cfg.get("ieee_api_key", "") or os.getenv("IEEE_API_KEY", ""),
             pdf_max_pages=cfg["pdf_max_pages"],
             rag_enabled=cfg["rag_enabled"],
+            rag_embedding_model=str(
+                cfg.get("rag_embedding_model") or _DFLT["rag_embedding_model"]
+            ),
+            rag_embedding_dimensions=max(
+                0, int(cfg.get("rag_embedding_dimensions", 384) or 0),
+            ),
+            rag_embedding_max_length=max(
+                64, int(cfg.get("rag_embedding_max_length", 256) or 256),
+            ),
+            rag_embedding_batch_size=max(
+                1, min(256, int(cfg.get("rag_embedding_batch_size", 32) or 32)),
+            ),
+            rag_embedding_device=str(cfg.get("rag_embedding_device") or "cpu").strip().lower(),
+            rag_embedding_collection=str(
+                cfg.get("rag_embedding_collection") or _DFLT["rag_embedding_collection"]
+            ).strip(),
             rag_reranker_enabled=bool(cfg.get("rag_reranker_enabled", False)),
             rag_reranker_model=str(cfg.get("rag_reranker_model") or _DFLT["rag_reranker_model"]),
             rag_reranker_candidate_limit=max(

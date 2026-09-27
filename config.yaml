@@ -26,6 +26,20 @@ pdf:
   max_pages: 20
 rag:
   enabled: true
+  embedding:
+    # 换嵌入模型只需改这里，无需改代码。
+    # 可选：all-MiniLM-L6-v2（384维/256token，CPU 友好）
+    #       Qwen/Qwen3-Embedding-0.6B（1024维/32k，支持 MRL 降维）
+    model: all-MiniLM-L6-v2
+    # 目标维度。Qwen3 支持 MRL，可降到 512/256 以省存储；填 0 表示用模型原生维度。
+    dimensions: 384
+    # 单个块的 token 上限，超过会被模型截断。Qwen3 可设 8192。
+    max_length: 256
+    batch_size: 32
+    device: cpu
+    # 集合名。换模型迁移时先建 papers_v2，验证通过后改这里切换；
+    # 出问题改回 papers 即可回滚（旧集合不会被删除）。
+    collection: papers_v2
   reranker:
     # 首次使用先运行 scripts/warm_reranker.py；运行时只从本地缓存加载。
     enabled: true

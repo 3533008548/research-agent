@@ -23,7 +23,7 @@ import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 from datetime import datetime
 
 try:
@@ -33,6 +33,10 @@ try:
 except ImportError:
     chromadb = None
     embedding_functions = None
+
+# The embedding backend is injected rather than hard-coded, so switching models
+# is a configuration change.  See embeddings.py for the contract.
+from embeddings import DEFAULT_EMBEDDING_MODEL, Embedder, build_embedder
 
 
 # The local paper corpus is normally modest.  For unusually large collections,
@@ -45,6 +49,165 @@ _PDF_READER_PREAMBLE = "📄 **PDF 解析完成**"
 RELATION_EXPANSION_SEED_LIMIT = 3
 RELATION_EXPANSION_MAX_PAPERS = 8
 RELATION_EXPANSION_RRF_FACTOR = 0.5
+
+# ── 按 token 的分块守卫 ──
+# 字符数无法预测 token 数：实测 token/字符密度在 0.21–0.73 之间波动（约 3.5 倍），
+# 因为公式、参考文献、非拉丁字符都会让密度飙升。因此按字符切好的块，
+# 仍需在编码前按模型真实的 token 上限复核，超限的再切一次，
+# 否则模型会静默丢掉尾部（当前模型下 45% 的块受影响）。
+
+def _longest_prefix_chars(text: str, tokenize, max_tokens: int) -> int:
+    """返回仍在 max_tokens 之内的最长前缀长度（字符）。"""
+    if len(tokenize(text)) <= max_tokens:
+        return len(text)
+    lo, hi = 1, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(tokenize(text[:mid])) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return max(1, lo)
+
+
+def _overlap_chars(piece: str, tokenize, overlap_tokens: int) -> int:
+    """返回 piece 末尾承载最后 overlap_tokens 个字符数（用于保留重叠）。"""
+    total = len(tokenize(piece))
+    target = max(0, total - overlap_tokens)
+    if target == 0:
+        return 0
+    lo, hi = 1, len(piece)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if len(tokenize(piece[:mid])) >= target:
+            hi = mid
+        else:
+            lo = mid + 1
+    return max(0, len(piece) - lo)
+
+
+def split_oversized_text(
+    text: str,
+    tokenize,
+    max_tokens: int,
+    overlap_tokens: int = 32,
+) -> list[tuple[int, str]]:
+    """把超长文本切成 (在原文本中的偏移, 片段) 列表，每片都不超过 token 上限。"""
+    if len(tokenize(text)) <= max_tokens:
+        return [(0, text)]
+    pieces: list[tuple[int, str]] = []
+    start = 0
+    guard = 0
+    while start < len(text) and guard < 500:
+        guard += 1
+        remaining = text[start:]
+        end = _longest_prefix_chars(remaining, tokenize, max_tokens)
+        piece = remaining[:end].strip()
+        if piece:
+            pieces.append((start, piece))
+        if end >= len(remaining):
+            break
+        keep = _overlap_chars(remaining[:end], tokenize, overlap_tokens)
+        start += max(1, end - keep)
+    return pieces
+
+
+def limit_chunks_to_tokens(
+    chunks: list[dict],
+    tokenize,
+    max_tokens: int,
+    overlap_tokens: int = 32,
+) -> list[dict]:
+    """对超过模型 token 上限的块做二次切分，避免尾部被静默截断。
+
+    tokenize 不可用或 max_tokens <= 0 时原样返回，保证降级路径安全。
+    """
+    if tokenize is None or max_tokens <= 0:
+        return list(chunks)
+    limited: list[dict] = []
+    for chunk in chunks:
+        text = chunk.get("text") or ""
+        if not text:
+            continue
+        pieces = split_oversized_text(text, tokenize, max_tokens, overlap_tokens)
+        unchanged = len(pieces) == 1 and pieces[0][0] == 0 and pieces[0][1] == text
+        if unchanged:
+            limited.append(chunk)
+            continue
+        base = int(chunk.get("char_start") or 0)
+        for index, (offset, piece) in enumerate(pieces):
+            limited.append({
+                **chunk,
+                "text": piece,
+                "index": index,
+                "char_start": base + offset,
+                "char_end": base + offset + len(piece),
+            })
+    return limited
+
+
+class PaperStoreProtocol(Protocol):
+    """论文库的公共契约。
+
+    :class:`PaperStore` 与 :class:`NoOpStore` 都必须提供这些方法。
+    把它显式写出来，是为了让"接口"有唯一定义处：新增能力时只改这里，
+    并由 tests 校验两个实现都补齐，避免两份方法列表手工同步时漏改。
+    """
+
+    paper_count: int
+    chunk_count: int
+
+    def query(
+        self,
+        query_text: str,
+        top_k: int = 3,
+        paper_ids: Optional[list[str]] = None,
+        section: Optional[str] = None,
+    ) -> list[dict]: ...
+
+    def query_hybrid(
+        self,
+        query_text: str,
+        top_k: int = 3,
+        paper_ids: Optional[list[str]] = None,
+        section: Optional[str] = None,
+    ) -> list[dict]: ...
+
+    def query_with_timeout(self, query_text: str, **kwargs: Any) -> tuple[list[dict], Any]: ...
+
+    def start_embedding_warmup(self) -> Any: ...
+
+    def index_paper(
+        self,
+        text: str,
+        title: str = "Unknown",
+        paper_id: Optional[str] = None,
+    ) -> str: ...
+
+    def index_document_map(self, document_map: dict, **kwargs: Any) -> str: ...
+
+    def list_papers(self) -> list[dict]: ...
+
+    def delete_paper(self, paper_id: str) -> int: ...
+
+    def get_paper_chunks(self, paper_id: str) -> list[dict]: ...
+
+
+# 集合名可配置，便于换模型时并行建新集合（如 papers_v2）再切换，旧集合留作回滚备份。
+DEFAULT_COLLECTION_NAME = "papers"
+
+# ── 检索调参：集中定义，避免魔数散落在各个方法里 ──
+# 稠密召回的过取倍数：多取候选，供章节加权重排后再截断。
+SEMANTIC_CANDIDATE_FACTOR = 3
+# 混合召回的过取倍数：需要足够候选喂给 RRF 融合与精排。
+HYBRID_CANDIDATE_FACTOR = 4
+# 命中这些关键词的章节视为"方法/实验类"，在排序时给一点距离折扣。
+SECTION_PRIORITY_TERMS = ("method", "experiment", "evaluation", "result", "proposed")
+SECTION_PRIORITY_BONUS = 0.05
+# BM25 参数：k1 控制词频饱和，b 控制长度归一化强度，scale 只影响量纲。
+BM25_K1 = 1.5
+BM25_B = 0.75
+BM25_SCALE = 2.5
 
 
 def clean_index_text(text: str) -> str:
@@ -215,12 +378,16 @@ def chunk_text(
 
 class PaperStore:
     """
-    论文向量存储 — 基于 ChromaDB + SentenceTransformer。
+    论文向量存储 — ChromaDB + 可插拔嵌入后端。
+
+    向量化由注入的 Embedder 完成（见 embeddings.py），本类不绑定任何具体模型。
+    默认后端是 ChromaDB 内置 ONNX all-MiniLM-L6-v2（384 维，纯 CPU）；
+    换成 Qwen3-Embedding 只需改 config.yaml 的 rag.embedding，无需改动本文件。
 
     存储结构:
       APP_DATA_DIR/derived/chroma/
         └── collection "papers"
-              ├── embedding: 384维向量 (all-MiniLM-L6-v2)
+              ├── embedding: 维度由 embedder 决定（当前默认 384 维）
               ├── metadata: {paper_id, title, chunk_index, char_start, char_end}
               └── document: 块文本
     """
@@ -231,6 +398,13 @@ class PaperStore:
         self,
         persist_dir: str | None = None,
         *,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_dimensions: int = 0,
+        embedding_max_length: int = 0,
+        embedding_batch_size: int = 32,
+        embedding_device: str = "cpu",
+        embedder: Embedder | None = None,
+        collection_name: str = DEFAULT_COLLECTION_NAME,
         reranker_enabled: bool = False,
         reranker_model: str = DEFAULT_RERANKER_MODEL,
         reranker_candidate_limit: int = HYBRID_CANDIDATE_LIMIT,
@@ -248,13 +422,23 @@ class PaperStore:
         persist_dir = persist_dir.resolve()
         self.persist_dir = str(persist_dir)
 
-        # 使用 ChromaDB 内置 ONNX 嵌入（all-MiniLM-L6-v2, ~80MB, 纯 CPU）
-        # 首次运行自动下载模型，之后本地缓存，无需安装 sentence-transformers
+        # 嵌入后端可插拔：未显式注入时按配置名构建。
+        # 默认后端（ChromaDB 内置 ONNX）在首次调用时才真正加载权重，之后本地缓存。
+        self._embed_fn: Embedder = embedder or build_embedder(
+            embedding_model,
+            dimensions=embedding_dimensions,
+            max_length=embedding_max_length,
+            batch_size=embedding_batch_size,
+            device=embedding_device,
+        )
+        self.embedding_model_name = self._embed_fn.model_name
+        self.embedding_dimensions = self._embed_fn.dimensions
+        self.embedding_max_length = self._embed_fn.max_length
         print(
-            f"      [Embedding] 加载 ChromaDB ONNX 模型...",
+            f"      [Embedding] {self.embedding_model_name} "
+            f"({self.embedding_dimensions} 维 / {self.embedding_max_length} token)...",
             end="", flush=True, file=sys.stderr,
         )
-        self._embed_fn = embedding_functions.DefaultEmbeddingFunction()
         print(" 完成", file=sys.stderr)
 
         # 初始化 ChromaDB（持久化模式）
@@ -264,8 +448,9 @@ class PaperStore:
         )
 
         # 获取或创建 collection（注入嵌入函数）
+        self.collection_name = collection_name or DEFAULT_COLLECTION_NAME
         self._collection = self._chroma.get_or_create_collection(
-            name=self.COLLECTION_NAME,
+            name=self.collection_name,
             embedding_function=self._embed_fn,
             metadata={"hnsw:space": "cosine"},
         )
@@ -305,7 +490,35 @@ class PaperStore:
         if not text:
             return ""
 
-        return self._index_chunks(chunk_text(text), title=title, paper_id=paper_id)
+        return self._index_chunks(
+            self._fit_chunks(chunk_text(text)), title=title, paper_id=paper_id,
+        )
+
+    def index_chunks(
+        self,
+        chunks: list[dict],
+        *,
+        title: str = "Unknown",
+        paper_id: Optional[str] = None,
+    ) -> str:
+        """Index pre-built chunks (used by the migration script).
+
+        与 index_paper 的区别只是跳过分块；token 守卫仍会执行。
+        """
+        if not chunks:
+            return ""
+        return self._index_chunks(self._fit_chunks(list(chunks)), title=title, paper_id=paper_id)
+
+    def _fit_chunks(self, chunks: list[dict]) -> list[dict]:
+        """Re-split chunks the embedding model would otherwise truncate.
+
+        分块是按字符切的，而模型按 token 截断，两者无法换算（密度波动约 3.5 倍），
+        所以入库前必须用模型自己的分词器复核一次。
+        """
+        tokenize = getattr(self._embed_fn, "tokenize", None)
+        if tokenize is None:
+            return chunks
+        return limit_chunks_to_tokens(chunks, tokenize, self.embedding_max_length)
 
     def index_document_map(
         self,
@@ -317,7 +530,7 @@ class PaperStore:
         """Index page-scoped chunks created by ``paper_artifacts.build_document_map``."""
         resolved_title = str(document_map.get("title") or title)
         resolved_id = str(document_map.get("paper_id") or paper_id or "") or None
-        chunks = list(document_map.get("chunks") or [])
+        chunks = self._fit_chunks(list(document_map.get("chunks") or []))
         resolved_id = self._index_chunks(chunks, title=resolved_title, paper_id=resolved_id)
         self._queue_relation_review(resolved_id, resolved_title, document_map)
         return resolved_id
@@ -439,21 +652,24 @@ class PaperStore:
         # 检索
         raw = self._collection.query(
             query_texts=[query_text],
-            n_results=min(collection_count, top_k * 3),  # 多取一些用于章节加权
+            n_results=min(collection_count, top_k * SEMANTIC_CANDIDATE_FACTOR),
             where=where,
             include=["documents", "metadatas", "distances"],
         )
 
         # 整理结果 + 章节加权（Method/Experiments 优先）
-        WEIGHT_SECTIONS = {"method", "experiment", "evaluation", "result", "proposed"}
         results = []
         if raw["ids"] and raw["ids"][0]:
             for i, doc_id in enumerate(raw["ids"][0]):
                 meta = raw["metadatas"][0][i] if raw["metadatas"] and raw["metadatas"][0] else {}
                 dist = raw["distances"][0][i] if raw["distances"] and raw["distances"][0] else 0
                 sec = meta.get("section", "未标注")
-                # 章节加权：Method 类章节距离减 0.05
-                weight_penalty = 0.05 if any(w in sec.lower() for w in WEIGHT_SECTIONS) else 0
+                # 章节加权：方法/实验类章节给一点距离折扣（余弦距离越小越近）
+                weight_penalty = (
+                    SECTION_PRIORITY_BONUS
+                    if any(term in sec.lower() for term in SECTION_PRIORITY_TERMS)
+                    else 0
+                )
                 results.append({
                     "text": raw["documents"][0][i] if raw["documents"] and raw["documents"][0] else "",
                     "section": sec,
@@ -790,7 +1006,7 @@ class PaperStore:
         candidate_k = min(
             HYBRID_CANDIDATE_LIMIT,
             max(
-                top_k * 4,
+                top_k * HYBRID_CANDIDATE_FACTOR,
                 getattr(self, "_reranker_candidate_limit", 0)
                 if getattr(self, "_reranker_enabled", False) else 0,
             ),
@@ -909,8 +1125,10 @@ class PaperStore:
                     continue
                 idf = math.log(1 + (document_count - document_frequency[term] + 0.5) /
                                (document_frequency[term] + 0.5))
-                denominator = frequency + 1.5 * (1 - 0.75 + 0.75 * length / average_length)
-                score += idf * frequency * 2.5 / denominator
+                denominator = frequency + BM25_K1 * (
+                    1 - BM25_B + BM25_B * length / average_length
+                )
+                score += idf * frequency * BM25_SCALE / denominator
             item["keyword_score"] = round(score, 6)
 
         candidates = [item for item in candidates if item["keyword_score"] > 0]
@@ -1013,7 +1231,15 @@ class PaperStore:
 # ═══════════════════════════════════════════════════════════════
 
 class NoOpStore:
-    """空操作存储 — ChromaDB 离线时保持 Agent 可用"""
+    """空操作存储 — ChromaDB 离线时保持 Agent 可用。
+
+    实现 :class:`PaperStoreProtocol` 的全部方法。
+    每个方法都返回"空但类型正确"的值，避免调用方拿到 None 后崩溃；
+    新增协议方法时必须同步补这里（有测试校验，见 tests/test_core.py）。
+    """
+    paper_count = 0
+    chunk_count = 0
+
     def query(self, *a, **kw): return []
     def query_hybrid(self, *a, **kw): return []
     def query_with_timeout(self, *a, **kw): return [], None
@@ -1022,8 +1248,7 @@ class NoOpStore:
     def index_document_map(self, *a, **kw): return ""
     def list_papers(self): return []
     def delete_paper(self, *a, **kw): return 0
-    paper_count = 0
-    chunk_count = 0
+    def get_paper_chunks(self, *a, **kw): return []
 
 
 # ═══════════════════════════════════════════════════════════════

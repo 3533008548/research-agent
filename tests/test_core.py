@@ -5579,5 +5579,97 @@ class TestRagRetrievalEvaluation(unittest.TestCase):
                 load_cases(manifest)
 
 
+class TestPaperStoreProtocol(unittest.TestCase):
+    """Both store implementations must satisfy the shared protocol."""
+
+    def _protocol_members(self):
+        from paper_store import PaperStoreProtocol
+
+        members = set(PaperStoreProtocol.__protocol_attrs__)
+        # __protocol_attrs__ only lists members declared in the Protocol body.
+        if not members:
+            members = {
+                name for name in vars(PaperStoreProtocol)
+                if not name.startswith("_")
+            }
+        return members
+
+    def test_paper_store_implements_protocol(self):
+        from paper_store import PaperStore
+
+        missing = [name for name in sorted(self._protocol_members())
+                   if not hasattr(PaperStore, name)]
+        self.assertEqual([], missing, f"PaperStore 缺少协议方法: {missing}")
+
+    def test_noop_store_implements_protocol(self):
+        from paper_store import NoOpStore
+
+        missing = [name for name in sorted(self._protocol_members())
+                   if not hasattr(NoOpStore, name)]
+        self.assertEqual([], missing, f"NoOpStore 缺少协议方法: {missing}")
+
+    def test_noop_store_returns_typed_empty_values(self):
+        """A disabled store must degrade, not return None and crash callers."""
+        from paper_store import NoOpStore
+
+        store = NoOpStore()
+        self.assertEqual([], store.query("anything"))
+        self.assertEqual([], store.query_hybrid("anything"))
+        self.assertEqual(([], None), store.query_with_timeout("anything"))
+        self.assertEqual([], store.list_papers())
+        self.assertEqual([], store.get_paper_chunks("paper-1"))
+        self.assertEqual(0, store.delete_paper("paper-1"))
+        self.assertEqual(0, store.paper_count)
+
+    def test_embedder_is_injectable(self):
+        """The store must accept an explicit embedder instead of hard-coding one."""
+        import tempfile
+
+        from embeddings import MiniLMEmbedder
+        from paper_store import PaperStore
+
+        embedder = MiniLMEmbedder()
+        store = PaperStore(persist_dir=tempfile.mkdtemp(), embedder=embedder)
+        self.assertIs(embedder, store._embed_fn)
+        self.assertEqual(embedder.model_name, store.embedding_model_name)
+
+
+    def test_tokenizer_counts_full_length(self):
+        """The tokenizer must not silently cap counts at its shipped truncation."""
+        from embeddings import MiniLMEmbedder
+
+        tokenize = MiniLMEmbedder().tokenize
+        if tokenize is None:
+            self.skipTest("tokenizer 不可用")
+        text = "alpha beta gamma delta epsilon zeta eta theta. " * 60
+        self.assertGreater(len(tokenize(text)), 128)
+
+    def test_oversized_chunks_are_split_to_the_token_ceiling(self):
+        """Character chunking cannot predict tokens, so oversize is re-split."""
+        from embeddings import MiniLMEmbedder
+        from paper_store import limit_chunks_to_tokens
+
+        tokenize = MiniLMEmbedder().tokenize
+        if tokenize is None:
+            self.skipTest("tokenizer 不可用")
+        long_text = "alpha beta gamma delta epsilon zeta eta theta. " * 60
+        self.assertGreater(len(tokenize(long_text)), 256)
+
+        chunks = [{"text": long_text, "char_start": 0, "char_end": len(long_text)}]
+        split = limit_chunks_to_tokens(chunks, tokenize, 256)
+        self.assertGreater(len(split), 1)
+        for item in split:
+            self.assertLessEqual(len(tokenize(item["text"])), 256)
+        # No content is dropped: every piece is a slice of the original.
+        self.assertTrue(all(item["text"] in long_text for item in split))
+
+    def test_token_guard_is_a_noop_when_tokenizer_missing(self):
+        from paper_store import limit_chunks_to_tokens
+
+        chunks = [{"text": "short chunk", "char_start": 0}]
+        self.assertEqual(chunks, limit_chunks_to_tokens(chunks, None, 256))
+        self.assertEqual(chunks, limit_chunks_to_tokens(chunks, lambda t: [1], 0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
