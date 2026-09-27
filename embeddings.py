@@ -291,10 +291,22 @@ class Qwen3Embedder:
         return self._encode(texts)
 
     def tokenize(self, text: str) -> list[int] | None:
-        try:
-            return list(self._model.tokenizer.encode(text).ids)
-        except Exception:  # noqa: BLE001 - tokenizer shape varies by version
+        """Token ids from the loaded tokenizer, or None when it is unavailable.
+
+        sentence-transformers exposes two tokenizer shapes depending on its
+        version and the checkpoint: an object whose ``encode`` returns an
+        ``Encoding`` (with ``.ids``), or a bare transformers tokenizer that
+        returns a plain list.  Both must be handled — losing the ids silently
+        disables the token-based chunk guard and reintroduces silent truncation.
+        """
+        tokenizer = getattr(getattr(self, "_model", None), "tokenizer", None)
+        if tokenizer is None:
             return None
+        try:
+            encoded = tokenizer.encode(text)
+        except Exception:  # noqa: BLE001 - never let counting break indexing
+            return None
+        return list(getattr(encoded, "ids", encoded))
 
     @classmethod
     def name(cls) -> str:

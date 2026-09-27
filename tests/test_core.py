@@ -5707,5 +5707,46 @@ class TestPaperStoreProtocol(unittest.TestCase):
         self.assertEqual(chunks, limit_chunks_to_tokens(chunks, lambda t: [1], 0))
 
 
+class TestQwen3TokenizerCompatibility(unittest.TestCase):
+    """The chunk guard needs token ids whatever tokenizer shape ST exposes."""
+
+    @staticmethod
+    def _embedder_with(tokenizer):
+        from embeddings import Qwen3Embedder
+
+        # Skip __init__: constructing the real backend would download weights.
+        embedder = Qwen3Embedder.__new__(Qwen3Embedder)
+        embedder._model = type("_Model", (), {"tokenizer": tokenizer})()
+        return embedder
+
+    def test_accepts_encoding_objects(self):
+        """Older sentence-transformers returns an Encoding carrying ``.ids``."""
+
+        class _EncodingTokenizer:
+            def encode(self, text: str):
+                return type("Encoding", (), {"ids": [1, 2, 3]})()
+
+        embedder = self._embedder_with(_EncodingTokenizer())
+        self.assertEqual([1, 2, 3], embedder.tokenize("anything"))
+
+    def test_accepts_plain_id_lists(self):
+        """transformers tokenizers return a bare list instead."""
+
+        class _ListTokenizer:
+            def encode(self, text: str):
+                return [7, 8]
+
+        embedder = self._embedder_with(_ListTokenizer())
+        self.assertEqual([7, 8], embedder.tokenize("anything"))
+
+    def test_returns_none_when_unavailable(self):
+        class _BrokenTokenizer:
+            def encode(self, text: str):
+                raise RuntimeError("no such file")
+
+        self.assertIsNone(self._embedder_with(_BrokenTokenizer()).tokenize("x"))
+        self.assertIsNone(self._embedder_with(None).tokenize("x"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
