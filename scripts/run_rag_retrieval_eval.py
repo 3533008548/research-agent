@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="要评测的集合名；留空沿用 config.yaml 的 rag.embedding.collection"
              "（模型对比时用它指向探针集合，例如 papers_qwen3_probe）",
     )
+    parser.add_argument(
+        "--model",
+        default="",
+        help="查询侧的嵌入模型；留空沿用 config。评测非默认集合时必须显式指定，"
+             "否则查询向量维度与集合维度不匹配会直接报错",
+    )
+    parser.add_argument("--max-length", type=int, default=0, help="查询侧的 token 上限；0 用模型默认")
     parser.add_argument("--output", help="报告 JSON 路径；默认写入被 Git 忽略的 evals/reports/")
     parser.add_argument("--no-write", action="store_true", help="只打印摘要，不保存报告")
     return parser
@@ -72,6 +79,12 @@ def main(argv: list[str] | None = None) -> int:
         }
         if args.collection:
             options["collection_name"] = args.collection
+        if args.model:
+            from embeddings import build_embedder
+
+            options["embedder"] = build_embedder(
+                args.model, max_length=args.max_length, device="cpu",
+            )
         store = PaperStore(
             persist_dir=str(persist_dir) if persist_dir else None,
             **options,
