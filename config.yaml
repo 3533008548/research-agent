@@ -41,9 +41,10 @@ rag:
     max_length: 512
     batch_size: 32
     device: cpu
-    # 集合名。当前 papers 是 512 上限重建后的版本（17 篇 / 794 块）；
-    # papers_v2 保留 256 上限的旧版本（17 篇 / 1158 块）作回滚备份，
-    # 出问题改回 papers_v2（同时把 max_length 改回 256）即可。
+    # 集合名。papers 是 512 上限重建后的版本（17 篇 / 794 块）。
+    # 256 上限的旧集合 papers_v2 已删除：需要回退时把 max_length 改回 256，
+    # 再用 scripts/build_length_probe.py 重建即可（约 48 秒），
+    # 原始分块数据始终保留在 runtime/derived/paper_artifacts/*/document_map.json。
     collection: papers
   reranker:
     # 首次使用先运行 scripts/warm_reranker.py；运行时只从本地缓存加载。
