@@ -33,13 +33,18 @@ rag:
     model: all-MiniLM-L6-v2
     # 目标维度。Qwen3 支持 MRL，可降到 512/256 以省存储；填 0 表示用模型原生维度。
     dimensions: 384
-    # 单个块的 token 上限，超过会被模型截断。Qwen3 可设 8192。
-    max_length: 256
+    # 单个块的 token 上限，超过会被模型截断。
+    # 256 只是 sentence-transformers / ChromaDB 的约定：MiniLM 的 ONNX 图
+    # 实际有 512 个位置编码（实测 512 可跑、514 报广播失败）。
+    # 放开到 512 后，原始逻辑块（中位 247 token）基本不用再被守卫切开，
+    # 段落级 R@1 从 5.9% 回到 38.2%，块数少 31%。Qwen3 可设更大。
+    max_length: 512
     batch_size: 32
     device: cpu
-    # 集合名。换模型迁移时先建 papers_v2，验证通过后改这里切换；
-    # 出问题改回 papers 即可回滚（旧集合不会被删除）。
-    collection: papers_v2
+    # 集合名。当前 papers 是 512 上限重建后的版本（17 篇 / 794 块）；
+    # papers_v2 保留 256 上限的旧版本（17 篇 / 1158 块）作回滚备份，
+    # 出问题改回 papers_v2（同时把 max_length 改回 256）即可。
+    collection: papers
   reranker:
     # 首次使用先运行 scripts/warm_reranker.py；运行时只从本地缓存加载。
     enabled: true
