@@ -137,16 +137,23 @@ class MiniLMOnnxEncoder:
     uses ChromaDB's own wrapper instead.
     """
 
+    # sentence-transformers and ChromaDB both pin this model to 256, but the
+    # ONNX graph itself carries 512 position embeddings — verified: 512 token
+    # inputs run, 514 raises.  256 is a convention, not a model limit.
     MAX_LENGTH = 256
+    HARD_MAX_LENGTH = 512
 
-    def __init__(self, batch_size: int = 32, threads: int = 0) -> None:
+    def __init__(
+        self, batch_size: int = 32, threads: int = 0, max_length: int = 0
+    ) -> None:
         import numpy as np
         import onnxruntime
         from tokenizers import Tokenizer
 
+        self._max_length = self._resolve_max_length(max_length)
         tokenizer = Tokenizer.from_file(str(_MINILM_TOKENIZER_PATH))
-        # Same bounds ChromaDB uses: truncate at 256, then pad per batch below.
-        tokenizer.enable_truncation(max_length=self.MAX_LENGTH)
+        # Truncate at the configured ceiling, then pad per batch below.
+        tokenizer.enable_truncation(max_length=self._max_length)
         tokenizer.no_padding()
         self._tokenizer = tokenizer
         self._np = np
@@ -166,6 +173,17 @@ class MiniLMOnnxEncoder:
             sess_options=options,
             providers=["CPUExecutionProvider"],
         )
+
+    @classmethod
+    def _resolve_max_length(cls, max_length: int) -> int:
+        """Clamp a requested ceiling to what the ONNX graph can address.
+
+        Zero, negative, and missing values all mean "use the historical 256".
+        """
+        requested = int(max_length or 0)
+        if requested <= 0:
+            requested = cls.MAX_LENGTH
+        return min(requested, cls.HARD_MAX_LENGTH)
 
     def __call__(self, texts: Sequence[str]) -> list[list[float]]:
         np = self._np
@@ -210,22 +228,25 @@ class MiniLMOnnxEncoder:
         return [vector for vector in vectors if vector is not None]
 
 
-# One process-wide pipeline: building the session costs about half a second, so
-# every store in the process shares it.  ``False`` caches "construction failed"
-# so an offline host does not retry on every call.
-_MINILM_ONNX: Any = None
+# One process-wide pipeline per token ceiling: building the session costs about
+# half a second, so every store in the process shares it.  The ceiling is part of
+# the key because it is baked into the tokenizer's truncation.  ``False`` caches
+# "construction failed" so an offline host does not retry on every call.
+_MINILM_ONNX: dict[int, Any] = {}
 _MINILM_ONNX_LOCK = threading.Lock()
 
 
-def _load_minilm_onnx(batch_size: int = 32, threads: int = 0) -> Any:
+def _load_minilm_onnx(
+    batch_size: int = 32, threads: int = 0, max_length: int = 0
+) -> Any:
     """Return the shared fast encoder, or ``False`` when it cannot be built."""
-    global _MINILM_ONNX
-    if _MINILM_ONNX is None:
+    key = MiniLMOnnxEncoder._resolve_max_length(max_length)
+    if key not in _MINILM_ONNX:
         with _MINILM_ONNX_LOCK:
-            if _MINILM_ONNX is None:
+            if key not in _MINILM_ONNX:
                 try:
-                    _MINILM_ONNX = MiniLMOnnxEncoder(
-                        batch_size=batch_size, threads=threads
+                    _MINILM_ONNX[key] = MiniLMOnnxEncoder(
+                        batch_size=batch_size, threads=threads, max_length=key
                     )
                 except Exception as exc:  # noqa: BLE001 - no weights, no runtime
                     print(
@@ -233,8 +254,8 @@ def _load_minilm_onnx(batch_size: int = 32, threads: int = 0) -> Any:
                         f"（{type(exc).__name__}: {exc}），改用 ChromaDB 默认通道",
                         file=sys.stderr,
                     )
-                    _MINILM_ONNX = False
-    return _MINILM_ONNX
+                    _MINILM_ONNX[key] = False
+    return _MINILM_ONNX[key]
 
 
 class MiniLMEmbedder:
@@ -245,7 +266,9 @@ class MiniLMEmbedder:
     unavailable.
     """
 
-    def __init__(self, batch_size: int = 32, threads: int = 0) -> None:
+    def __init__(
+        self, batch_size: int = 32, threads: int = 0, max_length: int = 0
+    ) -> None:
         from chromadb.utils import embedding_functions
 
         # Kept as the compatibility surface: ChromaDB persists "default" as the
@@ -254,6 +277,7 @@ class MiniLMEmbedder:
         self._fn = embedding_functions.DefaultEmbeddingFunction()
         self._batch_size = max(1, int(batch_size or 32))
         self._threads = max(0, int(threads or 0))
+        self._max_length = MiniLMOnnxEncoder._resolve_max_length(max_length)
 
     @property
     def model_name(self) -> str:
@@ -265,11 +289,11 @@ class MiniLMEmbedder:
 
     @property
     def max_length(self) -> int:
-        # Verified empirically: inputs beyond 256 tokens are discarded.
-        return 256
+        """Token ceiling in force.  512 is the ONNX graph's real limit."""
+        return self._max_length
 
     def __call__(self, input: Sequence[str]) -> list[list[float]]:
-        model = _load_minilm_onnx(self._batch_size, self._threads)
+        model = _load_minilm_onnx(self._batch_size, self._threads, self._max_length)
         if model is False:
             return self._fn(list(input))
         try:

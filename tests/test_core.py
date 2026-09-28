@@ -5919,16 +5919,27 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
         embedder = MiniLMEmbedder.__new__(MiniLMEmbedder)
         embedder._batch_size = 32
         embedder._threads = 0
+        embedder._max_length = 256
         embedder._fn = lambda texts: [[0.0, 1.0] for _ in texts]
 
         import embeddings
 
         original = embeddings._MINILM_ONNX
-        embeddings._MINILM_ONNX = False
+        embeddings._MINILM_ONNX = {256: False}
         try:
             self.assertEqual([[0.0, 1.0]], embedder(["anything"]))
         finally:
             embeddings._MINILM_ONNX = original
+
+    def test_max_length_clamps_to_the_onnx_position_limit(self):
+        """256 is a sentence-transformers convention; the graph holds 512."""
+        from embeddings import MiniLMEmbedder, MiniLMOnnxEncoder
+
+        self.assertEqual(MiniLMEmbedder(max_length=512).max_length, 512)
+        self.assertEqual(MiniLMEmbedder(max_length=4096).max_length, 512)
+        self.assertEqual(MiniLMEmbedder().max_length, 256)
+        self.assertEqual(MiniLMOnnxEncoder._resolve_max_length(0), 256)
+        self.assertEqual(MiniLMOnnxEncoder._resolve_max_length(-1), 256)
 
 
 if __name__ == "__main__":
