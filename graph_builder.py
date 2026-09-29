@@ -120,6 +120,40 @@ def sanitize_model_messages(
 #  build_graph
 # ═══════════════════════════════════════════════════════════════
 
+def tool_rounds_in(messages: list[dict]) -> int:
+    """Count tool-issuing assistant turns, scoped to the latest user turn.
+
+    Rounds are counted per assistant message that carries ``tool_calls`` rather
+    than per individual call: a model asking for three tools at once has spent
+    one round, not three.
+    """
+    turn_start = max(
+        (index for index, message in enumerate(messages)
+         if message.get("role") == "user"),
+        default=-1,
+    )
+    return sum(
+        1 for index, message in enumerate(messages)
+        if message.get("role") == "assistant" and message.get("tool_calls")
+        and index > turn_start
+    )
+
+
+def budget_exhaustion_warning(remaining: int) -> dict:
+    """A system nudge asking the model to finish before recursion cuts it off."""
+    return {
+        "role": "system",
+        "content": (
+            "[预算提醒]\n"
+            f"本轮的工具调用预算还剩 {remaining} 次，之后系统会强制结束。\n"
+            "不要再发起探索性或重试性的工具调用。请立即基于已获得的信息作答：\n"
+            "1) 说清楚已经完成的部分；"
+            "2) 若任务没做完，明确列出剩下要做的步骤，并说明下一步应从哪里继续；\n"
+            "3) 不要提交内容不完整或被截断的补丁。"
+        ),
+    }
+
+
 def build_graph(
     api_key: str,
     api_url: str = "https://api.deepseek.com/chat/completions",
@@ -141,6 +175,10 @@ def build_graph(
     enable_verify: bool = True,
     request_policy: RequestPolicy | None = None,
     max_tool_rounds: int | None = None,
+    # Soft budget used only to warn the model before the hard recursion limit
+    # fires.  Without it a long task dies with GraphRecursionError and the
+    # partial work is never surfaced to the user.
+    tool_round_budget: int | None = None,
     tool_argument_normalizer: Callable[[str, dict], dict] | None = None,
     tool_context: ToolExecutionContext | None = None,
     force_tool_name: str | None = None,
@@ -579,22 +617,28 @@ def build_graph(
         losing them to a graph recursion error when a model keeps searching.
         """
         if max_tool_rounds is not None:
-            current_turn_start = max(
-                (index for index, message in enumerate(state.get("messages", []))
-                 if message.get("role") == "user"),
-                default=-1,
-            )
-            rounds = sum(
-                1 for index, message in enumerate(state.get("messages", []))
-                if message.get("role") == "assistant" and message.get("tool_calls")
-                and index > current_turn_start
-            )
-            if rounds >= max_tool_rounds:
+            if tool_rounds_in(state.get("messages", [])) >= max_tool_rounds:
                 emit("tool_round_limit_reached", limit=max_tool_rounds)
                 return END
         return "llm"
 
     # ═══ 工具节点 ═══
+
+    def _warn_when_budget_is_nearly_spent(
+        state_messages: list[dict], tool_msgs: list[dict],
+    ) -> None:
+        """Tell the model to wrap up instead of letting recursion kill the run.
+
+        The hard limit is LangGraph's recursion_limit, which surfaces as
+        GraphRecursionError and discards every intermediate result.  A warning
+        one round early lets the model answer with what it already has.
+        """
+        if not tool_round_budget:
+            return
+        remaining = int(tool_round_budget) - tool_rounds_in(state_messages)
+        if remaining > 1:
+            return
+        tool_msgs.append(budget_exhaustion_warning(max(remaining, 0)))
 
     def tool_node(state: AgentState) -> dict:
         ensure_active("tools")
@@ -622,6 +666,7 @@ def build_graph(
             )
             ensure_active("after_tool")
             tool_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        _warn_when_budget_is_nearly_spent(messages, tool_msgs)
         return {"messages": tool_msgs}
 
     # ═══ 验证节点 ═══

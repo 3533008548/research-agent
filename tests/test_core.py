@@ -5233,6 +5233,84 @@ class TestRuntimeReplay(unittest.TestCase):
             compare_reports(report, {"suite_version": "other", "summary": {}})
 
 
+class TestAgentToolBudget(unittest.TestCase):
+    """The agent budget is expressed in tool rounds, never in graph steps.
+
+    Recursion steps and tool rounds differ by roughly a factor of two, and that
+    mismatch is what made "读论文更新档案" hit the ceiling so often.
+    """
+
+    def test_graph_steps_are_derived_from_rounds(self):
+        from research_agent import graph_steps_for_tool_rounds
+
+        self.assertEqual(graph_steps_for_tool_rounds(1), 4)
+        self.assertEqual(graph_steps_for_tool_rounds(12), 26)
+        # A nonsense budget must still leave room for one round plus a wrap-up.
+        self.assertEqual(graph_steps_for_tool_rounds(0), 4)
+        self.assertEqual(graph_steps_for_tool_rounds(-3), 4)
+
+    def test_every_named_budget_matches_its_rounds(self):
+        from research_agent import (
+            MAX_AGENT_GRAPH_STEPS,
+            MAX_AGENT_TOOL_ROUNDS,
+            RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS,
+            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
+            RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS,
+            RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS,
+            graph_steps_for_tool_rounds,
+        )
+
+        self.assertEqual(
+            MAX_AGENT_GRAPH_STEPS, graph_steps_for_tool_rounds(MAX_AGENT_TOOL_ROUNDS)
+        )
+        self.assertEqual(
+            RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS,
+            graph_steps_for_tool_rounds(RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS),
+        )
+        self.assertEqual(
+            RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS,
+            graph_steps_for_tool_rounds(RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS),
+        )
+
+    def test_budgets_leave_room_for_one_retry(self):
+        """The old 7-round chat budget died on the first failed tool call."""
+        from research_agent import (
+            MAX_AGENT_TOOL_ROUNDS,
+            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
+        )
+
+        # Ideal path is read context -> read dossier -> apply patch.
+        self.assertGreaterEqual(MAX_AGENT_TOOL_ROUNDS, 10)
+        self.assertGreaterEqual(RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS, 6)
+
+    def test_rounds_are_counted_per_turn_not_per_call(self):
+        from graph_builder import tool_rounds_in
+
+        messages = [
+            {"role": "user", "content": "读这篇论文"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}, {"id": "b"}]},
+            {"role": "tool", "content": "x"},
+            {"role": "assistant", "tool_calls": [{"id": "c"}]},
+        ]
+        self.assertEqual(tool_rounds_in(messages), 2)
+
+        # An earlier user turn must not inflate the current round count.
+        older = [
+            {"role": "assistant", "tool_calls": [{"id": "z"}]},
+            {"role": "user", "content": "新问题"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+        ]
+        self.assertEqual(tool_rounds_in(older), 1)
+
+    def test_warning_nudge_is_only_emitted_when_budget_runs_out(self):
+        from graph_builder import budget_exhaustion_warning
+
+        warning = budget_exhaustion_warning(1)
+        self.assertEqual(warning["role"], "system")
+        self.assertIn("预算提醒", warning["content"])
+        self.assertIn("还剩 1 次", warning["content"])
+
+
 class TestAuditRegressionFixes(unittest.TestCase):
     """Regression coverage for correctness and boundary issues found in code audit."""
 
@@ -5372,9 +5450,13 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 agent.memory.close()
                 agent.sessions.close()
 
-    def test_full_patch_route_uses_two_round_commit_without_verification(self):
+    def test_full_patch_route_is_bounded_without_verification(self):
         from config import Config
-        from research_agent import RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS, ResearchAgent
+        from research_agent import (
+            RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS,
+            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
+            ResearchAgent,
+        )
         from research_document_routing import route_research_document_request
 
         class _FakeApp:
@@ -5410,7 +5492,13 @@ class TestAuditRegressionFixes(unittest.TestCase):
                     },
                 )
                 self.assertFalse(captured["enable_verify"])
-                self.assertEqual(captured["max_tool_rounds"], 2)
+                # Two rounds could not even fit the ideal path (read context ->
+                # read dossier -> apply patch), so any retry tripped the limit.
+                self.assertEqual(
+                    captured["max_tool_rounds"],
+                    RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
+                )
+                self.assertGreaterEqual(captured["max_tool_rounds"], 6)
                 self.assertEqual(app.config["recursion_limit"], RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS)
             finally:
                 agent.memory.close()

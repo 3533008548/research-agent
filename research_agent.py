@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from datetime import datetime
 
 import requests
@@ -69,16 +69,68 @@ from tool_catalog import get_tool_definition
 from tool_runtime import ToolExecutionContext
 
 
-# Keep a normal chat turn bounded even when the model repeatedly requests tools.
-# A graph "round" contains several internal nodes, so this still leaves room for
-# multiple search/read calls while preventing an accidental unbounded cost loop.
-MAX_AGENT_GRAPH_STEPS = 16
-# A document-scoped confirmed patch can legitimately need one list, up to four
-# section reads, and one atomic patch.  It has a narrow tool scope, so giving
-# this workflow a little more graph budget does not loosen the normal chat
-# loop's cost guard.
-RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS = 28
-RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS = 8
+# ── 图预算：一律用"工具轮数"表达 ──
+# LangGraph 的 recursion_limit 数的是**节点执行次数**，而一次工具往返要走过
+# llm + tools 两个节点，收尾还要一次 llm（外加可选的 verify）。直接拿步数当
+# 预算，实际可用轮数只剩名义值的一半左右，历史上反复被调错。所以这里只写
+# 轮数，步数由 graph_steps_for_tool_rounds() 推导。
+GRAPH_STEPS_PER_TOOL_ROUND = 2
+# 收尾：最后一次 llm（给出结论）+ 可选的 verify 节点。
+GRAPH_STEPS_FINALIZE = 2
+
+
+def graph_steps_for_tool_rounds(rounds: int) -> int:
+    """Convert a tool-round budget into LangGraph's ``recursion_limit``."""
+    return max(1, int(rounds)) * GRAPH_STEPS_PER_TOOL_ROUND + GRAPH_STEPS_FINALIZE
+
+
+def _budget_exhausted_answer(app: Any, thread_id: str) -> str:
+    """Report what a recursion-limited run already accomplished.
+
+    LangGraph raises GraphRecursionError and discards the result, which used to
+    surface as "请缩小问题范围后重试" — throwing away every tool call the run had
+    already paid for.  The checkpoint still holds them, so name them.
+    """
+    head = "⚠️ 本轮已达到工具调用上限，已停止执行。"
+    steps: list[str] = []
+    try:
+        if app is not None:
+            snapshot = app.get_state({"configurable": {"thread_id": thread_id}})
+            values = getattr(snapshot, "values", None) or {}
+            for message in values.get("messages") or []:
+                if message.get("role") != "assistant":
+                    continue
+                for call in message.get("tool_calls") or []:
+                    name = str(call.get("function", {}).get("name") or "").strip()
+                    if name:
+                        steps.append(name)
+    except Exception:  # noqa: BLE001 - reporting progress must never mask the limit
+        steps = []
+    if not steps:
+        return head + "请缩小问题范围后重试（例如先只处理档案的某一章）。"
+    return (
+        f"{head}\n\n已完成 {len(steps)} 次工具调用：{'、'.join(steps[-8:])}。\n"
+        "这些结果仍保留在会话里 —— 直接说「继续」即可从中断处接着做，"
+        "或把任务拆小（例如只更新某一章）后再试。"
+    )
+
+
+# 普通对话。读一篇论文再更新科研档案的理想路径是 3~4 轮，但必须容得下
+# "工具返回未找到 → 换个关键词重试"这类探索，否则一次重试就触顶。
+MAX_AGENT_TOOL_ROUNDS = 12
+# 文档级确认补丁：一次 list、最多四次章节读取、一次原子补丁，再加余量。
+RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS = 13
+# 完整补丁：读上下文 → 读现有档案 → 提交补丁，理想 3 轮，给一倍余量。
+RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS = 6
+
+# 派生值：保留旧名字，让调用点和测试不必各自心算换算关系。
+MAX_AGENT_GRAPH_STEPS = graph_steps_for_tool_rounds(MAX_AGENT_TOOL_ROUNDS)
+RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS = graph_steps_for_tool_rounds(
+    RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS
+)
+RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS = graph_steps_for_tool_rounds(
+    RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS
+)
 
 
 _DIRECT_ENGINEERING_MARKERS = (
@@ -402,12 +454,15 @@ class ResearchAgent:
             force_research_document_save = should_force_research_document_save(user_input)
             routed_tool_scope = allowed_tools_for_routed_request(user_input)
             routed_document_intent = routed_research_document_intent(user_input)
-            graph_step_limit = (
-                RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS
-                if routed_document_intent == "full_patch"
-                else RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS
-                if routed_document_intent == "safe_patch" else MAX_AGENT_GRAPH_STEPS
-            )
+            if routed_document_intent == "full_patch":
+                graph_step_limit = RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS
+                graph_tool_round_budget = RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS
+            elif routed_document_intent == "safe_patch":
+                graph_step_limit = RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS
+                graph_tool_round_budget = RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS
+            else:
+                graph_step_limit = MAX_AGENT_GRAPH_STEPS
+                graph_tool_round_budget = MAX_AGENT_TOOL_ROUNDS
             full_document_patch = routed_document_intent == "full_patch"
             forced_tool_name = ""
             if force_experiment_project_update:
@@ -451,7 +506,11 @@ class ResearchAgent:
                         run_id=chat_run_id, session_id=thread_id,
                         steer_provider=_consume_running_steers,
                         enable_verify=not full_document_patch,
-                        max_tool_rounds=2 if full_document_patch else None,
+                        max_tool_rounds=(
+                            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS
+                            if full_document_patch else None
+                        ),
+                        tool_round_budget=graph_tool_round_budget,
                     )
                 result = app.invoke(
                     state,
@@ -494,9 +553,11 @@ class ResearchAgent:
                 return answer
             except Exception as e:
                 if type(e).__name__ == "GraphRecursionError":
-                    answer = (
-                        "⚠️ 本轮 Agent 已达到工具调用上限，已停止继续执行。"
-                        "请缩小问题范围后重试。"
+                    # The graph drops its result, but the checkpoint still holds
+                    # every tool result gathered so far.  Reporting them turns
+                    # "start over" into "continue from here".
+                    answer = _budget_exhausted_answer(
+                        locals().get("app"), thread_id,
                     )
                     outcome = "agent_limit"
                     return answer
