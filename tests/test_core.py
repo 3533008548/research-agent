@@ -5272,15 +5272,19 @@ class TestAgentToolBudget(unittest.TestCase):
             graph_steps_for_tool_rounds(RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS),
         )
 
-    def test_budgets_leave_room_for_one_retry(self):
-        """The old 7-round chat budget died on the first failed tool call."""
+    def test_chat_budget_is_a_loop_guard_not_a_cost_cap(self):
+        """Context compaction bounds tokens, so rounds only need to stop loops.
+
+        The old 7-round budget died on the first failed tool call and forced the
+        user to start over.  Cost is no longer a reason to keep it small.
+        """
         from research_agent import (
             MAX_AGENT_TOOL_ROUNDS,
             RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
         )
 
+        self.assertGreaterEqual(MAX_AGENT_TOOL_ROUNDS, 20)
         # Ideal path is read context -> read dossier -> apply patch.
-        self.assertGreaterEqual(MAX_AGENT_TOOL_ROUNDS, 10)
         self.assertGreaterEqual(RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS, 6)
 
     def test_rounds_are_counted_per_turn_not_per_call(self):
