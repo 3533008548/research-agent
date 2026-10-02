@@ -6034,5 +6034,32 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
         self.assertEqual(MiniLMOnnxEncoder._resolve_max_length(-1), 256)
 
 
+class TestRerankerBudget(unittest.TestCase):
+    """Reranking is the quality backbone, so its budget is measured, not guessed.
+
+    Without a cross-encoder, passage R@1 is 38.2%; with it, 79.4%.  Cutting the
+    budget blindly would halve retrieval quality, so these values come from a
+    34-case sweep rather than from intuition.
+    """
+
+    def test_config_carries_the_measured_budget(self):
+        from config import Config
+
+        cfg = Config.load()
+        self.assertEqual(cfg.rag_reranker_candidate_limit, 12)
+        self.assertEqual(cfg.rag_reranker_max_length, 256)
+
+    def test_eval_cli_can_override_the_budget(self):
+        """Otherwise every evaluation silently runs the constructor default."""
+        from scripts.run_rag_retrieval_eval import build_parser
+
+        args = build_parser().parse_args([
+            "--cases", "x.json", "--reranker",
+            "--reranker-candidate-limit", "8", "--reranker-max-length", "384",
+        ])
+        self.assertEqual(args.reranker_candidate_limit, 8)
+        self.assertEqual(args.reranker_max_length, 384)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

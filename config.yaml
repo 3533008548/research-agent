@@ -50,7 +50,13 @@ rag:
     # 首次使用先运行 scripts/warm_reranker.py；运行时只从本地缓存加载。
     enabled: true
     model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
-    candidate_limit: 20
+    # 送进重排的候选条数。工具层 top_k 上限只有 5，20 条明显过量。
+    # 34 条金标实测：12 条时质量与 20 条**完全一致**（段落级 R@1 79.4%），
+    # 降到 8 条才会掉到 70.6%。所以 12 是"质量不降"的临界点。
+    candidate_limit: 12
+    # cross-encoder 的输入截断长度。我们的块中位约 219 token，
+    # 大部分用不满 512；实测 512→256 质量零损失（MRR 0.8245→0.8309）。
+    max_length: 256
 ui:
   port: 7860
   theme: soft

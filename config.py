@@ -31,6 +31,7 @@ _DFLT = {
     "rag_reranker_enabled": False,
     "rag_reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
     "rag_reranker_candidate_limit": 20,
+    "rag_reranker_max_length": 512,
     "ui_port": 7860,
     "ui_debug": False,
     "verify_timeout_seconds": 8,
@@ -72,6 +73,7 @@ class Config:
     rag_reranker_enabled: bool = False
     rag_reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     rag_reranker_candidate_limit: int = 20
+    rag_reranker_max_length: int = 512
 
     ui_port: int = 7860
     ui_debug: bool = False
@@ -189,6 +191,9 @@ class Config:
                         cfg["rag_reranker_candidate_limit"] = reranker.get(
                             "candidate_limit", cfg["rag_reranker_candidate_limit"],
                         )
+                        cfg["rag_reranker_max_length"] = reranker.get(
+                            "max_length", cfg["rag_reranker_max_length"],
+                        )
                 if "ui" in yaml_cfg:
                     cfg["ui_port"] = yaml_cfg["ui"].get("port", cfg["ui_port"])
                 if "daily_search" in yaml_cfg:
@@ -295,6 +300,9 @@ class Config:
             rag_reranker_model=str(cfg.get("rag_reranker_model") or _DFLT["rag_reranker_model"]),
             rag_reranker_candidate_limit=max(
                 1, min(20, int(cfg.get("rag_reranker_candidate_limit", 20))),
+            ),
+            rag_reranker_max_length=max(
+                64, int(cfg.get("rag_reranker_max_length") or 512),
             ),
             ui_port=cfg["ui_port"],
             ui_debug=cfg.get("ui_debug", False),

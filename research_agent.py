@@ -268,6 +268,7 @@ class ResearchAgent:
                     reranker_enabled=cfg.rag_reranker_enabled,
                     reranker_model=cfg.rag_reranker_model,
                     reranker_candidate_limit=cfg.rag_reranker_candidate_limit,
+                    reranker_max_length=cfg.rag_reranker_max_length,
                     relation_store=PaperRelationStore(cfg.runtime_paths),
                 )
                 self._attach_relation_reviewer(cfg.runtime_paths)

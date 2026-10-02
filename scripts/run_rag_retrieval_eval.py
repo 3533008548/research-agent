@@ -42,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=float, default=8.0, help="timed_hybrid 的前台等待上限")
     parser.add_argument("--reranker", action="store_true", help="启用本地 cross-encoder 重排后评测")
     parser.add_argument("--reranker-model", help="覆盖默认的本地重排模型")
+    parser.add_argument(
+        "--reranker-candidate-limit", type=int, default=0,
+        help="覆盖 config.yaml 的 rag.reranker.candidate_limit",
+    )
+    parser.add_argument(
+        "--reranker-max-length", type=int, default=0,
+        help="覆盖 config.yaml 的 rag.reranker.max_length",
+    )
     parser.add_argument("--data-dir", help="运行时根目录；默认使用当前 APP_DATA_DIR/runtime")
     parser.add_argument(
         "--collection",
@@ -77,6 +85,20 @@ def main(argv: list[str] | None = None) -> int:
             "reranker_enabled": args.reranker,
             "reranker_model": args.reranker_model or "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
         }
+        if args.reranker:
+            # Read the real reranker budget from config.  Leaving these at their
+            # constructor defaults silently evaluates a different setup than the
+            # one the service runs, which hides both cost and quality effects.
+            from config import Config
+
+            reranker_config = Config.load()
+            options["reranker_candidate_limit"] = (
+                args.reranker_candidate_limit
+                or reranker_config.rag_reranker_candidate_limit
+            )
+            options["reranker_max_length"] = (
+                args.reranker_max_length or reranker_config.rag_reranker_max_length
+            )
         if args.collection:
             options["collection_name"] = args.collection
         if args.model:
