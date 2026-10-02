@@ -4,8 +4,15 @@
 并把两者各自的内部阶段（查询编码、向量检索、全库 get、分词、打分）拆开，
 输出 mean / p50 / p95。
 
+⚠️ 默认走**生产配置**（集合名、是否重排、重排预算都从 config.yaml 读）。
+   这不是可选项：config.yaml 里 reranker.enabled=true，而 PaperStore 的
+   reranker_enabled 默认是 False。曾经因为没显式传参，测出 hybrid 只要 50 ms
+   的假数字，线上实际是 1127 ms —— 重排占了 95%。
+   想看"不重排"的对照，显式加 --no-reranker，别靠默认值。
+
 用法（容器内）：
-    python -m scripts.profile_retrieval --collection papers_v2 --repeat 2
+    python -m scripts.profile_retrieval --repeat 2
+    python -m scripts.profile_retrieval --no-reranker        # 对照组
 """
 
 from __future__ import annotations
@@ -44,28 +51,59 @@ def _fmt(values_ms: list[float]) -> str:
     )
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Exposed so tests can assert the defaults follow config.yaml."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--collection", default="papers_v2")
+    parser.add_argument("--collection", default=None,
+                        help="默认用 config.yaml 的 rag.embedding.collection")
     parser.add_argument("--cases", default="evals/fixtures/rag_retrieval_cases_en.json")
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=1)
-    args = parser.parse_args()
+    parser.add_argument("--no-reranker", action="store_true",
+                        help="关闭重排做对照组（默认跟随 config.yaml）")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     from config import Config
     from paper_store import PaperStore
 
     config = Config.load()
+    collection = args.collection or config.rag_embedding_collection
     persist_dir = Path(config.chroma_dir or "runtime/derived/chroma")
+
+    # 必须显式传：PaperStore 的默认值是"不重排"，跟生产配置不一致。
+    reranker_enabled = config.rag_reranker_enabled and not args.no_reranker
 
     cases_path = PROJECT_ROOT / args.cases
     payload = json.loads(cases_path.read_text(encoding="utf-8"))
     cases = payload.get("cases", payload) if isinstance(payload, dict) else payload
     queries = [str(c.get("query", "")).strip() for c in cases]
     queries = [q for q in queries if q]
-    print(f"语料集合: {args.collection}  查询数: {len(queries)}  重复: {args.repeat}")
+    print(f"语料集合: {collection}  查询数: {len(queries)}  重复: {args.repeat}")
+    if reranker_enabled:
+        print(
+            f"重排: 启用  候选数 {config.rag_reranker_candidate_limit}  "
+            f"截断 {config.rag_reranker_max_length}"
+        )
+    else:
+        print("重排: 关闭（对照组）")
 
-    store = PaperStore(persist_dir=persist_dir, collection_name=args.collection)
+    store = PaperStore(
+        persist_dir=persist_dir,
+        collection_name=collection,
+        embedding_model=config.rag_embedding_model,
+        embedding_dimensions=config.rag_embedding_dimensions,
+        embedding_max_length=config.rag_embedding_max_length,
+        embedding_batch_size=config.rag_embedding_batch_size,
+        embedding_device=config.rag_embedding_device,
+        reranker_enabled=reranker_enabled,
+        reranker_model=config.rag_reranker_model,
+        reranker_candidate_limit=config.rag_reranker_candidate_limit,
+        reranker_max_length=config.rag_reranker_max_length,
+    )
     total = store._collection.count()
     print(f"块数: {total}")
 

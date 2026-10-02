@@ -6060,6 +6060,28 @@ class TestRerankerBudget(unittest.TestCase):
         self.assertEqual(args.reranker_candidate_limit, 8)
         self.assertEqual(args.reranker_max_length, 384)
 
+    def test_profiler_defaults_to_the_production_configuration(self):
+        """The profiler must not silently measure a reranker-free path.
+
+        ``PaperStore(reranker_enabled=...)`` defaults to False while
+        ``config.yaml`` sets ``reranker.enabled: true``.  The profiler used to
+        construct the store without those arguments, which produced a cheerful
+        "hybrid is 50 ms" number while production was really paying 1127 ms.
+        """
+        import inspect
+
+        from scripts import profile_retrieval
+
+        source = inspect.getsource(profile_retrieval.main)
+        # The store must be built from Config, not from bare constructor defaults.
+        self.assertIn("reranker_enabled=reranker_enabled", source)
+        self.assertIn("config.rag_reranker_candidate_limit", source)
+
+        # Defaults follow config.yaml instead of hard-coding a collection.
+        args = profile_retrieval.build_parser().parse_args([])
+        self.assertIsNone(args.collection)
+        self.assertFalse(args.no_reranker)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
