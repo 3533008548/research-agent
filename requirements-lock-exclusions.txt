@@ -1,0 +1,44 @@
+# Dependency-lock exclusions — why this file exists.
+#
+# The runtime image is CPU-only (see Dockerfile: the PyPI Linux wheel of torch
+# drags in several GB of CUDA libraries). The Dockerfile therefore pre-installs
+# ``torch==<TORCH_VERSION>+cpu`` from the PyTorch CPU index *before* installing
+# the lock file, and ``sentence-transformers`` reuses it.
+#
+# This file lists every package that belongs to the torch/GPU dependency tree so
+# the lock-file generator leaves them out. Without it the resolver still emits
+# torch's dependencies even when torch itself is excluded, which silently undoes
+# the CPU-only design and inflates the image.
+#
+# Verified against torch 2.13.0+cpu: the CPU wheel's own dependency set is just
+# filelock, fsspec, jinja2, MarkupSafe, mpmath, networkx, sympy,
+# typing-extensions — no nvidia-* / cuda-* / triton.
+#
+# When bumping TORCH_VERSION, re-check the CPU wheel's dependencies and update
+# this list if the tree changes.
+
+# --- torch itself: installed by the Dockerfile from the PyTorch CPU index ---
+torch
+torchvision
+torchaudio
+
+# --- GPU runtime pulled in by the default (CUDA) PyPI torch wheel ---
+triton
+cuda-bindings
+cuda-pathfinder
+cuda-toolkit
+nvidia-cublas
+nvidia-cuda-cupti
+nvidia-cuda-nvrtc
+nvidia-cuda-runtime
+nvidia-cudnn-cu13
+nvidia-cufft
+nvidia-cufile
+nvidia-curand
+nvidia-cusolver
+nvidia-cusparse
+nvidia-cusparselt-cu13
+nvidia-nccl-cu13
+nvidia-nvjitlink
+nvidia-nvshmem-cu13
+nvidia-nvtx

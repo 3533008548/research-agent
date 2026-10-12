@@ -38,9 +38,27 @@
 
 ### 1. 安装依赖
 
+复现项目已验证的环境（推荐，CI 与 Docker 镜像都用它）：
+
+```bash
+pip install -r requirements.lock.txt
+```
+
+只想装"最新兼容版本"、不追求与 CI 一致时：
+
 ```bash
 pip install -r requirements.txt
 ```
+
+> `requirements.txt` 是**想要什么**（人类维护），`requirements.lock.txt` 是**现在实际是什么**
+> （机器生成，133 个包含全部传递依赖）。Dockerfile 与 CI 只认锁文件，因此镜像与
+> 流水线可逐字节复现。
+>
+> **新增或升级依赖时**：改 `requirements.txt` → 运行 `bash scripts/regenerate_lock.sh`
+> → 提交 `requirements.txt` 与两个 `*.lock.txt`。漏掉重新生成的话，CI 会继续使用旧锁，
+> 等于这次改动根本没生效。脚本会顺带检查 GPU 依赖有没有漏进锁文件。
+> torch 及其 GPU 依赖树被刻意排除在锁文件外（由 Dockerfile 从 PyTorch CPU 源单独安装），
+> 原因见 `requirements-lock-exclusions.txt`。
 
 ### 2. 配置
 
@@ -234,7 +252,7 @@ python -m evals.release_gate --strict
 浏览器回归测试会启动临时 FastAPI + React 服务，确认浏览器通过统一运行接口创建任务、消费 SSE，并在切换会话时取消旧任务。它不读取用户 `runtime/`，也不访问真实模型。首次运行需安装 Chromium，并先构建前端：
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.lock.txt
 python -m playwright install chromium
 cd frontend && npm ci && npm run build && cd ..
 python -m unittest tests.test_mounted_api_e2e

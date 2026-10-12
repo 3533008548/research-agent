@@ -27,12 +27,15 @@ RUN apt-get update \
     && addgroup --system --gid 10001 app \
     && adduser --system --uid 10001 --ingroup app app
 
-COPY requirements.txt ./
+COPY requirements.txt requirements.lock.txt ./
 # The default Linux wheel on PyPI pulls CUDA libraries. This service runs on CPU,
 # so install the matching CPU wheel first; sentence-transformers then reuses it.
+# torch (and its ~19-package GPU dependency tree) is deliberately absent from the
+# lock file so this line remains the single source of truth for the torch build.
+# See requirements-lock-exclusions.txt; regenerate locks via scripts/regenerate_lock.sh.
 ARG TORCH_VERSION=2.13.0+cpu
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}" \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.lock.txt
 
 COPY . ./
 COPY --from=frontend-build /frontend/dist ./frontend/dist
