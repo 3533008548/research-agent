@@ -28,10 +28,13 @@ rag:
   enabled: true
   embedding:
     # 换嵌入模型只需改这里，无需改代码。
-    # 可选：all-MiniLM-L6-v2（384维/256token，CPU 友好）
-    #       Qwen/Qwen3-Embedding-0.6B（1024维/32k，支持 MRL 降维）
-    model: all-MiniLM-L6-v2
-    # 目标维度。Qwen3 支持 MRL，可降到 512/256 以省存储；填 0 表示用模型原生维度。
+    # 可选：intfloat/multilingual-e5-small（384维/512token，中英同空间，当前默认）
+    #       all-MiniLM-L6-v2（384维/512token，英文单语，中文查询近乎噪声）
+    #       Qwen/Qwen3-Embedding-0.6B（1024维/32k，支持 MRL 降维；CPU 上比 MiniLM
+    #       慢约两个数量级，全库重建要几十分钟）
+    model: intfloat/multilingual-e5-small
+    # 目标维度。e5 未经 Matryoshka 训练，不支持降维；填错会被纠正为模型原生 384。
+    # Qwen3 支持 MRL，可降到 512/256 以省存储。
     dimensions: 384
     # 单个块的 token 上限，超过会被模型截断。
     # 256 只是 sentence-transformers / ChromaDB 的约定：MiniLM 的 ONNX 图
@@ -41,11 +44,13 @@ rag:
     max_length: 512
     batch_size: 32
     device: cpu
-    # 集合名。papers 是 512 上限重建后的版本（17 篇 / 794 块）。
-    # 256 上限的旧集合 papers_v2 已删除：需要回退时把 max_length 改回 256，
-    # 再用 scripts/build_length_probe.py 重建即可（约 48 秒），
+    # 集合名。papers_e5 是用 multilingual-e5-small 重建的版本（17 篇 / 796 块）。
+    # 换嵌入模型必须换集合：向量空间变了，旧集合的向量不可比。
+    #   python scripts/migrate_embedding.py --source papers --target <新名> \
+    #       --model <模型> --max-length 512   # 约 52 秒，源集合保留作回滚备份
+    # 旧集合 papers（all-MiniLM-L6-v2 / 512 token / 794 块）暂时保留，确认无误后可删。
     # 原始分块数据始终保留在 runtime/derived/paper_artifacts/*/document_map.json。
-    collection: papers
+    collection: papers_e5
   reranker:
     # 首次使用先运行 scripts/warm_reranker.py；运行时只从本地缓存加载。
     enabled: true

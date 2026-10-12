@@ -39,7 +39,7 @@ docker compose exec -T research-agent python -m evals.release_gate --compare eva
 
 ```powershell
 python scripts/run_rag_retrieval_eval.py `
-  --cases runtime/derived/rag_eval/current_local_cases.json `
+  --cases evals/fixtures/rag_retrieval_cases.json `
   --mode timed_hybrid
 ```
 
@@ -50,13 +50,24 @@ python scripts/run_rag_retrieval_eval.py `
 - `MRR`：首个正确证据块的平均倒数排名；
 - `latency_ms` 与 `fallback_case_count`：检索体验和降级情况。
 
-金标文件必须包含论文标题、块序号及原文锚点 `text_contains`；只标论文标题会被拒绝。标注应先阅读原始 PDF 或已解析原文，再查看检索结果，避免用当前排序反向制造“正确答案”。真实本地论文的金标文件只放在 `runtime/derived/rag_eval/`，不得提交 Git。
+金标文件必须包含论文标题、块序号及原文锚点 `text_contains`；只标论文标题会被拒绝。标注应先阅读原始 PDF 或已解析原文，再查看检索结果，避免用当前排序反向制造“正确答案”。
+
+`evals/fixtures/rag_retrieval_cases.json` 是与当前 17 篇本地论文对齐的 34 条金标，可直接用。针对自己论文库另标的金标放在 `runtime/derived/rag_eval/`（不得提交 Git），例如 `runtime/derived/rag_eval/my_cases.json`。⚠️ 金标与库必须对齐：换过论文库后旧金标会全部判为未命中（表现为 R@1=0%），发现全 0 先核对标题交集。
+
+⚠️ 本脚本**不读 `config.yaml` 的模型与集合**：不传 `--model` 会退回 `all-MiniLM-L6-v2`，不传 `--collection` 会退回默认集合，从而“测了个寂寞”。评测非默认模型/集合时必须显式指定：
+
+```powershell
+python scripts/run_rag_retrieval_eval.py `
+  --cases evals/fixtures/rag_retrieval_cases.json `
+  --collection papers_e5 --model intfloat/multilingual-e5-small --max-length 512 `
+  --mode timed_hybrid --reranker
+```
 
 可额外运行关键词对照，以确认混合检索的收益是否真实存在：
 
 ```powershell
 python scripts/run_rag_retrieval_eval.py `
-  --cases runtime/derived/rag_eval/current_local_cases.json `
+  --cases evals/fixtures/rag_retrieval_cases.json `
   --mode keyword `
   --output evals/reports/rag-retrieval-keyword-baseline.json
 ```
@@ -258,7 +269,7 @@ docker compose exec research-agent python -m evals.runtime_replay --compare eval
 ```powershell
 pip install -r requirements.txt
 python scripts/warm_reranker.py
-python scripts/run_rag_retrieval_eval.py --cases runtime/derived/rag_eval/current_local_cases.json --mode timed_hybrid --ks 1,3,5,10,20 --reranker
+python scripts/run_rag_retrieval_eval.py --cases evals/fixtures/rag_retrieval_cases.json --mode timed_hybrid --ks 1,3,5,10,20 --reranker
 ```
 
 `--reranker` 只重排混合召回的前 20 条候选，不扩大给模型的上下文；运行时只从本地缓存加载 `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`。确认指标有收益后，再将 `config.yaml` 的 `rag.reranker.enabled` 改为 `true`。
