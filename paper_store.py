@@ -38,6 +38,12 @@ except ImportError:
 # is a configuration change.  See embeddings.py for the contract.
 from embeddings import DEFAULT_EMBEDDING_MODEL, Embedder, build_embedder
 from logger import get_logger
+from papers.lexical import build_index as build_lexical_index
+from papers.lexical import iter_documents as lexical_documents
+from papers.lexical import query_terms as lexical_query_terms
+from papers.lexical import scan_score as scan_lexical
+from papers.lexical import score_index as score_lexical_index
+from papers.lexical import tokenize as lexical_tokenize
 from papers.metrics import StageTimer
 
 # Structured logging instead of print(): print() carries no level, timestamp or
@@ -132,10 +138,8 @@ HYBRID_CANDIDATE_FACTOR = 4
 # 命中这些关键词的章节视为"方法/实验类"，在排序时给一点距离折扣。
 SECTION_PRIORITY_TERMS = ("method", "experiment", "evaluation", "result", "proposed")
 SECTION_PRIORITY_BONUS = 0.05
-# BM25 参数：k1 控制词频饱和，b 控制长度归一化强度，scale 只影响量纲。
-BM25_K1 = 1.5
-BM25_B = 0.75
-BM25_SCALE = 2.5
+# BM25_K1 / BM25_B / BM25_SCALE moved to papers/lexical.py with the formula that
+# uses them.  Tunable in one place instead of two that could drift apart.
 
 
 
@@ -548,15 +552,17 @@ class PaperStore:
 
     @staticmethod
     def _lexical_tokens(text: str) -> list[str]:
-        """Tokenize text for the small local BM25 index."""
-        latin_terms = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{1,}", text.lower())
-        cjk = "".join(re.findall(r"[\u4e00-\u9fff]", text))
-        return latin_terms + [cjk[i:i + 2] for i in range(max(len(cjk) - 1, 0))]
+        """Tokenize text for the small local BM25 index.
+
+        Delegates to ``papers.lexical``; tests and benchmarks still reach this
+        method, so the name stays as the compatibility seam.
+        """
+        return lexical_tokenize(text)
 
     @classmethod
     def _query_terms(cls, query_text: str) -> list[str]:
         """提取适合中英文论文文本的去重检索词。"""
-        return list(dict.fromkeys(cls._lexical_tokens(query_text)))
+        return lexical_query_terms(query_text)
 
     @staticmethod
     def _result_key(result: dict) -> tuple[str, str, int]:
@@ -881,37 +887,11 @@ class PaperStore:
         Scanning and tokenizing every chunk per request measured ~160 ms on the
         1158-chunk corpus, which is most of the hybrid latency once the encoder
         is fast.  The postings map a term to ``{position: term frequency}``.
-        """
-        raw = self._collection.get(include=["documents", "metadatas"])
-        entries: list[dict] = []
-        lengths: list[int] = []
-        postings: dict[str, dict[int, int]] = {}
-        for doc, meta in zip(raw.get("documents") or [], raw.get("metadatas") or []):
-            meta = meta or {}
-            tokens = self._lexical_tokens(doc or "")
-            position = len(entries)
-            lengths.append(len(tokens))
-            entries.append({
-                "text": doc or "",
-                "section": meta.get("section", "未标注"),
-                "title": meta.get("title", "Unknown"),
-                "paper_id": meta.get("paper_id", ""),
-                "chunk_index": meta.get("chunk_index", 0),
-                "char_start": meta.get("char_start", 0),
-                "char_end": meta.get("char_end", 0),
-                "page": meta.get("page", -1),
-                "page_end": meta.get("page_end", meta.get("page", -1)),
-                "element_id": meta.get("element_id", ""),
-                "element_kind": meta.get("element_kind", "text"),
-                "retrieval": "keyword",
-            })
-            frequencies: dict[str, int] = {}
-            for token in tokens:
-                frequencies[token] = frequencies.get(token, 0) + 1
-            for term, count in frequencies.items():
-                postings.setdefault(term, {})[position] = count
-        return {"entries": entries, "lengths": lengths, "postings": postings}
 
+        Only the document *source* stays here: the postings are produced by
+        ``papers.lexical``, which is why that module needs no vector store.
+        """
+        return build_lexical_index(lexical_documents(self._collection))
     def _get_lexical_index(self) -> dict | None:
         """Return the cached postings index, rebuilding it after a corpus change.
 
@@ -941,67 +921,7 @@ class PaperStore:
         section: Optional[str],
     ) -> list[dict]:
         """Score only the chunks the query terms actually occur in."""
-        entries = index["entries"]
-        lengths = index["lengths"]
-        postings = index["postings"]
-
-        if paper_ids or section:
-            allowed = {
-                position
-                for position, entry in enumerate(entries)
-                if (not paper_ids or entry["paper_id"] in paper_ids)
-                and (not section or entry["section"] == section)
-            }
-        else:
-            allowed = set(range(len(entries)))
-        if not allowed:
-            return []
-
-        # BM25 statistics stay scoped to the candidate set, exactly as the
-        # pre-index implementation did, so scores are unchanged.
-        document_count = len(allowed)
-        average_length = sum(lengths[position] for position in allowed) / document_count
-
-        scores: dict[int, float] = {}
-        for term in terms:
-            hits = postings.get(term)
-            if not hits:
-                continue
-            document_frequency = (
-                len(hits) if len(allowed) == len(entries)
-                else len(hits.keys() & allowed)
-            )
-            idf = math.log(
-                1 + (document_count - document_frequency + 0.5) / (document_frequency + 0.5)
-            )
-            for position, frequency in hits.items():
-                if position not in allowed:
-                    continue
-                denominator = frequency + BM25_K1 * (
-                    1 - BM25_B + BM25_B * lengths[position] / average_length
-                )
-                scores[position] = (
-                    scores.get(position, 0.0) + idf * frequency * BM25_SCALE / denominator
-                )
-
-        ranked = []
-        for position, score in scores.items():
-            value = round(score, 6)
-            if value <= 0:
-                continue
-            ranked.append((position, value))
-        ranked.sort(
-            key=lambda item: (
-                -item[1], entries[item[0]]["title"], entries[item[0]]["chunk_index"],
-            )
-        )
-
-        results = []
-        for position, value in ranked[:top_k]:
-            item = dict(entries[position])
-            item["keyword_score"] = value
-            results.append(item)
-        return results
+        return score_lexical_index(index, terms, top_k, paper_ids, section)
 
     def query_lexical(
         self,
@@ -1029,59 +949,9 @@ class PaperStore:
         section: Optional[str],
     ) -> list[dict]:
         """Full-corpus fallback for collections past the interactive budget."""
-        raw = self._collection.get(include=["documents", "metadatas"])
-        candidates = []
-        for doc, meta in zip(raw.get("documents") or [], raw.get("metadatas") or []):
-            meta = meta or {}
-            if paper_ids and meta.get("paper_id") not in paper_ids:
-                continue
-            if section and meta.get("section") != section:
-                continue
-            candidates.append({
-                "text": doc or "",
-                "section": meta.get("section", "未标注"),
-                "title": meta.get("title", "Unknown"),
-                "paper_id": meta.get("paper_id", ""),
-                "chunk_index": meta.get("chunk_index", 0),
-                "char_start": meta.get("char_start", 0),
-                "char_end": meta.get("char_end", 0),
-                "page": meta.get("page", -1),
-                "page_end": meta.get("page_end", meta.get("page", -1)),
-                "element_id": meta.get("element_id", ""),
-                "element_kind": meta.get("element_kind", "text"),
-                "retrieval": "keyword",
-            })
-
-        if not candidates:
-            return []
-
-        tokenized = [self._lexical_tokens(item["text"]) for item in candidates]
-        document_count = len(tokenized)
-        average_length = sum(len(tokens) for tokens in tokenized) / document_count
-        document_frequency = {
-            term: sum(term in set(tokens) for tokens in tokenized)
-            for term in terms
-        }
-        for item, tokens in zip(candidates, tokenized):
-            length = len(tokens)
-            score = 0.0
-            for term in terms:
-                frequency = tokens.count(term)
-                if not frequency:
-                    continue
-                idf = math.log(1 + (document_count - document_frequency[term] + 0.5) /
-                               (document_frequency[term] + 0.5))
-                denominator = frequency + BM25_K1 * (
-                    1 - BM25_B + BM25_B * length / average_length
-                )
-                score += idf * frequency * BM25_SCALE / denominator
-            item["keyword_score"] = round(score, 6)
-
-        candidates = [item for item in candidates if item["keyword_score"] > 0]
-        return sorted(
-            candidates,
-            key=lambda item: (-item["keyword_score"], item["title"], item["chunk_index"]),
-        )[:top_k]
+        return scan_lexical(
+            lexical_documents(self._collection), terms, top_k, paper_ids, section,
+        )
 
     def list_papers(self) -> list[dict]:
         """列出所有已索引的论文（去重）"""

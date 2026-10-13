@@ -90,16 +90,31 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(metrics.mean_ms("rerank"), 0.0)
 
     def test_mean_is_total_over_count(self):
-        """Mean is rounded to 3 decimals on the way out, so compare at that
-        precision -- asserting 6 places would fail on the rounding, not on a bug."""
-        with metrics.StageTimer("semantic"):
-            time.sleep(0.02)
-        with metrics.StageTimer("semantic"):
-            time.sleep(0.02)
-        mean = metrics.mean_ms("semantic")
-        total = metrics.snapshot()["stages"]["semantic"]["total_ms"]
-        self.assertAlmostEqual(mean, round(total / 2, 3), places=3)
-        self.assertGreater(mean, 10)
+        """Mean is total over count, checked without depending on the clock.
+
+        An earlier version slept 20ms twice and compared with ``places=3``,
+        which demands an error below 0.0005 -- the size of the function's own
+        3-decimal rounding. It therefore failed or passed depending on where the
+        wall-clock value happened to land. Deterministic inputs remove both the
+        flakiness and the need to choose a tolerance.
+        """
+        # StageTimer reads perf_counter twice per use (__enter__ and __exit__),
+        # so each iteration consumes a pair: 0->10ms, 20->30ms, 40->50ms.
+        readings = iter((0.0, 0.010, 0.020, 0.030, 0.040, 0.050))
+        original = time.perf_counter
+        try:
+            time.perf_counter = lambda: next(readings)
+            for _ in range(3):
+                with metrics.StageTimer("semantic"):
+                    pass
+        finally:
+            time.perf_counter = original
+
+        snap = metrics.snapshot()
+        stage = snap["stages"]["semantic"]
+        self.assertEqual(stage["count"], 3)
+        self.assertAlmostEqual(stage["total_ms"], 30.0, delta=0.01)
+        self.assertAlmostEqual(metrics.mean_ms("semantic"), 10.0, delta=0.001)
 
 
 class FakeRedis:
