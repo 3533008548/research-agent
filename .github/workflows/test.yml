@@ -51,7 +51,7 @@ jobs:
         run: python -m pip install --requirement requirements.lock.txt
 
       - name: Run offline unit tests
-        run: python -m unittest tests.test_core -v
+        run: python -m unittest tests.test_core tests.test_chunking -v
 
       - name: Run offline release quality gate
         run: python -m evals.release_gate --strict
