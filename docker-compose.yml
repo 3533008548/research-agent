@@ -9,6 +9,9 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    # AOF rewrites the whole log on a fork, so a growing dataset can transiently
+    # double Redis's footprint.  Cap it so that cannot starve the app containers.
+    mem_limit: ${REDIS_MEM_LIMIT:-512m}
     restart: unless-stopped
 
   research-agent:
@@ -38,6 +41,17 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
+    # Resource ceilings.  Measured idle usage is ~170 MiB here, but a retrieval
+    # burst loads the ONNX encoder plus the cross-encoder reranker, and a
+    # large-corpus lexical scan allocates postings for the whole collection.
+    # Without a ceiling one runaway request can exhaust host memory, and the
+    # kernel OOM killer may terminate an unrelated process instead -- Docker
+    # would only report "container exited" with no explanation.
+    # Raise these if you switch to Qwen3 embeddings: they are ~48x slower on
+    # CPU than MiniLM and hold substantially more memory.
+    mem_limit: ${AGENT_MEM_LIMIT:-2g}
+    mem_reservation: ${AGENT_MEM_RESERVE:-512m}
+    cpus: ${AGENT_CPUS:-2.0}
     depends_on:
       redis:
         condition: service_healthy
@@ -61,6 +75,11 @@ services:
       disable: true
     restart: unless-stopped
     stop_grace_period: 30s
+    # This process is the one that actually runs retrieval and reranking, so it
+    # gets the larger budget; the web process stays lean on purpose.
+    mem_limit: ${WORKER_MEM_LIMIT:-3g}
+    mem_reservation: ${WORKER_MEM_RESERVE:-768m}
+    cpus: ${WORKER_CPUS:-2.0}
     depends_on:
       redis:
         condition: service_healthy
