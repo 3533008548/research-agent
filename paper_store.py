@@ -45,6 +45,8 @@ from papers.lexical import scan_score as scan_lexical
 from papers.lexical import score_index as score_lexical_index
 from papers.lexical import tokenize as lexical_tokenize
 from papers.metrics import StageTimer
+from papers.rerank import load_cross_encoder
+from papers.rerank import rerank_with
 
 # Structured logging instead of print(): print() carries no level, timestamp or
 # module name, so an incident ends up as an unstructured blob nobody can query.
@@ -584,9 +586,7 @@ class PaperStore:
                 return self._reranker
             self._reranker_load_attempted = True
             try:
-                from sentence_transformers import CrossEncoder
-
-                self._reranker = CrossEncoder(
+                self._reranker = load_cross_encoder(
                     self._reranker_model_name,
                     max_length=self._reranker_max_length,
                     local_files_only=True,
@@ -599,39 +599,15 @@ class PaperStore:
         return self._reranker
 
     def _rerank(self, query_text: str, candidates: list[dict]) -> list[dict]:
-        """Use a cross-encoder to reorder only the already retrieved candidates."""
+        """Use a cross-encoder to reorder only the already retrieved candidates.
+
+        The ordering and the degradation path live in ``papers.rerank``; only the
+        model instance and its lock stay here, because those are per-store state.
+        """
         reranker = self._get_reranker()
         if reranker is None or not candidates:
             return candidates
-        try:
-            scores = reranker.predict(
-                [(query_text, item["text"]) for item in candidates],
-                batch_size=8,
-                show_progress_bar=False,
-            )
-        except Exception as exc:
-            log.warning(
-                "RAG 重排失败，保留 RRF 结果 (exc_type=%s, exc=%s)",
-                type(exc).__name__, exc,
-            )
-            return candidates
-
-        ranked = []
-        for item, score in zip(candidates, scores):
-            ranked.append({
-                **item,
-                "reranked": True,
-                "reranker_score": round(float(score), 6),
-            })
-        return sorted(
-            ranked,
-            key=lambda item: (
-                -item["reranker_score"],
-                -item.get("hybrid_score", 0.0),
-                item.get("title", ""),
-                item.get("chunk_index", 0),
-            ),
-        )
+        return rerank_with(query_text, candidates, reranker.predict)
 
     @staticmethod
     def _sort_hybrid_results(results: list[dict]) -> list[dict]:
