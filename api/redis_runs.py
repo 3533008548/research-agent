@@ -17,6 +17,8 @@ from typing import Any, Iterator
 
 from api.sse import format_sse
 from cancellation import RequestCancelledError
+from papers.metrics import load_published as load_published_retrieval_metrics
+from papers.metrics import publish as publish_retrieval_metrics
 from run_contract import execution_metadata
 
 
@@ -253,6 +255,29 @@ class RedisChatRunBroker:
         except Exception as exc:
             raise QueueUnavailableError("could not read worker heartbeats") from exc
 
+    def publish_retrieval_metrics(self) -> None:
+        """Mirror this worker's retrieval aggregates for the web process to serve.
+
+        Retrieval runs in the worker, but ``/metrics`` is rendered by the web
+        process, so the numbers have to cross the process boundary.  A TTL'd
+        key (same shape as the heartbeat) means a dead worker stops being
+        reported instead of freezing stale latency in the dashboard forever.
+
+        Unlike the heartbeat this one does *not* raise on failure: losing a
+        telemetry sample must never take down a run that is otherwise healthy.
+        """
+        try:
+            publish_retrieval_metrics(self._redis)
+        except Exception:  # noqa: BLE001 - telemetry is best-effort by design
+            pass
+
+    def load_retrieval_metrics(self) -> dict | None:
+        """Read published retrieval aggregates, or None when unavailable."""
+        try:
+            return load_published_retrieval_metrics(self._redis)
+        except Exception:  # noqa: BLE001
+            return None
+
 
 @dataclass(frozen=True)
 class QueuedResearchRun:
@@ -473,9 +498,21 @@ class _RedisRunWorker:
             self.broker.acknowledge(job.message_id)
         return True
 
+    def publish_retrieval_metrics(self) -> None:
+        """Push this process's retrieval aggregates so the web process can serve them.
+
+        Retrieval runs here, in the worker; ``/metrics`` is served by the web
+        process.  Without this hop the endpoint reports a permanent zero for
+        every retrieval stage.  Uses the same TTL'd-key transport as the
+        worker heartbeat, and swallows every failure for the same reason the
+        heartbeat does: instrumentation must not take down the run.
+        """
+        self.broker.publish_retrieval_metrics()
+
     def run_forever(self) -> None:
         while True:
             self.broker.heartbeat(self.consumer)
+            self.publish_retrieval_metrics()
             self.run_once(block_ms=5_000)
 
     def _cancel_monitor(self, run_id: str) -> tuple[threading.Event, threading.Event, threading.Thread]:

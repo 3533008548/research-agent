@@ -92,4 +92,32 @@ def render_prometheus_metrics(app: Any) -> str:
         "# TYPE research_agent_redis_up gauge",
         _line("research_agent_redis_up", redis_up),
     ])
+
+    # Retrieval happens in the worker process; its aggregates are mirrored to
+    # Redis and read back here.  Without this the endpoint exposes zero
+    # retrieval series and "which stage got slow" stays unanswerable from a
+    # running system -- only from an offline profile run.
+    lines.extend(_retrieval_lines(app))
     return "\n".join(lines) + "\n"
+
+
+def _retrieval_lines(app: Any) -> list[str]:
+    """Render retrieval-stage latency, or nothing when no worker has reported."""
+    from papers.metrics import render_prometheus
+
+    published = None
+    for manager_name in ("chat_run_manager", "research_run_manager", "daily_run_manager"):
+        manager = getattr(app.state, manager_name, None)
+        broker = getattr(manager, "broker", None)
+        loader = getattr(broker, "load_retrieval_metrics", None)
+        if loader is None:
+            continue
+        try:
+            published = loader() or published
+        except Exception:  # noqa: BLE001 - a scrape must never 500 on telemetry
+            continue
+        if published:
+            break
+    if not published:
+        return []
+    return render_prometheus(published)

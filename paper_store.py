@@ -38,6 +38,7 @@ except ImportError:
 # is a configuration change.  See embeddings.py for the contract.
 from embeddings import DEFAULT_EMBEDDING_MODEL, Embedder, build_embedder
 from logger import get_logger
+from papers.metrics import StageTimer
 
 # Structured logging instead of print(): print() carries no level, timestamp or
 # module name, so an incident ends up as an unstructured blob nobody can query.
@@ -787,6 +788,11 @@ class PaperStore:
         their ranks, keeps ties deterministic, and needs no extra dependency or
         persisted index.  On a large local corpus we retain semantic retrieval
         rather than scanning every chunk on the request path.
+
+        Every exit path is timed into one of four stages.  That includes the
+        early returns: skipping them would bias the averages, and the degraded
+        paths (huge corpus, lexical failure) are exactly when an operator wants
+        to see that a stage stopped being reached.
         """
         top_k = max(1, min(int(top_k), 20))
         candidate_k = min(
@@ -797,7 +803,8 @@ class PaperStore:
                 if getattr(self, "_reranker_enabled", False) else 0,
             ),
         )
-        semantic = self.query(query_text, candidate_k, paper_ids, section)
+        with StageTimer("semantic"):
+            semantic = self.query(query_text, candidate_k, paper_ids, section)
         collection_count = self._collection.count()
         if collection_count > HYBRID_LEXICAL_MAX_CHUNKS:
             return [
@@ -806,7 +813,8 @@ class PaperStore:
             ]
 
         try:
-            lexical = self.query_lexical(query_text, candidate_k, paper_ids, section)
+            with StageTimer("lexical"):
+                lexical = self.query_lexical(query_text, candidate_k, paper_ids, section)
         except Exception:
             # A working vector result is more useful than failing the complete
             # request because a best-effort local keyword scan is unavailable.
@@ -843,16 +851,21 @@ class PaperStore:
         # supplied paper IDs.
         # An empty scope is still a scope: never widen it into an unscoped
         # search that walks relations across the whole library.
-        if not paper_ids:
-            self._expand_relation_candidates(
-                query_text, fused, ranked, candidate_k=candidate_k, section=section,
-            )
-            ranked = self._sort_hybrid_results(list(fused.values()))
+        with StageTimer("fusion"):
+            if not paper_ids:
+                self._expand_relation_candidates(
+                    query_text, fused, ranked, candidate_k=candidate_k, section=section,
+                )
+                ranked = self._sort_hybrid_results(list(fused.values()))
         rerank_limit = (
             getattr(self, "_reranker_candidate_limit", 0)
             if getattr(self, "_reranker_enabled", False) else 0
         )
-        reranked = self._rerank(query_text, ranked[:rerank_limit]) if rerank_limit else ranked
+        if rerank_limit:
+            with StageTimer("rerank"):
+                reranked = self._rerank(query_text, ranked[:rerank_limit])
+        else:
+            reranked = ranked
         return reranked[:top_k]
 
     def _invalidate_lexical_index(self) -> None:
