@@ -53,7 +53,7 @@ jobs:
       - name: Run offline unit tests
         run: >-
           python -m unittest tests.test_core tests.test_chunking
-          tests.test_lexical tests.test_rerank
+          tests.test_lexical tests.test_rerank tests.test_hybrid
           tests.test_retrieval_metrics tests.test_metrics_chain -v
 
       - name: Run offline release quality gate

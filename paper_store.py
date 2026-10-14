@@ -44,6 +44,20 @@ from papers.lexical import query_terms as lexical_query_terms
 from papers.lexical import scan_score as scan_lexical
 from papers.lexical import score_index as score_lexical_index
 from papers.lexical import tokenize as lexical_tokenize
+from papers.hybrid import RELATION_EXPANSION_MAX_PAPERS as HYBRID_RELATION_MAX_PAPERS
+from papers.hybrid import RELATION_EXPANSION_RRF_FACTOR as HYBRID_RELATION_RRF_FACTOR
+from papers.hybrid import RELATION_EXPANSION_SEED_LIMIT as HYBRID_RELATION_SEED_LIMIT
+from papers.hybrid import RRF_K as HYBRID_RRF_K
+from papers.hybrid import SEMANTIC_CANDIDATE_FACTOR as HYBRID_SEMANTIC_CANDIDATE_FACTOR
+from papers.hybrid import SECTION_PRIORITY_BONUS as HYBRID_SECTION_PRIORITY_BONUS
+from papers.hybrid import SECTION_PRIORITY_TERMS as HYBRID_SECTION_PRIORITY_TERMS
+from papers.hybrid import HYBRID_CANDIDATE_FACTOR, HYBRID_CANDIDATE_LIMIT
+from papers.hybrid import attach_relation_hint
+from papers.hybrid import expand_relation_candidates
+from papers.hybrid import relation_seed_ids
+from papers.hybrid import reciprocal_rank_fusion
+from papers.hybrid import result_key as hybrid_result_key
+from papers.hybrid import sort_hybrid_results
 from papers.metrics import StageTimer
 from papers.rerank import load_cross_encoder
 from papers.rerank import rerank_with
@@ -133,15 +147,18 @@ class PaperStoreProtocol(Protocol):
 DEFAULT_COLLECTION_NAME = "papers"
 
 # ── 检索调参：集中定义，避免魔数散落在各个方法里 ──
-# 稠密召回的过取倍数：多取候选，供章节加权重排后再截断。
-SEMANTIC_CANDIDATE_FACTOR = 3
-# 混合召回的过取倍数：需要足够候选喂给 RRF 融合与精排。
-HYBRID_CANDIDATE_FACTOR = 4
-# 命中这些关键词的章节视为"方法/实验类"，在排序时给一点距离折扣。
-SECTION_PRIORITY_TERMS = ("method", "experiment", "evaluation", "result", "proposed")
-SECTION_PRIORITY_BONUS = 0.05
-# BM25_K1 / BM25_B / BM25_SCALE moved to papers/lexical.py with the formula that
-# uses them.  Tunable in one place instead of two that could drift apart.
+# Tuning constants moved to papers/hybrid.py with the logic that uses them, so
+# a value and its formula can no longer drift apart.  Re-exported here because
+# the profile script and tests read them off this module.
+SEMANTIC_CANDIDATE_FACTOR = HYBRID_SEMANTIC_CANDIDATE_FACTOR
+HYBRID_CANDIDATE_FACTOR = HYBRID_CANDIDATE_FACTOR
+HYBRID_CANDIDATE_LIMIT = HYBRID_CANDIDATE_LIMIT
+SECTION_PRIORITY_TERMS = HYBRID_SECTION_PRIORITY_TERMS
+SECTION_PRIORITY_BONUS = HYBRID_SECTION_PRIORITY_BONUS
+RELATION_EXPANSION_SEED_LIMIT = HYBRID_RELATION_SEED_LIMIT
+RELATION_EXPANSION_MAX_PAPERS = HYBRID_RELATION_MAX_PAPERS
+RELATION_EXPANSION_RRF_FACTOR = HYBRID_RELATION_RRF_FACTOR
+RRF_K = HYBRID_RRF_K
 
 
 
@@ -569,11 +586,7 @@ class PaperStore:
     @staticmethod
     def _result_key(result: dict) -> tuple[str, str, int]:
         """Return a stable key for merging semantic and lexical candidates."""
-        return (
-            str(result.get("paper_id") or result.get("title") or ""),
-            str(result.get("title") or ""),
-            int(result.get("chunk_index") or 0),
-        )
+        return hybrid_result_key(result)
 
     def _get_reranker(self):
         """Load the optional local cross-encoder only when a query needs it."""
@@ -611,36 +624,17 @@ class PaperStore:
 
     @staticmethod
     def _sort_hybrid_results(results: list[dict]) -> list[dict]:
-        return sorted(
-            results,
-            key=lambda item: (
-                -float(item.get("hybrid_score", 0.0)),
-                min(item.get("semantic_rank", 99_999), item.get("keyword_rank", 99_999)),
-                item.get("title", ""),
-                item.get("chunk_index", 0),
-            ),
-        )
+        return sort_hybrid_results(results)
 
     @staticmethod
     def _relation_seed_ids(ranked: list[dict]) -> list[str]:
         """Use only already relevant first-pass papers as one-hop relation seeds."""
-        seeds = []
-        for item in ranked:
-            paper_id = str(item.get("paper_id") or "").strip()
-            if paper_id and paper_id not in seeds:
-                seeds.append(paper_id)
-            if len(seeds) >= RELATION_EXPANSION_SEED_LIMIT:
-                break
-        return seeds
+        return relation_seed_ids(ranked, RELATION_EXPANSION_SEED_LIMIT)
 
     @staticmethod
     def _attach_relation_hint(item: dict, hint: dict[str, Any]) -> None:
         """Expose an auditable retrieval hint without changing paper content."""
-        item["relation_boost"] = round(float(hint.get("boost") or 0.0), 6)
-        item["relation_ids"] = list(hint.get("relation_ids") or [])
-        item["relation_types"] = list(hint.get("relation_types") or [])
-        item["relation_seed_paper_ids"] = list(hint.get("seed_paper_ids") or [])
-        item["relation_seed_titles"] = list(hint.get("seed_titles") or [])
+        attach_relation_hint(item, hint)
 
     def _expand_relation_candidates(
         self,
@@ -653,108 +647,20 @@ class PaperStore:
     ) -> None:
         """Add only one-hop, topic-matched candidates from confirmed relations.
 
-        Relation traversal never replaces retrieval: a related paper contributes
-        only chunks that also score in semantic or lexical retrieval.  The
-        semantic cutoff is the first-pass candidate boundary, so a disconnected
-        paper's merely "least bad" chunk cannot enter because of a relation.
+        The traversal rules live in ``papers.hybrid``; this method only supplies
+        the three collaborators it needs -- the relation store, and the two
+        retrieval entry points -- so the stage stays testable without a store.
         """
-        relation_store = getattr(self, "relation_store", None)
-        if relation_store is None or not ranked:
-            return
-        seeds = self._relation_seed_ids(ranked)
-        if not seeds:
-            return
-        try:
-            hints = relation_store.related_paper_boosts(seeds)
-        except Exception as exc:
-            log.warning(
-                "论文关系检索已跳过 (exc_type=%s, exc=%s)",
-                type(exc).__name__, exc,
-            )
-            return
-        hints = {
-            paper_id: hint for paper_id, hint in hints.items()
-            if paper_id not in set(seeds)
-        }
-        if not hints:
-            return
-        related_ids = sorted(hints)[:RELATION_EXPANSION_MAX_PAPERS]
-        if not related_ids:
-            return
-
-        # Existing results can receive the small, explainable tie-break signal.
-        for item in fused.values():
-            hint = hints.get(str(item.get("paper_id") or ""))
-            if hint:
-                self._attach_relation_hint(item, hint)
-                item["hybrid_score"] = round(
-                    float(item.get("hybrid_score", 0.0)) + float(hint["boost"]), 6,
-                )
-                item["_relation_score_applied"] = True
-
-        try:
-            related_semantic = self.query(
-                query_text, candidate_k, paper_ids=related_ids, section=section,
-            )
-            related_lexical = self.query_lexical(
-                query_text, candidate_k, paper_ids=related_ids, section=section,
-            )
-        except Exception as exc:
-            log.warning(
-                "论文关系候选扩展已跳过 (exc_type=%s, exc=%s)",
-                type(exc).__name__, exc,
-            )
-            return
-
-        semantic_distances = [
-            float(item["distance"]) for item in ranked
-            if item.get("distance") is not None
-        ]
-        semantic_cutoff = max(semantic_distances) if semantic_distances else None
-
-        def merge_related(source: str, candidates: list[dict]) -> None:
-            for rank, candidate in enumerate(candidates, start=1):
-                if source == "semantic" and semantic_cutoff is not None:
-                    distance = candidate.get("distance")
-                    if distance is None or float(distance) > semantic_cutoff:
-                        continue
-                paper_id = str(candidate.get("paper_id") or "")
-                hint = hints.get(paper_id)
-                if hint is None:
-                    continue
-                key = self._result_key(candidate)
-                # A chunk created here reached the results only through a
-                # relation, so it must stay distinguishable from a direct hit.
-                is_expansion_only = key not in fused
-                item = fused.setdefault(key, {
-                    **candidate,
-                    "hybrid_score": 0.0,
-                    "retrieval": "hybrid",
-                })
-                if is_expansion_only:
-                    item["relation_expanded"] = True
-                # This is a secondary retrieval source, not an extra normal
-                # RRF vote.  It cannot dominate a directly retrieved answer.
-                extra_score = RELATION_EXPANSION_RRF_FACTOR / (RRF_K + rank)
-                item["hybrid_score"] = round(
-                    float(item.get("hybrid_score", 0.0)) + extra_score, 6,
-                )
-                item[f"relation_{source}_rank"] = rank
-                self._attach_relation_hint(item, hint)
-
-        merge_related("semantic", related_semantic)
-        merge_related("keyword", related_lexical)
-        for item in fused.values():
-            hint = hints.get(str(item.get("paper_id") or ""))
-            if hint is not None and "relation_boost" in item:
-                # New candidates get their one bounded relation adjustment here;
-                # existing candidates were adjusted before candidate expansion.
-                if "_relation_score_applied" not in item:
-                    item["hybrid_score"] = round(
-                        float(item.get("hybrid_score", 0.0)) + float(hint["boost"]), 6,
-                    )
-                    item["_relation_score_applied"] = True
-            item.pop("_relation_score_applied", None)
+        expand_relation_candidates(
+            query_text,
+            fused,
+            ranked,
+            candidate_k=candidate_k,
+            section=section,
+            relation_store=getattr(self, "relation_store", None),
+            query_semantic=self.query,
+            query_lexical=self.query_lexical,
+        )
 
     def query_hybrid(
         self,
@@ -813,21 +719,12 @@ class PaperStore:
                 for item in semantic[:top_k]
             ]
 
-        fused: dict[tuple[str, str, int], dict] = {}
-        for source, candidates in (("semantic", semantic), ("keyword", lexical)):
-            for rank, candidate in enumerate(candidates, start=1):
-                key = self._result_key(candidate)
-                item = fused.setdefault(key, dict(candidate))
-                item[f"{source}_rank"] = rank
-                item["hybrid_score"] = round(
-                    float(item.get("hybrid_score", 0.0)) + 1.0 / (RRF_K + rank), 6,
-                )
-
-        results = []
+        fused = reciprocal_rank_fusion(
+            (("semantic", semantic), ("keyword", lexical)),
+        )
         for item in fused.values():
             item["retrieval"] = "hybrid"
-            results.append(item)
-        ranked = self._sort_hybrid_results(results)
+        ranked = self._sort_hybrid_results(list(fused.values()))
         # Paper relations are a post-hybrid one-hop expansion.  Explicitly
         # scoped retrieval must remain scoped, so it never walks outside its
         # supplied paper IDs.
