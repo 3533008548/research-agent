@@ -19,7 +19,7 @@ from api.sse import format_sse
 from cancellation import RequestCancelledError
 from papers.metrics import load_published as load_published_retrieval_metrics
 from papers.metrics import publish as publish_retrieval_metrics
-from run_contract import execution_metadata
+from run_contract import bounded_timing_metrics, execution_metadata
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial_failed"}
@@ -651,13 +651,20 @@ class RedisChatRunWorker(_RedisRunWorker):
         self.broker.clear_cancel(job.run_id)
 
 
-def _safe_status_event(event: dict[str, Any]) -> dict[str, str]:
-    """Keep only de-identified stage/status fields from existing progress traces."""
-    return {
+def _safe_status_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Keep only de-identified stage/status fields from existing progress traces.
+
+    ``at_ms``/``duration_ms`` are two bounded numbers and are forwarded so the
+    live timeline can draw a stage the moment it finishes, instead of waiting
+    for a page reload.  Everything else is dropped as before.
+    """
+    payload: dict[str, Any] = {
         "type": "status",
         "stage": str(event.get("stage") or "run")[:80],
         "status": str(event.get("status") or "running")[:40],
     }
+    payload.update(bounded_timing_metrics(event))
+    return payload
 
 
 class _RedisRunStream:

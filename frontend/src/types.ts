@@ -40,6 +40,9 @@ export interface RunEvent {
   status?: string;
   stage?: string;
   tool?: string;
+  /** Wall-clock offset of this event from the start of its run. */
+  at_ms?: number;
+  /** Measured only by the backend clock; never inferred by the client. */
   duration_ms?: number;
   text?: string;
   answer?: string;

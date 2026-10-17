@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from run_contract import SSE_EVENT_TYPES
+from run_contract import SSE_EVENT_TYPES, bounded_timing_metrics
 
 
 def _bounded_text(value: object, limit: int) -> str:
@@ -49,6 +49,9 @@ def public_sse_event(event: dict[str, Any]) -> dict[str, Any]:
         payload["stage"] = _bounded_text(event["stage"], 80)
     if event.get("run_id"):
         payload["run_id"] = _bounded_text(event["run_id"], 120)
+    # Status events also carry the two bounded timing numbers so a live
+    # timeline needs no second request to place a finished stage.
+    payload.update(bounded_timing_metrics(event))
     return payload
 
 

@@ -18,6 +18,17 @@ RUN_EVENT_PROTOCOL = "run-event/v1"
 # clients to share without exposing internal graph events.
 SSE_EVENT_TYPES = frozenset({"status", "token", "tool", "done", "error"})
 
+# Wall-clock position and elapsed time are the two numbers a timeline needs.
+# They are aggregate measurements, so they stay inside the existing safe
+# numeric allow-list instead of widening the public vocabulary.
+TIMING_METRIC_KEYS = ("at_ms", "duration_ms")
+
+# Statuses that close a stage.  ``partial``/``partial_failed`` close it too:
+# a stage that only half-succeeded still consumed measurable wall-clock time.
+TERMINAL_STAGE_STATUSES = frozenset({
+    "completed", "failed", "cancelled", "partial", "partial_failed", "skipped",
+})
+
 # Token chunks are intentionally ephemeral Redis data.  Durable audit events
 # exclude them so a long answer cannot turn SQLite into a stream transcript.
 PERSISTED_EVENT_TYPES = frozenset({"status", "tool", "done", "error"})
@@ -116,6 +127,27 @@ def infer_persisted_event_type(
     if status in TERMINAL_RUN_STATUSES and stage in TERMINAL_EVENT_STAGES:
         return "done"
     return "status"
+
+
+def is_timing_metric(key: str) -> bool:
+    """Whether ``key`` carries wall-clock position rather than content."""
+    return key in TIMING_METRIC_KEYS
+
+
+def bounded_timing_metrics(source: dict[str, Any] | None) -> dict[str, float]:
+    """Project only ``at_ms``/``duration_ms`` out of an internal event.
+
+    Timeline rendering must never be able to reach prompts, tool arguments or
+    paper text, so the projection is an explicit allow-list of two numeric
+    measurement keys rather than a filter over whatever the caller passed.
+    """
+    bounded: dict[str, float] = {}
+    for key in TIMING_METRIC_KEYS:
+        value = (source or {}).get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        bounded[key] = round(float(value), 1)
+    return bounded
 
 
 def daily_event_summary(stage: str, status: str) -> str:

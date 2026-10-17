@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,7 @@ from paper_records import (
     same_paper,
     title_similarity,
 )
+from run_contract import TERMINAL_STAGE_STATUSES
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -77,6 +79,15 @@ class DailyResearchOrchestrator:
         )
         self.daily_sources = configured_sources or ("openalex", "openaire", "dblp")
         self.temporary_sources = ("openalex", "arxiv")
+        # Wall-clock bookkeeping for the stage timeline.  ``_stage_started`` maps
+        # ``(run_id, agent)`` to the ``perf_counter`` reading that opened its
+        # current stage, and ``_run_started`` anchors every ``at_ms`` to the
+        # beginning of that run so the UI can position stages on a shared axis.
+        # Keying by ``run_id`` matters: one orchestrator instance serves every
+        # queued run, so a module-level clock would let one run's duration leak
+        # into the next one's timeline.
+        self._stage_started: dict[tuple[str, str], float] = {}
+        self._run_started: dict[str, float] = {}
         # Source-level permits are stricter than keyword-level parallelism.
         # This prevents a burst of active keywords from tripping one provider.
         self._source_slots = {
@@ -115,6 +126,7 @@ class DailyResearchOrchestrator:
             candidates = self.scheduler.get_daily_candidates(run_id)
             source_stats = dict(existing.get("source_stats") or {})
             self.scheduler.update_daily_run(run_id, status="running", plan=plan)
+            self._open_stage(run_id, "planner")
             self._event(run_id, "planner", "completed", "已加载已排队的每日检索计划", on_progress, plan)
         else:
             reused = self.scheduler.get_latest_resumable_run(kind) if resume else None
@@ -135,6 +147,7 @@ class DailyResearchOrchestrator:
                 run_id = str(run["run_id"])
                 candidates = []
                 source_stats: dict[str, Any] = {}
+                self._open_stage(run_id, "planner")
                 self._event(run_id, "planner", "completed", "已生成规则化检索计划", on_progress, plan)
 
         try:
@@ -150,7 +163,7 @@ class DailyResearchOrchestrator:
                     f"正在由 {len(sources)} 名来源 Scout 检索 {len(keywords)} 个关键词", on_progress,
                 )
                 raw_candidates, source_stats = self._run_scouts(
-                    keywords, sources, cancel_event, on_progress,
+                    keywords, sources, cancel_event, on_progress, run_id,
                 )
                 for key, stats in source_stats.items():
                     failed = [name for name, detail in stats.items() if detail.get("status") != "ok"]
@@ -158,6 +171,7 @@ class DailyResearchOrchestrator:
                     if failed:
                         message += f"；{', '.join(failed)} 未完成"
                     self._event(run_id, "scouts", "partial" if failed else "completed", message, on_progress, stats)
+                self._open_stage(run_id, "normalizer")
                 candidates = self._deduplicate(raw_candidates, paper_store)
                 self.scheduler.save_daily_candidates(run_id, candidates)
                 self.scheduler.update_daily_run(run_id, source_stats=source_stats)
@@ -167,6 +181,7 @@ class DailyResearchOrchestrator:
                 )
 
             self._ensure_active(cancel_event)
+            self._open_stage(run_id, "quality_gate")
             candidates = self._apply_quality_gate(candidates)
             self.scheduler.save_daily_candidates(run_id, candidates)
             eligible = [item for item in candidates if item["quality"].get("eligible")]
@@ -186,6 +201,7 @@ class DailyResearchOrchestrator:
             )
 
             self._ensure_active(cancel_event)
+            self._open_stage(run_id, "critic")
             critique = self._critique_if_needed(candidates, cancel_event)
             if critique.get("ran"):
                 self._event(run_id, "critic", critique["status"], critique["message"], on_progress)
@@ -204,6 +220,7 @@ class DailyResearchOrchestrator:
                 "selected": selected,
                 "curator_mode": curator_mode,
             }
+            self._open_stage(run_id, "delivery")
             self.scheduler.update_daily_run(
                 run_id, status=status, source_stats=source_stats,
                 results=result_payload, critique=critique,
@@ -213,10 +230,12 @@ class DailyResearchOrchestrator:
                 f"已生成 {len(selected)} 篇每日推荐" + ("；部分来源失败" if partial else ""),
                 on_progress,
             )
+            self._reset_stage_timing(run_id)
             return DailyRunResult(run_id, status, selected, source_stats, brief, critique)
         except RequestCancelledError:
             self.scheduler.update_daily_run(run_id, status="cancelled", source_stats=source_stats)
             self._event(run_id, "orchestrator", "cancelled", "每日检索已停止，可从已保存候选继续", on_progress)
+            self._reset_stage_timing(run_id)
             return DailyRunResult(run_id, "cancelled", candidates, source_stats, "每日检索已停止。", {})
         except Exception as exc:
             self.scheduler.update_daily_run(
@@ -224,6 +243,7 @@ class DailyResearchOrchestrator:
                 error_text=f"{type(exc).__name__}: {exc}",
             )
             self._event(run_id, "orchestrator", "failed", f"每日检索失败：{type(exc).__name__}", on_progress)
+            self._reset_stage_timing(run_id)
             return DailyRunResult(run_id, "failed", candidates, source_stats, "每日检索未完整完成。", {})
 
     def _resolve_keywords(self, kind: str, keyword: str | None) -> list[str]:
@@ -251,6 +271,7 @@ class DailyResearchOrchestrator:
         sources: tuple[str, ...],
         cancel_event: threading.Event | None,
         on_progress: ProgressCallback | None,
+        run_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         results: list[dict[str, Any]] = []
         stats: dict[str, Any] = {}
@@ -276,7 +297,10 @@ class DailyResearchOrchestrator:
                 results.extend(items)
                 stats[keyword] = keyword_stats
                 completed += 1
-                self._notify(on_progress, "scouts", "running", f"已完成 {completed}/{len(keywords)} 个关键词")
+                self._notify_progress(
+                    on_progress, run_id, "scouts", "running",
+                    f"已完成 {completed}/{len(keywords)} 个关键词",
+                )
         return results, stats
 
     def _scout_keyword(
@@ -796,17 +820,83 @@ class DailyResearchOrchestrator:
         self, run_id: str, agent: str, status: str, message: str,
         callback: ProgressCallback | None, details: dict | None = None,
     ) -> None:
-        self.scheduler.add_daily_agent_event(run_id, agent, status, message, details)
-        self._notify(callback, agent, status, message)
+        """Record one stage event with real wall-clock timing attached.
+
+        ``created_at`` alone cannot answer "how long did the curator take",
+        because several stages emit only a terminal event.  Pairing the
+        monotonic clock here keeps the timing measurement at the only place
+        that actually knows when the work started, and keeps the timeline
+        honest instead of letting the UI guess from arrival order.
+        """
+        timing = self._stage_timing(run_id, agent, status)
+        metrics = dict(details) if isinstance(details, dict) else {}
+        metrics.update(timing)
+        self.scheduler.add_daily_agent_event(run_id, agent, status, message, metrics)
+        self._notify(callback, agent, status, message, timing)
+
+    def _stage_timing(self, run_id: str, agent: str, status: str) -> dict[str, float]:
+        """Advance this agent's stage clock and return the timing metrics."""
+        now = time.perf_counter()
+        run_start = self._run_started.setdefault(run_id, now)
+        at_ms = round((now - run_start) * 1_000, 1)
+        timing: dict[str, float] = {"at_ms": at_ms}
+        key = (str(run_id), str(agent))
+        if status in TERMINAL_STAGE_STATUSES:
+            started = self._stage_started.pop(key, None)
+            if started is not None:
+                timing["duration_ms"] = round((now - started) * 1_000, 1)
+        elif status not in {"queued", "resumed"}:
+            # ``running`` opens a stage; a later terminal event closes it.  Use
+            # setdefault so a repeated status refresh does not reset the clock.
+            self._stage_started.setdefault(key, now)
+        return timing
+
+    def _open_stage(self, run_id: str, agent: str) -> None:
+        """Start an agent's stage clock without emitting an event.
+
+        Several stages (``planner``, ``quality_gate``, ``delivery``) only ever
+        report a terminal status.  Without this the duration would be
+        unmeasurable, and computing it in the UI from event arrival order
+        would silently attribute queue time to the wrong stage.  Opening the
+        clock here keeps the event stream byte-identical to before.
+        """
+        now = time.perf_counter()
+        self._run_started.setdefault(str(run_id), now)
+        self._stage_started.setdefault((str(run_id), str(agent)), now)
+
+    def _reset_stage_timing(self, run_id: str) -> None:
+        """Drop leftover stage clocks once a run reaches a terminal state."""
+        self._run_started.pop(str(run_id), None)
+        for key in [key for key in self._stage_started if key[0] == str(run_id)]:
+            self._stage_started.pop(key, None)
 
     @staticmethod
-    def _notify(callback: ProgressCallback | None, agent: str, status: str, message: str) -> None:
+    def _notify(
+        callback: ProgressCallback | None, agent: str, status: str, message: str,
+        timing: dict[str, float] | None = None,
+    ) -> None:
         if callback is None:
             return
         try:
-            callback({"stage": agent, "status": status, "message": message})
+            callback({"stage": agent, "status": status, "message": message, **(timing or {})})
         except Exception:
             pass
+
+    def _notify_progress(
+        self, callback: ProgressCallback | None, run_id: str | None, agent: str,
+        status: str, message: str,
+    ) -> None:
+        """Emit an intra-stage progress ping with position but no new stage.
+
+        Repeated ``running`` pings must not close or restart the stage clock —
+        they only report how far along the current stage already is, which is
+        what ``at_ms`` alone expresses.
+        """
+        timing: dict[str, float] = {}
+        start = self._run_started.get(str(run_id)) if run_id is not None else None
+        if start is not None:
+            timing["at_ms"] = round((time.perf_counter() - start) * 1_000, 1)
+        self._notify(callback, agent, status, message, timing)
 
     @staticmethod
     def _parse_json(raw: str) -> dict:

@@ -31,7 +31,7 @@ from research_evidence import (
     split_tool_evidence,
     strip_citation_markers,
 )
-from run_contract import execution_metadata
+from run_contract import TERMINAL_STAGE_STATUSES, execution_metadata
 from tool_runtime import ToolExecutionContext
 
 
@@ -207,7 +207,36 @@ class ResearchOrchestrator:
         # operational log.
         external_progress = on_progress
 
+        # Per-run stage clock.  This lives in a closure rather than on ``self``
+        # so two concurrent research runs cannot read each other's timings, and
+        # so the state disappears with the request instead of leaking.
+        stage_started: dict[str, float] = {}
+        run_started = time.perf_counter()
+
+        def _timing(stage: str, status: str) -> dict[str, float]:
+            """Pair each stage's opening and closing event into a duration.
+
+            The research stages already emit ``running`` then a terminal
+            status, which makes this the same measurement the daily pipeline
+            needs — but the clock has to be monotonic and per-run, otherwise a
+            completed run's curator time would surface on the next run.
+            """
+            now = time.perf_counter()
+            timing: dict[str, float] = {"at_ms": round((now - run_started) * 1_000, 1)}
+            if status in TERMINAL_STAGE_STATUSES:
+                started = stage_started.pop(stage, None)
+                if started is not None:
+                    timing["duration_ms"] = round((now - started) * 1_000, 1)
+            elif status not in {"waiting", "streaming"}:
+                stage_started.setdefault(stage, now)
+            return timing
+
         def _persisted_progress(event: dict[str, Any]) -> None:
+            stage = str(event.get("stage") or "research")
+            status = str(event.get("status") or "running")
+            timing = _timing(stage, status)
+            if external_progress:
+                external_progress({**event, **timing})
             stage = str(event.get("stage") or "research")
             status = str(event.get("status") or "running")
             labels = {
@@ -225,10 +254,8 @@ class ResearchOrchestrator:
             agent, summary = labels.get(stage, ("orchestrator", "研究运行状态已更新"))
             self.sessions.add_run_event(
                 thread_id, run_id, "research", agent, stage, status,
-                summary=summary,
+                summary=summary, metrics=timing,
             )
-            if external_progress:
-                external_progress(event)
 
         on_progress = _persisted_progress
         self.sessions.add_run_event(
