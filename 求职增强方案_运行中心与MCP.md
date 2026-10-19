@@ -100,110 +100,100 @@ def bounded_timing_metrics(source) -> dict[str, float]: ...
 373 tests OK  (206 → +16)
 ```
 
+### ⚠️ 补完这一步之后才发现：时间戳到不了浏览器
+
+第一版只做了测量，**没有做投递**。`/runs/{id}` 对 `daily-` 运行返回
+`events: []` —— daily 的阶段事件存在 `daily_agent_events` 表里，
+而 `get_run` 只对 `chat-/research-/experiment-` 去读 `agent_run_events`。
+前端拿到的是空数组，界面照样画不出时间轴。
+
+修法：新增 `_daily_timeline_events`，把 daily 事件投影成与其他 run 相同的
+`{type, stage, status, at_ms, duration_ms}`，界面就只需**一个**归约函数。
+
+→ **教训**：埋点要连着"谁读它"一起确认。只验证"写进去了"会漏掉整整一条链路。
+
 ---
 
-## 2. 阶段二：拆 RunCenter + 阶段时间轴（2–3 天）
+## 2. 阶段二：拆 RunCenter + 阶段时间轴（已完成）
 
 **直接对应 JD 的"执行过程可视化"**。复用已有 `runs` tab，不新建页面。
 
-### 2.1 组件拆分（顺带解决 App.tsx 2582 行）
-
-现状：前端 6 个文件，`App.tsx` 独占 2582 行。
+### 2.1 实际落地结构
 
 ```
 frontend/src/
-├── App.tsx                    瘦身为壳：只做 tab 编排与路由
-├── api.ts                     数据层（已有 399 行，仅追加端点）
-├── types.ts                   类型（已有 290 行）
+├── App.tsx                             2569 行（原 2582）
+├── api.ts / types.ts                   数据层与类型
 ├── lib/
-│   └── timeline.ts            纯函数：events[] → TimelineStage[]
-│                                （可单测，不依赖 React）
-└── components/
-    ├── runcenter/
-    │   ├── RunCenter.tsx      运行列表 + 筛选
-    │   ├── StageTimeline.tsx  ★ 甘特式时间轴
-    │   ├── ToolTrace.tsx      工具调用与单次耗时
-    │   └── StageCard.tsx      单阶段详情
-    └── ...（现有组件）
+│   ├── timeline.ts                ★ 纯函数归约，13 个测试
+│   └── timeline.test.ts
+└── components/runcenter/
+    ├── RunCenterList.tsx           运行列表 + Badcase 标记
+    ├── RunDetailPanel.tsx          按需拉取事件、切换 daily/research 端点
+    └── StageTimeline.tsx           甘特式时间轴 + 工具调用面板
 ```
 
-⚠️ **拆分纪律**：`App.tsx` 现在同时是页面容器和状态中心。
-拆分必须**纯搬移**，不夹带行为变更 —— 与 `paper_store` 重构同一条纪律。
-先搬后改，一步一提交，每步 `npm run build` 通过。
+**前端测试不引新依赖**：Node 24 内置 runner + 原生 `--experimental-strip-types`
+就能跑纯 TS。`tsconfig.app.json` 排除 `*.test.ts`，所以测试不进应用构建。
 
 ### 2.2 时间轴的数据形状
 
-`lib/timeline.ts` 是核心，**纯函数、可单测、不依赖 React**：
+`lib/timeline.ts` 是纯函数、不依赖 React、不发请求，因此最关键那条规则能被单独测：
 
 ```ts
 export interface TimelineStage {
-  stage: string;          // "planner" | "researchers" | ...
-  status: string;         // completed | running | partial | failed | skipped
-  startMs: number;        // at_ms
-  durationMs: number | null;  // null = 未结束或后端未测量
-  agent: string;          // "orchestrator" | "researcher" | ...
+  stage: string;            // 后端原名，如 planner / synthesis
+  status: string;
+  startMs: number;          // 来自 at_ms
+  durationMs: number | null;// 后端没给就是 null
+  running: boolean;
 }
-
-export function buildTimeline(events: RunEvent[]): TimelineStage[]
 ```
 
-**归约规则（必须与后端语义一致，否则界面会说谎）：**
+**归约规则（与后端语义严格一致，否则界面会说谎）：**
 1. 按 `stage` 分组，保持首次出现顺序。
-2. `durationMs` **只取后端给的 `duration_ms`**。
-   没有就是 `null`，界面显示"—"，**绝不用 `at_ms` 差值兜底**。
-3. `status` 取该 stage 最后一个事件的状态。
-4. 未配对的 `running` → `durationMs: null`，界面显示"进行中"并持续增长（增长用本地时钟，
-   但**只用于动画，收敛值仍以后端为准**）。
+2. `durationMs` **只取后端给的 `duration_ms`**，没有就是 `null` → 渲染 `—`，
+   **绝不用 `at_ms` 差值兜底**。
+3. `measuredTotalMs()` 只累加**已测量**的阶段，
+   避免未测量阶段把合计撑大到超过整体。
+4. 未执行的已知阶段补成 `pending`（灰色），而不是留空让人以为流程短。
 
-⚠️ 规则 2 是原则问题：一旦前端开始自己估算耗时，界面就和后端日志对不上，
-排查问题时会出现两个真相。我在前端代码里会写明这一点。
+### 2.3 两个实测出来的真 bug
 
-### 2.3 界面布局
+**① `startMs === 0` 当哨兵是错的**
+最初用 `0` 表示"未测量"，但 `at_ms` 的合法值就是 `0`。结果 planner 的起点
+被后续 `running` 刷新从 0 拖到 900ms —— 一个只在特定数据下才出现的偏移错误。
+改用独立的 `startsSeen: Set<string>`记录是否已见测量值。
+→ 通用教训：**哨兵值不能与合法值重合**。
 
-```
-┌─ 运行中心 ────────────────────────────────────────────┐
-│ [运行列表]          │  深度研究 · run_7f3a            │
-│ ● 完成  research    │                                  │
-│ ● 运行中 daily      │  ▓▓▓▓▓▓░░░░  1.2s  planner      │
-│ ○ 失败  chat        │  ▓▓▓▓▓▓▓▓▓▓ 0.4s  researchers   │
-│                    │  ▓▓░░░░░░░░  0.1s  evidence_analysis
-│                    │  ▓▓▓▓▓▓▓▓▓▓ 2.8s  synthesis     │
-│                    │  ░░░░░░░░░░     —     critic (skipped)
-│                    │                                  │
-│                    │  ── 工具 ──────────────────────  │
-│                    │  query_papers        612ms   ✓   │
-│                    │  search_papers       88ms    ✓   │
-│                    │  rerank(cross-enc)   603ms   ✓   │
-│                    │                                  │
-│                    │  ── 结果 ──────────────────────  │
-│                    │  证据 8 · 引用 5 · 全文 2.1k字    │
-└────────────────────┴──────────────────────────────────┘
-```
+**② 前端不能假设所有 run kind 走同一个端点**
+`/runs/{id}` 需要 Redis run manager；daily 改走 `/workspace/daily-runs/{id}`
+（只依赖 scheduler）。这不是测试环境的问题 —— **没配 Redis 的部署本来就该能用时间轴**。
+→ 这条是让 API 测试的 404 失败暴露出来的，属于意外收获。
 
-- 时间轴宽度按 `at_ms + duration` 归一化，最长阶段 100%。
-- 阶段名用**英文原名**（`planner`/`synthesis`/...），配中文 tooltip。
-  理由：这些是真实代码里的 stage 名，面试时可以直接翻代码对上，界面不能另起一套叫法。
+### 2.4 界面表现
 
-### 2.4 实时性
+- 时间轴按 `at_ms + duration` 归一化，最长阶段占满宽度。
+- 阶段名用**英文原名**（`planner`/`synthesis`/…）。理由：这些是真实代码里的
+  stage 名，面试时可以直接翻代码对上，界面不能另起一套叫法。
+- **未测量阶段用虚线框，不用实心条** —— 避免"没有数据"和"耗时为零"视觉混淆。
+- 颜色按状态：`completed` 蓝、`running` 琥珀、`failed/partial` 红、`skipped/pending` 灰。
 
-现有 SSE 已能收到带耗时的 status 事件（本次已打通），所以：
-- 运行中：SSE 事件到达即更新对应阶段，不轮询。
-- 刷新页面：从 `run.events` 归约，历史时间轴完整恢复。
+### 2.5 验收情况
 
-### 2.5 验收标准
-
-| 项 | 标准 |
+| 项 | 结果 |
 |---|---|
-| 时间轴数值正确 | 选 3 个真实 run，界面耗时与 SQLite `details_json` 逐项一致 |
-| 无耗时阶段 | 显示 "—"，**不是 0ms** |
-| 跳过阶段 | `critic/skipped` 灰色显示，不占宽度 |
-| 并发运行 | 同时开 daily + research，互不串时间轴 |
-| 回归 | 现有 373 个后端测试 + `npm run build` + `npm run lint` 全绿 |
-| 不夹带变更 | 拆分提交与功能提交分开，`git diff` 可审查 |
+| 时间轴数值 | 后端 376 测试绿，含 API 端到端断言（`duration_ms`/`at_ms` 确实到 JSON） |
+| 无耗时阶段 | 显示 `—`，虚线框 |
+| 跳过阶段 | 灰色 `pending`/`skipped`，不占宽度 |
+| 投影不泄露 | 测试断言 daily 事件只含 5 个白名单 key |
+| 前端构建 | `tsc -b && vite build` 通过 |
+| 前端测试 | 13 例，`npm run test`，已进 CI 新 job |
+| App.tsx | 2582 → 2569 行（本阶段只搬移 RunCenter 列表） |
 
 ---
 
-## 3. 阶段三：MCP Server（1–2 天）
+## 3. 阶段三：MCP Server（1–2 天，下一步）
 
 **直接对应 JD 的 MCP 要求。** 优先做 Server，因为它把本项目**已有的能力对外暴露**，
 不需要新的模型决策，风险最低、见效最快。
@@ -269,14 +259,16 @@ export function buildTimeline(events: RunEvent[]): TimelineStage[]
 
 | 阶段 | 内容 | 验收 | 风险 |
 |---|---|---|---|
-| ✅ 第一步 | 后端阶段时间戳 | 373 测试绿 | 已完成 |
-| 二 | RunCenter 拆分 + 时间轴 | 时间轴与 SQLite 逐项一致 | 低（纯前端） |
+| ✅ 第一步 | 后端阶段时间戳 + daily 事件投递 | 376 测试绿 | 已完成 |
+| ✅ 第二步 | RunCenter 拆分 + 时间轴 | 数值与 SQLite 一致、前端 13 例 | 已完成 |
 | 三 | MCP Server | 4 tool 可 inspect、结果一致 | 低（暴露已有能力） |
 | 四 | MCP Client | 外部 tool 自动获得熔断 | **中**（外部不可控） |
 | 五 | `App.tsx` 剩余部分收尾 | 组件均 < 500 行 | 低 |
 
 **顺序理由**：二和三都能独立交付、独立演示，风险都低。
 四放最后，因为它唯一依赖外部系统；如果时间不够，前三步已经能覆盖 JD 的两条要求。
+
+**当前进度**：一、二已完成（`618be09`、`cbbf4ab`）。下一步是 MCP Server。
 
 ---
 
