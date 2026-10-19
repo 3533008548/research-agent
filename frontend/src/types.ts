@@ -73,7 +73,13 @@ export interface Run {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
-  events: Array<Record<string, unknown>>;
+  /**
+   * Durable events from the backend. Typed as `RunEvent` rather than
+   * `Record<string, unknown>` because the stage timeline reads `stage`,
+   * `at_ms` and `duration_ms` off them; leaving it untyped is how a field
+   * rename silently becomes `undefined` in the UI instead of a compile error.
+   */
+  events: RunEvent[];
   steers: RunSteer[];
 }
 
@@ -248,6 +254,8 @@ export interface DailyRunDetail {
   brief: string;
   warnings: string[];
   papers: DailyRunPaper[];
+  /** Stage events on the shared timeline shape. */
+  events: RunEvent[];
 }
 
 export interface SessionUsage {

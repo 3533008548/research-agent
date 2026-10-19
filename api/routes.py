@@ -57,6 +57,7 @@ from repository_sources import (
 )
 from paper_artifacts import load_document_map
 from research_document_routing import route_research_document_request
+from run_contract import bounded_timing_metrics
 from workspace_uploads import UploadValidationError
 
 
@@ -144,7 +145,7 @@ def _research_payload(run: dict, events: list[dict] | None = None) -> dict:
     )
 
 
-def _daily_payload(run: dict) -> dict:
+def _daily_payload(run: dict, events: list[dict] | None = None) -> dict:
     result = run.get("result") or {}
     selected = result.get("selected") if isinstance(result, dict) else []
     candidates = run.get("candidates") or []
@@ -158,6 +159,7 @@ def _daily_payload(run: dict) -> dict:
             "selected_count": len(selected) if isinstance(selected, list) else 0,
         },
         error_type=error_text.split(":", 1)[0][:120] if error_text else "",
+        events=events,
     )
 
 
@@ -178,6 +180,7 @@ def _experiment_payload(run: dict, events: list[dict] | None = None) -> dict:
 
 def _daily_run_detail_payload(scheduler, run: dict) -> dict:
     """Project a persisted daily result into a workbench document page."""
+    run_id = str(run.get("run_id") or "")
     result = run.get("result") if isinstance(run.get("result"), dict) else {}
     critique = run.get("critique") if isinstance(run.get("critique"), dict) else {}
     papers = []
@@ -211,7 +214,46 @@ def _daily_run_detail_payload(scheduler, run: dict) -> dict:
         "brief": str(result.get("brief") or "")[:600],
         "warnings": [str(warning)[:160] for warning in warnings[:4] if str(warning).strip()],
         "papers": papers,
+        "events": _daily_timeline_events(scheduler, run_id),
     }
+
+
+def _daily_timeline_events(scheduler, run_id: str) -> list[dict]:
+    """Project daily stage events onto the shared timeline shape.
+
+    Same allow-list as ``_timeline_events``; kept separate only because the
+    daily detail endpoint has no ``Request`` to reach the app state through.
+    """
+    projected: list[dict[str, Any]] = []
+    for event in scheduler.get_daily_agent_events(run_id):
+        metrics = event.get("details") if isinstance(event.get("details"), dict) else {}
+        item: dict[str, Any] = {
+            "type": "status",
+            "stage": str(event.get("agent") or "orchestrator"),
+            "status": str(event.get("status") or "running"),
+        }
+        item.update(bounded_timing_metrics(metrics))
+        projected.append(item)
+    return projected
+
+
+def _timeline_events(
+    request: Request, run_id: str, run: dict, events: list[dict],
+) -> list[dict]:
+    """Expose the same stage-event shape for every run kind.
+
+    Daily runs persist their stage timeline in a different table from chat and
+    research runs, so without this the timeline simply has nothing to draw for
+    them.  Both sources are projected onto ``{type, stage, status, at_ms,
+    duration_ms}`` so the UI needs exactly one reducer.  The projection is an
+    allow-list: whatever else a durable event carries stays server-side.
+    """
+    if not run_id.startswith("daily-"):
+        return events
+    scheduler = getattr(request.app.state, "workspace_scheduler", None)
+    if scheduler is None:
+        return []
+    return _daily_timeline_events(scheduler, run_id)
 
 
 def _manager(request: Request):
@@ -249,7 +291,7 @@ def _run_payload(request: Request, run: dict, events: list[dict] | None = None) 
     if run_id.startswith("research-"):
         payload = _research_payload(run, events)
     elif run_id.startswith("daily-"):
-        payload = _daily_payload(run)
+        payload = _daily_payload(run, events)
     elif run_id.startswith("experiment-"):
         payload = _experiment_payload(run, events)
     else:
@@ -983,7 +1025,7 @@ def get_run(run_id: str, request: Request) -> dict:
     events = []
     if run_id.startswith(("chat-", "research-", "experiment-")):
         events = request.app.state.agent.sessions.get_run_events(run_id, run["thread_id"])
-    return _run_payload(request, run, events)
+    return _run_payload(request, run, _timeline_events(request, run_id, run, events))
 
 
 @router.post(

@@ -60,6 +60,27 @@ jobs:
       - name: Run offline release quality gate
         run: python -m evals.release_gate --strict
 
+  frontend-tests:
+    name: Frontend reducer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Run timeline reducer tests
+        # No test framework on purpose: Node's built-in runner plus native type
+        # stripping covers a pure reducer without adding a dependency that CI
+        # would then have to keep current.
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run test
+
   browser-e2e:
     name: Browser UI and FastAPI integration
     runs-on: ubuntu-latest

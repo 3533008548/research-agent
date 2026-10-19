@@ -455,6 +455,20 @@ class TestFastAPIService(unittest.TestCase):
             self.assertEqual(daily_detail.status_code, 200)
             self.assertEqual(daily_detail.json()["papers"][0]["reason"], "与关键词高度相关")
             self.assertEqual(client.get("/api/v1/workspace/daily-runs/daily-missing").status_code, 404)
+
+            # The stage timeline has to survive the trip to the browser, or the
+            # run center has nothing to draw for daily runs.
+            scheduler.add_daily_agent_event(
+                daily_run["run_id"], "planner", "completed", "", {"at_ms": 0, "duration_ms": 12.5},
+            )
+            scheduler.add_daily_agent_event(
+                daily_run["run_id"], "delivery", "completed", "", {"at_ms": 900, "duration_ms": 800},
+            )
+            daily_timeline = client.get(f"/api/v1/workspace/daily-runs/{daily_run['run_id']}").json()["events"]
+            self.assertEqual([item["stage"] for item in daily_timeline], ["planner", "delivery"])
+            self.assertEqual(daily_timeline[0]["duration_ms"], 12.5)
+            self.assertEqual(daily_timeline[1]["at_ms"], 900)
+            self.assertEqual(daily_timeline[0]["type"], "status")
             self.assertEqual(client.delete("/api/v1/workspace/daily-keywords/TSN%20scheduling").status_code, 204)
 
             saved = client.put("/api/v1/workspace/settings", json={

@@ -8,7 +8,9 @@ forward anything that is not one of the two bounded numbers.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from api.redis_runs import _safe_status_event
 from api.sse import format_sse, public_sse_event
@@ -142,8 +144,6 @@ class DailyRunTimelineTests(unittest.TestCase):
 
     def test_offline_run_records_per_stage_durations(self):
         import json
-        import tempfile
-        from pathlib import Path
         from unittest.mock import patch
 
         from daily_orchestrator import DailyResearchOrchestrator
@@ -199,6 +199,86 @@ class DailyRunTimelineTests(unittest.TestCase):
             self.assertIsInstance(row["details"]["duration_ms"], (int, float))
             self.assertNotIsInstance(row["details"]["duration_ms"], bool)
             json.dumps(row["details"])
+
+
+class DailyTimelineProjectionTests(unittest.TestCase):
+    """Daily stage events must actually reach the browser.
+
+    The timing work is worthless in the product if the API still answers
+    ``events: []`` for daily runs, so this pins the projection rather than the
+    measurement.
+    """
+
+    def _daily_run_with_events(self, tmp: str, failed_sources=()):
+        from unittest.mock import patch
+
+        from daily_orchestrator import DailyResearchOrchestrator
+        from evals.runtime_fakes import FixtureSourceRouter
+        from scheduler import Scheduler
+
+        fixtures = Path(__file__).resolve().parents[1] / "evals" / "fixtures" / "providers"
+        store = Scheduler(str(Path(tmp) / "daily.db"))
+        store.add_keyword("offline projection")
+        router = FixtureSourceRouter(fixtures, failed_sources=set(failed_sources), seed=11)
+        orchestrator = DailyResearchOrchestrator(
+            scheduler=store, llm_client=None, model="",
+            max_keyword_concurrency=1, max_results_per_keyword=1,
+        )
+        with patch("daily_orchestrator.requests.get", side_effect=router.get):
+            orchestrator.run("daily")
+        # The store stays open on purpose: the caller asserts against the same
+        # database the run wrote to, which is the point of the test.
+        return store
+
+    def test_daily_events_are_projected_with_timing(self):
+        from api.routes import _daily_timeline_events
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._daily_run_with_events(tmp)
+            try:
+                run = store.list_daily_runs(limit=1)[0]
+                projected = _daily_timeline_events(store, str(run["run_id"]))
+            finally:
+                store.close()
+
+        self.assertTrue(projected, "daily projection produced no events")
+        stages = {item["stage"] for item in projected}
+        # The real stage names, not invented ones.
+        self.assertIn("planner", stages)
+        self.assertIn("scouts", stages)
+        self.assertIn("delivery", stages)
+        for item in projected:
+            self.assertEqual(item["type"], "status")
+            self.assertIn("status", item)
+            # Allow-list projection: no server-side detail may leak through.
+            self.assertLessEqual(set(item), {"type", "stage", "status", "at_ms", "duration_ms"})
+        self.assertTrue(any("duration_ms" in item for item in projected))
+
+    def test_projection_keeps_skipped_and_failed_stages(self):
+        from api.routes import _daily_timeline_events
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._daily_run_with_events(tmp, failed_sources={"openaire"})
+            try:
+                run = store.list_daily_runs(limit=1)[0]
+                projected = _daily_timeline_events(store, str(run["run_id"]))
+            finally:
+                store.close()
+
+        statuses = {item["status"] for item in projected}
+        # A partially failed source still produced a real, timed stage.
+        self.assertIn("partial", statuses)
+
+    def test_unknown_run_yields_no_events_rather_than_raising(self):
+        from api.routes import _daily_timeline_events
+        from scheduler import Scheduler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Scheduler(str(Path(tmp) / "daily.db"))
+            try:
+                self.assertEqual(_daily_timeline_events(store, "daily-does-not-exist"), [])
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

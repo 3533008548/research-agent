@@ -41,6 +41,8 @@ import {
   useExperimentMethodReconstruction,
   uploadWorkspaceFile,
 } from "./api";
+import { RunCenterList } from "./components/runcenter/RunCenterList";
+import { RunDetailPanel } from "./components/runcenter/RunDetailPanel";
 import {
   ApiError,
   type BadcaseCandidate,
@@ -488,6 +490,7 @@ export function App() {
   const [runCenterRuns, setRunCenterRuns] = useState<Run[]>([]);
   const [badcases, setBadcases] = useState<BadcaseCandidate[]>([]);
   const [runCenterLoading, setRunCenterLoading] = useState(false);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [badcaseSubmitting, setBadcaseSubmitting] = useState<string | null>(null);
   const [badcaseCategories, setBadcaseCategories] = useState<Record<string, BadcaseCategory>>({});
   const [manualBadcaseRunId, setManualBadcaseRunId] = useState("");
@@ -1144,6 +1147,14 @@ export function App() {
     } finally {
       setRunCenterLoading(false);
     }
+  }
+
+  const selectedRun = runCenterRuns.find((run) => run.run_id === selectedRunId) || null;
+
+  function selectRunForTimeline(run: Run) {
+    // Clicking the selected row again closes the panel, so the list doubles as
+    // the toggle without needing a separate control.
+    setSelectedRunId((current) => (current === run.run_id ? null : run.run_id));
   }
 
   async function openRunCenter() {
@@ -2240,52 +2251,28 @@ export function App() {
                 </section>
                 <section className="daily-section run-center-section">
                   <div className="section-heading">
-                    <div><h2>近期运行</h2><p>当前会话与每日检索各保留最近 20 条。</p></div>
+                    <div><h2>近期运行</h2><p>当前会话与每日检索各保留最近 20 条；点击任意运行查看其阶段时间轴。</p></div>
                   </div>
-                  {runCenterLoading ? (
-                    <p className="empty-panel">正在读取运行记录…</p>
-                  ) : runCenterRuns.length ? (
-                    <div className="run-center-list">
-                      {runCenterRuns.map((run) => (
-                        <article className="run-center-row" key={run.run_id}>
-                          <div className="run-center-main">
-                            <div className="run-center-meta">
-                              <span className={`status status-${run.status}`}>{statusLabel(run.status)}</span>
-                              <span>{runKindLabel(run.kind)}</span>
-                              <span>{durationLabel(run.duration_ms) || "未完成"}</span>
-                            </div>
-                            <strong title={run.run_id}>{run.run_id}</strong>
-                            {run.error_type && <p className="run-center-error">{run.error_type}</p>}
-                          </div>
-                          <div className="badcase-editor">
-                            <select
-                              aria-label={`${run.run_id} 的 Badcase 分类`}
-                              value={badcaseCategories[run.run_id] || "answer_quality"}
-                              onChange={(event) => setBadcaseCategories((current) => ({
-                                ...current,
-                                [run.run_id]: event.target.value as BadcaseCategory,
-                              }))}
-                            >
-                              {(["retrieval_miss", "citation_quality", "answer_quality", "tool_failure", "performance", "safety", "other"] as BadcaseCategory[]).map((category) => (
-                                <option key={category} value={category}>{badcaseCategoryLabel(category)}</option>
-                              ))}
-                            </select>
-                            <button
-                              className="button button-secondary"
-                              type="button"
-                              onClick={() => void markRunAsBadcase(run)}
-                              disabled={badcaseSubmitting === run.run_id || !["completed", "failed", "cancelled", "partial_failed"].includes(run.status)}
-                            >
-                              {badcaseSubmitting === run.run_id ? "记录中…" : "标记问题"}
-                            </button>
-                          </div>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="empty-panel">当前范围内尚无运行记录。</p>
-                  )}
+                  <RunCenterList
+                    runs={runCenterRuns}
+                    loading={runCenterLoading}
+                    selectedRunId={selectedRunId}
+                    badcaseCategories={badcaseCategories}
+                    badcaseSubmitting={badcaseSubmitting}
+                    onSelect={selectRunForTimeline}
+                    onBadcaseCategoryChange={(runId, category) => setBadcaseCategories((current) => ({
+                      ...current,
+                      [runId]: category,
+                    }))}
+                    onMarkBadcase={(run) => void markRunAsBadcase(run)}
+                  />
                 </section>
+
+                <RunDetailPanel
+                  apiKey={apiKey}
+                  run={selectedRun}
+                  onClose={() => setSelectedRunId(null)}
+                />
 
                 <section className="daily-section">
                   <div className="section-heading">

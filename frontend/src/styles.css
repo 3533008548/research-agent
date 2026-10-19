@@ -384,3 +384,43 @@ a.daily-paper-title:hover { color: #95c8ff; text-decoration: underline; }
   .message-list, .run-inspector { overflow: visible; }
   .message { gap: 0.55rem; }
 }
+
+/* ── 运行中心：阶段时间轴 ──────────────────────────────────────────────
+   配色沿用既有深色变量，未测量的阶段用虚线框而非实心条，
+   这样"没有数据"和"耗时为零"在视觉上不会混淆。 */
+.run-center-select { flex: 1 1 auto; min-width: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.run-center-row-active { border-color: #4d7fb8; background: #16273d; }
+.run-center-row-active .run-center-select strong { color: #f0f6ff; }
+
+.run-detail { display: flex; flex-direction: column; gap: 0.85rem; padding: 0.95rem; border: 1px solid #29415e; border-radius: 0.65rem; background: #111f33; }
+.run-detail-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.85rem; }
+.run-detail-heading h2 { margin: 0.2rem 0 0; overflow: hidden; color: #e6eff9; font-size: 0.95rem; text-overflow: ellipsis; white-space: nowrap; }
+.run-detail-meta { margin: 0.35rem 0 0; color: #8498b0; font-size: 0.7rem; }
+.run-detail-error { margin: 0; color: #f1aab1; font-size: 0.72rem; }
+
+.stage-timeline { display: flex; flex-direction: column; gap: 0.5rem; }
+.stage-timeline-header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; margin-top: 0.35rem; }
+.stage-timeline-header h3 { margin: 0; color: #cfdcec; font-size: 0.76rem; font-weight: 600; }
+.stage-timeline-note { color: #7d90a8; font-size: 0.66rem; }
+
+.stage-list { display: grid; gap: 0.38rem; margin: 0; padding: 0; list-style: none; }
+.stage-row { display: grid; gap: 0.24rem; padding: 0.42rem 0.5rem; border: 1px solid #24374f; border-radius: 0.45rem; background: #0d1828; }
+.stage-row-head { display: flex; align-items: baseline; gap: 0.5rem; }
+.stage-name { color: #d8e5f3; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; }
+.stage-status { color: #8498b0; font-size: 0.65rem; }
+.stage-duration { margin-left: auto; color: #a9bed4; font-size: 0.68rem; font-variant-numeric: tabular-nums; }
+.stage-track { position: relative; height: 0.4rem; border-radius: 0.2rem; background: #16263c; overflow: hidden; }
+.stage-bar { position: absolute; top: 0; bottom: 0; border-radius: 0.2rem; background: linear-gradient(90deg, #3d7ab8, #5aa0d8); }
+.stage-bar-unmeasured { left: 0; right: 0; border: 1px dashed #3a4d68; border-radius: 0.2rem; background: transparent; }
+.stage-running .stage-bar { background: linear-gradient(90deg, #b8863c, #d9a441); }
+.stage-failed .stage-bar, .stage-partial .stage-bar, .stage-partial_failed .stage-bar { background: linear-gradient(90deg, #a8455a, #cf5f74); }
+.stage-skipped, .stage-pending { opacity: 0.5; }
+.stage-skipped .stage-name, .stage-pending .stage-name { color: #7d90a8; }
+
+.tool-trace { display: grid; gap: 0.28rem; margin: 0; padding: 0; list-style: none; }
+.tool-trace-row { display: flex; align-items: center; gap: 0.55rem; padding: 0.34rem 0.5rem; border: 1px solid #24374f; border-radius: 0.4rem; background: #0d1828; font-size: 0.68rem; }
+.tool-trace-name { color: #d8e5f3; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tool-trace-status { color: #8498b0; }
+.tool-trace-completed { color: #7fb894; }
+.tool-trace-failed { color: #f1aab1; }
+.tool-trace-duration { margin-left: auto; color: #a9bed4; font-variant-numeric: tabular-nums; }

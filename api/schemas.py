@@ -252,6 +252,9 @@ class DailyRunDetailResponse(BaseModel):
     brief: str = ""
     warnings: list[str] = Field(default_factory=list)
     papers: list[DailyRunPaperResponse] = Field(default_factory=list)
+    # Stage events projected onto the shared timeline shape, so reloading a
+    # finished daily run restores the same view the live stream drew.
+    events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DailyPaperStatusUpdateRequest(BaseModel):
