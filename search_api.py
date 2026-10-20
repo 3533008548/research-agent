@@ -321,8 +321,17 @@ def search_ieee(
     return _render_search_results(query, accepted, quality, label="IEEE Xplore ")
 
 
-def search_public_papers(query: str, limit: int = 5, source: str = "all") -> str:
-    """Merge public metadata sources and report provider failures safely."""
+def search_public_records(
+    query: str, limit: int = 5, source: str = "all",
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    """Return merged public records plus quality stats, without rendering text.
+
+    Split out from :func:`search_public_papers` so that structured consumers
+    (notably the MCP server) get the deduplicated, relevance-gated records
+    directly.  Re-implementing the merge here instead would create a second
+    ranking path that could drift from the one the app and its evaluation suite
+    exercise.
+    """
     selected = ("openalex", "arxiv") if source == "all" else (source,)
     records: list[dict[str, Any]] = []
     failures: list[str] = []
@@ -361,9 +370,33 @@ def search_public_papers(query: str, limit: int = 5, source: str = "all") -> str
         "score_max": max(scores) if scores else None,
         "rejection_reason": "多源相关性门控",
     }
+    return displayed, quality, failures
+
+
+def search_public_papers(query: str, limit: int = 5, source: str = "all") -> str:
+    """Merge public metadata sources and report provider failures safely."""
+    displayed, quality, failures = search_public_records(query, limit=limit, source=source)
     if not displayed and failures:
         return "❌ 所有已选来源均未完成：" + "；".join(failures)
     return _render_search_results(query, displayed, quality, label="多源学术", failures=failures)
+
+
+def list_downloaded_records() -> list[dict[str, Any]]:
+    """Return local PDF metadata without the rendered listing text."""
+    from runtime_paths import get_runtime_paths
+
+    pdf_dir = get_runtime_paths().papers_dir
+    pdfs = sorted(pdf_dir.glob("*.pdf")) if pdf_dir.exists() else []
+    records = []
+    for item in pdfs:
+        stat = item.stat()
+        records.append({
+            "filename": item.name,
+            "title": item.stem,
+            "size_kb": round(stat.st_size / 1024),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+        })
+    return records
 
 
 def list_downloaded_papers() -> str:
