@@ -13,3 +13,6 @@ PyMuPDF
 PyYAML
 python-docx>=1.1,<2
 sentence-transformers>=5.6,<7
+# MCP server surface (mcp_server.py). The SDK is also a client dependency,
+# so the same pin serves both directions of the protocol.
+mcp>=1.28,<2
