@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any
 
 from config import Config
@@ -394,12 +395,48 @@ def _run_stdio_with_reserved_stdout(server: Any, transport_stdout: Any) -> None:
     anyio.run(_serve)
 
 
+def _warm_store(service: RetrievalService) -> None:
+    """Build the vector store **before** the event loop starts serving.
+
+    This looks like a performance nicety, but it is load-bearing.  Constructing
+    ``PaperStore`` loads the ONNX embedding graph and the cross-encoder, and
+    doing that from inside the anyio event loop hangs the server: the handshake
+    completes, then the first tool call never answers, with no error anywhere.
+    Building the same store on the main thread before ``anyio.run()`` takes
+    ~22 s and then serves normally, so the work is not slow — it is *deadlocked
+    when driven from the loop*.
+
+    The likely mechanism is the interaction between the loaders' native threads
+    and the loop's own; chasing it further is not worth it when warming at
+    startup removes the failure entirely and also removes a 22 s surprise from
+    the client's first call.
+
+    Failure is tolerated: a missing corpus should degrade the two retrieval
+    tools, not stop the server from serving the other three.
+    """
+    started = time.perf_counter()
+    try:
+        # Read the property exactly once: touching it is what triggers the
+        # native load, and a second read would be a second chance to block.
+        store = service.paper_store
+    except Exception as exc:  # noqa: BLE001 - a missing corpus must not be fatal
+        log.warning("MCP: 论文库预热失败，检索类工具将不可用 (%s)", type(exc).__name__)
+        return
+    if store is None:
+        log.info("MCP: 论文库不可用，检索类工具将返回空结果")
+        return
+    log.info("MCP: 论文库已就绪（%.1fs）", time.perf_counter() - started)
+
+
 def main() -> int:
     """Run the server over stdio."""
     transport_stdout = _reserve_transport_stdout()
     service = None
     try:
         server, service = build_server()
+        # Warm before the loop starts: see _warm_store for why this ordering
+        # is required rather than merely faster.
+        _warm_store(service)
         log.info("MCP 服务启动，公开工具：%s", ", ".join(READ_ONLY_TOOLS))
         # The default level is INFO and would write to the transport stream.
         server.settings.log_level = os.getenv("MCP_LOG_LEVEL", "INFO").upper()

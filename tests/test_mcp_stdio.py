@@ -102,6 +102,42 @@ class McpStdioIntegrationTests(unittest.TestCase):
         for stage in ("semantic", "lexical", "fusion", "rerank"):
             self.assertIn(stage, payload.get("stages", {}))
 
+    @unittest.skipUnless(
+        os.path.isdir(os.path.join(PROJECT_ROOT, "runtime")),
+        "本地没有论文库，跳过需要加载模型的用例",
+    )
+    def test_store_backed_tool_answers_over_stdio(self):
+        """A tool that builds ``PaperStore`` must actually return.
+
+        Building the store from inside the event loop deadlocks the server, so
+        the symptom is a successful handshake followed by silence. Only a real
+        call can catch it, which is why the warm-up case lives here and not in
+        the unit tests.
+        """
+        async def exercise():
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=[os.path.join(PROJECT_ROOT, "mcp_server.py")],
+                env={**os.environ, "PYTHONPATH": PROJECT_ROOT, "MCP_LOG_LEVEL": "WARNING"},
+            )
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    # Generous: this covers a cold model load, and the point is
+                    # to distinguish "slow" from "deadlocked", not to benchmark.
+                    with anyio.fail_after(600):
+                        return await session.call_tool("list_indexed_papers", {})
+
+        import anyio
+
+        try:
+            result = anyio.run(exercise)
+        except TimeoutError:
+            self.fail("list_indexed_papers 超过 600 秒无响应：store 预热顺序可能已被改坏")
+
+        payload = getattr(result, "structuredContent", None) or {}
+        self.assertTrue(payload.get("available"), "论文库不可用，本用例的前提不成立")
+
 
 if __name__ == "__main__":
     unittest.main()

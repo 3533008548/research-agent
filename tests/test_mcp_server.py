@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import inspect
 import unittest
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from config import Config
 from mcp_server import (
@@ -336,6 +336,51 @@ class StdioSafetyTests(unittest.TestCase):
         source = inspect.getsource(stdio)
         self.assertIn("if not stdout:", source)
         self.assertIn("sys.stdout.buffer", source)
+
+
+class WarmUpOrderingTests(unittest.TestCase):
+    """The store must be built before the event loop starts serving.
+
+    Constructing ``PaperStore`` from inside the loop deadlocks the server: the
+    handshake succeeds and then no tool call ever answers, with no error on
+    either side.  These tests pin the ordering that avoids it.
+    """
+
+    def test_warm_up_touches_the_store(self):
+        from mcp_server import _warm_store
+
+        service = _service_without_store()
+        with patch.object(
+            RetrievalService, "paper_store", new_callable=PropertyMock, return_value=None,
+        ) as store:
+            _warm_store(service)
+        # Even an unavailable store must be probed, otherwise the first real
+        # call would be the one that deadlocks.
+        self.assertEqual(store.call_count, 1)
+
+    def test_warm_up_survives_a_broken_corpus(self):
+        from mcp_server import _warm_store
+
+        service = RetrievalService()
+
+        def _explode(self):
+            raise RuntimeError("chroma missing")
+
+        with patch.object(RetrievalService, "paper_store", new_callable=property, fget=_explode):
+            _warm_store(service)  # must not raise: 3 of 5 tools still work
+
+    def test_main_warms_before_serving(self):
+        import inspect
+
+        from mcp_server import main
+
+        source = inspect.getsource(main)
+        warm_at = source.index("_warm_store(service)")
+        serve_at = source.index("server.run(transport=")
+        self.assertLess(
+            warm_at, serve_at,
+            "必须在开始服务前预热，否则第一个工具调用会死锁",
+        )
 
 
 class BoundedTextTests(unittest.TestCase):

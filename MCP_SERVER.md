@@ -66,7 +66,7 @@ mcp_server.py::RetrievalService         → 返回 {title, page, section, text, 
 
 ---
 
-## 两个容易踩的坑（已在代码里处理）
+## 三个容易踩的坑（已在代码里处理）
 
 **① stdout 是协议通道，不是日志通道。**
 本项目到处是 `print()`（`research_agent.py` 的进度横幅、ChromaDB 的输出、
@@ -81,7 +81,29 @@ mcp_server.py::RetrievalService         → 返回 {title, page, section, text, 
 不报错、不超时退出，是最难查的一类故障。
 （见 `mcp_server.py::_reserve_transport_stdout` 与 `_run_stdio_with_reserved_stdout`）
 
-**② `-> dict` 会让结构化输出退化成文本。**
+**② 必须在事件循环启动前构建论文库。**
+这是最隐蔽的一个坑，症状极像"网络慢"：
+
+```
+客户端：握手成功 ✅  →  调用 query_papers → 永久无响应，无任何报错
+```
+
+实测数据（同一台机器、同一份语料）：
+
+| 构建时机 | 结果 |
+|---|---|
+| 在事件循环**内**（懒加载，第一次工具调用时才建） | **死锁**，15 分钟无响应 |
+| 在 `anyio.run()` **之前**（启动时预热） | 22 秒完成，之后 query 2.8 秒返回 |
+
+所以 `main()` 里显式调 `_warm_store(service)`。这不只是性能优化——
+它把 22 秒开销从"客户端第一次调用时的神秘等待"挪到"启动时的一次性等待"。
+
+> ⚠️ **一个被推翻的假设，留作记录**：我一开始判断是"stderr 管道被 `tqdm`
+> 进度条写满导致阻塞"，为此加了 stderr 限流和进度条静音。实测 stderr 只有
+> **496 字节**，那个假设是错的。真正的分界线是"在事件循环内构建"还是
+> "在事件循环外构建"。→ **排除法也要讲证据**，理论合理不等于结论成立。
+
+**③ `-> dict` 会让结构化输出退化成文本。**
 FastMCP 依据返回类型注解决定是否生成 output schema。裸 `-> dict`
 **不会**生成，于是结果只以 JSON 字符串形式到达客户端，
 `structuredContent` 是 `None` —— 而那正是程序化客户端唯一会读的字段。
@@ -94,13 +116,16 @@ FastMCP 依据返回类型注解决定是否生成 output schema。裸 `-> dict`
 ## 测试
 
 ```
-python -m unittest tests.test_mcp_server   # 26 例：工具面、结构化输出、边界、stdio 安全
-python -m unittest tests.test_mcp_stdio    # 3 例：真实起进程、走 stdio 协议
+python -m unittest tests.test_mcp_server   # 29 例：工具面、结构化输出、边界、stdio安全、预热顺序
+python -m unittest tests.test_mcp_stdio    # 4 例：真实起进程、走 stdio 协议
 ```
 
 `test_mcp_stdio` 会**真的拉起子进程**、用官方 `ClientSession` 握手并调用工具。
-这是唯一能抓到协议层故障的方式：stdout 横幅、握手失败、返回值无法解码，
-**全部能通过所有单元测试**。
+这是唯一能抓到协议层故障的方式：stdout 横幅、握手失败、返回值无法解码、
+store 在事件循环内构建导致死锁，**全部能通过所有单元测试**。
+
+其中 `test_store_backed_tool_answers_over_stdio` 是专门为坑②加的：
+单元测试全绿时它会挂住，因为死锁只在真实进程 + 真实协议下才发生。
 
 ---
 
