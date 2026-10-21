@@ -1,3 +1,9 @@
+import {
+  badcaseCategoryLabel,
+  durationLabel,
+  runKindLabel,
+  statusLabel,
+} from "../../lib/labels";
 import type { BadcaseCategory, Run } from "../../types";
 
 /**
@@ -78,45 +84,4 @@ export function RunCenterList({
       ))}
     </div>
   );
-}
-
-// These three helpers are duplicated from App.tsx on purpose: App still uses
-// them for the chat header, the daily board and the run list, and sharing them
-// across the two files would mean relocating them to a module both can import.
-// That is a pure-move refactor and is deliberately left out of this commit so
-// the timeline work stays reviewable on its own.
-function statusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    queued: "排队中",
-    running: "执行中",
-    cancelling: "正在取消",
-    completed: "已完成",
-    cancelled: "已取消",
-    failed: "执行失败",
-    partial_failed: "部分完成",
-  };
-  return labels[status || ""] || status || "等待开始";
-}
-
-function runKindLabel(kind: Run["kind"]): string {
-  return kind === "daily" ? "每日检索" : kind === "research" ? "深度研究" : kind === "experiment" ? "论文复现" : "对话";
-}
-
-function badcaseCategoryLabel(category: BadcaseCategory): string {
-  return ({
-    retrieval_miss: "召回遗漏",
-    citation_quality: "引用质量",
-    answer_quality: "回答质量",
-    tool_failure: "工具失败",
-    performance: "性能",
-    safety: "安全",
-    other: "其他",
-  })[category];
-}
-
-export function durationLabel(value: number | null | undefined): string {
-  if (typeof value !== "number") {
-    return "";
-  }
-  return value >= 1000 ? `${(value / 1000).toFixed(1)} 秒` : `${Math.round(value)} 毫秒`;
 }
