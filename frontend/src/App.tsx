@@ -3,40 +3,32 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ChangeEv
 import {
   cancelRun,
   createBadcase,
-  createDailyRun,
-  createDailyKeyword,
   createRun,
   createRunSteer,
   createSession,
-  deleteDailyKeyword,
   deleteSession,
   downloadResearchDocument,
   deleteResearchDocument,
-  getDailyRunDetail,
   getResearchDocument,
   getRun,
   getSessionMessages,
   getSessionUsage,
   getWorkspaceProfile,
-  getDailyDigest,
   getWorkspaceSettings,
-  listDailyKeywords,
-  listDailyRuns,
   listBadcases,
+  listDailyRuns,
   listPapers,
   listResearchDocuments,
   listSessionRuns,
   listSessions,
   routeResearchDocumentRequest,
   streamRun,
-  updateDailyPaperStatus,
   updateWorkspaceSettings,
   uploadWorkspaceFile,
 } from "./api";
 import {
   appendRunEvent,
   badcaseCategoryLabel,
-  dailyRunTitle,
   displayMessages,
   durationLabel,
   experimentCodeSource,
@@ -55,17 +47,14 @@ import { ExperimentPanel } from "./components/workspace/ExperimentPanel";
 import { DocumentPanel } from "./components/workspace/DocumentPanel";
 import { DailyRunPanel, ProfilePanel } from "./components/workspace/SimplePanels";
 import { RunsPanel } from "./components/workspace/RunsPanel";
+import { useDailyWorkspace } from "./hooks/useDailyWorkspace";
 import { useExperiments } from "./hooks/useExperiments";
 import { SessionSidebar } from "./components/workspace/SessionSidebar";
 import {
   ApiError,
   type BadcaseCandidate,
   type BadcaseCategory,
-  type DailyDigest,
-  type DailyKeyword,
-  type DailyPaper,
   type DailyRunDetail,
-  type DailyRunKind,
   type ExperimentProjectDetail,
   type Paper,
   type ResearchDocument,
@@ -239,8 +228,6 @@ export function App() {
   ]);
   const [activeWorkbenchTabId, setActiveWorkbenchTabId] = useState("chat");
   const [papers, setPapers] = useState<Paper[]>([]);
-  const [keywords, setKeywords] = useState<DailyKeyword[]>([]);
-  const [keywordDraft, setKeywordDraft] = useState("");
   const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null);
   const [settingsDraft, setSettingsDraft] = useState({
     model: "",
@@ -250,11 +237,6 @@ export function App() {
   });
   const [attachment, setAttachment] = useState<WorkspaceUpload | null>(null);
   const [isUploading, setIsUploading] = useState(false);
-  const [dailyDigest, setDailyDigest] = useState<DailyDigest>({ progress: "", papers: [] });
-  const [dailyRuns, setDailyRuns] = useState<Run[]>([]);
-  const [dailyLoading, setDailyLoading] = useState(false);
-  const [dailyAction, setDailyAction] = useState<DailyRunKind | null>(null);
-  const [dailySearchDraft, setDailySearchDraft] = useState("");
   const [runCenterRuns, setRunCenterRuns] = useState<Run[]>([]);
   const [badcases, setBadcases] = useState<BadcaseCandidate[]>([]);
   const [runCenterLoading, setRunCenterLoading] = useState(false);
@@ -264,6 +246,44 @@ export function App() {
   const [manualBadcaseRunId, setManualBadcaseRunId] = useState("");
   const [manualBadcaseCategory, setManualBadcaseCategory] = useState<BadcaseCategory>("answer_quality");
   const [manualBadcaseNote, setManualBadcaseNote] = useState("");
+
+
+  const abortRef = useRef<AbortController | null>(null);
+  const requestGenerationRef = useRef(0);
+  const messageListRef = useRef<HTMLDivElement | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  const {
+    dailyDigest,
+    dailyRuns,
+    dailyLoading,
+    dailyAction,
+    dailySearchDraft,
+    keywords,
+    keywordDraft,
+    setKeywordDraft,
+    setDailySearchDraft,
+    selectDailyRun,
+    addDailyKeyword,
+    removeDailyKeyword,
+    loadKeywords,
+    replaceDailyRuns,
+    loadDailyCenter,
+    openDailyCenter,
+    updateDailyPaper,
+    startDailyAction,
+  } = useDailyWorkspace({
+    apiKey,
+    setNotice,
+    setWorkbenchTabs,
+    setActiveWorkbenchTabId,
+    setCurrentRun,
+    isSending,
+    setIsSending,
+    setRunEvents,
+    abortRef,
+  });
+
   const {
     experiments,
     refreshExperiments,
@@ -292,11 +312,6 @@ export function App() {
     setActiveWorkbenchTabId,
     closeWorkbenchTab,
   });
-
-  const abortRef = useRef<AbortController | null>(null);
-  const requestGenerationRef = useRef(0);
-  const messageListRef = useRef<HTMLDivElement | null>(null);
-  const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const activeWorkbenchTab = workbenchTabs.find((tab) => tab.id === activeWorkbenchTabId) || workbenchTabs[0];
   const selectedDocumentId = activeWorkbenchTab?.kind === "document"
     ? activeWorkbenchTab.document.document_id
@@ -378,12 +393,7 @@ export function App() {
       } else if (panel === "experiments") {
         await refreshExperiments();
       } else if (panel === "keywords") {
-        const [nextKeywords, nextDailyRuns] = await Promise.all([
-          listDailyKeywords(apiKey),
-          listDailyRuns(apiKey),
-        ]);
-        setKeywords(nextKeywords);
-        setDailyRuns(nextDailyRuns);
+        await loadKeywords();
       } else {
         const settings = await getWorkspaceSettings(apiKey);
         setWorkspaceSettings(settings);
@@ -411,25 +421,6 @@ export function App() {
           return current.map((tab) => tab.id === tabId ? { ...tab, title: document.title, document } : tab);
         }
         return [...current, { id: tabId, kind: "document", title: document.title, document }];
-      });
-      setActiveWorkbenchTabId(tabId);
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function selectDailyRun(runId: string) {
-    try {
-      const detail = await getDailyRunDetail(apiKey, runId);
-      const tabId = `daily-run:${detail.run_id}`;
-      const title = dailyRunTitle(detail);
-      setWorkbenchTabs((current) => {
-        const existing = current.find((tab) => tab.id === tabId);
-        if (existing?.kind === "dailyRun") {
-          return current.map((tab) => tab.id === tabId ? { ...tab, title, detail } : tab);
-        }
-        return [...current, { id: tabId, kind: "dailyRun", title, detail }];
       });
       setActiveWorkbenchTabId(tabId);
       setNotice(null);
@@ -545,139 +536,6 @@ export function App() {
     }
   }
 
-  async function addDailyKeyword(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const keyword = keywordDraft.trim();
-    if (!keyword) {
-      return;
-    }
-    try {
-      await createDailyKeyword(apiKey, keyword);
-      setKeywords(await listDailyKeywords(apiKey));
-      setKeywordDraft("");
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function removeDailyKeyword(keyword: string) {
-    if (!window.confirm(`删除每日检索关键词“${keyword}”？`)) {
-      return;
-    }
-    try {
-      await deleteDailyKeyword(apiKey, keyword);
-      setKeywords((current) => current.filter((item) => item.keyword !== keyword));
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function loadDailyCenter() {
-    setDailyLoading(true);
-    try {
-      const [digest, runs] = await Promise.all([
-        getDailyDigest(apiKey),
-        listDailyRuns(apiKey),
-      ]);
-      setDailyDigest(digest);
-      setDailyRuns(runs);
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    } finally {
-      setDailyLoading(false);
-    }
-  }
-
-  async function openDailyCenter() {
-    setWorkbenchTabs((current) => current.some((tab) => tab.id === "daily")
-      ? current
-      : [...current, { id: "daily", kind: "daily", title: "每日检索" }]);
-    setActiveWorkbenchTabId("daily");
-    await loadDailyCenter();
-  }
-
-  async function updateDailyPaper(paper: DailyPaper, status: Exclude<DailyPaper["status"], "new">) {
-    try {
-      await updateDailyPaperStatus(apiKey, paper.keyword, paper.title, status);
-      setDailyDigest((current) => ({
-        ...current,
-        papers: current.papers.map((item) => item.keyword === paper.keyword && item.title === paper.title
-          ? { ...item, status }
-          : item),
-      }));
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function startDailyAction(kind: DailyRunKind) {
-    if (isSending) {
-      return;
-    }
-    const keyword = dailySearchDraft.trim();
-    if (kind === "search" && !keyword) {
-      setNotice({ kind: "info", text: "请输入要临时检索的关键词。" });
-      return;
-    }
-
-    setDailyAction(kind);
-    setIsSending(true);
-    setNotice(null);
-    setRunEvents([]);
-    try {
-      const started = await createDailyRun(apiKey, kind, keyword || undefined);
-      setCurrentRun({
-        run_id: started.run_id,
-        kind: started.kind,
-        session_id: null,
-        project_id: started.project_id,
-        status: started.status,
-        model: "",
-        answer: "",
-        duration_ms: null,
-        metrics: {},
-        error_type: "",
-        created_at: "",
-        updated_at: "",
-        completed_at: null,
-        events: [],
-        steers: [],
-      });
-      const controller = new AbortController();
-      abortRef.current = controller;
-      await streamRun(apiKey, started.stream_url, (runEvent) => {
-        setRunEvents((current) => appendRunEvent(current, runEvent));
-        if (runEvent.type === "status" || runEvent.type === "done") {
-          setCurrentRun((current) => current && { ...current, status: runEvent.status || current.status });
-        }
-        if (runEvent.type === "error") {
-          setCurrentRun((current) => current && {
-            ...current,
-            status: "failed",
-            error_type: runEvent.error_type || "RunError",
-          });
-        }
-      }, controller.signal);
-      setCurrentRun(await getRun(apiKey, started.run_id));
-      if (kind === "search") {
-        setDailySearchDraft("");
-      }
-      await loadDailyCenter();
-    } catch (error) {
-      const message = userFacingError(error);
-      setNotice({ kind: "error", text: message });
-      setCurrentRun((current) => current && { ...current, status: "failed" });
-    } finally {
-      abortRef.current = null;
-      setIsSending(false);
-      setDailyAction(null);
-    }
-  }
-
   async function loadRunCenter() {
     setRunCenterLoading(true);
     try {
@@ -690,7 +548,7 @@ export function App() {
       setRunCenterRuns([...sessionRuns, ...nextDailyRuns].sort((left, right) => (
         `${right.updated_at}${right.created_at}`.localeCompare(`${left.updated_at}${left.created_at}`)
       )));
-      setDailyRuns(nextDailyRuns);
+      replaceDailyRuns(nextDailyRuns);
       setBadcases(nextBadcases);
       setSessionUsage(usage);
       setNotice(null);
