@@ -328,12 +328,27 @@ export interface TimelineStage {
 | ✅ 第二步 | RunCenter 拆分 + 时间轴 | 数值与 SQLite 一致、前端 13 例 | 已完成 |
 | ✅ 三 | MCP Server | 5 tool 可 inspect、结果一致 | 已完成（`a6dc4a1`/`301258d`） |
 | ✅ 四 | MCP Client | 外部 tool 自动获得熔断 | 已完成（`MCP_CLIENT.md`） |
-| 五 | `App.tsx` 剩余部分收尾 | 组件均 < 500 行 | 低 |
+| ✅ 五 | `App.tsx` 剩余部分收尾 | 组件均 < 500 行 | 已完成（`App.tsx` 2569 → 512） |
 
 **顺序理由**：二和三都能独立交付、独立演示，风险都低。
 四放最后，因为它唯一依赖外部系统；如果时间不够，前三步已经能覆盖 JD 的两条要求。
 
-**当前进度**：一至四已完成。下一步是阶段五（`App.tsx` 收尾）。
+**当前进度**：一至五全部完成。
+
+阶段五的结果：`App.tsx` 2569 → 512 行，App 组件本体 478 行，所有组件与 hook 均 < 500 行。拆法按**数据归属**而非字母：
+
+```
+App.tsx（组合根）
+  ├─ hooks/useConversation      会话/消息/输入框/正在跑的 run（拥有共享 run 状态）
+  ├─ hooks/useDailyWorkspace    每日检索（从 conversation 借 run 状态）
+  ├─ hooks/useRunCenter         运行中心（从 daily 借）
+  ├─ hooks/useDocuments         科研档案（依赖 chat 的 sendMessage）
+  ├─ hooks/useExperiments       论文复现（依赖 chat 的 setDraft）
+  ├─ hooks/useWorkspaceChrome   面板开合与内容加载
+  └─ components/workspace/*     六个面板 + 侧栏 + 聊天面板
+```
+
+hook 调用顺序由编译器盯着：顺序写反直接编译不过。
 
 ---
 
