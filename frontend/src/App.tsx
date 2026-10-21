@@ -1,228 +1,54 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 
 import {
-  cancelRun,
-  createBadcase,
-  createRun,
-  createRunSteer,
-  createSession,
-  deleteSession,
-  downloadResearchDocument,
-  deleteResearchDocument,
-  getResearchDocument,
-  getRun,
-  getSessionMessages,
-  getSessionUsage,
   getWorkspaceProfile,
   getWorkspaceSettings,
-  listBadcases,
-  listDailyRuns,
   listPapers,
   listResearchDocuments,
-  listSessionRuns,
   listSessions,
-  routeResearchDocumentRequest,
-  streamRun,
   updateWorkspaceSettings,
-  uploadWorkspaceFile,
 } from "./api";
 import {
-  appendRunEvent,
-  badcaseCategoryLabel,
-  displayMessages,
-  durationLabel,
   experimentCodeSource,
   methodReconstruction,
   modeLabel,
   repositoryPreparation,
-  runKindLabel,
-  stageLabel,
-  statusLabel,
-  toolLabel,
-  type DisplayMessage,
-  type ResearchMode,
 } from "./lib/labels";
+import { ChatMessage } from "./components/ChatMessage";
+import { RunInspector } from "./components/RunInspector";
 import { DailyPanel } from "./components/workspace/DailyPanel";
 import { ExperimentPanel } from "./components/workspace/ExperimentPanel";
 import { DocumentPanel } from "./components/workspace/DocumentPanel";
 import { DailyRunPanel, ProfilePanel } from "./components/workspace/SimplePanels";
 import { RunsPanel } from "./components/workspace/RunsPanel";
+import { userFacingError } from "./lib/errors";
+import type { Notice, WorkbenchTab, WorkspacePanel } from "./lib/workspace";
+import { useConversation } from "./hooks/useConversation";
 import { useDailyWorkspace } from "./hooks/useDailyWorkspace";
+import { useDocuments } from "./hooks/useDocuments";
+import { useRunCenter } from "./hooks/useRunCenter";
 import { useExperiments } from "./hooks/useExperiments";
 import { SessionSidebar } from "./components/workspace/SessionSidebar";
 import {
-  ApiError,
-  type BadcaseCandidate,
-  type BadcaseCategory,
-  type DailyRunDetail,
-  type ExperimentProjectDetail,
   type Paper,
-  type ResearchDocument,
-  type ResearchDocumentDetail,
   type ResearchScope,
-  type Run,
-  type RunEvent,
-  type Session,
-  type SessionUsage,
   type WorkspaceSettings,
-  type WorkspaceUpload,
-  type UserProfile,
 } from "./types";
 
-const MarkdownContent = lazy(() => import("./MarkdownContent"));
 
 const API_TOKEN_KEY = "research-agent.api-token";
 const ACTIVE_SESSION_KEY = "research-agent.active-session";
 
-type WorkspacePanel = "documents" | "profile" | "papers" | "experiments" | "keywords" | "settings";
-type Notice = { kind: "error" | "info"; text: string } | null;
-type WorkbenchTab =
-  | { id: "chat"; kind: "chat"; title: string }
-  | { id: string; kind: "document"; title: string; document: ResearchDocumentDetail }
-  | { id: "profile"; kind: "profile"; title: string; profile: UserProfile }
-  | { id: "daily"; kind: "daily"; title: string }
-  | { id: string; kind: "dailyRun"; title: string; detail: DailyRunDetail }
-  | { id: string; kind: "experiment"; title: string; project: ExperimentProjectDetail }
-  | { id: "runs"; kind: "runs"; title: string };
-
-function userFacingError(error: unknown): string {
-  if (error instanceof ApiError) {
-    return error.status === 401
-      ? "需要 API 令牌。请在左下角填入 API_AUTH_TOKEN 后重试。"
-      : error.message;
-  }
-  if (error instanceof DOMException && error.name === "AbortError") {
-    return "事件流已停止。";
-  }
-  return "连接服务失败，请确认 FastAPI 服务正在运行。";
-}
-
-function ChatMessage({ message }: { message: DisplayMessage }) {
-  return (
-    <article className={`message message-${message.role}`}>
-      <div className="message-avatar" aria-hidden="true">
-        {message.role === "user" ? "你" : "研"}
-      </div>
-      <div className="message-body">
-        <p className="message-role">{message.role === "user" ? "你" : "Research Agent"}</p>
-        {message.content ? (
-          <Suspense fallback={<p className="markdown-loading">{message.content}</p>}>
-            <MarkdownContent content={message.content} />
-          </Suspense>
-        ) : (
-          <p className="streaming-placeholder">正在生成回答<span aria-hidden="true">…</span></p>
-        )}
-      </div>
-    </article>
-  );
-}
-
-function RunInspector({
-  run,
-  events,
-  onCancel,
-  onRetry,
-  onOpenRunCenter,
-  cancelling,
-}: {
-  run: Run | null;
-  events: RunEvent[];
-  onCancel: () => void;
-  onRetry: () => void;
-  onOpenRunCenter: () => void;
-  cancelling: boolean;
-}) {
-  return (
-    <aside className="run-inspector" aria-label="运行检查器">
-      <div className="panel-heading">
-        <div>
-          <p className="eyebrow">运行检查器</p>
-          <h2>本轮任务</h2>
-        </div>
-        <div className="run-inspector-actions">
-          <button className="text-button" type="button" onClick={onOpenRunCenter}>历史运行</button>
-          {run && <span className={`status status-${run.status}`}>{statusLabel(run.status)}</span>}
-        </div>
-      </div>
-
-      {!run ? (
-        <p className="empty-panel">开始一项对话或深度研究后，这里会显示脱敏的运行状态和工具活动。</p>
-      ) : (
-        <>
-          <dl className="run-summary">
-            <div><dt>类型</dt><dd>{runKindLabel(run.kind)}</dd></div>
-            <div><dt>耗时</dt><dd>{durationLabel(run.duration_ms) || "进行中"}</dd></div>
-            {run.model && <div><dt>模型</dt><dd>{run.model}</dd></div>}
-          </dl>
-          {!["completed", "cancelled", "failed"].includes(run.status) && (
-            <button
-              className="button button-secondary button-full"
-              type="button"
-              onClick={onCancel}
-              disabled={cancelling}
-              title="协作式停止当前任务；不是可恢复的进程暂停"
-            >
-              {cancelling ? "正在暂停…" : "暂停任务"}
-            </button>
-          )}
-          {run.kind === "chat" && ["failed", "cancelled"].includes(run.status) && (
-            <button
-              className="button button-secondary button-full"
-              type="button"
-              onClick={onRetry}
-            >
-              重新发送本轮问题
-            </button>
-          )}
-          <ol className="run-events">
-            {events.map((event, index) => (
-              <li key={`${event.type}-${index}`} className="run-event">
-                <span className={`event-dot event-${event.type}`} aria-hidden="true" />
-                <div>
-                  <strong>
-                    {event.type === "tool" ? toolLabel(event.tool) : statusLabel(event.status)}
-                  </strong>
-                  <p>
-                    {event.type === "tool"
-                      ? `工具${event.status === "completed" ? "已完成" : "正在执行"}${durationLabel(event.duration_ms) ? ` · ${durationLabel(event.duration_ms)}` : ""}`
-                      : event.type === "error"
-                        ? event.error_type || "运行出错"
-                        : stageLabel(event.stage, event.type === "done" ? "已生成最终结果" : "任务状态更新")}
-                  </p>
-                </div>
-              </li>
-            ))}
-          </ol>
-          {run.error_type && <p className="run-error">错误类型：{run.error_type}</p>}
-        </>
-      )}
-    </aside>
-  );
-}
-
 export function App() {
   const [apiKey, setApiKey] = useState(() => sessionStorage.getItem(API_TOKEN_KEY) || "");
   const [apiKeyDraft, setApiKeyDraft] = useState(() => sessionStorage.getItem(API_TOKEN_KEY) || "");
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(
-    () => localStorage.getItem(ACTIVE_SESSION_KEY),
-  );
-  const [messages, setMessages] = useState<DisplayMessage[]>([]);
-  const [sessionUsage, setSessionUsage] = useState<SessionUsage | null>(null);
-  const [draft, setDraft] = useState("");
-  const [mode, setMode] = useState<ResearchMode>("chat");
-  const [researchScope, setResearchScope] = useState<ResearchScope>("both");
-  const [currentRun, setCurrentRun] = useState<Run | null>(null);
-  const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
+
+
+
   const [isLoading, setIsLoading] = useState(true);
-  const [isSending, setIsSending] = useState(false);
-  const [isCancelling, setIsCancelling] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
   const [openWorkspacePanel, setOpenWorkspacePanel] = useState<WorkspacePanel | null>(null);
   const [workspaceLoading, setWorkspaceLoading] = useState<WorkspacePanel | null>(null);
-  const [documents, setDocuments] = useState<ResearchDocument[]>([]);
-  const [documentRequest, setDocumentRequest] = useState("");
-  const [profile, setProfile] = useState<UserProfile | null>(null);
   const [workbenchTabs, setWorkbenchTabs] = useState<WorkbenchTab[]>([
     { id: "chat", kind: "chat", title: "对话" },
   ]);
@@ -235,23 +61,49 @@ export function App() {
     pdf_max_pages: 15,
     daily_search_enabled: false,
   });
-  const [attachment, setAttachment] = useState<WorkspaceUpload | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
-  const [runCenterRuns, setRunCenterRuns] = useState<Run[]>([]);
-  const [badcases, setBadcases] = useState<BadcaseCandidate[]>([]);
-  const [runCenterLoading, setRunCenterLoading] = useState(false);
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [badcaseSubmitting, setBadcaseSubmitting] = useState<string | null>(null);
-  const [badcaseCategories, setBadcaseCategories] = useState<Record<string, BadcaseCategory>>({});
-  const [manualBadcaseRunId, setManualBadcaseRunId] = useState("");
-  const [manualBadcaseCategory, setManualBadcaseCategory] = useState<BadcaseCategory>("answer_quality");
-  const [manualBadcaseNote, setManualBadcaseNote] = useState("");
 
-
-  const abortRef = useRef<AbortController | null>(null);
-  const requestGenerationRef = useRef(0);
-  const messageListRef = useRef<HTMLDivElement | null>(null);
-  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const {
+    canSteerCurrentRun,
+    sessions,
+    activeSessionId,
+    messages,
+    sessionUsage,
+    draft,
+    mode,
+    researchScope,
+    currentRun,
+    runEvents,
+    isSending,
+    isCancelling,
+    attachment,
+    isUploading,
+    setDraft,
+    setMode,
+    setResearchScope,
+    setMessages,
+    setCurrentRun,
+    setRunEvents,
+    setIsSending,
+    setAttachment,
+    setActiveSessionId,
+    setSessions,
+    setSessionUsage,
+    messageListRef,
+    uploadInputRef,
+    abortRef,
+    loadSession,
+    selectSession,
+    startSession,
+    removeActiveSession,
+    sendMessage,
+    stopCurrentRun,
+    retryCurrentChat,
+    selectAttachment,
+  } = useConversation({
+    apiKey,
+    setNotice,
+    setActiveWorkbenchTabId,
+  });
 
   const {
     dailyDigest,
@@ -285,6 +137,59 @@ export function App() {
   });
 
   const {
+    runCenterRuns,
+    badcases,
+    runCenterLoading,
+    selectedRunId,
+    badcaseSubmitting,
+    badcaseCategories,
+    manualBadcaseRunId,
+    manualBadcaseCategory,
+    manualBadcaseNote,
+    setSelectedRunId,
+    setBadcaseCategories,
+    setManualBadcaseRunId,
+    setManualBadcaseCategory,
+    setManualBadcaseNote,
+    loadRunCenter,
+    selectRunForTimeline,
+    openRunCenter,
+    markRunAsBadcase,
+    markManualBadcase,
+  } = useRunCenter({
+    apiKey,
+    activeSessionId,
+    setNotice,
+    setSessionUsage,
+    replaceDailyRuns,
+    setWorkbenchTabs,
+    setActiveWorkbenchTabId,
+  });
+
+  const {
+    documents,
+    documentRequest,
+    profile,
+    setDocumentRequest,
+    setDocuments,
+    setProfile,
+    selectResearchDocument,
+    submitResearchDocumentRequest,
+    downloadDocument,
+    removeResearchDocument,
+    openProfile,
+  } = useDocuments({
+    apiKey,
+    isSending,
+    setNotice,
+    setWorkbenchTabs,
+    setActiveWorkbenchTabId,
+    closeWorkbenchTab,
+    setMode,
+    sendMessage,
+  });
+
+  const {
     experiments,
     refreshExperiments,
     experimentStarting,
@@ -312,6 +217,9 @@ export function App() {
     setActiveWorkbenchTabId,
     closeWorkbenchTab,
   });
+
+
+
   const activeWorkbenchTab = workbenchTabs.find((tab) => tab.id === activeWorkbenchTabId) || workbenchTabs[0];
   const selectedDocumentId = activeWorkbenchTab?.kind === "document"
     ? activeWorkbenchTab.document.document_id
@@ -320,33 +228,12 @@ export function App() {
     ? activeWorkbenchTab.project.project_id
     : null;
   const selectedExperimentFile = selectedExperimentId ? experimentFiles[selectedExperimentId] : null;
-  const canSteerCurrentRun = Boolean(
-    isSending
-    && currentRun
-    && currentRun.session_id === activeSessionId
-    && ["chat", "research"].includes(currentRun.kind)
-    && ["queued", "running"].includes(currentRun.status),
-  );
-
   useEffect(() => {
     const list = messageListRef.current;
     if (list) {
       list.scrollTop = list.scrollHeight;
     }
   }, [messages]);
-
-  const loadSession = useCallback(async (sessionId: string) => {
-    const [history, usage] = await Promise.all([
-      getSessionMessages(apiKey, sessionId),
-      getSessionUsage(apiKey, sessionId),
-    ]);
-    setActiveSessionId(sessionId);
-    localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
-    setMessages(displayMessages(history));
-    setSessionUsage(usage);
-    setCurrentRun(null);
-    setRunEvents([]);
-  }, [apiKey]);
 
   const loadWorkspace = useCallback(async () => {
     setIsLoading(true);
@@ -411,42 +298,6 @@ export function App() {
     }
   }
 
-  async function selectResearchDocument(documentId: string) {
-    try {
-      const document = await getResearchDocument(apiKey, documentId);
-      const tabId = `document:${document.document_id}`;
-      setWorkbenchTabs((current) => {
-        const existing = current.find((tab) => tab.id === tabId);
-        if (existing?.kind === "document") {
-          return current.map((tab) => tab.id === tabId ? { ...tab, title: document.title, document } : tab);
-        }
-        return [...current, { id: tabId, kind: "document", title: document.title, document }];
-      });
-      setActiveWorkbenchTabId(tabId);
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function submitResearchDocumentRequest(event: FormEvent<HTMLFormElement>, document: ResearchDocumentDetail) {
-    event.preventDefault();
-    const request = documentRequest.trim();
-    if (!request || isSending) {
-      return;
-    }
-    try {
-      const routed = await routeResearchDocumentRequest(apiKey, document.document_id, request);
-      setDocumentRequest("");
-      setMode("chat");
-      setWorkbenchTabs((current) => current.some((tab) => tab.id === "chat") ? current : [...current, { id: "chat", kind: "chat", title: "对话" }]);
-      setActiveWorkbenchTabId("chat");
-      await sendMessage(undefined, false, routed.message, "chat");
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
   function preparePaperRelationReview(paper: Paper) {
     setDraft(
       `【论文关系审查】\n源论文：${paper.title}\nsource_paper_id=${paper.paper_id}\n\n`
@@ -456,22 +307,6 @@ export function App() {
     setWorkbenchTabs((current) => current.some((tab) => tab.id === "chat") ? current : [...current, { id: "chat", kind: "chat", title: "对话" }]);
     setActiveWorkbenchTabId("chat");
     setNotice({ kind: "info", text: "论文关系审查指令已放入对话框。Agent 会先给出带证据的候选关系，只有你确认后才会保存。" });
-  }
-
-  async function openProfile() {
-    try {
-      const nextProfile = profile || await getWorkspaceProfile(apiKey);
-      setProfile(nextProfile);
-      setWorkbenchTabs((current) => current.some((tab) => tab.id === "profile")
-        ? current.map((tab) => tab.id === "profile"
-          ? { id: "profile", kind: "profile", title: "用户画像", profile: nextProfile }
-          : tab)
-        : [...current, { id: "profile", kind: "profile", title: "用户画像", profile: nextProfile }]);
-      setActiveWorkbenchTabId("profile");
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
   }
 
   function closeWorkbenchTab(tabId: string) {
@@ -484,130 +319,7 @@ export function App() {
     setActiveWorkbenchTabId((current) => current === tabId ? fallbackTabId : current);
   }
 
-  async function downloadDocument(document: ResearchDocumentDetail) {
-    try {
-      await downloadResearchDocument(apiKey, document);
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function removeResearchDocument(document: ResearchDocument) {
-    if (!window.confirm(`删除科研档案“${document.title}”？这会同时删除该档案的正文、证据与假设账本及历史版本文件，且不可恢复。`)) {
-      return;
-    }
-    try {
-      await deleteResearchDocument(apiKey, document.document_id);
-      setDocuments((current) => current.filter((item) => item.document_id !== document.document_id));
-      closeWorkbenchTab(`document:${document.document_id}`);
-      setNotice({ kind: "info", text: "科研档案已删除。" });
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function uploadAttachment(file: File) {
-    if (isUploading || isSending) {
-      return;
-    }
-    setIsUploading(true);
-    try {
-      const upload = await uploadWorkspaceFile(apiKey, file);
-      setAttachment(upload);
-      setNotice({
-        kind: "info",
-        text: upload.duplicate
-          ? `已找到已有文件：${upload.filename}。发送后会直接使用它。`
-          : `已添加 ${upload.filename}。发送后会开始${upload.kind === "pdf" ? "解析与索引" : "图片理解"}。`,
-      });
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    } finally {
-      setIsUploading(false);
-    }
-  }
-
-  function selectAttachment(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.currentTarget.files?.[0];
-    event.currentTarget.value = "";
-    if (file) {
-      void uploadAttachment(file);
-    }
-  }
-
-  async function loadRunCenter() {
-    setRunCenterLoading(true);
-    try {
-      const [sessionRuns, nextDailyRuns, nextBadcases, usage] = await Promise.all([
-        activeSessionId ? listSessionRuns(apiKey, activeSessionId) : Promise.resolve([] as Run[]),
-        listDailyRuns(apiKey),
-        listBadcases(apiKey),
-        activeSessionId ? getSessionUsage(apiKey, activeSessionId) : Promise.resolve(null),
-      ]);
-      setRunCenterRuns([...sessionRuns, ...nextDailyRuns].sort((left, right) => (
-        `${right.updated_at}${right.created_at}`.localeCompare(`${left.updated_at}${left.created_at}`)
-      )));
-      replaceDailyRuns(nextDailyRuns);
-      setBadcases(nextBadcases);
-      setSessionUsage(usage);
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    } finally {
-      setRunCenterLoading(false);
-    }
-  }
-
   const selectedRun = runCenterRuns.find((run) => run.run_id === selectedRunId) || null;
-
-  function selectRunForTimeline(run: Run) {
-    // Clicking the selected row again closes the panel, so the list doubles as
-    // the toggle without needing a separate control.
-    setSelectedRunId((current) => (current === run.run_id ? null : run.run_id));
-  }
-
-  async function openRunCenter() {
-    setWorkbenchTabs((current) => current.some((tab) => tab.id === "runs")
-      ? current
-      : [...current, { id: "runs", kind: "runs", title: "运行中心" }]);
-    setActiveWorkbenchTabId("runs");
-    await loadRunCenter();
-  }
-
-  async function markRunAsBadcase(run: Run) {
-    const category = badcaseCategories[run.run_id] || "answer_quality";
-    setBadcaseSubmitting(run.run_id);
-    try {
-      const candidate = await createBadcase(apiKey, run.run_id, category);
-      setBadcases((current) => [candidate, ...current.filter((item) => item.candidate_id !== candidate.candidate_id)]);
-      setNotice({ kind: "info", text: `已将该运行标记为 Badcase：${badcaseCategoryLabel(category)}。` });
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    } finally {
-      setBadcaseSubmitting(null);
-    }
-  }
-
-  async function markManualBadcase() {
-    const runId = manualBadcaseRunId.trim();
-    if (!runId) {
-      setNotice({ kind: "info", text: "请填写要标记的运行 ID。" });
-      return;
-    }
-    const requestId = `manual:${runId}`;
-    setBadcaseSubmitting(requestId);
-    try {
-      const candidate = await createBadcase(apiKey, runId, manualBadcaseCategory, manualBadcaseNote);
-      setBadcases((current) => [candidate, ...current.filter((item) => item.candidate_id !== candidate.candidate_id)]);
-      setManualBadcaseNote("");
-      setNotice({ kind: "info", text: `已将 ${runId} 标记为 Badcase。` });
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    } finally {
-      setBadcaseSubmitting(null);
-    }
-  }
 
   async function saveWorkspaceSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -624,283 +336,6 @@ export function App() {
     } catch (error) {
       setNotice({ kind: "error", text: userFacingError(error) });
     }
-  }
-
-  async function selectSession(sessionId: string) {
-    if (sessionId === activeSessionId) {
-      return;
-    }
-    try {
-      await abandonActiveRunForNavigation();
-      await loadSession(sessionId);
-      setActiveWorkbenchTabId("chat");
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function startSession() {
-    try {
-      await abandonActiveRunForNavigation();
-      const session = await createSession(apiKey);
-      setSessions((current) => [session, ...current]);
-      await loadSession(session.thread_id);
-      setActiveWorkbenchTabId("chat");
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  async function removeActiveSession() {
-    if (!activeSessionId || isSending || !window.confirm("确定删除当前会话吗？此操作会同时删除该会话的运行记录。")) {
-      return;
-    }
-    try {
-      await deleteSession(apiKey, activeSessionId);
-      const remaining = sessions.filter((item) => item.thread_id !== activeSessionId);
-      setSessions(remaining);
-      if (remaining[0]) {
-        await loadSession(remaining[0].thread_id);
-      } else {
-        localStorage.removeItem(ACTIVE_SESSION_KEY);
-        setActiveSessionId(null);
-        setMessages([]);
-        setSessionUsage(null);
-        setCurrentRun(null);
-        setRunEvents([]);
-      }
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
-  function appendToken(text: string) {
-    setMessages((current) => {
-      const last = current.at(-1);
-      if (last?.role !== "assistant" || !last.streaming) {
-        return [...current, { id: `stream-${Date.now()}`, role: "assistant", content: text, streaming: true }];
-      }
-      return [...current.slice(0, -1), { ...last, content: last.content + text }];
-    });
-  }
-
-  function completeAnswer(answer: string | undefined) {
-    setMessages((current) => {
-      const last = current.at(-1);
-      if (last?.role === "assistant" && last.streaming) {
-        return [...current.slice(0, -1), { ...last, content: answer ?? last.content, streaming: false }];
-      }
-      return current;
-    });
-  }
-
-  async function sendMessage(
-    event: FormEvent<HTMLFormElement> | undefined,
-    resumeResearch = false,
-    retryContent = "",
-    requestedMode?: ResearchMode,
-  ) {
-    event?.preventDefault();
-    const content = resumeResearch ? "" : (retryContent || draft.trim());
-    const pendingAttachment = resumeResearch ? null : attachment;
-    if ((!content && !pendingAttachment && !resumeResearch) || isUploading) {
-      return;
-    }
-    if (!activeSessionId) {
-      setNotice({ kind: "info", text: "请先新建一个会话。" });
-      return;
-    }
-
-    if (canSteerCurrentRun) {
-      if (!content) {
-        return;
-      }
-      if (pendingAttachment) {
-        setNotice({ kind: "info", text: "运行中补充暂只支持文本；请先移除已暂存的附件，或等待当前任务结束后再发送。" });
-        return;
-      }
-      try {
-        await createRunSteer(apiKey, currentRun!.run_id, content);
-        setDraft("");
-        setMessages((current) => {
-          const guidance = {
-            id: `steer-${Date.now()}`,
-            role: "user" as const,
-            content: `运行中补充：\n${content}`,
-          };
-          const last = current.at(-1);
-          // The assistant bubble must remain last so later stream tokens
-          // continue its answer instead of creating a disconnected second one.
-          return last?.role === "assistant" && last.streaming
-            ? [...current.slice(0, -1), guidance, last]
-            : [...current, guidance];
-        });
-        setRunEvents((current) => appendRunEvent(current, {
-          type: "status", status: currentRun!.status, stage: "steer_queued",
-        }));
-        setNotice({ kind: "info", text: "补充已保存，会在当前任务的下一处理节点使用。" });
-      } catch (error) {
-        setNotice({ kind: "error", text: userFacingError(error) });
-      }
-      return;
-    }
-
-    if (isSending) {
-      return;
-    }
-
-    const requestGeneration = requestGenerationRef.current + 1;
-    requestGenerationRef.current = requestGeneration;
-    const isCurrentRequest = () => requestGenerationRef.current === requestGeneration;
-
-    const requestMode: ResearchMode = resumeResearch ? "research" : (requestedMode || mode);
-    if (requestMode === "research" && pendingAttachment) {
-      setNotice({ kind: "info", text: "请先在普通对话中发送并索引附件，再发起深度研究。" });
-      return;
-    }
-    const shownContent = resumeResearch ? "继续上次深度研究" : [
-      pendingAttachment ? `📎 ${pendingAttachment.filename}` : "",
-      content,
-    ].filter(Boolean).join("\n");
-    if (!resumeResearch && !retryContent) {
-      setDraft("");
-    }
-    setIsSending(true);
-    setNotice(null);
-    setRunEvents([]);
-    setMessages((current) => [
-      ...current,
-      { id: `user-${Date.now()}`, role: "user", content: shownContent },
-      { id: `assistant-${Date.now()}`, role: "assistant", content: "", streaming: true },
-    ]);
-
-    try {
-      const started = await createRun(
-        apiKey, requestMode, activeSessionId, content, pendingAttachment?.upload_id,
-        researchScope, resumeResearch,
-      );
-      if (!isCurrentRequest()) {
-        await cancelRun(apiKey, started.run_id).catch(() => undefined);
-        return;
-      }
-      if (!resumeResearch) {
-        setAttachment(null);
-      }
-      setCurrentRun({
-        run_id: started.run_id,
-        kind: started.kind,
-        session_id: started.session_id,
-        project_id: started.project_id,
-        status: started.status,
-        model: "",
-        answer: "",
-        duration_ms: null,
-        metrics: {},
-        error_type: "",
-        created_at: "",
-        updated_at: "",
-        completed_at: null,
-        events: [],
-        steers: [],
-      });
-      const controller = new AbortController();
-      abortRef.current = controller;
-      await streamRun(apiKey, started.stream_url, (runEvent) => {
-        if (!isCurrentRequest()) {
-          return;
-        }
-        setRunEvents((current) => appendRunEvent(current, runEvent));
-        if (runEvent.type === "token") {
-          appendToken(runEvent.text || "");
-        }
-        if (runEvent.type === "status" || runEvent.type === "done") {
-          setCurrentRun((current) => current && { ...current, status: runEvent.status || current.status });
-        }
-        if (runEvent.type === "done") {
-          completeAnswer(runEvent.answer);
-        }
-        if (runEvent.type === "error") {
-          completeAnswer("运行未能完成，请查看右侧错误信息。");
-          setCurrentRun((current) => current && { ...current, status: "failed", error_type: runEvent.error_type || "RunError" });
-        }
-      }, controller.signal);
-      if (!isCurrentRequest()) {
-        return;
-      }
-      const detail = await getRun(apiKey, started.run_id);
-      if (!isCurrentRequest()) {
-        return;
-      }
-      setCurrentRun(detail);
-      completeAnswer(detail.answer || undefined);
-      const [refreshedSessions, usage] = await Promise.all([
-        listSessions(apiKey),
-        getSessionUsage(apiKey, activeSessionId),
-      ]);
-      setSessions(refreshedSessions);
-      setSessionUsage(usage);
-    } catch (error) {
-      if (!isCurrentRequest()) {
-        return;
-      }
-      const message = userFacingError(error);
-      completeAnswer(`⚠️ ${message}`);
-      setNotice({ kind: "error", text: message });
-      setCurrentRun((current) => current && { ...current, status: "failed" });
-    } finally {
-      if (isCurrentRequest()) {
-        abortRef.current = null;
-        setIsSending(false);
-      }
-    }
-  }
-
-  async function abandonActiveRunForNavigation() {
-    requestGenerationRef.current += 1;
-    const activeRun = currentRun;
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setIsSending(false);
-    setIsCancelling(false);
-    setCurrentRun(null);
-    setRunEvents([]);
-    if (activeRun && !["completed", "cancelled", "failed"].includes(activeRun.status)) {
-      try {
-        await cancelRun(apiKey, activeRun.run_id);
-      } catch {
-        // Navigation must not be blocked when the server has already ended the run.
-      }
-    }
-  }
-
-  async function stopCurrentRun() {
-    if (!currentRun || !isSending || isCancelling || ["completed", "cancelled", "failed"].includes(currentRun.status)) {
-      return;
-    }
-    setIsCancelling(true);
-    try {
-      const cancelled = await cancelRun(apiKey, currentRun.run_id);
-      setCurrentRun((current) => current && { ...current, status: cancelled.status });
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    } finally {
-      setIsCancelling(false);
-    }
-  }
-
-  async function retryCurrentChat() {
-    if (!currentRun || currentRun.kind !== "chat" || isSending) {
-      return;
-    }
-    const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
-    const content = lastUserMessage?.content.trim() || "";
-    if (!content || content.startsWith("📎")) {
-      setNotice({ kind: "info", text: "含附件或不可恢复的输入请重新上传后发送；纯文本对话可在此一键重试。" });
-      return;
-    }
-    await sendMessage(undefined, false, content);
   }
 
   function applyApiKey() {
