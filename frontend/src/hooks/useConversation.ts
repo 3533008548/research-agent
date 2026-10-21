@@ -43,10 +43,12 @@ export function useConversation({
   apiKey,
   setNotice,
   setActiveWorkbenchTabId,
+  setIsLoading,
 }: {
   apiKey: string;
   setNotice: (notice: Notice) => void;
   setActiveWorkbenchTabId: (tabId: string) => void;
+  setIsLoading: (value: boolean) => void;
 }) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(
@@ -397,8 +399,33 @@ export function useConversation({
     && ["queued", "running"].includes(currentRun.status),
   );
 
+  const loadWorkspace = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const nextSessions = await listSessions(apiKey);
+      setSessions(nextSessions);
+      const remembered = localStorage.getItem(ACTIVE_SESSION_KEY);
+      const selected = nextSessions.find((item) => item.thread_id === remembered) || nextSessions[0];
+      if (selected) {
+        await loadSession(selected.thread_id);
+      } else {
+        setActiveSessionId(null);
+        setMessages([]);
+        setSessionUsage(null);
+      }
+      setNotice(null);
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+      setSessions([]);
+      setMessages([]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [apiKey, loadSession]);
+
   return {
     canSteerCurrentRun,
+    loadWorkspace,
     sessions,
     activeSessionId,
     messages,

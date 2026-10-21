@@ -1,20 +1,14 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 
 import {
-  getWorkspaceProfile,
-  getWorkspaceSettings,
-  listPapers,
-  listResearchDocuments,
-  listSessions,
   updateWorkspaceSettings,
 } from "./api";
 import {
   experimentCodeSource,
   methodReconstruction,
-  modeLabel,
   repositoryPreparation,
 } from "./lib/labels";
-import { ChatMessage } from "./components/ChatMessage";
+import { ChatPanel } from "./components/workspace/ChatPanel";
 import { RunInspector } from "./components/RunInspector";
 import { DailyPanel } from "./components/workspace/DailyPanel";
 import { ExperimentPanel } from "./components/workspace/ExperimentPanel";
@@ -27,17 +21,16 @@ import { useConversation } from "./hooks/useConversation";
 import { useDailyWorkspace } from "./hooks/useDailyWorkspace";
 import { useDocuments } from "./hooks/useDocuments";
 import { useRunCenter } from "./hooks/useRunCenter";
+import { useWorkspaceChrome } from "./hooks/useWorkspaceChrome";
 import { useExperiments } from "./hooks/useExperiments";
 import { SessionSidebar } from "./components/workspace/SessionSidebar";
 import {
   type Paper,
-  type ResearchScope,
   type WorkspaceSettings,
 } from "./types";
 
 
 const API_TOKEN_KEY = "research-agent.api-token";
-const ACTIVE_SESSION_KEY = "research-agent.active-session";
 
 export function App() {
   const [apiKey, setApiKey] = useState(() => sessionStorage.getItem(API_TOKEN_KEY) || "");
@@ -80,18 +73,15 @@ export function App() {
     setDraft,
     setMode,
     setResearchScope,
-    setMessages,
     setCurrentRun,
     setRunEvents,
     setIsSending,
     setAttachment,
-    setActiveSessionId,
-    setSessions,
     setSessionUsage,
     messageListRef,
     uploadInputRef,
     abortRef,
-    loadSession,
+    loadWorkspace,
     selectSession,
     startSession,
     removeActiveSession,
@@ -103,6 +93,7 @@ export function App() {
     apiKey,
     setNotice,
     setActiveWorkbenchTabId,
+    setIsLoading,
   });
 
   const {
@@ -218,6 +209,28 @@ export function App() {
     closeWorkbenchTab,
   });
 
+  const {
+    toggleWorkspacePanel,
+    preparePaperRelationReview,
+  } = useWorkspaceChrome({
+    apiKey,
+    setNotice,
+    setDocuments,
+    setProfile,
+    setPapers,
+    setWorkspaceSettings,
+    setSettingsDraft,
+    openWorkspacePanel,
+    setOpenWorkspacePanel,
+    setWorkspaceLoading,
+    setDraft,
+    setWorkbenchTabs,
+    setActiveWorkbenchTabId,
+    refreshExperiments,
+    loadKeywords,
+  });
+
+
 
 
   const activeWorkbenchTab = workbenchTabs.find((tab) => tab.id === activeWorkbenchTabId) || workbenchTabs[0];
@@ -235,79 +248,9 @@ export function App() {
     }
   }, [messages]);
 
-  const loadWorkspace = useCallback(async () => {
-    setIsLoading(true);
-    try {
-      const nextSessions = await listSessions(apiKey);
-      setSessions(nextSessions);
-      const remembered = localStorage.getItem(ACTIVE_SESSION_KEY);
-      const selected = nextSessions.find((item) => item.thread_id === remembered) || nextSessions[0];
-      if (selected) {
-        await loadSession(selected.thread_id);
-      } else {
-        setActiveSessionId(null);
-        setMessages([]);
-        setSessionUsage(null);
-      }
-      setNotice(null);
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-      setSessions([]);
-      setMessages([]);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [apiKey, loadSession]);
-
   useEffect(() => {
     void loadWorkspace();
   }, [loadWorkspace]);
-
-  async function toggleWorkspacePanel(panel: WorkspacePanel) {
-    if (openWorkspacePanel === panel) {
-      setOpenWorkspacePanel(null);
-      return;
-    }
-    setOpenWorkspacePanel(panel);
-    setWorkspaceLoading(panel);
-    try {
-      if (panel === "documents") {
-        setDocuments(await listResearchDocuments(apiKey));
-      } else if (panel === "profile") {
-        setProfile(await getWorkspaceProfile(apiKey));
-      } else if (panel === "papers") {
-        setPapers(await listPapers(apiKey));
-      } else if (panel === "experiments") {
-        await refreshExperiments();
-      } else if (panel === "keywords") {
-        await loadKeywords();
-      } else {
-        const settings = await getWorkspaceSettings(apiKey);
-        setWorkspaceSettings(settings);
-        setSettingsDraft({
-          model: settings.model,
-          rag_enabled: settings.rag_enabled,
-          pdf_max_pages: settings.pdf_max_pages,
-          daily_search_enabled: settings.daily_search_enabled,
-        });
-      }
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    } finally {
-      setWorkspaceLoading(null);
-    }
-  }
-
-  function preparePaperRelationReview(paper: Paper) {
-    setDraft(
-      `【论文关系审查】\n源论文：${paper.title}\nsource_paper_id=${paper.paper_id}\n\n`
-      + "请先检查这篇论文与下列目标论文之间是否存在值得记录的关系。必须用两篇论文的页码或检索片段定位证据；只可提出候选，不要自动写入。请说明关系方向、关系类型（方法相似/方法改进/实验可比/结果冲突/明确引用）、依据和不确定性，最后等待我确认。\n\n"
-      + "目标论文标题或 paper_id：- （在此填写）",
-    );
-    setWorkbenchTabs((current) => current.some((tab) => tab.id === "chat") ? current : [...current, { id: "chat", kind: "chat", title: "对话" }]);
-    setActiveWorkbenchTabId("chat");
-    setNotice({ kind: "info", text: "论文关系审查指令已放入对话框。Agent 会先给出带证据的候选关系，只有你确认后才会保存。" });
-  }
 
   function closeWorkbenchTab(tabId: string) {
     if (tabId === "chat") {
@@ -527,122 +470,29 @@ export function App() {
             />
 
           ) : (
-            <>
-              <div className="conversation-heading">
-                <div>
-                  <p className="eyebrow">研究工作台</p>
-                  <h1>{activeSessionId ? "开始一项研究任务" : "新建会话以开始"}</h1>
-                </div>
-                <div className="mode-switch" aria-label="任务类型">
-                  {(["chat", "research"] as const).map((item) => (
-                    <button
-                      key={item}
-                      className={mode === item ? "selected" : ""}
-                      onClick={() => setMode(item)}
-                      disabled={isSending}
-                    >
-                      {modeLabel(item)}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {mode === "research" && (
-                <div className="research-options" aria-label="深度研究选项">
-                  <label>
-                    来源范围
-                    <select value={researchScope} onChange={(event) => setResearchScope(event.target.value as ResearchScope)} disabled={isSending}>
-                      <option value="both">本地论文 + 公开文献</option>
-                      <option value="local">仅本地论文库</option>
-                      <option value="public">仅公开文献</option>
-                    </select>
-                  </label>
-                  <button
-                    className="button button-secondary"
-                    type="button"
-                    onClick={() => void sendMessage(undefined, true)}
-                    disabled={isSending || !activeSessionId}
-                  >
-                    继续上次研究
-                  </button>
-                </div>
-              )}
-
-              <div className="message-list" ref={messageListRef} aria-live="polite">
-                {isLoading ? (
-                  <p className="empty-state">正在加载会话…</p>
-                ) : messages.length ? (
-                  messages.map((message) => <ChatMessage key={message.id} message={message} />)
-                ) : (
-                  <div className="empty-state">
-                    <h2>从一个研究问题、论文或假设开始。</h2>
-                    <p>对话用于快速讨论；深度研究会规划并收集本地与公开证据。</p>
-                  </div>
-                )}
-              </div>
-
-              <form className="composer" onSubmit={(event) => void sendMessage(event)}>
-                <input
-                  ref={uploadInputRef}
-                  className="file-input"
-                  type="file"
-                  accept=".pdf,.png,.jpg,.jpeg"
-                  onChange={selectAttachment}
-                  disabled={isSending || isUploading}
-                />
-                <div className="composer-attachments">
-                  <button
-                    className="button button-secondary"
-                    type="button"
-                    onClick={() => uploadInputRef.current?.click()}
-                    disabled={isSending || isUploading}
-                  >
-                    {isUploading ? "上传中…" : "添加 PDF / 图片"}
-                  </button>
-                  {attachment && (
-                    <span className="attachment-chip">
-                      <span title={attachment.filename}>📎 {attachment.filename}</span>
-                      <button type="button" onClick={() => setAttachment(null)} disabled={isSending}>×</button>
-                    </span>
-                  )}
-                </div>
-                <textarea
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  placeholder={canSteerCurrentRun
-                    ? "补充当前任务的约束、线索或更正…"
-                    : mode === "research" ? "输入研究问题，开始深度研究…" : "提出问题，开始对话…"}
-                  rows={3}
-                  disabled={(!canSteerCurrentRun && isSending) || !activeSessionId}
-                />
-                <div className="composer-footer">
-                  <span>{canSteerCurrentRun
-                    ? "补充会在下一模型或研究节点使用，不能打断已经发出的请求。"
-                    : attachment ? "发送后会在后台处理附件，进度显示在右侧。"
-                      : mode === "research" ? "可选择来源范围，或继续上次未完成研究" : "支持引用、公式与 Markdown"}</span>
-                  <div className="composer-actions">
-                    {isSending && currentRun && !["completed", "cancelled", "failed"].includes(currentRun.status) && (
-                      <button
-                        className="button button-secondary"
-                        type="button"
-                        onClick={() => void stopCurrentRun()}
-                        disabled={isCancelling}
-                        title="协作式停止当前任务；深度研究已收集的证据会被保留"
-                      >
-                        {isCancelling ? "正在暂停…" : "暂停任务"}
-                      </button>
-                    )}
-                    <button
-                      className="button button-primary"
-                      type="submit"
-                      disabled={isUploading || (!draft.trim() && !attachment) || !activeSessionId || (isSending && !canSteerCurrentRun) || (canSteerCurrentRun && Boolean(attachment))}
-                    >
-                      {canSteerCurrentRun ? "发送补充" : isSending ? "任务进行中…" : mode === "research" ? "开始研究" : "发送"}
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </>
+            <ChatPanel
+              messages={messages}
+              draft={draft}
+              mode={mode}
+              researchScope={researchScope}
+              currentRun={currentRun}
+              isLoading={isLoading}
+              isSending={isSending}
+              isCancelling={isCancelling}
+              isUploading={isUploading}
+              canSteerCurrentRun={canSteerCurrentRun}
+              activeSessionId={activeSessionId}
+              attachment={attachment}
+              messageListRef={messageListRef}
+              uploadInputRef={uploadInputRef}
+              setDraft={setDraft}
+              setMode={setMode}
+              setResearchScope={setResearchScope}
+              setAttachment={setAttachment}
+              sendMessage={sendMessage}
+              stopCurrentRun={stopCurrentRun}
+              selectAttachment={selectAttachment}
+            />
           )}
         </section>
 
