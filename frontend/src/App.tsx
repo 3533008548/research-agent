@@ -44,15 +44,11 @@ import {
 import {
   appendRunEvent,
   badcaseCategoryLabel,
-  codeSourceLabel,
   dailyPaperStatusLabel,
   dailyRunTitle,
   displayMessages,
   durationLabel,
   experimentCodeSource,
-  ledgerKindLabel,
-  ledgerRelationLabel,
-  ledgerStatusLabel,
   methodReconstruction,
   modeLabel,
   repositoryPreparation,
@@ -64,6 +60,9 @@ import {
   type RepositoryRelationship,
   type ResearchMode,
 } from "./lib/labels";
+import { ExperimentPanel } from "./components/workspace/ExperimentPanel";
+import { DocumentPanel } from "./components/workspace/DocumentPanel";
+import { DailyRunPanel, ProfilePanel } from "./components/workspace/SimplePanels";
 import { RunCenterList } from "./components/runcenter/RunCenterList";
 import { RunDetailPanel } from "./components/runcenter/RunDetailPanel";
 import {
@@ -1617,416 +1616,42 @@ export function App() {
 
           {notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
           {activeWorkbenchTab?.kind === "profile" ? (
-            <article className="document-page" aria-label="用户画像">
-              <header className="document-page-heading">
-                <div>
-                  <p className="eyebrow">跨会话偏好</p>
-                  <h1>用户画像</h1>
-                  <p className="document-page-meta">仅显示 Agent 已保存的稳定偏好，不包含完整对话内容。</p>
-                </div>
-              </header>
-              <div className="document-page-content">
-                {activeWorkbenchTab.profile.content ? (
-                  <Suspense fallback={<p className="markdown-loading">{activeWorkbenchTab.profile.content}</p>}>
-                    <MarkdownContent content={activeWorkbenchTab.profile.content} />
-                  </Suspense>
-                ) : <p>尚未形成用户画像。</p>}
-              </div>
-            </article>
+            <ProfilePanel profile={activeWorkbenchTab.profile} />
           ) : activeWorkbenchTab?.kind === "document" ? (
-            <article className="document-page document-reading" aria-label={`科研档案：${activeWorkbenchTab.document.title}`}>
-              <header className="document-page-heading">
-                <div>
-                  <p className="eyebrow">科研档案</p>
-                  <h1>{activeWorkbenchTab.document.title}</h1>
-                  <p className="document-page-meta">
-                    修订 {activeWorkbenchTab.document.revision} · 更新于 {activeWorkbenchTab.document.updated_at || activeWorkbenchTab.document.created_at} · 四章节模板
-                  </p>
-                </div>
-                <div className="document-page-actions">
-                  <button className="button button-secondary" type="button" onClick={() => void downloadDocument(activeWorkbenchTab.document)}>
-                    下载 Word
-                  </button>
-                  <button className="button button-danger" type="button" onClick={() => void removeResearchDocument(activeWorkbenchTab.document)}>
-                    删除档案
-                  </button>
-                </div>
-              </header>
-              <nav className="document-outline-strip" aria-label="科研档案章节目录">
-                {activeWorkbenchTab.document.sections.map((section) => (
-                  <span className="document-outline-chip" key={section.section_id} title={section.summary || "待补充"}>
-                    <strong>{section.heading}</strong>
-                    <span>{section.content_length} 字符</span>
-                  </span>
-                ))}
-              </nav>
-              <div className="document-body">
-                <div className="document-main">
-                  <div className="document-page-content">
-                    <Suspense fallback={<p className="markdown-loading">{activeWorkbenchTab.document.content}</p>}>
-                      <MarkdownContent content={activeWorkbenchTab.document.content} />
-                    </Suspense>
-                  </div>
-                  {activeWorkbenchTab.document.versions.length > 1 && (
-                    <section className="document-version-history" aria-label="版本历史">
-                      <h2>版本历史</h2>
-                      <p>当前内容及每个写入前的完整快照均可由 Agent 在你确认后恢复。</p>
-                      <ul>
-                        {activeWorkbenchTab.document.versions.map((version) => (
-                          <li key={`${version.revision}-${version.updated_at}`}>
-                            第 {version.revision} 版 · {version.current ? "当前版本" : "可恢复快照"} · {version.updated_at}
-                          </li>
-                        ))}
-                      </ul>
-                    </section>
-                  )}
-                </div>
-                <aside className="document-rail" aria-label="档案工具与索引">
-                  <section className="document-request" aria-label="围绕当前科研档案提问">
-                    <header className="document-request-heading">
-                      <h2>直接描述你想做什么</h2>
-                      <p>例如“补充研究方案”“和新导入论文比对”“梳理证据与假设”或“审查创新性”。</p>
-                    </header>
-                    <form onSubmit={(event) => void submitResearchDocumentRequest(event, activeWorkbenchTab.document)}>
-                      <textarea
-                        value={documentRequest}
-                        onChange={(event) => setDocumentRequest(event.target.value)}
-                        placeholder="例如：结合《论文标题》补充研究方案，或梳理证据与假设…"
-                        rows={3}
-                        disabled={isSending || !activeSessionId}
-                      />
-                      <div>
-                        <span>仅关联相关章节（不塞入全文），写入前保留完整快照。</span>
-                        <button className="button button-primary" type="submit" disabled={!documentRequest.trim() || isSending || !activeSessionId}>
-                          发送给 Agent
-                        </button>
-                      </div>
-                    </form>
-                    {isSending && (
-                      <p className="document-request-status" role="status">Agent 正在处理你的请求，可在「运行检查器」或会话中查看进度。</p>
-                    )}
-                  </section>
-                  <section className="research-ledger" aria-label="研究判断索引">
-                    <header className="research-ledger-heading">
-                      <h2>研究判断索引</h2>
-                      <span>账本修订 {activeWorkbenchTab.document.ledger.ledger_revision}</span>
-                    </header>
-                    <p className="research-ledger-summary">
-                      {activeWorkbenchTab.document.ledger.summary.items} 项判断 · 已支持 {activeWorkbenchTab.document.ledger.summary.supported} · 存在争议 {activeWorkbenchTab.document.ledger.summary.contested} · 待复核 {activeWorkbenchTab.document.ledger.summary.stale_links}
-                    </p>
-                    {activeWorkbenchTab.document.ledger.items.length ? (
-                      <div className="research-ledger-list">
-                        {activeWorkbenchTab.document.ledger.items.map((item) => (
-                          <article className={`research-ledger-item ${item.section_current ? "" : "stale"}`} key={item.item_id}>
-                            <div className="research-ledger-item-meta">
-                              <span>{item.heading}</span>
-                              <span>{ledgerKindLabel(item.kind)} · {ledgerStatusLabel(item.status)}</span>
-                              {!item.section_current && <span className="ledger-stale">正文已改动，需复核</span>}
-                            </div>
-                            <strong>{item.statement}</strong>
-                            {item.falsification && <p>可证伪条件：{item.falsification}</p>}
-                            {item.evidence.length > 0 && (
-                              <ul>
-                                {item.evidence.map((evidence, index) => (
-                                  <li key={`${item.item_id}-${index}`}>
-                                    {ledgerRelationLabel(evidence.relation)}：{evidence.title || evidence.paper_id || "未命名论文"}
-                                    {evidence.page ? ` · 第 ${evidence.page} 页` : ""}
-                                    {evidence.chunk_index !== null ? ` · 切块 ${evidence.chunk_index}` : ""}
-                                    {evidence.note ? ` · ${evidence.note}` : ""}
-                                  </li>
-                                ))}
-                              </ul>
-                            )}
-                          </article>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="research-ledger-empty">尚未记录研究判断。可在上方直接要求梳理证据与假设；Agent 会先提出条目，只有你确认后才会写入。</p>
-                    )}
-                  </section>
-                </aside>
-              </div>
-            </article>
+            <DocumentPanel
+              document={activeWorkbenchTab.document}
+              activeSessionId={activeSessionId}
+              isSending={isSending}
+              documentRequest={documentRequest}
+              onDocumentRequestChange={setDocumentRequest}
+              onSubmitRequest={(event, doc) => void submitResearchDocumentRequest(event, doc)}
+              onDownload={(doc) => void downloadDocument(doc)}
+              onRemove={(doc) => void removeResearchDocument(doc)}
+            />
           ) : activeWorkbenchTab?.kind === "experiment" ? (
-            <article className="document-page experiment-page" aria-label={`论文复现实验：${activeWorkbenchTab.project.paper_title}`}>
-              <header className="document-page-heading">
-                <div>
-                  <p className="eyebrow">论文代码复现</p>
-                  <h1>{activeWorkbenchTab.project.paper_title}</h1>
-                  <p className="document-page-meta">
-                    <span className={`status status-${activeWorkbenchTab.project.status}`}>{activeWorkbenchTab.project.status}</span>
-                    {" · "}{activeWorkbenchTab.project.reproduction_level === "exact" ? "精确复现规格" : activeWorkbenchTab.project.reproduction_level === "approximate" ? "近似复现规格" : "待确认规格"}
-                    {" · 修订 "}{activeWorkbenchTab.project.revision}
-                  </p>
-                </div>
-                <div className="experiment-page-actions">
-                  <button className="button button-secondary" type="button" onClick={() => void selectExperimentProject(activeWorkbenchTab.project.project_id)}>
-                    刷新项目
-                  </button>
-                  {activeWorkbenchTab.project.status !== "ready" && (
-                    <button
-                      className="button button-primary"
-                      type="button"
-                      onClick={() => void retryExperimentProject(activeWorkbenchTab.project)}
-                      disabled={Boolean(experimentStarting)}
-                    >
-                      {experimentStarting === `retry:${activeWorkbenchTab.project.project_id}` ? "重试中…" : "重试生成"}
-                    </button>
-                  )}
-                  <button
-                    className="button button-danger"
-                    type="button"
-                    onClick={() => void removeExperimentProject(activeWorkbenchTab.project)}
-                    disabled={["queued", "running"].includes(activeWorkbenchTab.project.status)}
-                    title={["queued", "running"].includes(activeWorkbenchTab.project.status) ? "任务执行中，请先等待完成" : "删除项目及其文件"}
-                  >
-                    删除项目
-                  </button>
-                </div>
-              </header>
-              <div className="document-page-content experiment-page-content">
-                <section className="experiment-summary">
-                  <h2>当前状态</h2>
-                  <p>{activeWorkbenchTab.project.summary || "正在等待任务生成实验规格。"}</p>
-                  <p className="experiment-note">首版只生成证据驱动的规格、代码与静态校验，不会下载数据、执行训练或宣称论文指标已复现。</p>
-                </section>
-                <section className="experiment-source">
-                  <div className="experiment-source-heading">
-                    <div>
-                      <h2>代码来源</h2>
-                      <p>{activeExperimentSource ? codeSourceLabel(activeExperimentSource) : "尚未检查"}</p>
-                    </div>
-                    <div className="experiment-source-actions">
-                      <button
-                        className="button button-secondary"
-                        type="button"
-                        onClick={() => void searchExperimentRepositories(activeWorkbenchTab.project)}
-                        disabled={Boolean(experimentStarting)}
-                      >
-                        {experimentStarting === `source:${activeWorkbenchTab.project.project_id}` ? "检索中…" : "查找 GitHub 候选"}
-                      </button>
-                      <button
-                        className="button button-secondary"
-                        type="button"
-                        onClick={() => void startExperimentMethodReconstruction(activeWorkbenchTab.project)}
-                        disabled={Boolean(experimentStarting)}
-                      >
-                        {experimentStarting === `method:${activeWorkbenchTab.project.project_id}` ? "还原中…" : "按论文方法还原"}
-                      </button>
-                    </div>
-                  </div>
-                  {activeExperimentSource?.mode === "repository" && activeExperimentSource.repository?.repository_url ? (
-                    <div className="experiment-repository-connected">
-                      <a href={activeExperimentSource.repository.repository_url} target="_blank" rel="noreferrer">
-                        {activeExperimentSource.repository.full_name || activeExperimentSource.repository.repository_url}
-                      </a>
-                      <span>{activeExperimentSource.repository.commit_sha ? `commit ${activeExperimentSource.repository.commit_sha.slice(0, 12)}` : "未取得 commit"}</span>
-                      <button
-                        className="button button-primary"
-                        type="button"
-                        onClick={() => void prepareExperimentRepository(activeWorkbenchTab.project)}
-                        disabled={Boolean(experimentStarting) || !activeExperimentSource.repository.commit_sha}
-                      >
-                        {experimentStarting === `prepare:${activeWorkbenchTab.project.project_id}` ? "准备中…" : "同步并分析上游代码"}
-                      </button>
-                      <p>会克隆固定 commit 并解析 README、依赖文件与训练入口；不会安装依赖、下载数据或执行代码。</p>
-                    </div>
-                  ) : activeExperimentSource?.mode === "method_reconstruction" ? (
-                    <p className="experiment-note">当前产物是论文方法还原，不是原作者代码复现；关键缺失信息会继续显示在待确认项中。</p>
-                  ) : (
-                    <p className="experiment-note">可按论文标题检索候选，或直接粘贴一个 GitHub 仓库地址。检索结果只代表候选，不会自动标为官方实现。</p>
-                  )}
-                  {Array.isArray(activeExperimentSource?.candidates) && activeExperimentSource.candidates.length > 0 && (
-                    <div className="experiment-repository-candidates">
-                      {activeExperimentSource.candidates.map((candidate) => (
-                        <div key={candidate.repository_url || candidate.full_name} className="experiment-repository-candidate">
-                          <div>
-                            <a href={candidate.repository_url} target="_blank" rel="noreferrer">{candidate.full_name || candidate.repository_url}</a>
-                            <p>{candidate.description || "GitHub 未提供简介"}{typeof candidate.stars === "number" ? ` · ★ ${candidate.stars}` : ""}</p>
-                          </div>
-                          <button
-                            className="button button-secondary"
-                            type="button"
-                            onClick={() => void connectExperimentCodeRepository(activeWorkbenchTab.project, candidate.repository_url || "", "candidate_unverified")}
-                            disabled={Boolean(experimentStarting) || !candidate.repository_url}
-                          >
-                            使用此候选
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {activeRepositoryPreparation && (
-                    <div className="experiment-repository-plan">
-                      <div>
-                        <strong>{activeRepositoryPreparation.status === "failed" ? "上游仓库准备失败" : "上游仓库已准备"}</strong>
-                        <span>{activeRepositoryPreparation.local_path || "repository/source"}{activeRepositoryPreparation.commit_sha ? ` · ${activeRepositoryPreparation.commit_sha.slice(0, 12)}` : ""}</span>
-                      </div>
-                      <p>依赖声明：{activeRepositoryPreparation.dependency_files?.join("、") || "未找到"}</p>
-                      <p>训练/评测入口候选：{activeRepositoryPreparation.entrypoint_candidates?.join("、") || "未找到"}</p>
-                      {activeRepositoryPreparation.has_submodules && <p>检测到 submodule，尚未初始化。</p>}
-                      {activeRepositoryPreparation.scan_truncated && <p>仓库文件较多，静态清单已按上限截断。</p>}
-                      {activeRepositoryPreparation.status === "failed" && <p>最近错误：{activeRepositoryPreparation.error || "未知错误"}</p>}
-                      <p className="experiment-note">下一阶段需先确认数据集位置、执行入口与资源预算，再显式安装依赖和运行。</p>
-                    </div>
-                  )}
-                  {activeMethodReconstruction && (
-                    <div className="experiment-method-plan">
-                      <div>
-                        <strong>论文方法还原参考实现</strong>
-                        <span>{activeMethodReconstruction.source_ref_count || 0} 条页面级证据定位</span>
-                      </div>
-                      <p>{activeMethodReconstruction.method_summary || "尚未可靠提取方法概述，请先查看待确认项。"}</p>
-                      {activeMethodReconstruction.components?.length ? (
-                        <ul>
-                          {activeMethodReconstruction.components.map((component, index) => (
-                            <li key={`${component.name || "component"}-${index}`}>
-                              <strong>{component.name || "未命名组件"}</strong>
-                              {component.responsibility ? `：${component.responsibility}` : ""}
-                              {component.evidence_ids?.length ? <span>（证据：{component.evidence_ids.join("、")}）</span> : <span>（未定位到直接证据）</span>}
-                            </li>
-                          ))}
-                        </ul>
-                      ) : <p>未能可靠拆出方法组件，已保留可编辑骨架。</p>}
-                      {activeMethodReconstruction.assumptions?.length ? <p>工程假设：{activeMethodReconstruction.assumptions.join("；")}</p> : null}
-                      <p className="experiment-note">这里只完成源代码草案和静态检查。补齐数据、参数或实现事实后，可通过“在对话中确认”写回项目。</p>
-                    </div>
-                  )}
-                  <form
-                    className="experiment-repository-form"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      void connectExperimentCodeRepository(activeWorkbenchTab.project, repositoryUrlDraft, repositoryRelationship);
-                    }}
-                  >
-                    <input
-                      value={repositoryUrlDraft}
-                      onChange={(event) => setRepositoryUrlDraft(event.target.value)}
-                      placeholder="https://github.com/owner/repo"
-                      aria-label="GitHub 仓库地址"
-                      disabled={Boolean(experimentStarting)}
-                    />
-                    <select
-                      value={repositoryRelationship}
-                      onChange={(event) => setRepositoryRelationship(event.target.value as Exclude<RepositoryRelationship, "candidate_unverified">)}
-                      aria-label="仓库来源性质"
-                      disabled={Boolean(experimentStarting)}
-                    >
-                      <option value="user_provided">用户提供，待核验</option>
-                      <option value="official_confirmed">我已确认是官方实现</option>
-                      <option value="community">社区实现</option>
-                    </select>
-                    <button className="button button-primary" type="submit" disabled={Boolean(experimentStarting) || !repositoryUrlDraft.trim()}>
-                      连接仓库
-                    </button>
-                  </form>
-                </section>
-                <section className="experiment-grid">
-                  <div>
-                    <h2>待确认项</h2>
-                    {Array.isArray(activeWorkbenchTab.project.spec.unknowns) && activeWorkbenchTab.project.spec.unknowns.length ? (
-                      <ul>{activeWorkbenchTab.project.spec.unknowns.map((item, index) => <li key={`${String(item)}-${index}`}>{String(item)}</li>)}</ul>
-                    ) : <p>没有记录待确认项。</p>}
-                  </div>
-                  <div>
-                    <h2>验证结果</h2>
-                    {activeWorkbenchTab.project.validation.valid ? <p className="validation-ok">已通过代码静态验证。</p> : (
-                      <ul className="validation-errors">
-                        {(activeWorkbenchTab.project.validation.errors || ["尚未完成静态验证。"]).map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}
-                      </ul>
-                    )}
-                  </div>
-                </section>
-                <section className="experiment-confirmation">
-                  <div>
-                    <h2>如何确认待确认项？</h2>
-                    <p>点击右侧按钮后，会在当前会话的输入框中放入一段项目专属指令。补全数据集、参数、实现约束等已知事实，再发送给 Agent；它只会写入明确确认的信息。</p>
-                  </div>
-                  <button className="button button-primary" type="button" onClick={() => prepareExperimentConfirmation(activeWorkbenchTab.project)}>
-                    在对话中确认
-                  </button>
-                </section>
-                <section className="experiment-spec-section">
-                  <h2>论文证据范围</h2>
-                  <p>{Array.isArray(activeWorkbenchTab.project.spec.source_refs) ? `已保留 ${activeWorkbenchTab.project.spec.source_refs.length} 条页面级来源定位；具体参数和数据集仅在证据充分时写入规格。` : "尚未提取来源定位。"}</p>
-                </section>
-                <section className="experiment-files-section">
-                  <h2>项目文件</h2>
-                  {activeWorkbenchTab.project.files.length ? (
-                    <div className="experiment-file-layout">
-                      <div className="experiment-file-list">
-                        {activeWorkbenchTab.project.files.map((file) => (
-                          <button
-                            key={file.path}
-                            type="button"
-                            className={selectedExperimentFile?.path === file.path ? "selected" : ""}
-                            onClick={() => void openExperimentFile(activeWorkbenchTab.project.project_id, file.path)}
-                          >
-                            <strong>{file.path}</strong><span>{Math.max(1, Math.ceil(file.size_bytes / 1024))} KB</span>
-                          </button>
-                        ))}
-                      </div>
-                      <pre className="experiment-file-preview"><code>{selectedExperimentFile?.content || "选择一个文件查看内容。"}</code></pre>
-                    </div>
-                  ) : <p>项目尚未生成代码文件。</p>}
-                </section>
-              </div>
-            </article>
+            <ExperimentPanel
+              project={activeWorkbenchTab.project}
+              source={activeExperimentSource}
+              preparation={activeRepositoryPreparation}
+              reconstruction={activeMethodReconstruction}
+              starting={experimentStarting}
+              selectedFile={selectedExperimentFile}
+              repositoryUrlDraft={repositoryUrlDraft}
+              repositoryRelationship={repositoryRelationship}
+              onRepositoryUrlDraftChange={setRepositoryUrlDraft}
+              onRepositoryRelationshipChange={setRepositoryRelationship}
+              onRefresh={(projectId) => void selectExperimentProject(projectId)}
+              onRetry={(project) => void retryExperimentProject(project)}
+              onRemove={(project) => void removeExperimentProject(project)}
+              onSearchRepositories={(project) => void searchExperimentRepositories(project)}
+              onConnectRepository={(project, url, relationship) => void connectExperimentCodeRepository(project, url, relationship)}
+              onPrepareRepository={(project) => void prepareExperimentRepository(project)}
+              onStartMethodReconstruction={(project) => void startExperimentMethodReconstruction(project)}
+              onPrepareConfirmation={(project) => prepareExperimentConfirmation(project)}
+              onOpenFile={(projectId, path) => void openExperimentFile(projectId, path)}
+            />
           ) : activeWorkbenchTab?.kind === "dailyRun" ? (
-            <article className="document-page" aria-label={`每日检索报告：${activeWorkbenchTab.title}`}>
-              <header className="document-page-heading">
-                <div>
-                  <p className="eyebrow">每日检索报告</p>
-                  <h1>{activeWorkbenchTab.title}</h1>
-                  <p className="document-page-meta">
-                    <span className={`status status-${activeWorkbenchTab.detail.status}`}>{statusLabel(activeWorkbenchTab.detail.status)}</span>
-                    {" · "}{activeWorkbenchTab.detail.run_id}
-                  </p>
-                </div>
-              </header>
-              <div className="document-page-content daily-report-page">
-                {activeWorkbenchTab.detail.brief && (
-                  <section className="daily-report-brief">
-                    <h2>本次摘要</h2>
-                    <p>{activeWorkbenchTab.detail.brief}</p>
-                  </section>
-                )}
-                {activeWorkbenchTab.detail.warnings.length > 0 && (
-                  <section className="daily-report-warnings">
-                    <h2>质量提示</h2>
-                    <ul>{activeWorkbenchTab.detail.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
-                  </section>
-                )}
-                <section className="daily-report-papers">
-                  <h2>论文推荐</h2>
-                  {activeWorkbenchTab.detail.papers.length ? (
-                    <div className="daily-paper-list">
-                      {activeWorkbenchTab.detail.papers.map((paper) => (
-                        <article className="daily-paper" key={`${paper.title}:${paper.url}`}>
-                          <div className="daily-paper-main">
-                            <p className="daily-paper-meta">
-                              {paper.selected ? "已入选" : "候选"}
-                              {paper.source ? ` · ${paper.source}` : ""}
-                              {paper.year ? ` · ${paper.year}` : ""}
-                              {paper.citation_count !== null ? ` · 引用 ${paper.citation_count}` : ""}
-                            </p>
-                            {paper.url ? (
-                              <a className="daily-paper-title" href={paper.url} target="_blank" rel="noreferrer">{paper.title}</a>
-                            ) : (
-                              <strong className="daily-paper-title">{paper.title}</strong>
-                            )}
-                            {paper.reason && <p className="daily-paper-reason">推荐理由：{paper.reason}</p>}
-                            {paper.tags.length > 0 && <p className="daily-paper-tags">{paper.tags.map((tag) => <span key={tag}>{tag}</span>)}</p>}
-                          </div>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <p>该任务尚未产生可展示的论文推荐。</p>
-                  )}
-                </section>
-              </div>
-            </article>
+            <DailyRunPanel title={activeWorkbenchTab.title} detail={activeWorkbenchTab.detail} />
           ) : activeWorkbenchTab?.kind === "runs" ? (
             <article className="utility-page" aria-label="运行中心">
               <header className="utility-page-heading">
