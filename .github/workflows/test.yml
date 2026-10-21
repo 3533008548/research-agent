@@ -56,7 +56,9 @@ jobs:
           tests.test_lexical tests.test_rerank tests.test_hybrid
           tests.test_retrieval_metrics tests.test_metrics_chain
           tests.test_stage_timing tests.test_mcp_server
-          tests.test_mcp_stdio tests.test_dependency_lock_coverage -v
+          tests.test_mcp_stdio tests.test_dependency_lock_coverage
+          tests.test_mcp_client tests.test_mcp_client_e2e
+          tests.test_mcp_client_wiring -v
 
       - name: Run offline release quality gate
         run: python -m evals.release_gate --strict

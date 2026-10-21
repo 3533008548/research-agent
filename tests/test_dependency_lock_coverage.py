@@ -43,6 +43,7 @@ SHIPPED_SURFACE = (
     "api_worker.py",
     "research_agent.py",
     "mcp_server.py",
+    "mcp_client.py",
     "daily_orchestrator.py",
     "graph_builder.py",
     "tool_runtime.py",

@@ -13,6 +13,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from runtime_paths import RuntimePaths
 
@@ -48,6 +49,12 @@ _DFLT = {
     "api_max_retries": 2,
     "api_circuit_failure_threshold": 3,
     "api_circuit_recovery_seconds": 120,
+    # External MCP servers are off unless the operator turns them on.
+    "mcp_enabled": False,
+    "mcp_servers": (),
+    "mcp_tool_timeout_seconds": 30.0,
+    "mcp_circuit_failure_threshold": 3,
+    "mcp_circuit_recovery_seconds": 120,
     "api_url": "https://api.deepseek.com/chat/completions",
 }
 
@@ -92,6 +99,15 @@ class Config:
     api_max_retries: int = 2
     api_circuit_failure_threshold: int = 3
     api_circuit_recovery_seconds: int = 120
+
+    # External MCP servers to consume.  Empty means the feature is off, which
+    # is the default: reaching out to another process is an operator's
+    # decision, not something the agent does on its own.
+    mcp_servers: tuple[dict[str, Any], ...] = ()
+    mcp_enabled: bool = False
+    mcp_tool_timeout_seconds: float = 30.0
+    mcp_circuit_failure_threshold: int = 3
+    mcp_circuit_recovery_seconds: int = 120
 
     data_dir: str = "runtime"
     checkpoint_db: str = ""
@@ -221,6 +237,63 @@ class Config:
                     cfg["verify_timeout_seconds"] = yaml_cfg["agent"].get(
                         "verify_timeout_seconds", cfg["verify_timeout_seconds"]
                     )
+                if "mcp" in yaml_cfg:
+                    mcp_settings = yaml_cfg["mcp"]
+                    cfg["mcp_enabled"] = bool(
+                        mcp_settings.get("enabled", cfg["mcp_enabled"])
+                    )
+                    cfg["mcp_tool_timeout_seconds"] = float(
+                        mcp_settings.get(
+                            "tool_timeout_seconds", cfg["mcp_tool_timeout_seconds"],
+                        )
+                    )
+                    cfg["mcp_circuit_failure_threshold"] = max(
+                        1, int(mcp_settings.get(
+                            "circuit_failure_threshold",
+                            cfg["mcp_circuit_failure_threshold"],
+                        ))
+                    )
+                    cfg["mcp_circuit_recovery_seconds"] = max(
+                        10, int(mcp_settings.get(
+                            "circuit_recovery_seconds",
+                            cfg["mcp_circuit_recovery_seconds"],
+                        ))
+                    )
+                    servers = mcp_settings.get("servers")
+                    if isinstance(servers, list):
+                        normalised: list[dict[str, Any]] = []
+                        for entry in servers:
+                            if not isinstance(entry, dict):
+                                continue
+                            name = str(entry.get("name") or "").strip()
+                            command = str(entry.get("command") or "").strip()
+                            if not name or not command:
+                                continue
+                            raw_args = entry.get("args") or []
+                            args = [str(item) for item in raw_args] if isinstance(raw_args, list) else []
+                            raw_env = entry.get("env") or {}
+                            env = (
+                                {str(k): str(v) for k, v in raw_env.items()}
+                                if isinstance(raw_env, dict) else {}
+                            )
+                            raw_allowed = entry.get("allowed_tools") or []
+                            allowed = (
+                                frozenset(str(item) for item in raw_allowed)
+                                if isinstance(raw_allowed, list) else frozenset()
+                            )
+                            normalised.append({
+                                "name": name,
+                                "command": command,
+                                "args": args,
+                                "env": env,
+                                "cwd": str(entry.get("cwd") or ""),
+                                "timeout_seconds": float(
+                                    entry.get("timeout_seconds", cfg["mcp_tool_timeout_seconds"])
+                                ),
+                                "enabled": bool(entry.get("enabled", True)),
+                                "allowed_tools": allowed,
+                            })
+                        cfg["mcp_servers"] = tuple(normalised)
                 if "api_resilience" in yaml_cfg:
                     settings = yaml_cfg["api_resilience"]
                     for key in (
@@ -323,5 +396,16 @@ class Config:
             api_max_retries=max(0, int(cfg.get("api_max_retries", 2))),
             api_circuit_failure_threshold=max(1, int(cfg.get("api_circuit_failure_threshold", 3))),
             api_circuit_recovery_seconds=max(10, int(cfg.get("api_circuit_recovery_seconds", 120))),
+            mcp_enabled=bool(cfg.get("mcp_enabled", False)),
+            mcp_servers=tuple(cfg.get("mcp_servers") or ()),
+            mcp_tool_timeout_seconds=max(
+                1.0, float(cfg.get("mcp_tool_timeout_seconds", 30.0)),
+            ),
+            mcp_circuit_failure_threshold=max(
+                1, int(cfg.get("mcp_circuit_failure_threshold", 3)),
+            ),
+            mcp_circuit_recovery_seconds=max(
+                10, int(cfg.get("mcp_circuit_recovery_seconds", 120)),
+            ),
             data_dir=str(paths.root),
         )

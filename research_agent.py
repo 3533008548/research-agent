@@ -306,6 +306,59 @@ class ResearchAgent:
             self._load_context_from_checkpoint(self._thread_id)
             self._prune_checkpoint(max_snapshots=50)
 
+        # 外部 MCP 服务：把别人的工具接进来。默认关闭——是否连到外部进程是
+        # 运维的决定，不是 Agent 自己能做的。
+        self.mcp_registry = self._start_external_mcp(cfg)
+
+    def _start_external_mcp(self, cfg) -> Any:
+        """Launch the configured external MCP servers and publish their tools.
+
+        A server that fails to start is reported and skipped: the agent keeps
+        its built-in tools and stays usable.  That is the whole point of the
+        degradation rule — an optional capability must never take the product
+        down.
+        """
+        from mcp_client import ExternalToolRegistry, McpServerSpec
+
+        if not cfg.mcp_enabled or not cfg.mcp_servers:
+            return None
+        specs = [
+            McpServerSpec(
+                name=str(entry.get("name") or ""),
+                command=str(entry.get("command") or ""),
+                args=tuple(str(item) for item in (entry.get("args") or ())),
+                env={str(k): str(v) for k, v in (entry.get("env") or {}).items()},
+                cwd=str(entry.get("cwd") or ""),
+                timeout_seconds=float(
+                    entry.get("timeout_seconds", cfg.mcp_tool_timeout_seconds)
+                ),
+                enabled=bool(entry.get("enabled", True)),
+                allowed_tools=frozenset(
+                    str(item) for item in (entry.get("allowed_tools") or ())
+                ),
+            )
+            for entry in cfg.mcp_servers
+            if str(entry.get("name") or "") and str(entry.get("command") or "")
+        ]
+        if not specs:
+            return None
+        registry = ExternalToolRegistry(
+            specs,
+            failure_threshold=cfg.mcp_circuit_failure_threshold,
+            recovery_seconds=cfg.mcp_circuit_recovery_seconds,
+        )
+        registry.start()
+        published = registry.publish_to_catalog()
+        if published:
+            print(
+                f"      🔌 外部 MCP 工具已接入（{len(published)} 个）："
+                f"{', '.join(published)}",
+                file=sys.stderr,
+            )
+        for name, error in registry.errors().items():
+            print(f"      ⚠️ 外部 MCP 服务 {name} 不可用：{error}", file=sys.stderr)
+        return registry
+
     def _attach_relation_reviewer(self, paths) -> None:
         """Enable automatic relation review after each successful index.
 
@@ -691,6 +744,10 @@ class ResearchAgent:
                 vision_model=self.cfg.vision_model,
                 llm_client=self.llm_client,
                 verify_timeout_seconds=self.cfg.verify_timeout_seconds,
+                external_tool_names=(
+                    frozenset(self.mcp_registry.qualified_names())
+                    if self.mcp_registry is not None else frozenset()
+                ),
             )
             result = orchestrator.run(
                 query,

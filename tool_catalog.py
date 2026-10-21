@@ -9,9 +9,10 @@ contracts get out of sync.
 
 from __future__ import annotations
 
+import threading
 from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from tool_schemas import _raw_tool_schemas
 
@@ -24,6 +25,12 @@ class ToolDefinition:
     label: str
     result_limit: int
     schema: dict[str, Any]
+    # External tools (from an MCP server) carry a handler, because they are not
+    # implemented in this repository.  Built-in tools leave it unset and are
+    # dispatched by name.
+    handler: Callable[[dict[str, Any]], str] | None = None
+    # The server an external tool came from, for diagnostics.
+    source: str = ""
 
 
 _PRESENTATION = {
@@ -82,17 +89,50 @@ TOOL_CATALOG = _build_catalog()
 TOOL_NAMES = frozenset(definition.name for definition in TOOL_CATALOG)
 _BY_NAME = {definition.name: definition for definition in TOOL_CATALOG}
 
+# External tools live in their own namespace because they are discovered at
+# runtime rather than declared in this repository.  Keeping them out of
+# ``TOOL_CATALOG`` means the built-in consistency check above stays meaningful:
+# it still proves that every declared schema has a presentation contract and
+# a dispatcher, which is a statement about *this* repository's tools only.
+_EXTERNAL_LOCK = threading.RLock()
+_EXTERNAL_BY_NAME: dict[str, ToolDefinition] = {}
+
+
+def register_external_tools(definitions: list[ToolDefinition]) -> None:
+    """Register external (MCP-provided) tools into the public catalog.
+
+    Registering rather than mutating keeps the built-in catalog immutable, so
+    an external server can never weaken the contract that every built-in tool
+    has a schema, a label and a result limit.
+    """
+    with _EXTERNAL_LOCK:
+        for definition in definitions:
+            _EXTERNAL_BY_NAME[definition.name] = definition
+
+
+def clear_external_tools() -> None:
+    """Remove every external tool, e.g. when the servers shut down."""
+    with _EXTERNAL_LOCK:
+        _EXTERNAL_BY_NAME.clear()
+
 
 def get_tool_definition(name: str) -> ToolDefinition | None:
-    """Return a bundled tool definition, or ``None`` for an unknown name."""
-    return _BY_NAME.get(str(name or ""))
+    """Return a tool definition, or ``None`` for an unknown name."""
+    key = str(name or "")
+    found = _BY_NAME.get(key)
+    if found is not None:
+        return found
+    with _EXTERNAL_LOCK:
+        return _EXTERNAL_BY_NAME.get(key)
 
 
 def get_tool_schemas(allowed_tool_names: set[str] | frozenset[str] | None = None) -> list[dict]:
     """Return caller-owned schemas, optionally filtered by the capability scope."""
     allowed = None if allowed_tool_names is None else frozenset(allowed_tool_names)
+    with _EXTERNAL_LOCK:
+        external = list(_EXTERNAL_BY_NAME.values())
     return [
         deepcopy(definition.schema)
-        for definition in TOOL_CATALOG
+        for definition in (*TOOL_CATALOG, *external)
         if allowed is None or definition.name in allowed
     ]

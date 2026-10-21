@@ -31,7 +31,7 @@ from tools.experiment_projects import handle_update_experiment_project
 from tools.describe import handle_describe_image
 from tools.profile_tool import handle_update_profile
 from cancellation import raise_if_cancelled
-from tool_catalog import TOOL_NAMES
+from tool_catalog import TOOL_NAMES, get_tool_definition
 
 
 _TOOL_HANDLERS = {
@@ -123,6 +123,14 @@ def execute_tool(
             llm_client=llm_client, model=model,
             cancel_event=cancel_event,
         )
+        raise_if_cancelled(cancel_event, "工具调用已取消")
+        return result
+    # External (MCP-provided) tools are dispatched through the catalog rather
+    # than through a second path here, so they reach the model and the caller
+    # through exactly the same boundary as the built-in ones.
+    definition = get_tool_definition(name)
+    if definition is not None and definition.handler is not None:
+        result = definition.handler(args)
         raise_if_cancelled(cancel_event, "工具调用已取消")
         return result
     return f"❌ 未知工具: {name}"

@@ -253,6 +253,71 @@ export interface TimelineStage {
 - 外部 tool 的返回可能是恶意指令文本 → 走现有的"工具结果不当指令"防线。
 - **接入失败必须降级而非报错**：MCP Server 起不来时，Agent 仍能用内置工具正常工作。
 
+### 4.3 实际落地（已完成）
+
+`mcp_client.py` + `MCP_CLIENT.md`。核心结论与原方案一致，但有一处必须改写：
+
+> 原方案写的是"熔断/超时/重试/降级**全部复用**"。实际落地时必须说清楚
+> **哪些是复用、哪些是新增**——含混其辞会让人以为熔断也在 `ToolRuntime` 里。
+
+| 边界 | 机制 | 位置 | 性质 |
+|---|---|---|---|
+| 能力范围 | `allowed_tool_names` | `tool_runtime.py` | **复用** |
+| 取消 | `cancel_event` | `tool_runtime.py` | **复用** |
+| 结果上限 | `result_limit` | `tool_runtime.py` | **复用** |
+| 生命周期事件 | `event_callback` | `tool_runtime.py` | **复用** |
+| 熔断 | `CircuitBreaker`（每服务一个） | `mcp_client.py` | 新增，但**复用 `resilience.CircuitBreaker` 这个既有原语** |
+| 超时 | 每服务 `timeout_seconds` | `mcp_client.py` | 新增（`ToolRuntime.deadline_monotonic` 至今无人设置，是空壳） |
+
+外部工具**没有绕开 `ToolRuntime`**，所以前四项是白捡的；
+后两项必须新写，但用的是项目既有的熔断器原语，不是另起炉灶。
+
+**命名空间**：`mcp__<服务>__<工具>`。且**内置工具优先**——
+外部 Server 恰好用了同名工具也替换不掉内置定义（`result_limit` 之类不受影响）。
+
+**降级**：服务起不来 → 记录错误、跳过、Agent 照常用内置工具。
+已连接的会话掉线**也计入熔断**——否则会在每轮工具调用重试一次，每次付满超时。
+
+**信任边界**：聊天提示词新增「工具结果的信任边界」一节；
+研究 worker 提示词补充 `mcp__` 输出的定性。外部工具只授予 `public` 角色，
+`local` 与 `boundary` 角色拿不到。
+
+### 4.4 实测踩到的坑
+
+**`stdio_client(...).__aenter__()` 会被 GC。**
+`stdio_client` 是 `@asynccontextmanager` 的异步生成器；只调 `__aenter__()`
+而不持有对象，生成器被 GC 时**终结并拆掉子进程**。
+症状是「握手成功、工具数 0、错误只有一句 `Connection closed`」——
+错误信息完全指错方向，读日志查不出来。
+修法：`AsyncExitStack` 持有上下文，让生命周期覆盖整个会话。
+
+> 这类故障唯一的解法是**缩小变量**：先固定 session 只调 `list_tools`，
+> 再固定 loop 只跑一次握手，才定位到是对象生命周期而非协议问题。
+
+**测试自己也要能失败。** 熔断测试最初构造 registry 时没给 `specs`，
+熔断器根本没被创建，于是"连续失败 2 次"永远开不了闸——
+测试是绿的，熔断却不存在。
+
+**同步/异步桥接**：工具路径全同步、MCP SDK 全异步。
+用专用后台线程持有事件循环与活动会话，同步侧用
+`run_coroutine_threadsafe` 提交并等待。没有另起线程池，
+也没有把图改成异步（那会波及所有编排器）。
+
+### 4.5 验收情况
+
+| 项 | 结果 |
+|---|---|
+| 外部工具被模型看见 | `mcp__self__retrieval_metrics` 出现在 `get_tool_schemas()` |
+| 经由普通分发器可达 | `execute_tool("mcp__self__...", {})` 返回服务端真实载荷 |
+| 继承结果上限 | 外部工具的返回同样被 `result_limit` 截断 |
+| 继承取消 | 已取消的运行不会调用外部工具 |
+| 继承生命周期事件 | 外部工具同样发 `tool_started`/`tool_finished`/`tool_failed` |
+| 熔断 | 连续失败开闸；已连接但掉线也计入 |
+| 降级 | 起不来的服务被跳过，Agent 仍可用内置工具 |
+| 配置 | 默认关闭；畸形条目被跳过而不是拖垮整个配置 |
+| 测试 | 边界 25 + 传输 9 + 接线 6，全过 |
+| 后端回归 | **448 绿** |
+
 ---
 
 ## 5. 里程碑与顺序
@@ -261,14 +326,14 @@ export interface TimelineStage {
 |---|---|---|---|
 | ✅ 第一步 | 后端阶段时间戳 + daily 事件投递 | 376 测试绿 | 已完成 |
 | ✅ 第二步 | RunCenter 拆分 + 时间轴 | 数值与 SQLite 一致、前端 13 例 | 已完成 |
-| 三 | MCP Server | 4 tool 可 inspect、结果一致 | 低（暴露已有能力） |
-| 四 | MCP Client | 外部 tool 自动获得熔断 | **中**（外部不可控） |
+| ✅ 三 | MCP Server | 5 tool 可 inspect、结果一致 | 已完成（`a6dc4a1`/`301258d`） |
+| ✅ 四 | MCP Client | 外部 tool 自动获得熔断 | 已完成（`MCP_CLIENT.md`） |
 | 五 | `App.tsx` 剩余部分收尾 | 组件均 < 500 行 | 低 |
 
 **顺序理由**：二和三都能独立交付、独立演示，风险都低。
 四放最后，因为它唯一依赖外部系统；如果时间不够，前三步已经能覆盖 JD 的两条要求。
 
-**当前进度**：一、二已完成（`618be09`、`cbbf4ab`）。下一步是 MCP Server。
+**当前进度**：一至四已完成。下一步是阶段五（`App.tsx` 收尾）。
 
 ---
 

@@ -65,3 +65,31 @@ rag:
 ui:
   port: 7860
   theme: soft
+
+# ── 外部 MCP 服务（消费别人的 MCP Server） ──────────────────────────────
+# 默认关闭。是否连到外部进程是运维的决定，不由 Agent 自行决定。
+# 接入后的工具会以 mcp__<服务名>__<工具名> 的形式出现在工具列表里，
+# 并自动继承现有的熔断、超时、取消与结果长度限制——因为它们走的是同一条
+# 工具执行路径，而不是另开一套。
+mcp:
+  enabled: false
+  # 单次工具调用的超时上限（秒）。
+  tool_timeout_seconds: 30
+  # 连续失败多少次后熔断该服务；熔断窗口（秒）过后放行一个探测请求。
+  # 复用项目既有的 resilience.CircuitBreaker，不是另写一套。
+  circuit_failure_threshold: 3
+  circuit_recovery_seconds: 120
+  servers:
+    # 示例：连到本项目自己的 MCP Server（mcp_server.py），做一次自洽验证。
+    # 真实场景可换成 uvx arxiv-mcp-server 之类的第三方服务。
+    # - name: arxiv
+    #   command: uvx
+    #   args: ["arxiv-mcp-server"]
+    #   # 只开放指定工具；留空表示开放该服务全部工具（仅适用于可信服务）。
+    #   allowed_tools: ["search_papers"]
+    #   timeout_seconds: 30
+    # - name: local
+    #   command: python
+    #   args: ["mcp_server.py"]
+    #   env:
+    #     PYTHONPATH: "."
