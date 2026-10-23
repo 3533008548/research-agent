@@ -24,6 +24,10 @@
 | 🧠 **RAG 检索** | 章节与跨页续段感知切块 + 语义/BM25 RRF + 可选本地重排 + 公式保护 |
 | 🖼 **多模态看图** | DeepSeek 视觉模型描述 + 图注附带 + 描述缓存（省 token） |
 | 📰 **每日速递** | OpenAlex + OpenAIRE + DBLP 并行限时的后台推送，支持重试和待读清单管理 |
+| 🧭 **深度研究** | 规划 → 三个角色研究员并行取证 → 结构化证据 → 综合 → 质检 → 最多一次修订；双层引用与定位精度审计 |
+| 🧪 **论文复现** | 以页面级证据为边界生成实验规格与代码骨架；上游仓库只克隆不执行；不把未验证结果称为复现成功 |
+| 🔌 **MCP Server** | 把检索能力以标准 MCP 协议发布出去，5 个只读工具；其他 Agent 可直接接入本项目 |
+| 🔌 **MCP Client** | 反向消费外部 MCP Server；外部工具经同一份工具目录与同一运行时，自动继承白名单/取消/限长 |
 | 📁 **研究档案** | 将研究方案、假设或决策记录保存为可检索 Markdown 与可下载 Word 文档；按需读取，不注入会话摘要或用户画像 |
 | 👤 **用户画像** | Markdown 自动维护，Agent 从对话中学习偏好 |
 | 🧩 **辅助记忆** | 当前会话摘要自动压缩注入；论文方法/结果以全局三元组按需检索，会话之间严格隔离 |
@@ -102,6 +106,11 @@ Docker 的 `api-worker` 会在开始消费任务前预热本地 RAG 嵌入模型
 取消任务、PDF/图片上传、研究档案、论文库、每日检索（执行、重试、继续、阅读状态、
 按次报告标签页）、论文代码复现、用户画像和运行中心 / Badcase。运行中心还显示当前会话的持久化 Token 统计。
 失败或取消的普通对话可在运行检查器中重新发送；对任务的新补充会在下一编排节点生效。
+
+前端按**数据归属**拆分：每个业务域一个 hook（`useConversation` 拥有会话与正在跑的 run，
+`useDailyWorkspace` / `useRunCenter` / `useDocuments` / `useExperiments` 各自拥有自己的状态），
+工作台面板是纯展示组件。**所有组件与 hook 均 < 500 行**，hook 调用顺序由依赖关系决定，
+顺序写反会直接编译不过。
 
 生产构建由 FastAPI 从根路径 `/` 托管。深度研究、每日检索、论文复现和跨进程可恢复的对话需要 Redis 与独立 worker；没有 Redis 时仅保留进程内普通对话，不适合作为标准部署。最简部署方式为上面的 Docker Compose。前端开发时，在三个终端中运行：
 
@@ -212,9 +221,9 @@ PYTHON_IMAGE=<你的镜像仓库>/library/python:3.11-slim
 
 Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾选确认；旧版固定的 `research-main` 历史会自动迁移为“历史会话”。CLI 中仍可用 `/new` 新建会话。
 
-需要对一个问题做有边界的深度研究时，在对话框输入问题后点击 **🧭 深度研究**（可选择“本地论文 + 公开文献 / 仅本地论文 / 仅公开文献”）。它会先规划问题，再由最多两名研究员并行收集证据，最后完成综合、质检和最多一次修订；最终报告附带 `[E1]` 等证据编号与来源索引。研究只保存用户问题和最终报告，不会把内部工具消息写进会话历史。中途点击“停止”会保留已经收集的证据；在同一会话点击“继续上次研究”或输入 `/research continue` 可从这些证据继续。
+需要对一个问题做有边界的深度研究时，在对话框输入问题后点击 **🧭 深度研究**（可选择“本地论文 + 公开文献 / 仅本地论文 / 仅公开文献”）。它会先规划问题，再由三名角色研究员并行收集证据——本地证据研究员、文献与反例研究员、反证与边界研究员——最后经过结构化证据分析、综合、质检和最多一次修订；最终报告附带 `[E1]` 等证据编号、跨来源证据矩阵与引用溯源审计。研究只保存用户问题和最终报告，不会把内部工具消息写进会话历史。中途点击“停止”会保留已经收集的证据；在同一会话点击“继续上次研究”或输入 `/research continue` 可从这些证据继续。
 
-深度研究使用受限的工具集：本地研究员只能读取当前论文库，公开研究员只能检索公开论文；若需要新上传文件，请先在普通对话中完成上传和索引，再发起研究。
+深度研究使用受限的工具集，三名研究员的权限互不相同：本地研究员只能读取当前论文库，两个公开角色只能检索公开论文；**外部 MCP 工具只授予文献与反例研究员**，避免能力意外扩散。若需要新上传文件，请先在普通对话中完成上传和索引，再发起研究。
 
 普通对话中可以明确要求“为这篇论文生成证据卡”。它会读取已索引的本地 PDF，生成 `paper-card.md` 与 `source_map.json`；卡片中的论文事实以 `【论文 p.N · Sxxx】` 定位到提取块，模型推断会标记为 `【分析】`。PDF 文本不足或模型暂不可用时，系统会保留可追溯的证据草稿，而不会补写未提取到的实验或页码。
 
@@ -224,7 +233,49 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 
 在 React 工作台的“论文库”中，可对已解析论文点击“复现实验”。系统会以页面级解析证据为边界，提取可追溯的实验规格、待确认项和 Python 代码骨架，并保存到独立的 `runtime/primary/experiment_projects/` 项目页；它不会自动下载数据、运行训练或把未验证结果称为论文复现成功。项目页的“代码来源”可按论文标题检索 GitHub 候选，或直接连接用户提供的 GitHub 地址；候选永远不会被自动表述为官方实现。连接后点击“同步并分析上游代码”，系统会将记录的 commit 克隆到项目独立目录，并生成 README、依赖文件和训练入口清单；该步骤仍不会安装依赖、下载数据或执行仓库。若没有可用代码且你主动选择“按论文方法还原”，系统会创建单独的运行任务，基于论文页面级证据和已确认事实生成可编辑参考实现，并记录方法组件的证据定位、工程假设和待确认项；该产物始终标为近似方法还原，不是原作者代码复现，也不代表论文指标已复现。
 
+### 🔌 作为 MCP Server：把检索能力发布出去
+
+本项目可以作为一个标准 MCP Server 被其他 Agent 接入，暴露 5 个**只读**工具：
+
+| 工具 | 作用 |
+|------|------|
+| `search_papers` | 搜索学术论文元数据（OpenAlex / arXiv），返回标题、作者、年份、链接与摘要 |
+| `query_papers` | 在本地已索引论文库中做混合检索（语义 + 词法 + 重排），返回带页码与章节的原文段落 |
+| `list_papers` | 列出已下载到本地的论文 |
+| `list_indexed_papers` | 列出已进入向量库、可被混合检索的论文及其块数 |
+| `retrieval_metrics` | 返回本进程检索各阶段的聚合耗时统计（语义 / 词法 / 融合 / 重排） |
+
+```bash
+python mcp_server.py          # 以 stdio 传输启动
+```
+
+**刻意不暴露写工具。** MCP 是对外公开面，而写操作没有配额、审计与门控——把「删除论文」「修改档案」这类能力放到公开接口上，代价与收益不成比例。详见 [MCP_SERVER.md](MCP_SERVER.md)。
+
+### 🔌 作为 MCP Client：消费外部 MCP Server
+
+反过来，本项目也可以接入**别人**的 MCP Server，让 Agent 调用本项目没有实现的能力：
+
+```yaml
+# config.yaml —— 默认关闭，连到外部进程是运维的决定
+mcp:
+  enabled: true
+  tool_timeout_seconds: 30
+  circuit_failure_threshold: 3
+  circuit_recovery_seconds: 120
+  servers:
+    - name: arxiv
+      command: uvx
+      args: ["arxiv-mcp-server"]
+      allowed_tools: ["search_papers"]   # 白名单；留空 = 该服务全部工具
+      timeout_seconds: 30
+```
+
+外部工具以 `mcp__<服务名>__<工具名>` 暴露，且**注册进同一份 `tool_catalog`、经同一个 `tool_runtime` 执行**——因此自动继承能力白名单、协作式取消、结果长度上限与生命周期事件，不需要另写分发器。内置工具优先：外部 Server 恰好用了同名工具也替换不掉内置定义。
+
+信任边界上，外部工具的输出是**数据而不是指令**：聊天系统提示词里有专门的「工具结果的信任边界」一节，研究 worker 提示词也要求把 `mcp__` 输出标为第三方主张。外部工具只授予 `public` 研究员角色。详见 [MCP_CLIENT.md](MCP_CLIENT.md)。
+
 ### 标记 Badcase，形成可维护的回归样例
+
 
 在 **Agent 运行中心 → 标记问题（Badcase 候选）** 中选择问题类型；默认关联当前会话最新任务，也可在“手动标记”中粘贴运行卡片里的 `run_id`。候选只记录运行类型、状态、耗时、受限指标和脱敏事件时间线，绝不会自动复制问题、模型回答、论文正文或工具参数/结果。可选备注由你手动填写，因此也不能粘贴原始内容或密钥。
 
@@ -243,11 +294,34 @@ python scripts/export_badcase_template.py --candidate-id bc-xxxxxxxxxxxx
 ## 🧪 验证
 
 ```bash
-python tests/test_core.py
+# 后端全部离线测试（与 CI 的 offline job 完全同一份列表，538 项）
+python -m unittest tests.test_core tests.test_chunking \
+  tests.test_lexical tests.test_rerank tests.test_hybrid \
+  tests.test_retrieval_metrics tests.test_metrics_chain \
+  tests.test_stage_timing tests.test_mcp_server tests.test_mcp_stdio \
+  tests.test_dependency_lock_coverage tests.test_mcp_client \
+  tests.test_mcp_client_e2e tests.test_mcp_client_wiring \
+  tests.test_research_evidence tests.test_experiment_reproduction \
+  tests.test_conversation_reference tests.test_paper_matching \
+  tests.test_paper_scope tests.test_relation_review \
+  tests.test_repository_preparation tests.test_repository_sources \
+  tests.test_ci_test_coverage
+
+# 前端纯函数测试（时间轴归约 + 标签词汇）
+cd frontend && npm test
+
+# 发布质量门禁
 python -m evals.release_gate --strict
 ```
 
-核心回归测试覆盖 PDF 提取、分块/RAG、论文关系的确认/锚点/一跳检索约束、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订、Badcase 脱敏快照/会话删除，以及取消令牌从浏览器到模型/工具节点的传播。
+> **测试模块必须与 CI 列表一一对应。**
+> `tests/test_ci_test_coverage.py` 会比对磁盘上的测试模块与
+> `.github/workflows/test.yml` 里 offline job 列出的模块——漏加一个，
+> 那个模块就永远不会在 CI 里跑，**而绿色的 CI 徽章会显得比实际保证得更多**。
+> 这个守卫不是形式：它存在之前，有 8 个模块从未在 CI 跑过，
+> 其中 `test_research_evidence.py` 里有两个坏测试已经坏了很久而无人察觉。
+
+核心回归测试覆盖 PDF 提取、分块/RAG、论文关系的确认/锚点/一跳检索约束、验证重试状态清理、每日多 Agent 检索（跨源去重、单次批量 Curator、可恢复运行）、多会话隔离和硬删除、统一数据目录、同模型重试、端到端截止时间、熔断、流式中断恢复、深度研究的证据持久化/继续/修订与阶段边界、引用与定位精度审计、工具白名单、MCP Server 与 Client 的端到端接线、Badcase 脱敏快照/会话删除，以及取消令牌从浏览器到模型/工具节点的传播。
 
 浏览器回归测试会启动临时 FastAPI + React 服务，确认浏览器通过统一运行接口创建任务、消费 SSE，并在切换会话时取消旧任务。它不读取用户 `runtime/`，也不访问真实模型。首次运行需安装 Chromium，并先构建前端：
 
@@ -258,7 +332,7 @@ cd frontend && npm ci && npm run build && cd ..
 python -m unittest tests.test_mounted_api_e2e
 ```
 
-GitHub Actions 会分别运行核心回归和该浏览器端到端测试。
+GitHub Actions 分为四个 job：离线质量门禁、前端归约测试、Docker 构建与健康检查、浏览器与 FastAPI 集成测试。
 
 FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文本端点，用于
 监控 Redis 队列积压、各类 worker 心跳和运行状态计数。指标只包含固定标签与聚合数字，
@@ -270,34 +344,100 @@ FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文
 
 ## 🧱 技术架构
 
+项目里有 **三条彼此独立的编排链路** 和 **两个方向的 MCP 接口**。它们共用同一份工具目录与同一个工具运行时，但编排方式完全不同——这也是本项目最想说明清楚的一件事。
+
 ```
-LangGraph ReAct 循环 (graph_builder.py)
-  START → LLM ⇄ Tools → Verify(分级) → END
+▌对话（graph_builder.py）
+│  LangGraph 循环，同一张图反复走：
+│    START → LLM ⇄ Tools → Verify(分级) → END
+│  工具：全部 29 个（可按角色收窄）
 
-深度研究闭环 (research_orchestrator.py)
-  Planner → 本地证据研究员 ∥ 公开文献研究员 → Synthesis → Critic → Revision(最多一次)
+▌深度研究（research_orchestrator.py）
+│  父级是普通 Python 函数（不是图），并行驱动若干独立图实例：
+│    Planner ──▶ Researchers ×3（各自 build_graph 独立实例）
+│                  ├─ local     本地库只读
+│                  ├─ public    公共检索 + 外部 MCP 工具
+│                  └─ boundary  专门找反例与适用边界
+│            ──▶ Evidence Analysis（纯规则，无模型）
+│            ──▶ Synthesis ──▶ Critic ──▶ Revision（最多一次）
+│  只有 Researcher 跑图；其余四个阶段是无工具的纯文本阶段
 
-研究运行记录与会话共用 checkpoint.db，以 thread_id 关联；删除会话会同步删除可恢复的计划、证据、质检结果和最终报告。
+▌每日检索（daily_orchestrator.py）
+│  Rule Planner ──▶ Scouts ×3（OpenAlex ∥ OpenAIRE ∥ DBLP，HTTP 抓取）
+│                ──▶ Normalizer/Deduper ──▶ Quality Gate
+│                ──▶ Curator（整次任务一次） ──▶ Critic（条件式）
+│                ──▶ Delivery
+│  只有 Curator 与 Critic 用模型；两者失败都回落到可解释规则排序
 
-每日检索闭环 (daily_orchestrator.py)
-  Rule Planner → OpenAlex Scout ∥ OpenAIRE Scout ∥ DBLP Scout
-  → Normalizer/Deduper → Quality Gate → Curator(整次任务一次) → Conditional Critic → Delivery
+▌MCP Server（mcp_server.py）
+│  把本项目的检索能力发布成标准 MCP 协议：
+│    search_papers · query_papers · list_papers
+│    list_indexed_papers · retrieval_metrics
+│  只读、不暴露写工具——MCP 是对外公开面，写操作没有配额/审计/门控
 
-每日运行记录保存在 daily.db；来源请求按域名限流，任务停止或失败时可从保存的候选恢复。Curator 使用共享 LLMClient 的低优先级请求，模型暂不可用时只保留可解释的规则排序，不切换模型。公开论文检索默认合并 OpenAlex 与 arXiv。系统按 DOI、arXiv ID、标题相似度去重，并保留每条记录的来源、相关性依据和部分来源失败信息。IEEE Xplore 因 API 暂时不可用而被禁用。
+▌MCP Client（mcp_client.py）
+│  消费外部 MCP Server，外部工具注册进同一份 tool_catalog，
+│  经同一个 tool_runtime 执行——因此自动继承白名单、取消、
+│  结果限长与生命周期事件。唯一的例外是熔断与超时，因为
+│  ToolRuntime.deadline_monotonic 至今无人设置，是空壳。
+```
+
+### 多 Agent 的权限模型
+
+**权限不靠提示词约束，靠运行时强制。** 每个角色拿到的工具集合在 `ToolExecutionContext.allowed_tool_names` 里声明，`tool_runtime` 在每次执行前校验，不在白名单就返回 `Tool is not available in this {run_kind} role`。
+
+| 角色 | 工具白名单 | 职责 |
+|------|-----------|------|
+| `local` 本地证据研究员 | `query_papers` `list_papers` `list_indexed_papers` | 只读本地已索引库 |
+| `public` 文献与反例研究员 | `search_papers` **+ 外部 `mcp__` 工具** | 唯一能出网的角色 |
+| `boundary` 反证与边界研究员 | `search_papers` | 专门找反例、失败模式、泛化边界 |
+
+外部 MCP 工具**只授予 `public`**——能力不该意外扩散，所以必须点名授予。
+
+### 阶段边界：每个阶段只交付一件事
+
+越界是丢掉审计链最便宜的方式，所以每个阶段都有明确的禁止清单：
+
+| 阶段 | 边界 |
+|------|------|
+| Researcher | 不下结论、不排序、不写综述；取不到原文定位就报「无法定位」而不是改写成发现 |
+| Synthesis | 不重跑检索、不引入证据列表外的 ID、**不自证已验证**（验证归下一阶段） |
+| Critic | 只返回判决，**不改写草稿**、不加主张 |
+| Revision | 只删改无支撑的主张、保留限制；不引入新主张/新 ID/新章节 |
+
+### 引用与定位的诚实性
+
+深度研究采用**双层引用**：可见的 `[E1]` + 隐藏的 `<!--ref:E1--><!--anchor:page:7-->`，让「结论 → 证据 → 原文位置」可以被机械校验。
+
+关键取舍是**缺失的定位如实标 `none`**，不伪造成看起来可信的页码：
+
+> 「缺失 ≠ 可解析」。伪装成看起来可信的定位符比承认 none 更危险。
+
+审计会专门抓「定位升级」——声称有精确锚点但底层证据其实没解析出位置。
+
+### 降级保留产物
+
+三条链路失败时都不归零：研究保留已找到的证据、每日检索保留已抓到的候选、对话保留已给出的答案。模型超时会被标成 `skipped` 而不是伪装成 `completed`。
+
+研究运行记录与会话共用 `checkpoint.db`，以 `thread_id` 关联；删除会话会同步删除可恢复的计划、证据、质检结果和最终报告。
+
+每日运行记录保存在 `daily.db`；来源请求按域名限流，任务停止或失败时可从保存的候选恢复。Curator 使用共享 LLMClient 的低优先级请求，模型暂不可用时只保留可解释的规则排序，不切换模型。公开论文检索默认合并 OpenAlex 与 arXiv。系统按 DOI、arXiv ID、标题相似度去重，并保留每条记录的来源、相关性依据和部分来源失败信息。IEEE Xplore 因 API 暂时不可用而被禁用。
 
 Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过或达到重试上限后自动清理，避免影响后续对话。
 
-运行时数据层（APP_DATA_DIR，默认 ./runtime）:
-  primary/db/          → checkpoint、memory、daily、badcases SQLite 数据
-  primary/papers/      → 原始论文 PDF
-  primary/research_documents/ → 用户研究档案：Markdown 原稿与 Word 导出
-  primary/experiment_projects/ → 论文复现实验：证据规格、代码文件与版本快照
-  primary/paper_relations.json → 用户确认的论文关系：一跳检索提示与证据锚点
-  primary/profile.md   → 用户画像
-  primary/settings.json→ Web UI 用户设置
-  derived/chroma/      → 论文向量库（可重建）
-  derived/images/      → PDF 提取图片与图注（可重建）
-  derived/paper_artifacts/ → 页面元素映射、论文来源映射、证据卡与审计结果（可重建）
+### 运行时数据层（APP_DATA_DIR，默认 ./runtime）
+
+```
+primary/db/          → checkpoint、memory、daily、badcases SQLite 数据
+primary/papers/      → 原始论文 PDF
+primary/research_documents/ → 用户研究档案：Markdown 原稿与 Word 导出
+primary/experiment_projects/ → 论文复现实验：证据规格、代码文件与版本快照
+primary/paper_relations.json → 用户确认的论文关系：一跳检索提示与证据锚点
+primary/profile.md   → 用户画像
+primary/settings.json→ Web UI 用户设置
+derived/chroma/      → 论文向量库（可重建）
+derived/images/      → PDF 提取图片与图注（可重建）
+derived/paper_artifacts/ → 页面元素映射、论文来源映射、证据卡与审计结果（可重建）
 ```
 
 ---
@@ -316,6 +456,7 @@ research_agent/
 ├── paper_relations.py    # 用户确认的论文关系存储与一跳检索提示
 ├── paper_artifacts.py    # 页面映射、跨页逻辑块、关联上下文、证据卡与锚点审计
 ├── research_documents.py # 用户研究档案：四章节、局部补丁、历史快照、证据与假设账本 + Word 导出
+├── research_evidence.py  # 证据卡、证据单元、边界矩阵、引用与定位精度审计
 ├── paper_records.py      # 公开检索/每日检索共用的论文规范化与去重
 ├── search_api.py         # OpenAlex / arXiv 交互式与深度研究检索 API
 ├── ieee_xplore.py        # IEEE Xplore Metadata API 参数与响应规范化（当前禁用，保留恢复路径）
@@ -330,6 +471,8 @@ research_agent/
 ├── run_contract.py       # 对话、研究、每日任务共用的脱敏运行事件契约
 ├── badcase_store.py      # 本地 Badcase 候选池与合成夹具草稿导出
 ├── runtime_paths.py       # 运行时数据边界、版本与用户设置
+├── mcp_server.py         # 以 MCP 协议发布检索能力（5 个只读工具）
+├── mcp_client.py         # 消费外部 MCP Server，外部工具经同一运行时执行
 ├── config.py / config.yaml  # 统一配置
 ├── logger.py             # 结构化日志
 │
@@ -346,10 +489,18 @@ research_agent/
 ├── api_server.py         # FastAPI 入口与 React 生产构建托管
 ├── api_worker.py         # Redis 队列消费者：对话、研究、每日检索、论文复现
 ├── frontend/             # React + TypeScript 客户端（根路径 /，仅经 FastAPI 调用后端）
+│   └── src/
+│       ├── hooks/        # useConversation / useExperiments / useDailyWorkspace
+│       │                 # useRunCenter / useDocuments / useWorkspaceChrome
+│       ├── components/   # workspace/ 下的面板、侧栏、聊天面板 + runcenter/
+│       └── lib/          # 纯函数：timeline 归约、labels 词汇、workspace 类型
 ├── scripts/              # 数据迁移、索引重建、重排器预热、备份和 Badcase 夹具导出
-├── tests/                # 核心回归 + Playwright 浏览器会话隔离测试
+├── tests/                # 核心回归 + MCP 端到端 + Playwright 浏览器会话隔离测试
 ├── .github/workflows/    # CI 自动测试
 │
+├── MCP_SERVER.md         # 作为 MCP Server 发布的接口与边界说明
+├── MCP_CLIENT.md         # 作为 MCP Client 消费外部 Server 的接线与信任边界
+├── 工程约定与经验沉淀.md   # 从本项目真实踩坑提炼的工程约定
 ├── 需求决策日志.md         # 功能需求与决策记录 (条目 001-025)
 ├── 重构说明.md            # 代码变动文档
 └── requirements.txt

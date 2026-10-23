@@ -167,10 +167,30 @@ class TestCitationEmission(unittest.TestCase):
 
 
 class TestResearchBoundaryPlanning(unittest.TestCase):
+    @staticmethod
+    def _orchestrator():
+        """A minimal orchestrator.
+
+        ``_worker_specs`` is an instance method: it reads
+        ``self.external_tool_names`` to decide which public worker may reach
+        an external MCP server.  Calling it unbound would pass the scope
+        string in the ``self`` slot, so build a real instance instead.
+        """
+        from research_orchestrator import ResearchOrchestrator
+
+        return ResearchOrchestrator(
+            session_store=None,
+            api_key="test-key",
+            model="deepseek-chat",
+            paper_store=None,
+            llm_client=None,
+            verify_timeout_seconds=3,
+        )
+
     def test_public_scope_has_a_dedicated_boundary_worker(self):
         from research_orchestrator import ResearchOrchestrator
 
-        specs = ResearchOrchestrator._worker_specs("public")
+        specs = self._orchestrator()._worker_specs("public")
         self.assertEqual([spec.role for spec in specs], ["public", "boundary"])
         self.assertIn("counterevidence", specs[1].instruction)
         plan = ResearchOrchestrator._parse_plan(
@@ -179,6 +199,23 @@ class TestResearchBoundaryPlanning(unittest.TestCase):
             "x",
         )
         self.assertIn("主动核查反例、负面结果或适用边界", plan["completion_criteria"])
+
+    def test_only_the_public_worker_may_reach_an_external_mcp_server(self):
+        from research_orchestrator import ResearchOrchestrator
+
+        orchestrator = ResearchOrchestrator(
+            session_store=None,
+            api_key="test-key",
+            model="deepseek-chat",
+            paper_store=None,
+            llm_client=None,
+            verify_timeout_seconds=3,
+            external_tool_names=frozenset({"mcp__arxiv__search"}),
+        )
+        specs = {spec.role: spec for spec in orchestrator._worker_specs("both")}
+        self.assertIn("mcp__arxiv__search", specs["public"].allowed_tools)
+        self.assertNotIn("mcp__arxiv__search", specs["local"].allowed_tools)
+        self.assertNotIn("mcp__arxiv__search", specs["boundary"].allowed_tools)
 
     def test_renumber_keeps_boundary_evidence_inside_prompt_cap(self):
         from research_orchestrator import ResearchOrchestrator
@@ -209,7 +246,7 @@ class TestPhaseBoundaryAndCitationRules(unittest.TestCase):
     def test_every_stage_input_carries_its_own_boundary(self):
         from research_orchestrator import PHASE_BOUNDARY, ResearchOrchestrator
 
-        spec = ResearchOrchestrator._worker_specs("local")[0]
+        spec = TestResearchBoundaryPlanning._orchestrator()._worker_specs("local")[0]
         worker = ResearchOrchestrator._worker_input("q", {"subtasks": []}, spec)
         self.assertIn(PHASE_BOUNDARY["researcher"], worker)
 
