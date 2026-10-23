@@ -359,3 +359,57 @@ hook 调用顺序由编译器盯着：顺序写反直接编译不过。
   旧数据没有这些字段，前端按"无耗时"处理即可。
   **没有 schema 变更，不需要重建数据库。**
 - MCP Server 独立进程，出问题直接停进程，不影响 Web 服务。
+
+---
+
+## 7. 已知未修问题（2026-10-23 评审）
+
+五个阶段全部收口后，对深度研究的多 Agent 设计做了一次评审。结论是
+**生成侧扎实，验收侧敞口**——前面所有精巧的机制最终都不影响 `run.status`。
+
+已修的三个（提交 `a344b25`）：
+
+| 缺陷 | 修法 |
+|---|---|
+| planner 子任务 id 与角色名不匹配 → 规划被静默丢弃 | `_normalize_subtask_roles()` 按 scope 归一化；plan 记 `focus_applied` |
+| 引用审计不是门控 → 坏引用照样 `completed` | 修订前先审计，坏引用强制触发修订；仍不成立则降级 `partial_failed` |
+| critic 读不到限制章节（`draft[:5000]` 只留头部） | `_draft_excerpt()` 首尾都保留，尾部标注所属章节 |
+
+**仍然存在**：
+
+### 🔴 P1：critic 超时被记成 `pass`
+
+```python
+critique = {"verdict": "pass", "issues": [f"自动质检已跳过：{type(exc).__name__}..."]}
+```
+
+**「没审」被记成「审过」。** `verdict="pass"` 让 `if verdict == "revise"` 不成立，
+于是跳过修订，报告以"质量检查通过"的状态交付。
+
+放大它的三个事实：
+
+- `verify_timeout_seconds: 8`——**8 秒覆盖排队 + HTTP + 读响应**
+  （`RequestBudget.deadline_at` 是共享预算）
+- critic 用 `RequestPriority.VERIFY` → `low_priority_slots`，
+  **全局只有 1 个并发**（`low_priority_max_concurrency: 1`）
+- 8 秒内要审完 5000 字草稿 + 12 张证据卡
+
+**建议**：verdict 引入第三态 `"unknown"`，超时/异常用它而非 `"pass"`；
+并给研究 critic 单独一个预算（`verify_timeout_seconds` 与对话 verify 共用，
+改它有连锁影响）。
+
+### 🟠 P1：`evidence_without_marker` 算了但没人用
+
+`research_evidence.py` 算出了"收集了却从未被引用的证据"，但**没有任何地方消费**。
+这恰恰是**"检索和综合脱节"最直接的信号**，现在完全不可见。
+
+**建议**：加进 `_citation_audit_line()` 的输出。
+
+### 🟡 P2 三个
+
+1. **研究员只有一次工具轮次**（`RESEARCH_WORKER_MAX_TOOL_ROUNDS = 1`）
+   → 检索不能迭代；工具节点还是顺序执行。
+2. **三个研究员的检索没有多样性约束**——没机制保证结果不重叠。
+   TSN 那套 `_worker_tool_argument_normalizer` 是现成的推广点。
+3. **`/research continue` 不会补充新证据**——`reuse_evidence` 分支把
+   planner + workers 整段跳过，只重跑证据分析与综合。
