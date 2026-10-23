@@ -62,7 +62,8 @@ jobs:
           tests.test_mcp_stdio tests.test_dependency_lock_coverage
           tests.test_mcp_client tests.test_mcp_client_e2e
           tests.test_mcp_client_wiring
-          tests.test_research_evidence tests.test_experiment_reproduction
+          tests.test_research_evidence tests.test_research_gates
+          tests.test_experiment_reproduction
           tests.test_conversation_reference tests.test_paper_matching
           tests.test_paper_scope tests.test_relation_review
           tests.test_repository_preparation tests.test_repository_sources

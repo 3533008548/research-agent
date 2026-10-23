@@ -257,6 +257,11 @@ class ResearchOrchestrator:
                 "failed": ("orchestrator", "研究运行未完整完成"),
             }
             agent, summary = labels.get(stage, ("orchestrator", "研究运行状态已更新"))
+            if status == "partial_failed":
+                # The label map is keyed by stage, so a partial failure would
+                # otherwise be persisted with a "completed" summary while the
+                # status says otherwise.
+                summary = "研究运行已生成报告，但存在无法核验的引用"
             self.sessions.add_run_event(
                 thread_id, run_id, "research", agent, stage, status,
                 summary=summary, metrics=timing,
@@ -326,7 +331,9 @@ class ResearchOrchestrator:
                         "into at most three complementary evidence-gathering tasks. One task must actively "
                         "seek counterevidence, failure modes, or limits of generalization. Do not answer the question."
                     ),
-                    user=self._planner_input(query, self._merge_context(context, planner_steers)),
+                    user=self._planner_input(
+                        query, self._merge_context(context, planner_steers), scope,
+                    ),
                     policy=RequestPolicy(
                         purpose="research_planner", priority=RequestPriority.RESEARCH,
                     ),
@@ -334,9 +341,16 @@ class ResearchOrchestrator:
                     cancel_event=cancel_event,
                     on_progress=on_progress,
                 )
-                plan = self._parse_plan(plan_text, query)
+                plan = self._parse_plan(plan_text, query, scope)
                 self.sessions.update_research_run(run_id, plan=plan, trace=trace)
                 trace["stages"].append({"stage": "planner", "status": "completed"})
+                if not plan.get("focus_applied", True):
+                    # The planner produced fewer distinct tasks than there are
+                    # researchers, so some role keeps its generic instruction.
+                    # Say so in the trace instead of letting it look complete.
+                    trace.setdefault("warnings", []).append(
+                        "规划未覆盖全部研究员角色，部分角色使用通用指令。"
+                    )
                 self._progress(on_progress, "planner", "completed", "研究计划已生成")
 
                 self._ensure_active(cancel_event)
@@ -475,6 +489,14 @@ class ResearchOrchestrator:
                     self._progress(on_progress, "critic", "skipped", "自动质检暂不可用，保留已综合报告")
             self.sessions.update_research_run(run_id, critique=critique, trace=trace)
 
+            # The citation contract is machine-checkable, so it is checked
+            # before the revision decision: a marker pointing at evidence
+            # which does not exist forces a revision even when the critic
+            # said the prose was fine.
+            draft_citation_audit = audit_citations(draft, evidence)
+            critique = self._merge_citation_gate(critique, draft_citation_audit)
+            trace["citation_audit_draft"] = draft_citation_audit
+
             final_text = draft
             if critique["verdict"] == "revise":
                 self._ensure_active(cancel_event)
@@ -505,12 +527,32 @@ class ResearchOrchestrator:
             )
             trace["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
             trace["usage"] = dict(usage)
+
+            # The gate bites here.  A report that still points at evidence
+            # which does not exist has failed the citation contract, so it is
+            # not delivered as a clean completion — a green status would
+            # certify more than was actually checked.
+            unresolved_refs = [str(item) for item in (citation_audit.get("unknown_refs") or [])]
+            if unresolved_refs:
+                status = "partial_failed"
+                trace["citation_gate"] = {
+                    "status": "failed",
+                    "unresolved_refs": unresolved_refs,
+                }
+            else:
+                status = "completed"
             self.sessions.update_research_run(
-                run_id, status="completed", evidence=evidence, critique=critique,
+                run_id, status=status, evidence=evidence, critique=critique,
                 final_answer=answer, trace=trace,
             )
-            self._progress(on_progress, "completed", "completed", "研究报告已完成")
-            return ResearchResult(run_id, "completed", answer, usage, trace)
+            if status == "completed":
+                self._progress(on_progress, "completed", "completed", "研究报告已完成")
+            else:
+                self._progress(
+                    on_progress, "completed", "partial_failed",
+                    f"研究报告已生成，但有 {len(unresolved_refs)} 处引用无法核验",
+                )
+            return ResearchResult(run_id, status, answer, usage, trace)
         except RequestCancelledError:
             trace["duration_ms"] = round((time.perf_counter() - started) * 1000, 1)
             trace["usage"] = dict(usage)
@@ -691,6 +733,58 @@ class ResearchOrchestrator:
             except Exception:
                 pass
 
+    @staticmethod
+    def _scope_roles(scope: str) -> list[str]:
+        """The researcher roles that will actually run for this scope.
+
+        Kept apart from ``_worker_specs`` so the planner's subtask ids can be
+        normalised against exactly the roles that exist for this run.
+        """
+        roles: list[str] = []
+        if scope in {"both", "local"}:
+            roles.append("local")
+        if scope in {"both", "public"}:
+            roles.extend(["public", "boundary"])
+        return roles
+
+    @classmethod
+    def _normalize_subtask_roles(
+        cls, subtasks: list[dict[str, Any]], scope: str,
+    ) -> list[dict[str, Any]]:
+        """Map the planner's free-form subtask ids onto the researcher roles.
+
+        The planner is asked for generic evidence-gathering subtasks; it is
+        never told that the researchers are named ``local``/``public``/
+        ``boundary``.  Matching the two by name therefore only ever worked by
+        accident, and when it failed every worker silently fell back to its
+        generic role instruction — the plan was discarded while the trace
+        still showed a tidy three-subtask decomposition.
+
+        So the ids are normalised here: a subtask that already names a role
+        keeps it, and the rest fill the remaining roles in canonical order.
+        """
+        roles = cls._scope_roles(scope)
+        by_role: dict[str, dict[str, Any]] = {}
+        leftovers: list[dict[str, Any]] = []
+        for item in subtasks:
+            item_id = str(item.get("id") or "")
+            if item_id in roles and item_id not in by_role:
+                by_role[item_id] = item
+            else:
+                leftovers.append(item)
+        for role, item in zip([r for r in roles if r not in by_role], leftovers):
+            by_role[role] = item
+        normalized: list[dict[str, Any]] = []
+        for role in roles:
+            item = by_role.get(role)
+            if item is None:
+                continue
+            normalized.append({
+                "id": role,
+                "focus": str(item.get("focus") or item.get("task") or "收集证据")[:500],
+            })
+        return normalized
+
     def _worker_specs(self, scope: str) -> list[_WorkerSpec]:
         specs: list[_WorkerSpec] = []
         if scope in {"both", "local"}:
@@ -742,21 +836,25 @@ class ResearchOrchestrator:
             ],
         }
 
-    def _parse_plan(self, text: str, query: str) -> dict[str, Any]:
+    def _parse_plan(self, text: str, query: str, scope: str = "both") -> dict[str, Any]:
         data = self._parse_json_object(text)
         if not data:
             return self._fallback_plan(query)
         subtasks = data.get("subtasks")
         if not isinstance(subtasks, list) or not subtasks:
             return self._fallback_plan(query)
+        raw = [item for item in subtasks[:3] if isinstance(item, dict)]
+        normalized = self._normalize_subtask_roles(raw, scope)
+        if not normalized:
+            return self._fallback_plan(query)
         return {
             "objective": str(data.get("objective") or query)[:500],
-            "subtasks": [
-                {"id": str(item.get("id") or f"task-{index + 1}"),
-                 "focus": str(item.get("focus") or item.get("task") or "收集证据")[:500]}
-                for index, item in enumerate(subtasks[:3]) if isinstance(item, dict)
-            ] or self._fallback_plan(query)["subtasks"],
+            "subtasks": normalized,
             "completion_criteria": self._completion_criteria(data.get("completion_criteria")),
+            # Whether every running role actually received a planned focus.
+            # A plan that names no role at all is a silent downgrade, so the
+            # fact is recorded rather than left to be inferred from the plan.
+            "focus_applied": len(normalized) == len(self._scope_roles(scope)),
         }
 
     @staticmethod
@@ -926,13 +1024,23 @@ class ResearchOrchestrator:
             "rejected_public_candidates": rejected_total,
         }
 
-    @staticmethod
-    def _planner_input(query: str, context: str | None) -> str:
+    @classmethod
+    def _planner_input(
+        cls, query: str, context: str | None, scope: str = "both",
+    ) -> str:
         context_note = f"\nOptional session context:\n{context[:1200]}" if context else ""
+        roles = cls._scope_roles(scope)
+        role_note = ""
+        if roles:
+            role_note = (
+                "\nEach subtask must carry one of these ids so the right researcher "
+                f"picks it up: {', '.join(roles)}."
+            )
         return (
             f"Question: {query}\n{context_note}\n"
             "Return {\"objective\": ..., \"subtasks\": [{\"id\": ..., \"focus\": ...}], "
             "\"completion_criteria\": [...]}"
+            + role_note
         )
 
     @staticmethod
@@ -1091,6 +1199,47 @@ class ResearchOrchestrator:
             + (f"\n\n{steer_context}" if steer_context else "")
         )
 
+    @staticmethod
+    def _draft_excerpt(draft: str, limit: int = 5000) -> str:
+        """Keep both ends of a draft, not just its head.
+
+        The synthesis stage writes Conclusions, then Applicable Conditions,
+        then Limitations.  A head-only truncation drops the Limitations
+        section first — which is exactly the part the critic exists to
+        check, so the boundary clues would be the least reviewed ones in
+        the report.  Keeping the tail as well means the section that carries
+        the caveats is always in front of the reviewer.
+        """
+        text = draft or ""
+        if len(text) <= limit:
+            return text
+        # The budget is weighted toward the tail.  The conclusion is a short
+        # section at the front, while the limitations sit at the very end and
+        # are the part a head-only truncation loses completely — so the tail
+        # gets two thirds of the budget and the head one third.
+        head = limit // 3
+        tail = limit - head
+        tail_start = len(text) - tail
+
+        # Name the sections the tail covers.  The headings themselves often
+        # fall outside the budget, and without this the reviewer cannot tell
+        # limitation prose from applicable-conditions prose — which is the
+        # difference between a caveat and a claim.
+        titles = [
+            match.group(1).strip()
+            for match in re.finditer(r"^##\s+(.+)$", text[tail_start:], re.MULTILINE)
+        ]
+        section_note = ""
+        if titles:
+            section_note = "[尾段包含章节：" + "、".join(titles) + "]\n\n"
+
+        omitted = len(text) - limit
+        return (
+            f"{text[:head]}\n\n"
+            f"[... 中间 {omitted} 字符已省略 ...]\n\n"
+            f"{section_note}{text[tail_start:]}"
+        )
+
     def _critic_input(
         self,
         query: str,
@@ -1101,7 +1250,7 @@ class ResearchOrchestrator:
         steer_context: str = "",
     ) -> str:
         return (
-            f"Question: {query}\nDraft:\n{draft[:5000]}\n\n"
+            f"Question: {query}\nDraft:\n{self._draft_excerpt(draft)}\n\n"
             f"Evidence IDs:\n{self._evidence_context(evidence)}\n\n"
             f"{compact_analysis_for_prompt(evidence_analysis or {})}\n\n"
             "Return {\"verdict\": \"pass\"|\"revise\", \"issues\": [..]}. Check unsupported "
@@ -1120,13 +1269,60 @@ class ResearchOrchestrator:
         *, steer_context: str = "",
     ) -> str:
         return (
-            f"Question: {query}\nDraft:\n{draft[:5000]}\n"
+            f"Question: {query}\nDraft:\n{self._draft_excerpt(draft)}\n"
             f"Critique: {json.dumps(critique, ensure_ascii=False)}\n\n"
             f"Allowed evidence:\n{self._evidence_context(evidence)}\n\n"
             f"{compact_analysis_for_prompt(evidence_analysis or {})}\n\n"
             f"{PHASE_BOUNDARY['revision']}"
             + (f"\n\n{steer_context}" if steer_context else "")
         )
+
+    @staticmethod
+    def _citation_issues(audit: dict[str, Any] | None) -> list[str]:
+        """Turn a citation audit into revision instructions.
+
+        A marker that points at evidence which does not exist is a hard
+        failure of the citation contract, not a stylistic quibble — the
+        existence rule says a citation that cannot be confirmed counts as
+        FAIL.  The findings are written as critique issues so the revision
+        stage, which already reads the critique, can act on them.
+        """
+        issues: list[str] = []
+        if not audit:
+            return issues
+        unknown = [str(item) for item in (audit.get("unknown_refs") or [])]
+        if unknown:
+            issues.append(
+                "引用了不存在的证据编号 " + "、".join(unknown)
+                + "。这些引用无法核验，必须删除对应主张或改写为可核验的引用，"
+                "不得保留为「有研究显示」这类模糊归因。"
+            )
+        upgraded = [str(item) for item in (audit.get("anchor_upgraded_refs") or [])]
+        if upgraded:
+            issues.append(
+                "以下引用声称了精确锚点但证据并未解析出位置 " + "、".join(upgraded)
+                + "。请降级为检索线索级引用，不要给出页码级或逐字级定位。"
+            )
+        return issues
+
+    @staticmethod
+    def _merge_citation_gate(
+        critique: dict[str, Any], audit: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Force a revision when the draft breaks the citation contract.
+
+        The critic judges prose; the citation contract is machine-checkable, so
+        it is checked separately.  A failing contract overrides a "pass"
+        verdict — otherwise a report citing evidence which does not exist
+        would ship as a clean completion.
+        """
+        issues = ResearchOrchestrator._citation_issues(audit)
+        if not issues:
+            return critique
+        merged = dict(critique)
+        merged["verdict"] = "revise"
+        merged["issues"] = [*(critique.get("issues") or []), *issues][:8]
+        return merged
 
     @staticmethod
     def _citation_audit_line(audit: dict[str, Any] | None) -> str:
