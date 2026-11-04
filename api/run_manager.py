@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from api.sse import format_sse
+from run_contract import latest_error_details, safe_error_details
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -101,8 +102,10 @@ class ChatRunManager:
                 self.agent.sessions.update_chat_run(
                     active.run_id, status=status, answer=answer,
                 )
-            active.append({"type": "done", "status": status, "answer": answer})
+            details = safe_error_details(trace.get("error_details")) if status == "failed" else {}
+            active.append({"type": "done", "status": status, "answer": answer, **({"error_details": details} if details else {})})
         except Exception as exc:  # Keep one bad API request from killing the ASGI process.
+            details = safe_error_details(getattr(exc, "error_details", None))
             status = "failed"
             answer = ""
             self.agent.sessions.update_chat_run(
@@ -110,10 +113,10 @@ class ChatRunManager:
             )
             self.agent.sessions.add_run_event(
                 active.session_id, active.run_id, "chat", "api", "run", status,
-                summary="API chat run failed", error_type=type(exc).__name__,
+                summary="API chat run failed", error_type=type(exc).__name__, error_details=details,
             )
-            active.append({"type": "error", "error_type": type(exc).__name__})
-            active.append({"type": "done", "status": status, "answer": answer})
+            active.append({"type": "error", "error_type": type(exc).__name__, **({"error_details": details} if details else {})})
+            active.append({"type": "done", "status": status, "answer": answer, **({"error_details": details} if details else {})})
         finally:
             active.done_event.set()
 
@@ -179,7 +182,8 @@ class ChatRunManager:
         with self._lock:
             active = self._active.get(run_id)
         if active is None:
-            yield format_sse({"type": "done", "status": run["status"], "answer": run.get("answer", "")})
+            details = latest_error_details(self.agent.sessions.get_run_events(run_id)) if run["status"] == "failed" else {}
+            yield format_sse({"type": "done", "status": run["status"], "answer": run.get("answer", ""), **({"error_details": details} if details else {})})
             return
 
         cursor = 0

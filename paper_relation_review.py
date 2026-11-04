@@ -25,13 +25,19 @@ import re
 import secrets
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from paper_artifacts import title_match_key, title_match_score
 from runtime_paths import RuntimePaths
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 SCHEMA_VERSION = 1
 CANDIDATE_ID = re.compile(r"rel-cand-[a-f0-9]{12}\Z")
@@ -43,10 +49,14 @@ EVIDENCE_LIMIT = 4
 MAX_ATTEMPTS = 3
 BACKOFF_SECONDS = (1.0, 4.0, 15.0)
 CIRCUIT_FAILURE_THRESHOLD = 3
+CIRCUIT_COOLDOWN_SECONDS = 30.0
 MIN_TASK_INTERVAL_SECONDS = 0.2
+QUEUE_POLL_SECONDS = 1.0
 
 _JOB_ACTIVE = ("pending", "running")
 _CANDIDATE_ACTIVE = ("pending",)
+_STATE_LOCKS: dict[str, Any] = {}
+_STATE_LOCKS_GUARD = threading.Lock()
 
 
 def paper_fingerprint(*, title: str, chunk_count: int, source_file: str) -> str:
@@ -73,6 +83,52 @@ def _normalise(value: object) -> str:
     return " ".join(str(value or "").split())
 
 
+class _RuntimeFileLock:
+    """A process-scoped OS lock, released automatically after a process exits."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = None
+
+    def acquire(self, *, blocking: bool = False) -> bool:
+        if self._handle is not None:
+            return True
+        handle = self.path.open("a+b")
+        # Windows byte-range locking needs a byte to lock.  The file remains in
+        # place so replacing the JSON state never changes the locked inode.
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                msvcrt.locking(handle.fileno(), mode, 1)
+            else:
+                mode = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                fcntl.flock(handle.fileno(), mode)
+        except OSError:
+            handle.close()
+            if blocking:
+                raise
+            return False
+        self._handle = handle
+        return True
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 class PaperRelationReviewStore:
     """Persist review jobs and relation candidates in one runtime file."""
 
@@ -80,7 +136,21 @@ class PaperRelationReviewStore:
         self.paths = paths
         self.paths.ensure_initialized()
         self.path = paths.paper_relation_review_file
-        self._lock = threading.RLock()
+        with _STATE_LOCKS_GUARD:
+            key = os.path.normcase(str(self.path.resolve()))
+            self._lock = _STATE_LOCKS.setdefault(key, threading.RLock())
+
+    @contextmanager
+    def _locked(self):
+        # API and task-worker processes both enqueue.  Consumer ownership alone
+        # cannot protect a JSON read-modify-write against the other producer.
+        with self._lock:
+            state_lock = _RuntimeFileLock(self.path.with_suffix(".state.lock"))
+            state_lock.acquire(blocking=True)
+            try:
+                yield
+            finally:
+                state_lock.release()
 
     # -- persistence ----------------------------------------------------
     def _read(self) -> dict[str, Any]:
@@ -114,7 +184,7 @@ class PaperRelationReviewStore:
         paper_id = str(paper_id or "").strip()
         if not paper_id:
             return False
-        with self._lock:
+        with self._locked():
             payload = self._read()
             jobs = payload["jobs"]
             for job in jobs:
@@ -145,7 +215,7 @@ class PaperRelationReviewStore:
 
     def claim(self) -> dict[str, Any] | None:
         """Take the next due job, marking it running under the lock."""
-        with self._lock:
+        with self._locked():
             payload = self._read()
             now = _now()
             for job in payload["jobs"]:
@@ -160,10 +230,54 @@ class PaperRelationReviewStore:
                 return dict(job)
         return None
 
+    def recover_interrupted_jobs(self) -> None:
+        """Resume jobs abandoned by a stopped process without resetting retries."""
+        with self._locked():
+            payload = self._read()
+            changed = False
+            for job in payload["jobs"]:
+                if job.get("status") != "running":
+                    continue
+                # A detector that was interrupted did start an attempt.  Count
+                # it so repeated restarts cannot bypass the finite retry budget.
+                attempts = int(job.get("attempts") or 0) + 1
+                job["attempts"] = attempts
+                job["status"] = "failed" if attempts >= MAX_ATTEMPTS else "pending"
+                job["next_attempt_at"] = ""
+                job["error"] = "Review process stopped during the previous attempt"
+                job["updated_at"] = _now()
+                changed = True
+            if changed:
+                self._write(payload)
+
+    def release_unstarted_job(self, paper_id: str) -> None:
+        """Return a claimed job on shutdown without consuming an attempt."""
+        with self._locked():
+            payload = self._read()
+            for job in payload["jobs"]:
+                if job.get("paper_id") == paper_id and job.get("status") == "running":
+                    job["status"] = "pending"
+                    job["updated_at"] = _now()
+                    self._write(payload)
+                    return
+
+    def next_pending_delay(self) -> float | None:
+        """Seconds until the earliest queued attempt, or None when idle."""
+        with self._locked():
+            jobs = self._read()["jobs"]
+        delays: list[float] = []
+        now = time.time()
+        for job in jobs:
+            if job.get("status") != "pending":
+                continue
+            due = str(job.get("next_attempt_at") or "")
+            delays.append(max(0.0, datetime.fromisoformat(due).timestamp() - now) if due else 0.0)
+        return min(delays) if delays else None
+
     def finish(
         self, paper_id: str, *, status: str, error: str = "", candidates: int = 0,
     ) -> None:
-        with self._lock:
+        with self._locked():
             payload = self._read()
             for job in payload["jobs"]:
                 if job.get("paper_id") != paper_id or job.get("status") != "running":
@@ -174,7 +288,7 @@ class PaperRelationReviewStore:
                 job["attempts"] = int(job.get("attempts") or 0) + 1
                 job["updated_at"] = _now()
                 if status == "failed" and job["attempts"] < MAX_ATTEMPTS:
-                    delay = BACKOFF_SECONDS[min(job["attempts"], len(BACKOFF_SECONDS) - 1)]
+                    delay = BACKOFF_SECONDS[min(job["attempts"] - 1, len(BACKOFF_SECONDS) - 1)]
                     job["status"] = "pending"
                     job["next_attempt_at"] = datetime.fromtimestamp(
                         time.time() + delay, timezone.utc,
@@ -183,7 +297,7 @@ class PaperRelationReviewStore:
                 return
 
     def cancel(self, paper_id: str) -> None:
-        with self._lock:
+        with self._locked():
             payload = self._read()
             for job in payload["jobs"]:
                 if job.get("paper_id") == paper_id and job.get("status") in _JOB_ACTIVE:
@@ -192,10 +306,13 @@ class PaperRelationReviewStore:
             self._write(payload)
 
     def consecutive_failures(self) -> int:
-        with self._lock:
+        with self._locked():
             jobs = self._read()["jobs"]
         count = 0
-        for job in reversed(jobs):
+        # Queue order differs from completion order when older jobs retry.
+        # Pending arrivals must not silently reset an already open circuit.
+        completed = [job for job in jobs if job.get("status") not in _JOB_ACTIVE]
+        for job in sorted(completed, key=lambda item: str(item.get("updated_at") or ""), reverse=True):
             if job.get("status") == "failed":
                 count += 1
                 continue
@@ -207,7 +324,7 @@ class PaperRelationReviewStore:
         """Merge new candidates, keeping one live record per (paper pair, type)."""
         if not candidates:
             return []
-        with self._lock:
+        with self._locked():
             payload = self._read()
             existing = payload["candidates"]
             saved: list[dict[str, Any]] = []
@@ -248,7 +365,7 @@ class PaperRelationReviewStore:
     def list_candidates(
         self, paper_id: str = "", status: str = "pending",
     ) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._locked():
             items = self._read()["candidates"]
         paper_id = str(paper_id or "").strip()
         rows = [
@@ -265,7 +382,7 @@ class PaperRelationReviewStore:
         return sorted(rows, key=lambda item: str(item.get("created_at") or ""), reverse=True)
 
     def resolve_candidate(self, candidate_id: str, status: str) -> dict[str, Any] | None:
-        with self._lock:
+        with self._locked():
             payload = self._read()
             for item in payload["candidates"]:
                 if item.get("candidate_id") == candidate_id:
@@ -277,7 +394,7 @@ class PaperRelationReviewStore:
 
     def drop_paper(self, paper_id: str) -> None:
         """Drop candidates and jobs for a deleted paper."""
-        with self._lock:
+        with self._locked():
             payload = self._read()
             payload["jobs"] = [
                 job for job in payload["jobs"] if str(job.get("paper_id") or "") != paper_id
@@ -292,7 +409,7 @@ class PaperRelationReviewStore:
             self._write(payload)
 
     def counts(self) -> dict[str, int]:
-        with self._lock:
+        with self._locked():
             payload = self._read()
         jobs = payload["jobs"]
         candidates = payload["candidates"]
@@ -420,46 +537,128 @@ class PaperRelationReviewer:
         self._running = False
         self._last_run = 0.0
         self._lock = threading.RLock()
+        self._stopping = threading.Event()
+        self._retry_timer: threading.Timer | None = None
+        self._consumer_lock = _RuntimeFileLock(self.store.path.with_suffix(".consumer.lock"))
+        self._owns_consumer = False
+        self._circuit_retry_at = 0.0
+        if self.enabled:
+            self._pump()
 
     def enqueue(self, paper_id: str, fingerprint: str) -> bool:
         """Queue a review and wake the worker.  Never blocks the caller."""
-        if not self.enabled:
-            return False
-        if not self.store.enqueue(paper_id, fingerprint):
-            return False
-        self._pump()
-        return True
+        with self._lock:
+            if not self.enabled or self._stopping.is_set():
+                return False
+            if not self.store.enqueue(paper_id, fingerprint):
+                return False
+            self._pump()
+            return True
 
     def shutdown(self, *, wait: bool = False) -> None:
-        self._executor.shutdown(wait=wait, cancel_futures=not wait)
+        # Wake any rate-limit wait and cancel the daemon deadline timer.  Pending
+        # work stays persisted for the next process; shutdown never waits out a
+        # retry backoff or starts another detector invocation.
+        with self._lock:
+            self._stopping.set()
+            if self._retry_timer is not None:
+                self._retry_timer.cancel()
+                self._retry_timer = None
+        # Let an already submitted drain enter its finally block even when it
+        # has not started yet: that block releases consumer ownership.
+        self._executor.shutdown(wait=wait)
+        with self._lock:
+            if not self._running:
+                self._release_consumer()
+
+    def _release_consumer(self) -> None:
+        if self._owns_consumer:
+            self._consumer_lock.release()
+            self._owns_consumer = False
+
+    def _schedule_wakeup(self, delay: float) -> None:
+        self._retry_timer = threading.Timer(delay, self._pump)
+        self._retry_timer.daemon = True
+        self._retry_timer.start()
 
     def _pump(self) -> None:
         with self._lock:
-            if self._running:
+            if self._stopping.is_set() or self._running:
                 return
+            if self._retry_timer is not None:
+                self._retry_timer.cancel()
+                self._retry_timer = None
+            if not self._owns_consumer:
+                if not self._consumer_lock.acquire():
+                    self._schedule_wakeup(QUEUE_POLL_SECONDS)
+                    return
+                self._owns_consumer = True
+                # Only the process holding this runtime's consumer lock may
+                # reclaim running jobs.  An active detector in another API or
+                # worker instance must never be mistaken for an interrupted one.
+                try:
+                    self.store.recover_interrupted_jobs()
+                except Exception:
+                    self._release_consumer()
+                    raise
             self._running = True
-        self._executor.submit(self._drain)
+            try:
+                self._executor.submit(self._drain)
+            except RuntimeError:
+                # Interpreter shutdown can race a daemon wakeup.  Do not leave
+                # ownership stuck when its executor can no longer start work.
+                self._running = False
+                self._stopping.set()
+                self._release_consumer()
 
     def _drain(self) -> None:
         try:
-            while True:
-                if self.store.consecutive_failures() >= CIRCUIT_FAILURE_THRESHOLD:
-                    # Stop hammering a detector that keeps failing; queued jobs
-                    # stay so a later successful run can pick them up.
-                    break
+            while not self._stopping.is_set():
+                half_open = self.store.consecutive_failures() >= CIRCUIT_FAILURE_THRESHOLD
+                if half_open:
+                    if not self._circuit_retry_at:
+                        self._circuit_retry_at = time.monotonic() + CIRCUIT_COOLDOWN_SECONDS
+                    if time.monotonic() < self._circuit_retry_at:
+                        break
+                else:
+                    self._circuit_retry_at = 0.0
                 job = self.store.claim()
                 if job is None:
                     break
+                # A shutdown may arrive while claim is doing filesystem I/O.
+                # This attempt has not started and must remain recoverable.
+                if self._stopping.is_set():
+                    self.store.release_unstarted_job(str(job.get("paper_id") or ""))
+                    break
                 self._run_job(job)
+                if half_open:
+                    # Only one probe is admitted after each cooldown.  Success
+                    # resets the persisted streak on the next loop iteration.
+                    self._circuit_retry_at = time.monotonic() + CIRCUIT_COOLDOWN_SECONDS
                 elapsed = time.monotonic() - self._last_run
                 if elapsed < MIN_TASK_INTERVAL_SECONDS:
-                    time.sleep(MIN_TASK_INTERVAL_SECONDS - elapsed)
+                    self._stopping.wait(MIN_TASK_INTERVAL_SECONDS - elapsed)
         finally:
             with self._lock:
                 self._running = False
+                if self._stopping.is_set():
+                    self._release_consumer()
+                else:
+                    delay = QUEUE_POLL_SECONDS
+                    pending_delay = self.store.next_pending_delay()
+                    if pending_delay is not None:
+                        pending_delay = max(pending_delay, self._circuit_retry_at - time.monotonic())
+                        delay = min(delay, pending_delay)
+                    # A deadline wakes retries; the low-frequency idle poll
+                    # discovers jobs enqueued by another process and lets a
+                    # standby take ownership after the current consumer exits.
+                    self._schedule_wakeup(delay)
 
     def _run_job(self, job: dict[str, Any]) -> None:
         paper_id = str(job.get("paper_id") or "")
+        if self._stopping.is_set():
+            self.store.release_unstarted_job(paper_id)
+            return
         self._last_run = time.monotonic()
         try:
             paper = self._find_paper(paper_id)
@@ -468,6 +667,9 @@ class PaperRelationReviewer:
                 return
             chunks = list(self.paper_store.get_paper_chunks(paper_id) or [])
             others = [item for item in self.paper_store.list_papers() if str(item.get("paper_id")) != paper_id]
+            if self._stopping.is_set():
+                self.store.release_unstarted_job(paper_id)
+                return
             if not others or not chunks:
                 # Nothing to compare against: an empty result, not a failure.
                 self.store.finish(paper_id, status="no_candidates", candidates=0)

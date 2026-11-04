@@ -1,4 +1,4 @@
-import type { Dispatch, FormEvent, SetStateAction } from "react";
+import type { Dispatch, FormEvent, ReactNode, SetStateAction } from "react";
 
 import { statusLabel } from "../../lib/labels";
 import { WorkspacePanel } from "../WorkspacePanel";
@@ -22,6 +22,8 @@ import type {
  * this component only lists and selects.
  */
 export function SessionSidebar({
+  hidden = false,
+  children,
   sessions,
   activeSessionId,
   isSending,
@@ -60,6 +62,8 @@ export function SessionSidebar({
   onApiKeyDraftChange,
   onApplyApiKey,
 }: {
+  hidden?: boolean;
+  children?: ReactNode;
   sessions: Session[];
   activeSessionId: string | null;
   isSending: boolean;
@@ -99,7 +103,8 @@ export function SessionSidebar({
   onApplyApiKey: () => void;
 }) {
   return (
-    <>
+    // Keep one real root: App assigns this entire rail to one grid area.
+    <aside id="session-sidebar" className="session-sidebar" aria-label="会话列表" hidden={hidden}>
       <div className="sidebar-heading">
         <div><p className="eyebrow">工作区</p><h2>会话</h2></div>
         <button className="icon-button" onClick={() => void onStartSession()} aria-label="新建会话">＋</button>
@@ -111,8 +116,8 @@ export function SessionSidebar({
             className={`session-item ${session.thread_id === activeSessionId ? "active" : ""}`}
             onClick={() => void onSelectSession(session.thread_id)}
           >
-            <strong>{session.title}</strong>
-            <span>{session.preview || "尚未开始"}</span>
+            <strong title={session.title}>{session.title}</strong>
+            <span title={session.preview || "尚未开始"}>{session.preview || "尚未开始"}</span>
           </button>
         ))}
       </nav>
@@ -173,7 +178,7 @@ export function SessionSidebar({
               {papers.map((paper) => (
                 <div className="workspace-list-item paper-item" key={paper.paper_id}>
                   <div>
-                    <strong>{paper.title}</strong>
+                    <strong title={paper.title}>{paper.title}</strong>
                     <span>{paper.chunks} 个检索片段 · {paper.relation_count ? `${paper.relation_count} 条已确认关系` : "暂无已确认关系"}</span>
                   </div>
                   <div className="paper-actions">
@@ -267,7 +272,7 @@ export function SessionSidebar({
                 <div className="keyword-list">
                   {keywords.map((item) => (
                     <div className="keyword-item" key={item.keyword}>
-                      <span>{item.keyword}</span>
+                      <span title={item.keyword}>{item.keyword}</span>
                       <button className="text-button danger" type="button" onClick={() => void onRemoveDailyKeyword(item.keyword)}>删除</button>
                     </div>
                   ))}
@@ -343,6 +348,7 @@ export function SessionSidebar({
           </div>
         </WorkspacePanel>
       </div>
-    </>
+      {children}
+    </aside>
   );
 }

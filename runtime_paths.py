@@ -23,8 +23,9 @@ class RuntimeStateError(RuntimeError):
 class RuntimePaths:
     """用户数据目录的唯一入口。
 
-    ``primary`` 保存不可丢失的用户数据；``derived`` 保存可由原始数据重建的
-    向量索引和 PDF 图片。Docker 中只需把 ``root`` 挂载到容器即可。
+    ``primary`` 保存不可丢失的用户数据；``derived`` 包含可重建的向量索引和
+    PDF 图片。Compose 还将 Redis 活动队列持久化到 ``derived/redis``，因此不能
+    按缓存清空整个 derived。Docker 中只需把 ``root`` 挂载到容器即可。
     """
 
     root: Path

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 
 from mcp import ClientSession, StdioServerParameters
@@ -28,14 +29,30 @@ class McpStdioIntegrationTests(unittest.TestCase):
 
         cls._McpError = McpError
 
+    def setUp(self):
+        # Config instances in other tests publish their data directory into
+        # os.environ, even when its temporary owner has already been removed.
+        # Each server must get a fresh runtime rather than inherit that path.
+        runtime = tempfile.TemporaryDirectory(prefix="mcp-stdio-")
+        self.addCleanup(runtime.cleanup)
+        self._runtime_dir = runtime.name
+
+    def _server_parameters(self):
+        return StdioServerParameters(
+            command=sys.executable,
+            args=[os.path.join(PROJECT_ROOT, "mcp_server.py")],
+            # The project must be importable when launched from any cwd.
+            env={
+                **os.environ,
+                "APP_DATA_DIR": self._runtime_dir,
+                "PYTHONPATH": PROJECT_ROOT,
+                "MCP_LOG_LEVEL": "WARNING",
+            },
+        )
+
     def test_client_can_initialize_and_list_tools(self):
         async def exercise():
-            params = StdioServerParameters(
-                command=sys.executable,
-                args=[os.path.join(PROJECT_ROOT, "mcp_server.py")],
-                # The project must be importable when launched from any cwd.
-                env={**os.environ, "PYTHONPATH": PROJECT_ROOT, "MCP_LOG_LEVEL": "WARNING"},
-            )
+            params = self._server_parameters()
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -61,11 +78,7 @@ class McpStdioIntegrationTests(unittest.TestCase):
 
     def test_list_papers_round_trips_through_the_protocol(self):
         async def exercise():
-            params = StdioServerParameters(
-                command=sys.executable,
-                args=[os.path.join(PROJECT_ROOT, "mcp_server.py")],
-                env={**os.environ, "PYTHONPATH": PROJECT_ROOT, "MCP_LOG_LEVEL": "WARNING"},
-            )
+            params = self._server_parameters()
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -80,14 +93,11 @@ class McpStdioIntegrationTests(unittest.TestCase):
         self.assertIn("count", payload, f"未收到结构化结果：{result}")
         self.assertIsInstance(payload["count"], int)
         self.assertIn("papers", payload)
+        self.assertEqual(payload["count"], 0, "隔离的临时论文库不应读取其他测试或用户的论文")
 
     def test_retrieval_metrics_is_callable_without_a_corpus(self):
         async def exercise():
-            params = StdioServerParameters(
-                command=sys.executable,
-                args=[os.path.join(PROJECT_ROOT, "mcp_server.py")],
-                env={**os.environ, "PYTHONPATH": PROJECT_ROOT, "MCP_LOG_LEVEL": "WARNING"},
-            )
+            params = self._server_parameters()
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -102,10 +112,6 @@ class McpStdioIntegrationTests(unittest.TestCase):
         for stage in ("semantic", "lexical", "fusion", "rerank"):
             self.assertIn(stage, payload.get("stages", {}))
 
-    @unittest.skipUnless(
-        os.path.isdir(os.path.join(PROJECT_ROOT, "runtime")),
-        "本地没有论文库，跳过需要加载模型的用例",
-    )
     def test_store_backed_tool_answers_over_stdio(self):
         """A tool that builds ``PaperStore`` must actually return.
 
@@ -115,11 +121,7 @@ class McpStdioIntegrationTests(unittest.TestCase):
         the unit tests.
         """
         async def exercise():
-            params = StdioServerParameters(
-                command=sys.executable,
-                args=[os.path.join(PROJECT_ROOT, "mcp_server.py")],
-                env={**os.environ, "PYTHONPATH": PROJECT_ROOT, "MCP_LOG_LEVEL": "WARNING"},
-            )
+            params = self._server_parameters()
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -137,6 +139,8 @@ class McpStdioIntegrationTests(unittest.TestCase):
 
         payload = getattr(result, "structuredContent", None) or {}
         self.assertTrue(payload.get("available"), "论文库不可用，本用例的前提不成立")
+        self.assertEqual(payload.get("count"), 0)
+        self.assertEqual(payload.get("chunk_count"), 0)
 
 
 if __name__ == "__main__":

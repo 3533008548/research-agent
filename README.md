@@ -29,7 +29,7 @@
 | 🔌 **MCP Server** | 把检索能力以标准 MCP 协议发布出去，5 个只读工具；其他 Agent 可直接接入本项目 |
 | 🔌 **MCP Client** | 反向消费外部 MCP Server；外部工具经同一份工具目录与同一运行时，自动继承白名单/取消/限长 |
 | 📁 **研究档案** | 将研究方案、假设或决策记录保存为可检索 Markdown 与可下载 Word 文档；按需读取，不注入会话摘要或用户画像 |
-| 👤 **用户画像** | Markdown 自动维护，Agent 从对话中学习偏好 |
+| 👤 **用户画像** | Markdown 持久化，支持条目去重、按章节和完整原文精确删除或修正 |
 | 🧩 **辅助记忆** | 当前会话摘要自动压缩注入；论文方法/结果以全局三元组按需检索，会话之间严格隔离 |
 | ✅ **自动验证** | verify 分级（严重重生成/轻微提示）+ 跳过门控 + 8 秒限时熔断降级 |
 | 📊 **Token 管理** | 按工具差异化截断 + 缓存命中统计 + 预算预警 + 费用估算 |
@@ -106,11 +106,13 @@ Docker 的 `api-worker` 会在开始消费任务前预热本地 RAG 嵌入模型
 取消任务、PDF/图片上传、研究档案、论文库、每日检索（执行、重试、继续、阅读状态、
 按次报告标签页）、论文代码复现、用户画像和运行中心 / Badcase。运行中心还显示当前会话的持久化 Token 统计。
 失败或取消的普通对话可在运行检查器中重新发送；对任务的新补充会在下一编排节点生效。
+普通对话的模型失败可在运行检查器或历史运行中查看具体错误代码、阶段、最后 HTTP 状态、耗时与预算、实际重试次数及请求 ID。诊断会持久化；旧记录缺失的信息不会自动补回。HTTP 200 仅代表收到响应头，后续流式读取仍可能超时。
+
+聊天与深度研究选择位于输入框工具区。工作台标签行两端的按钮可独立显示／隐藏会话侧栏和运行检查器；桌面可拖动侧栏内边界调宽，也可聚焦边界后用方向键、Home／End 调整。宽度与显隐偏好保存在当前浏览器，“布局选项”菜单可恢复默认；较窄窗口中运行区移到底部，手机宽度使用纵向排列。侧栏文字随宽度换行，档案内部布局按工作台实际宽度适配。问题记录和验证范围见[前端布局优化与回归防护方案](前端布局优化与回归防护方案.md)。
 
 前端按**数据归属**拆分：每个业务域一个 hook（`useConversation` 拥有会话与正在跑的 run，
 `useDailyWorkspace` / `useRunCenter` / `useDocuments` / `useExperiments` 各自拥有自己的状态），
-工作台面板是纯展示组件。**所有组件与 hook 均 < 500 行**，hook 调用顺序由依赖关系决定，
-顺序写反会直接编译不过。
+工作台面板负责展示与交互，栏宽和显隐由独立的 `useWorkspaceLayout` 管理；hook 之间通过显式参数共享必要状态。
 
 生产构建由 FastAPI 从根路径 `/` 托管。深度研究、每日检索、论文复现和跨进程可恢复的对话需要 Redis 与独立 worker；没有 Redis 时仅保留进程内普通对话，不适合作为标准部署。最简部署方式为上面的 Docker Compose。前端开发时，在三个终端中运行：
 
@@ -143,13 +145,22 @@ $env:APP_DATA_DIR = "D:\\research-agent-data"
 python -m uvicorn api_server:app --host 127.0.0.1 --port 7860
 ```
 
-`runtime/primary/` 保存 SQLite、论文 PDF、用户画像、研究档案、复现实验项目、已确认论文关系与设置；`runtime/derived/` 保存可由原始数据重建的 Chroma 索引和 PDF 图片。`runtime/primary/paper_relations.json` 是小型、可审阅的论文关系索引；`runtime/primary/db/badcases.db` 是本地 Badcase 候选池，只保存脱敏运行快照和人工分类。旧版根目录数据不会自动移动，可先预览再迁移：
+`runtime/primary/` 保存 SQLite、论文 PDF、用户画像、研究档案、复现实验项目、已确认论文关系与设置；`runtime/derived/` 中的 Chroma 索引和 PDF 图片可以重建，但该目录下并非所有数据都是缓存。Compose 把 Redis 的 AOF/RDB 持久化文件挂载在 `runtime/derived/redis/`，其中保存活动任务队列与运行事件，不能按缓存删除。`runtime/primary/paper_relations.json` 是小型、可审阅的论文关系索引；`runtime/primary/db/badcases.db` 是本地 Badcase 候选池，只保存脱敏运行快照和人工分类。旧版根目录数据不会自动移动，可先预览再迁移：
 
 ```bash
 python scripts/migrate_runtime.py
 python scripts/migrate_runtime.py --apply
 python scripts/backup_runtime.py --output backups/
 ```
+
+`backup_runtime.py` 默认备份 primary 数据和运行时元信息；即使指定 `--include-derived`，也只额外包含 Chroma 与图片，**不包含 Redis 持久化目录**。需要保存队列状态时，应另外按以下维护顺序操作：
+
+1. 停止接收新任务并暂停定时投递，保留 worker 运行，等待队列任务排空；确认没有 `queued`、`running`、`cancelling` 运行，也没有待确认的 Redis 消费组任务。若仍有任务，先等待或通过正常取消流程处理，不删除队列来代替排空。
+2. 停止应用和 worker，再正常停止 Redis，等待进程退出，使持久化写入完成。不要在 Redis 运行中直接复制正在变化的 AOF/RDB。
+3. 在同一停机时间点运行 primary 备份，并单独复制整个 `runtime/derived/redis/` 到备份位置；保留 Redis 的多文件 AOF 目录及清单、RDB 和原有权限，不只挑选某个 `.aof` 文件。
+4. 恢复时保持应用和 worker 停止，使用同一停机时间点的 primary 与 Redis 备份，先启动兼容版本的 Redis 并检查持久化加载，再启动应用和 worker。不要把旧队列与较新的 SQLite 混用，以免任务重放或状态不一致；只有 primary 备份时不能宣称恢复了未完成队列。
+
+清理或重建索引时应明确选中 `derived/chroma/`、`derived/images/` 等目标，不要递归清空整个 `derived/`。上面的维护流程需要运维人员主动执行，启动、迁移和索引重建不会自动替用户备份或删除 Redis 数据。
 
 PDF 阅读器或分块规则升级后，重建本地索引：
 
@@ -160,6 +171,8 @@ python scripts/reindex_local_papers.py --data-dir runtime --max-pages 20
 重建会为每篇论文生成页面级 `document_map.json`：原始正文、表格、图片、图注和相邻正文始终保留页级关联；另会派生仅供检索的跨页逻辑正文块。只有相邻页、同一章节、下一页未从标题开始且前页未以完整句末结束的正文才会合并；一次最多跨两页，避免将连续页面链式拼接成难以审计的宽范围证据。逻辑块以 1,200 字符为目标、1,320 字符为软硬边界继续切分，并保留起止页与全部源元素 ID，因此引用会显示为 `p.3–4`，仍可回查原页。`query_papers` 命中表或图时，会额外返回图表说明与必要的邻近正文；旧索引仍可查询，但不会具备这项补充上下文能力。PDF 阅读器或切块规则升级后，应执行上面的重建命令以应用新规则。
 
 本地论文还可建立轻量“论文关系增强检索”：只保存用户确认且带页码或 chunk 锚点的**一跳**关系（方法相似/改进、实验可比、结果冲突、明确引用）。关系不构成论文事实，也不会自动由模型猜测生成；检索先完成语义 + BM25 RRF，再从已有相关论文的一跳关系中补充仍能匹配当前问题的候选，并给予有限加分，最后交给可选 reranker。它不引入图数据库、图遍历或 GraphRAG；删除论文会同步删除相关关系边。
+
+当前仓库配置使用 `intfloat/multilingual-e5-small` 嵌入模型（384 维、512 token），集合为 `papers_e5`；旧 MiniLM 与 Qwen3 保留为可选后端。切换嵌入模型需要新集合并重新索引，不能直接复用旧向量空间。有效配置仍以启动时的配置来源为准。
 
 可选的中文/英文本地重排器首次下载和自检后，才在 `config.yaml` 中开启 `rag.reranker.enabled`：
 
@@ -291,21 +304,25 @@ python scripts/export_badcase_template.py --candidate-id bc-xxxxxxxxxxxx
 
 ---
 
+画像保存在 `APP_DATA_DIR/primary/profile.md`。可在对话中要求保存、删除或纠正条目；Agent 先通过 `read_profile(section)` 取得原文，再调用 `update_profile` 的 `remove_entry` 或 `replace_entry`（参数为 `section`、原文 `content`，修正另传 `replacement`）。原文不含 `- ` 列表前缀，仅忽略首尾空白，不做子串或语义匹配；找不到原文时明确报错。原有新增和偏好设置操作继续可用，同章节相同条目重复新增不会重复写入，操作涉及的历史重复副本会合并处理。未知操作会报错，同内容操作返回未变更；只有工具实际执行后才会持久化。
+
 ## 🧪 验证
 
 ```bash
-# 后端全部离线测试（与 CI 的 offline job 完全同一份列表，538 项）
+# 后端离线测试（模块列表与 CI 的 offline-quality job 一致）
 python -m unittest tests.test_core tests.test_chunking \
   tests.test_lexical tests.test_rerank tests.test_hybrid \
   tests.test_retrieval_metrics tests.test_metrics_chain \
   tests.test_stage_timing tests.test_mcp_server tests.test_mcp_stdio \
   tests.test_dependency_lock_coverage tests.test_mcp_client \
   tests.test_mcp_client_e2e tests.test_mcp_client_wiring \
-  tests.test_research_evidence tests.test_experiment_reproduction \
+  tests.test_research_evidence tests.test_research_gates \
+  tests.test_experiment_reproduction \
   tests.test_conversation_reference tests.test_paper_matching \
   tests.test_paper_scope tests.test_relation_review \
   tests.test_repository_preparation tests.test_repository_sources \
-  tests.test_ci_test_coverage
+  tests.test_ci_test_coverage tests.test_llm_diagnostics \
+  tests.test_error_diagnostics_contract tests.test_user_profile
 
 # 前端纯函数测试（时间轴归约 + 标签词汇）
 cd frontend && npm test
@@ -332,7 +349,7 @@ cd frontend && npm ci && npm run build && cd ..
 python -m unittest tests.test_mounted_api_e2e
 ```
 
-GitHub Actions 分为四个 job：离线质量门禁、前端归约测试、Docker 构建与健康检查、浏览器与 FastAPI 集成测试。
+GitHub Actions 有四个常规 job：离线质量门禁、前端归约测试、Docker 构建与健康检查、浏览器与 FastAPI 集成测试。另有条件运行的 `chroma-integration`：每周一定时运行，或手动触发 workflow 并启用 `run_chroma_integration` 时运行；普通 push / pull request 不运行该集成 job。离线质量门禁设置 `SKIP_CHROMA_INTEGRATION=1`，避免下载 Chroma 的 ONNX 模型。
 
 FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文本端点，用于
 监控 Redis 队列积压、各类 worker 心跳和运行状态计数。指标只包含固定标签与聚合数字，
@@ -389,10 +406,10 @@ FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文
 | 角色 | 工具白名单 | 职责 |
 |------|-----------|------|
 | `local` 本地证据研究员 | `query_papers` `list_papers` `list_indexed_papers` | 只读本地已索引库 |
-| `public` 文献与反例研究员 | `search_papers` **+ 外部 `mcp__` 工具** | 唯一能出网的角色 |
+| `public` 文献与反例研究员 | `search_papers` **+ 外部 `mcp__` 工具** | 公开文献取证，并独占外部 MCP 工具权限 |
 | `boundary` 反证与边界研究员 | `search_papers` | 专门找反例、失败模式、泛化边界 |
 
-外部 MCP 工具**只授予 `public`**——能力不该意外扩散，所以必须点名授予。
+外部 MCP 工具**只授予 `public`**——能力不该意外扩散，所以必须点名授予。`public` 与 `boundary` 都可以通过 `search_papers` 访问公开论文来源；独占的是外部 MCP 权限。
 
 ### 阶段边界：每个阶段只交付一件事
 
@@ -408,7 +425,7 @@ FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文
 两个阶段各有一道**机器可判**的关卡，落在提示词之外：
 
 - **规划关卡**：planner 的子任务 id 必须落到某个研究员角色上，否则规划会被静默丢弃
-- **引用关卡**：引用不存在的证据编号会强制触发修订，修订后仍不成立则运行状态降级为 `partial_failed`
+- **引用关卡**：不存在的证据编号或无法支撑的精确定位会强制触发修订，修订后仍不成立则运行状态降级为 `partial_failed`
 
 ### 引用与定位的诚实性
 
@@ -420,11 +437,13 @@ FastAPI 同时提供受 API 令牌保护的 `GET /api/v1/metrics` Prometheus 文
 
 审计会专门抓「定位升级」——声称有精确锚点但底层证据其实没解析出位置。
 
-**审计是门控，不只是报告。** 引用不存在的证据编号会强制触发一次修订；修订后仍不成立时，运行状态降级为 `partial_failed` 而不是 `completed`——绿色状态只代表真的检查过。
+**审计是门控，不只是报告。** 引用不存在的证据编号或把弱定位升级成精确定位，会强制触发一次修订；修订后仍有这两类问题时，运行状态为 `partial_failed`，并保留报告。存在未被正文引用的证据时，引用摘要会列出数量与编号；未引用本身是覆盖情况提示，不作为失败条件，也不自动证明综合遗漏。
 
 ### 降级保留产物
 
-三条链路失败时都不归零：研究保留已找到的证据、每日检索保留已抓到的候选、对话保留已给出的答案。模型超时会被标成 `skipped` 而不是伪装成 `completed`。
+三条链路失败时都保留可恢复产物：研究保留已找到的证据、每日检索保留已抓到的候选、对话保留已给出的答案。研究 critic 超时、调用异常或输出无法解析时，判决为 `unknown`；综合回退报告也标为 `unknown`。最终质检仍未知时以 `partial_failed` 交付报告，并提示人工复核。
+
+研究员单次执行仍只有一轮工具调用。某个角色成功结束但没有取到工具证据时，会在原 scope 与工具权限内注明查询改写理由，至多再补检索一次；模型或基础设施错误仍按各自失败策略处理，不借此重复调用。这不会自动切换来源范围。`/research continue` 沿用已保存证据重跑后续分析与综合，不主动补充新检索。
 
 研究运行记录与会话共用 `checkpoint.db`，以 `thread_id` 关联；删除会话会同步删除可恢复的计划、证据、质检结果和最终报告。
 
@@ -445,6 +464,7 @@ primary/settings.json→ Web UI 用户设置
 derived/chroma/      → 论文向量库（可重建）
 derived/images/      → PDF 提取图片与图注（可重建）
 derived/paper_artifacts/ → 页面元素映射、论文来源映射、证据卡与审计结果（可重建）
+derived/redis/       → Redis AOF/RDB：活动队列与运行事件（不能按缓存清理）
 ```
 
 ---

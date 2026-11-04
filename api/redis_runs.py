@@ -19,7 +19,7 @@ from api.sse import format_sse
 from cancellation import RequestCancelledError
 from papers.metrics import load_published as load_published_retrieval_metrics
 from papers.metrics import publish as publish_retrieval_metrics
-from run_contract import bounded_timing_metrics, execution_metadata
+from run_contract import bounded_timing_metrics, execution_metadata, safe_error_details, latest_error_details
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial_failed"}
@@ -472,8 +472,10 @@ class RedisChatRunManager:
             if not run:
                 return
             if run.get("status") in _TERMINAL_STATUSES:
+                details = latest_error_details(self.agent.sessions.get_run_events(run_id)) if run["status"] == "failed" else {}
                 yield format_sse({
                     "type": "done", "status": run["status"], "answer": run.get("answer", ""),
+                    **({"error_details": details} if details else {}),
                 })
                 return
             yield ": keep-alive\n\n"
@@ -621,21 +623,23 @@ class RedisChatRunWorker(_RedisRunWorker):
             )
             if current.get("status") not in _TERMINAL_STATUSES:
                 self.agent.sessions.update_chat_run(job.run_id, status=result_status, answer=answer)
-            self.broker.publish(job.run_id, {"type": "done", "status": result_status, "answer": answer})
+            details = safe_error_details(trace.get("error_details")) if result_status == "failed" else {}
+            self.broker.publish(job.run_id, {"type": "done", "status": result_status, "answer": answer, **({"error_details": details} if details else {})})
         except Exception as exc:
+            details = safe_error_details(getattr(exc, "error_details", None))
             self.agent.sessions.update_chat_run(
                 job.run_id, status="failed", answer="", error_type=type(exc).__name__,
             )
             self.agent.sessions.add_run_event(
                 job.session_id, job.run_id, "chat", "api_worker", "run", "failed",
-                summary="Durable API worker failed", error_type=type(exc).__name__, event_type="error",
+                summary="Durable API worker failed", error_type=type(exc).__name__, event_type="error", error_details=details,
             )
             self.agent.sessions.add_run_event(
                 job.session_id, job.run_id, "chat", "api_worker", "run", "failed",
                 summary="聊天运行已结束", event_type="done",
             )
-            self.broker.publish(job.run_id, {"type": "error", "error_type": type(exc).__name__})
-            self.broker.publish(job.run_id, {"type": "done", "status": "failed", "answer": ""})
+            self.broker.publish(job.run_id, {"type": "error", "error_type": type(exc).__name__, **({"error_details": details} if details else {})})
+            self.broker.publish(job.run_id, {"type": "done", "status": "failed", "answer": "", **({"error_details": details} if details else {})})
         finally:
             stop_monitor.set()
             monitor.join(timeout=0.2)
@@ -664,6 +668,9 @@ def _safe_status_event(event: dict[str, Any]) -> dict[str, Any]:
         "status": str(event.get("status") or "running")[:40],
     }
     payload.update(bounded_timing_metrics(event))
+    details = safe_error_details(event.get("error_details"))
+    if details:
+        payload["error_details"] = details
     return payload
 
 

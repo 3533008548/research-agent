@@ -483,17 +483,37 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "update_profile",
-                "description": "更新用户画像（研究方向/偏好/活跃问题/已读论文）。",
+                "description": "新增或更新用户画像；删除/修正须先 read_profile，按章节和完整原文精确匹配（不含列表前缀）。相同条目去重；无匹配、未知操作报错。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["add_direction", "add_question", "add_paper", "set_preference"],
+                            "enum": ["add_direction", "add_question", "add_paper", "set_preference", "remove_entry", "replace_entry"],
                         },
-                        "content": {"type": "string", "description": "内容文本"},
+                        "content": {"type": "string", "description": "单行内容；add_paper 用「标题: 摘要」，set_preference 用「键: 值」。删除/修正传原条目完整文本（不含 - 前缀，仅忽略首尾空白），不支持子串或模糊匹配。"},
+                        "section": {
+                            "type": "string",
+                            "enum": ["研究方向", "偏好设置", "活跃问题", "已读论文"],
+                            "description": "remove_entry/replace_entry 必填；其余操作不传。",
+                        },
+                        "replacement": {"type": "string", "description": "仅 replace_entry 必填：新的完整单行条目；偏好用「键: 值」。同章节的完全相同副本合并处理。"},
                     },
                     "required": ["action", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_profile",
+                "description": "读取指定画像章节的条目原文，包含未注入对话摘要的已读论文。删除或修正前用此工具确认完整原文。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "section": {"type": "string", "enum": ["研究方向", "偏好设置", "活跃问题", "已读论文"]},
+                    },
+                    "required": ["section"],
                 },
             },
         },

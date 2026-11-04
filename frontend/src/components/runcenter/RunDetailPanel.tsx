@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 
 import { getDailyRunDetail, getRun } from "../../api";
-import type { Run, RunEvent } from "../../types";
+import type { Run, RunEvent, RunErrorDetails as ErrorDetails } from "../../types";
 import { buildTimeline, type Timeline } from "../../lib/timeline";
 import { StageTimeline } from "./StageTimeline";
+import { RunErrorDetails } from "../RunErrorDetails";
 
 /**
  * Detail panel for one run.
@@ -30,22 +31,32 @@ export function RunDetailPanel({
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [errorDetails, setErrorDetails] = useState<ErrorDetails | undefined>();
+  const [errorType, setErrorType] = useState("");
 
   useEffect(() => {
     if (!run) {
       setEvents([]);
       setError("");
+      setErrorDetails(undefined);
+      setErrorType("");
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError("");
+    setErrorDetails(run.error_details);
+    setErrorType(run.error_type);
     const request = run.kind === "daily"
-      ? getDailyRunDetail(apiKey, run.run_id).then((detail) => detail.events ?? [])
-      : getRun(apiKey, run.run_id).then((detail) => detail.events ?? []);
+      ? getDailyRunDetail(apiKey, run.run_id).then((detail) => ({ events: detail.events ?? [], error_details: run.error_details, error_type: run.error_type }))
+      : getRun(apiKey, run.run_id).then((detail) => ({ events: detail.events ?? [], error_details: detail.error_details, error_type: detail.error_type }));
     request
       .then((loaded) => {
-        if (!cancelled) setEvents(loaded);
+        if (!cancelled) {
+          setEvents(loaded.events);
+          setErrorDetails(loaded.error_details);
+          setErrorType(loaded.error_type);
+        }
       })
       .catch((cause) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : "无法读取该运行的阶段事件");
@@ -90,6 +101,8 @@ export function RunDetailPanel({
 
       {error && <p className="run-detail-error">{error}</p>}
       {loading && !events.length && <p className="empty-panel">正在读取阶段事件…</p>}
+
+      <RunErrorDetails runId={run.run_id} errorType={errorType} details={errorDetails} />
 
       <StageTimeline timeline={timeline} kind={run.kind} />
     </section>

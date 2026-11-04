@@ -57,7 +57,7 @@ from repository_sources import (
 )
 from paper_artifacts import load_document_map
 from research_document_routing import route_research_document_request
-from run_contract import bounded_timing_metrics
+from run_contract import bounded_timing_metrics, latest_error_details
 from workspace_uploads import UploadValidationError
 
 
@@ -101,6 +101,7 @@ def _run_response(
         "duration_ms": duration_ms,
         "metrics": metrics or {},
         "error_type": error_type,
+        "error_details": latest_error_details(events) if run.get("status") in {"failed", "partial_failed"} else {},
         "created_at": run["created_at"],
         "updated_at": run["updated_at"],
         "completed_at": completed_at,

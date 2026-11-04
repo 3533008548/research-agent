@@ -302,14 +302,25 @@ export function useConversation({
           appendToken(runEvent.text || "");
         }
         if (runEvent.type === "status" || runEvent.type === "done") {
-          setCurrentRun((current) => current && { ...current, status: runEvent.status || current.status });
+          const completed = runEvent.type === "done" && runEvent.status === "completed";
+          setCurrentRun((current) => current && {
+            ...current,
+            status: runEvent.status || current.status,
+            error_type: completed ? "" : runEvent.error_type || current.error_type,
+            error_details: completed ? undefined : runEvent.error_details || current.error_details,
+          });
         }
         if (runEvent.type === "done") {
           completeAnswer(runEvent.answer);
         }
         if (runEvent.type === "error") {
-          completeAnswer("运行未能完成，请查看右侧错误信息。");
-          setCurrentRun((current) => current && { ...current, status: "failed", error_type: runEvent.error_type || "RunError" });
+          completeAnswer(`运行未能完成：${runEvent.error_type || "RunError"}。可点击「查看运行详情」了解当前状态。`);
+          setCurrentRun((current) => current && {
+            ...current,
+            status: "failed",
+            error_type: runEvent.error_type || "RunError",
+            error_details: runEvent.error_details || current.error_details,
+          });
         }
       }, controller.signal);
       if (!isCurrentRequest()) {

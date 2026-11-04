@@ -35,6 +35,21 @@ export interface RunStart {
   stream_url: string;
 }
 
+/** Bounded operational fields supplied by the backend; never response bodies. */
+export interface RunErrorDetails {
+  code?: string;
+  phase?: string;
+  exception_type?: string;
+  cause_type?: string;
+  http_status?: number;
+  elapsed_ms?: number;
+  deadline_ms?: number;
+  queue_wait_ms?: number;
+  attempts?: number;
+  retries_used?: number;
+  request_id?: string;
+}
+
 export interface RunEvent {
   type: "status" | "token" | "tool" | "done" | "error";
   status?: string;
@@ -47,6 +62,8 @@ export interface RunEvent {
   text?: string;
   answer?: string;
   error_type?: string;
+  summary?: string;
+  error_details?: RunErrorDetails;
 }
 
 export interface RunSteer {
@@ -70,6 +87,7 @@ export interface Run {
   duration_ms: number | null;
   metrics: Record<string, number>;
   error_type: string;
+  error_details?: RunErrorDetails;
   created_at: string;
   updated_at: string;
   completed_at: string | null;

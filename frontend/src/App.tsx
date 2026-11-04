@@ -7,6 +7,7 @@ import {
   experimentCodeSource,
   methodReconstruction,
   repositoryPreparation,
+  statusLabel,
 } from "./lib/labels";
 import { ChatPanel } from "./components/workspace/ChatPanel";
 import { RunInspector } from "./components/RunInspector";
@@ -23,6 +24,8 @@ import { useDocuments } from "./hooks/useDocuments";
 import { useRunCenter } from "./hooks/useRunCenter";
 import { useWorkspaceChrome } from "./hooks/useWorkspaceChrome";
 import { useExperiments } from "./hooks/useExperiments";
+import { useWorkspaceLayout } from "./hooks/useWorkspaceLayout";
+import { SidebarResizeHandle } from "./components/SidebarResizeHandle";
 import { SessionSidebar } from "./components/workspace/SessionSidebar";
 import {
   type Paper,
@@ -31,6 +34,15 @@ import {
 
 
 const API_TOKEN_KEY = "research-agent.api-token";
+
+function SidebarIcon({ side }: { side: "left" | "right" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <rect x="2.5" y="3.5" width="15" height="13" rx="2" />
+      <path d={side === "left" ? "M7.5 4v12" : "M12.5 4v12"} />
+    </svg>
+  );
+}
 
 export function App() {
   const [apiKey, setApiKey] = useState(() => sessionStorage.getItem(API_TOKEN_KEY) || "");
@@ -306,19 +318,19 @@ export function App() {
     isSending ||
     ["running", "queued", "cancelling"].includes(currentRun?.status ?? "");
   const docFocusMode = documentActive && !runInProgress;
+  const layout = useWorkspaceLayout({ docFocusMode });
+  const activeSessionTitle = sessions.find((session) => session.thread_id === activeSessionId)?.title || "对话";
+  const runNeedsAttention = currentRun && ["failed", "partial_failed"].includes(currentRun.status);
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <a className="brand" href="/" aria-label="Research Agent 首页">
-          <span className="brand-mark" aria-hidden="true">R</span>
-          <span>Research Agent</span>
-        </a>
-        <p>论文证据、研究推理与可追溯运行</p>
-      </header>
-
-      <div className={`workspace ${docFocusMode ? "workspace-doc-focus" : ""}`}>
+      <div
+        ref={layout.workspaceRef}
+        style={layout.workspaceStyle}
+        className={["workspace", !layout.leftVisible && "workspace-left-hidden", !layout.rightVisible && "workspace-right-hidden"].filter(Boolean).join(" ")}
+      >
         <SessionSidebar
+          hidden={!layout.leftVisible}
           sessions={sessions}
           activeSessionId={activeSessionId}
           isSending={isSending}
@@ -356,9 +368,21 @@ export function App() {
           onSettingsDraftChange={setSettingsDraft}
           onApiKeyDraftChange={setApiKeyDraft}
           onApplyApiKey={applyApiKey}
-        />
+        >
+          {layout.leftResizeProps && <SidebarResizeHandle {...layout.leftResizeProps} />}
+        </SessionSidebar>
 
         <section className={`conversation ${documentActive ? "conversation-doc" : ""}`} aria-label="研究工作台">
+          <div className="workbench-header">
+            <button
+              type="button"
+              className="icon-button"
+              onClick={layout.toggleLeft}
+              aria-controls="session-sidebar"
+              aria-expanded={layout.leftVisible}
+              aria-label={layout.leftVisible ? "隐藏会话侧栏" : "显示会话侧栏"}
+              title={layout.leftVisible ? "隐藏会话侧栏" : "显示会话侧栏"}
+            ><SidebarIcon side="left" /></button>
           <div className="workbench-tabs" role="tablist" aria-label="工作台页面">
             {workbenchTabs.map((tab) => (
               <div className={`workbench-tab ${tab.id === activeWorkbenchTab?.id ? "active" : ""}`} key={tab.id}>
@@ -367,7 +391,7 @@ export function App() {
                   role="tab"
                   aria-selected={tab.id === activeWorkbenchTab?.id}
                   onClick={() => setActiveWorkbenchTabId(tab.id)}
-                  title={tab.title}
+                  title={tab.kind === "chat" ? activeSessionTitle : tab.title}
                 >
                   {tab.kind === "document" && <span aria-hidden="true">▣</span>}
                   {tab.kind === "profile" && <span aria-hidden="true">◉</span>}
@@ -375,7 +399,7 @@ export function App() {
                   {tab.kind === "dailyRun" && <span aria-hidden="true">▧</span>}
                   {tab.kind === "experiment" && <span aria-hidden="true">⌘</span>}
                   {tab.kind === "runs" && <span aria-hidden="true">◫</span>}
-                  <span>{tab.title}</span>
+                  <span>{tab.kind === "chat" ? activeSessionTitle : tab.title}</span>
                 </button>
                 {tab.kind !== "chat" && (
                   <button
@@ -390,8 +414,42 @@ export function App() {
               </div>
             ))}
           </div>
+            {currentRun && (
+              <button
+                type="button"
+                className={`run-status-button status status-${currentRun.status}`}
+                onClick={layout.showRight}
+                aria-label={`查看运行详情：${statusLabel(currentRun.status)}`}
+                title="查看运行详情"
+              >{statusLabel(currentRun.status)}</button>
+            )}
+            <button
+              type="button"
+              className="icon-button"
+              onClick={layout.toggleRight}
+              aria-controls="run-inspector"
+              aria-expanded={layout.rightVisible}
+              aria-label={layout.rightVisible ? "隐藏运行检查器" : "显示运行检查器"}
+              title={layout.rightVisible ? "隐藏运行检查器" : "显示运行检查器"}
+            ><SidebarIcon side="right" /></button>
+            <details className="layout-menu">
+              <summary aria-label="布局选项" title="布局选项">⋯</summary>
+              <div className="layout-menu-content">
+                <button type="button" onClick={(event) => {
+                  layout.resetLayout();
+                  event.currentTarget.closest("details")?.removeAttribute("open");
+                }}>恢复默认布局</button>
+              </div>
+            </details>
+          </div>
 
           {notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
+          {!layout.rightVisible && runNeedsAttention && (
+            <p className="run-alert" role="status">
+              <span>任务{statusLabel(currentRun.status)}{currentRun.error_type ? `：${currentRun.error_type}` : ""}</span>
+              <button className="text-button" type="button" onClick={layout.showRight}>查看运行详情</button>
+            </p>
+          )}
           {activeWorkbenchTab?.kind === "profile" ? (
             <ProfilePanel profile={activeWorkbenchTab.profile} />
           ) : activeWorkbenchTab?.kind === "document" ? (
@@ -496,16 +554,17 @@ export function App() {
           )}
         </section>
 
-        {!docFocusMode && (
           <RunInspector
+            hidden={!layout.rightVisible}
             run={currentRun}
             events={runEvents}
             onCancel={() => void stopCurrentRun()}
             onRetry={() => void retryCurrentChat()}
             onOpenRunCenter={() => void openRunCenter()}
             cancelling={isCancelling}
-          />
-        )}
+          >
+            {layout.rightResizeProps && <SidebarResizeHandle {...layout.rightResizeProps} />}
+          </RunInspector>
       </div>
     </main>
   );

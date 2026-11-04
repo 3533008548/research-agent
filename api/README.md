@@ -34,6 +34,8 @@ FastAPI API 实例可以横向扩展：它们只向共享 Redis 队列投递任�
 挤占聊天请求。SQLite 尚未替换为多写入者的任务/状态存储前，请不要扩容 `api-worker`；
 届时还应增加 Redis 分布式模型信号量。
 
+Compose 把 Redis 的 AOF/RDB 持久化目录挂载到 `runtime/derived/redis/`。这里包含活动队列与消费组状态，不能当作可重建缓存清理。`scripts/backup_runtime.py`（包括 `--include-derived`）不备份 Redis；维护时应先停止接单与定时投递、排空任务，再正常停止应用、worker 和 Redis，分别保存同一停机时间点的 primary 与整个 Redis 持久化目录。恢复时先加载匹配的 Redis 数据，再启动任务处理，避免旧队列与新 SQLite 混用。完整步骤见 [README 的运行时数据目录](../README.md#运行时数据目录)。
+
 ## 鉴权与网络边界
 
 除 `GET /api/v1/health` 外，所有 `/api/v1/*` 路由均接受下列任一种鉴权方式：
@@ -230,3 +232,21 @@ curl -X POST http://localhost:7860/api/v1/runs/<run_id>/badcases \
 # 抓取脱敏的运行指标
 curl -H "X-API-Key: $TOKEN" http://localhost:7860/api/v1/metrics
 ```
+
+## 模型错误诊断
+
+普通对话的模型失败会在安全审计事件中持久化 `error_details`；失败运行的
+`GET /api/v1/runs/{run_id}` 从已存事件恢复顶层诊断。SSE 的 `error`、`done` 和已知
+`status` 事件可携带同一白名单结构，刷新后可从历史运行重新加载详情。
+
+- `code`、`phase`、`exception_type`、`cause_type`：固定错误类别、阶段及异常类别。
+- `http_status`：共享请求预算内最后一次实际收到的 HTTP 状态；从未收到响应时省略。
+  它可能是 `200`，而后续流式读取仍失败，不能把它当成失败原因或伪造为 `504`。
+- `elapsed_ms`、`deadline_ms`、`queue_wait_ms`：实测耗时、总预算和排队耗时。
+- `attempts`、`retries_used`：实际发出的请求及重试次数；预留重试但预算耗尽时不算已重试。
+- `request_id`：存在且通过校验的 `request-id`／`x-request-id` 响应头，用于上游关联。
+
+诊断字段不包含请求正文、提示词、响应原文、URL、API Key 或 Authorization。
+旧运行没有这些信息时返回空诊断，不通过错误文案猜测 HTTP 状态。
+这次改动不调整模型、超时或重试策略；已输出部分正文但最终流失败时保留正文并标记失败。
+结构化持久化目前接入普通对话链路；其他运行类型保留兼容接口，不代表已接入每个编排节点。

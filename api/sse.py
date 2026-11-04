@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from run_contract import SSE_EVENT_TYPES, bounded_timing_metrics
+from run_contract import SSE_EVENT_TYPES, bounded_timing_metrics, safe_error_details
 
 
 def _bounded_text(value: object, limit: int) -> str:
@@ -31,16 +31,24 @@ def public_sse_event(event: dict[str, Any]) -> dict[str, Any]:
             payload["duration_ms"] = round(float(event["duration_ms"]), 1)
         return payload
     if event_type == "done":
-        return {
+        payload = {
             "type": "done",
             "status": _bounded_text(event.get("status") or "completed", 40),
             "answer": str(event.get("answer") or ""),
         }
+        details = safe_error_details(event.get("error_details"))
+        if details:
+            payload["error_details"] = details
+        return payload
     if event_type == "error":
-        return {
+        payload = {
             "type": "error",
             "error_type": _bounded_text(event.get("error_type") or "RunError", 120),
         }
+        details = safe_error_details(event.get("error_details"))
+        if details:
+            payload["error_details"] = details
+        return payload
     payload = {
         "type": "status",
         "status": _bounded_text(event.get("status") or "running", 40),
@@ -52,6 +60,9 @@ def public_sse_event(event: dict[str, Any]) -> dict[str, Any]:
     # Status events also carry the two bounded timing numbers so a live
     # timeline needs no second request to place a finished stage.
     payload.update(bounded_timing_metrics(event))
+    details = safe_error_details(event.get("error_details"))
+    if details:
+        payload["error_details"] = details
     return payload
 
 

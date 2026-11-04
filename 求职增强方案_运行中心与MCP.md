@@ -1,7 +1,6 @@
 # 求职增强方案：运行中心可视化 + MCP 双向
 
-> 前提：阶段时间戳已落地（`run_contract.TIMING_METRIC_KEYS` + 两条编排链路的单调时钟），
-> 前端时间轴不需要再猜耗时。本文档只讲剩下的部分。
+> 状态校对：2026-10-23。运行中心、MCP Server、MCP Client 与前端拆分五个阶段均已落地；本文保留设计过程与历史验收记录。当前行为以 README 和实现为准，历史测试数量与行数不代表本次验证结果。
 
 ---
 
@@ -11,7 +10,7 @@
 
 | 流程 | 入口 | 真实阶段（来自代码） |
 |---|---|---|
-| **深度研究** | `research_orchestrator.py::research()` | `planner` → `researchers` → `evidence_analysis` → `synthesis` → `critic` →（可选 `revision`） |
+| **深度研究** | `research_orchestrator.py::run()` | `planner` → `researchers` → `evidence_analysis` → `synthesis` → `critic` →（可选 `revision`） |
 | **每日检索** | `daily_orchestrator.py::run()` | `planner` → `scouts` → `normalizer` → `quality_gate` → `curator` →（可选 `critic`）→ `delivery` |
 | **单轮对话** | `graph_builder.py` | `llm` / `tools` / `verify`（LangGraph 节点） |
 
@@ -193,7 +192,7 @@ export interface TimelineStage {
 
 ---
 
-## 3. 阶段三：MCP Server（1–2 天，下一步）
+## 3. 阶段三：MCP Server（已完成）
 
 **直接对应 JD 的 MCP 要求。** 优先做 Server，因为它把本项目**已有的能力对外暴露**，
 不需要新的模型决策，风险最低、见效最快。
@@ -204,10 +203,11 @@ export interface TimelineStage {
 
 | MCP Tool | 底层 | 价值 |
 |---|---|---|
-| `search_papers` | `tools/search.py` | 语义+词法混合检索（已重排） |
-| `query_paper_context` | `paper_artifacts.related_context` | 给定 paper_id 取关联上下文 |
-| `list_papers` | 已有工具 | 列出已索引论文 |
-| `get_retrieval_metrics` | `papers/metrics.py` | 本次重构产出的阶段耗时指标 |
+| `search_papers` | `search_api.py` | OpenAlex / arXiv 公开论文元数据检索 |
+| `query_papers` | `PaperStore` | 本地语义 + 词法混合检索，可选重排，保留原文定位 |
+| `list_papers` | 已有工具 | 列出已下载论文 |
+| `list_indexed_papers` | `PaperStore` | 列出已索引论文与块数 |
+| `retrieval_metrics` | `papers/metrics.py` | 检索阶段聚合耗时指标 |
 
 ⚠️ **不暴露**：`read_pdf`（需要上传通道）、写操作（会绕过质量门控）。
 理由：MCP Server 是给**外部客户端**用的，写操作没有对应的配额和审计。
@@ -217,20 +217,19 @@ export interface TimelineStage {
 - 独立进程 `mcp_server.py`，用官方 `mcp` Python SDK 的 stdio transport。
   **stdio 而非 HTTP**：本项目是单机自用，stdio 免端口免鉴权，且客户端能拉起子进程。
 - **复用现有 store 构造路径**，不新建 `PaperStore` 变体。
-  ⚠️ 陷阱：容器里模型已预热；若 MCP Server 在宿主机裸跑，
-  会触发 ONNX 图重优化（约 530ms/次，见项目记忆）。所以 MCP Server 应**跑在容器内**。
+  MCP Server 是独立进程，首次启动仍需加载模型；应对齐应用的数据目录、模型缓存和配置。当前嵌入实现已复用模型会话，旧版“每次调用重建 ONNX 会话”的性能问题不是要求只能在容器运行的理由。
 - 每个 tool 的返回值走 `bounded_timing_metrics` 同款白名单思路：
   **只返回文本与引用，不返回 chunk id 之外的内部 id、不返回向量**。
 
 ### 3.3 验收
 
-- `inspect` 能看到 4 个 tool 与各自 schema。
-- 4 个 tool 各跑一次，与直接调内部函数结果**逐字一致**。
-- 断网（无 DEEPSEEK_API_KEY）时，检索类 tool 仍可用 —— MCP 不该依赖 LLM。
+- `inspect` 能看到 5 个 tool 与各自 schema。
+- 工具结果与底层检索函数保持一致，并受返回长度约束。
+- 检索工具不依赖主模型 API key；本地模型与索引就绪时可离线使用本地检索，`search_papers` 仍需访问公开论文来源。
 
 ---
 
-## 4. 阶段四：MCP Client（1–2 天）
+## 4. 阶段四：MCP Client（已完成）
 
 让本项目**作为客户端**使用外部 MCP Server（例如让 Agent 去调真实的
 `arxiv-mcp-server`）。这一步证明的是另一件事：会**消费**别人的 MCP。
@@ -362,54 +361,24 @@ hook 调用顺序由编译器盯着：顺序写反直接编译不过。
 
 ---
 
-## 7. 已知未修问题（2026-10-23 评审）
+## 7. 深度研究评审与当前边界（2026-10-23 更新）
 
-五个阶段全部收口后，对深度研究的多 Agent 设计做了一次评审。结论是
-**生成侧扎实，验收侧敞口**——前面所有精巧的机制最终都不影响 `run.status`。
+早期评审发现了一批“机制存在但未接入运行结果”的问题。以下状态描述实现行为，不代替本次测试结果：
 
-已修的三个（提交 `a344b25`）：
-
-| 缺陷 | 修法 |
+| 问题 | 当前处理 |
 |---|---|
-| planner 子任务 id 与角色名不匹配 → 规划被静默丢弃 | `_normalize_subtask_roles()` 按 scope 归一化；plan 记 `focus_applied` |
-| 引用审计不是门控 → 坏引用照样 `completed` | 修订前先审计，坏引用强制触发修订；仍不成立则降级 `partial_failed` |
-| critic 读不到限制章节（`draft[:5000]` 只留头部） | `_draft_excerpt()` 首尾都保留，尾部标注所属章节 |
+| planner 子任务 id 与角色名不匹配 | `_normalize_subtask_roles()` 按 scope 归一化；plan 记 `focus_applied` |
+| 引用审计未影响状态 | 不存在的证据编号与无依据的精确定位强制触发一次修订；最终仍有问题则 `partial_failed` |
+| critic 只看到草稿头部 | `_draft_excerpt()` 保留首尾，避免先截掉末尾限制章节 |
+| critic 异常或输出无效被当作 `pass` | 改为 `unknown`，最终质检未知时保留报告并标 `partial_failed`；综合回退报告同样不视作审查通过 |
+| 未引用证据只存于 audit trace | 报告摘要展示未引用数量与编号，作为覆盖提示，不直接作为质量失败条件 |
+| 空结果没有 refinement 机会 | 成功结束但没有工具证据的角色会说明查询改写理由，在原 scope 和工具权限内至多补检索一次；每次 worker 执行仍只有一轮工具，模型或基础设施失败不借此重复调用 |
 
-**仍然存在**：
+仍保留的边界与后续选项：
 
-### 🔴 P1：critic 超时被记成 `pass`
+1. 轮内工具调用仍按顺序执行；是否并行应根据实际延迟与取消语义评估。
+2. 三个角色没有通用的检索多样性约束。TSN 专用参数归一化不是跨领域多样性机制；如要推广，需先用真实重叠与覆盖数据验证。
+3. `/research continue` 复用已保存证据，只重跑后续分析与综合；它不承诺新一轮检索。
+4. 当前研究 critic 仍复用 `verify_timeout_seconds`，预算覆盖排队与响应。可评估独立预算，但需要测量超时率、排队压力和成本后再调整；低优先级并发限制属于共享 LLMClient 实例，不能表述成跨进程全局限制。
 
-```python
-critique = {"verdict": "pass", "issues": [f"自动质检已跳过：{type(exc).__name__}..."]}
-```
-
-**「没审」被记成「审过」。** `verdict="pass"` 让 `if verdict == "revise"` 不成立，
-于是跳过修订，报告以"质量检查通过"的状态交付。
-
-放大它的三个事实：
-
-- `verify_timeout_seconds: 8`——**8 秒覆盖排队 + HTTP + 读响应**
-  （`RequestBudget.deadline_at` 是共享预算）
-- critic 用 `RequestPriority.VERIFY` → `low_priority_slots`，
-  **全局只有 1 个并发**（`low_priority_max_concurrency: 1`）
-- 8 秒内要审完 5000 字草稿 + 12 张证据卡
-
-**建议**：verdict 引入第三态 `"unknown"`，超时/异常用它而非 `"pass"`；
-并给研究 critic 单独一个预算（`verify_timeout_seconds` 与对话 verify 共用，
-改它有连锁影响）。
-
-### 🟠 P1：`evidence_without_marker` 算了但没人用
-
-`research_evidence.py` 算出了"收集了却从未被引用的证据"，但**没有任何地方消费**。
-这恰恰是**"检索和综合脱节"最直接的信号**，现在完全不可见。
-
-**建议**：加进 `_citation_audit_line()` 的输出。
-
-### 🟡 P2 三个
-
-1. **研究员只有一次工具轮次**（`RESEARCH_WORKER_MAX_TOOL_ROUNDS = 1`）
-   → 检索不能迭代；工具节点还是顺序执行。
-2. **三个研究员的检索没有多样性约束**——没机制保证结果不重叠。
-   TSN 那套 `_worker_tool_argument_normalizer` 是现成的推广点。
-3. **`/research continue` 不会补充新证据**——`reuse_evidence` 分支把
-   planner + workers 整段跳过，只重跑证据分析与综合。
+权限上，`public` 与 `boundary` 都可使用 `search_papers` 访问公开来源；只有 `public` 可调用外部 MCP 工具。当前 CI 的验证入口见 README，不沿用本方案中的历史测试数量。

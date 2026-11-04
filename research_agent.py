@@ -62,7 +62,7 @@ from research_document_routing import (
 from user_profile import ProfileManager
 from research_orchestrator import ResearchOrchestrator
 from resilience import CircuitBreaker
-from run_contract import execution_metadata
+from run_contract import execution_metadata, safe_error_details
 from search_api import list_downloaded_papers
 from session_store import SessionStore
 from tool_catalog import get_tool_definition
@@ -467,6 +467,7 @@ class ResearchAgent:
             first_token_ms: float | None = None
             outcome = "error"
             answer = ""
+            error_details: dict = {}
 
             def _record_event(event: dict) -> None:
                 at_ms = round((time.perf_counter() - started_at) * 1000, 1)
@@ -594,7 +595,12 @@ class ResearchAgent:
                         # The checkpoint and reference state are already
                         # durable; search indexing is an optional recall aid.
                         pass
-                outcome = "success"
+                last_model_event = next((event for event in reversed(trace_events)
+                                         if event.get("type") in {"llm_request_finished", "llm_request_failed"}), {})
+                error_details = safe_error_details(last_model_event.get("error_details"))
+                # Keep partial text, but a failed final model stream must not
+                # become a successful run merely because it returned a string.
+                outcome = "llm_error" if last_model_event.get("type") == "llm_request_failed" else "success"
                 return answer
             except RequestCancelledError:
                 answer = "⏹️ 请求已取消。"
@@ -604,6 +610,7 @@ class ResearchAgent:
             except LLMClientError as e:
                 answer = f"⚠️ {e}"
                 outcome = "llm_error"
+                error_details = safe_error_details(getattr(e, "error_details", None))
                 return answer
             except requests.RequestException as e:
                 answer = f"❌ 网络请求失败: {e}\n   请检查网络和 API Key。"
@@ -660,6 +667,7 @@ class ResearchAgent:
                     metrics={"duration_ms": duration_ms},
                     error_type="" if run_status == "completed" else outcome,
                     event_type="done",
+                    error_details=error_details,
                 )
                 self._last_traces[thread_id] = {
                     "chat_run_id": chat_run_id,
@@ -668,6 +676,7 @@ class ResearchAgent:
                     "outcome": outcome,
                     "duration_ms": duration_ms,
                     "first_token_ms": first_token_ms,
+                    "error_details": error_details,
                     "tool_trace": tool_events,
                     "events": trace_events,
                     "usage_delta": {
@@ -1088,6 +1097,7 @@ class ResearchAgent:
             summary=summary,
             metrics=metrics,
             error_type=str(event.get("error_type") or "")[:120],
+            error_details=safe_error_details(event.get("error_details")),
             event_type=(
                 "tool" if event_type in {"tool_started", "tool_finished", "tool_failed"}
                 else "error" if event_type in {"llm_request_failed", "verify_request_failed"}
@@ -1104,6 +1114,7 @@ class ResearchAgent:
         steer_provider: Callable[[str], list[str]] | None = None,
         enable_verify: bool = True,
         max_tool_rounds: int | None = None,
+        tool_round_budget: int | None = None,
     ):
         return build_graph(
             api_key=self.api_key,
@@ -1124,6 +1135,7 @@ class ResearchAgent:
             force_tool_name=force_tool_name,
             enable_verify=enable_verify,
             max_tool_rounds=max_tool_rounds,
+            tool_round_budget=tool_round_budget,
             tool_context=ToolExecutionContext(
                 run_kind="chat",
                 run_id=run_id,

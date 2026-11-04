@@ -376,6 +376,19 @@ def build_graph(
         )
         request_started = time.perf_counter()
         emit("llm_request_started", model=model, stream=stream_callback is not None)
+        request_failure_emitted = False
+
+        def emit_request_failed(error) -> None:
+            nonlocal request_failure_emitted
+            if request_failure_emitted:
+                return
+            request_failure_emitted = True
+            emit(
+                "llm_request_failed", error_type=type(error).__name__,
+                error_details=getattr(error, "error_details", {}),
+                duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
+            )
+
         try:
             post_args = {
                 "stream": stream_callback is not None,
@@ -386,7 +399,7 @@ def build_graph(
                 post_args["cancel_event"] = cancel_event
             resp = llm_client.post(payload, **post_args)
         except Exception as exc:
-            emit("llm_request_failed", error_type=type(exc).__name__)
+            emit_request_failed(exc)
             raise
         emit("llm_response_headers", duration_ms=round((time.perf_counter() - request_started) * 1000, 1))
 
@@ -503,8 +516,17 @@ def build_graph(
                         emit("request_cancelled", stage="stream")
                         raise RequestCancelledError("模型流式响应已取消") from exc
                     if llm_client:
+                        # Snapshot HTTP status and the low-level read failure
+                        # before closing/replaying a stream. A replay may fail
+                        # at its deadline gate without making another request.
+                        stream_error = (
+                            llm_client.stream_error(request_budget, exc, resp)
+                            if hasattr(llm_client, "stream_error") else
+                            LLMRequestTimeoutError("模型流式响应中断；未切换模型，请稍后点击重试")
+                        )
                         llm_client.finish_stream(resp, success=False)
                     else:
+                        stream_error = LLMRequestTimeoutError("模型流式响应中断；未切换模型，请稍后点击重试")
                         try:
                             resp.close()
                         except Exception:
@@ -521,12 +543,18 @@ def build_graph(
                         }
                         if cancel_event is not None:
                             retry_args["cancel_event"] = cancel_event
-                        resp = llm_client.post(payload, **retry_args)
+                        try:
+                            resp = llm_client.post(payload, **retry_args)
+                        except RequestCancelledError:
+                            raise
+                        except Exception as retry_error:
+                            emit_request_failed(retry_error)
+                            raise
                         continue
                     if not full_text:
-                        raise LLMRequestTimeoutError(
-                            "模型流式响应中断；未切换模型，请稍后点击重试"
-                        ) from exc
+                        emit_request_failed(stream_error)
+                        raise stream_error from exc
+                    emit_request_failed(stream_error)
                     interruption = "\n\n⚠️ 输出中断，已保留以上内容。发送 `/retry` 可重新请求。"
                     full_text += interruption
                     stream_callback(interruption)
@@ -556,11 +584,12 @@ def build_graph(
                     {"id": v["id"], "type": "function", "function": v["function"]}
                     for v in sorted(tool_calls_acc.values(), key=lambda x: x.get("id", ""))
                 ]
-            emit(
-                "llm_request_finished",
-                duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
-                **request_budget.metrics(),
-            )
+            if not request_failure_emitted:
+                emit(
+                    "llm_request_finished",
+                    duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
+                    **request_budget.metrics(),
+                )
             return {"messages": [assistant_msg]}
 
         # 非流式模式

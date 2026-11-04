@@ -22,6 +22,7 @@ from run_contract import (
     infer_persisted_event_type,
     safe_metadata,
     safe_metrics,
+    safe_error_details,
 )
 
 
@@ -849,6 +850,7 @@ class SessionStore:
         error_type: str = "",
         event_type: str | None = None,
         metadata: dict[str, Any] | None = None,
+        error_details: dict[str, Any] | None = None,
     ) -> None:
         if not self.get(thread_id):
             return
@@ -861,6 +863,10 @@ class SessionStore:
             error_type=str(error_type or ""),
             event_type=event_type,
         )
+        payload = safe_metadata(metadata)
+        details = safe_error_details(error_details)
+        if details:
+            payload["error_details"] = details
         with self._conn:
             self._conn.execute(
                 "INSERT INTO agent_run_events "
@@ -872,7 +878,7 @@ class SessionStore:
                     str(agent or "agent")[:80], str(stage or "run")[:80], str(status or "running")[:40],
                     compact_summary,
                     json.dumps(self._safe_event_metrics(metrics), ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(safe_metadata(metadata), ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                     RUN_EVENT_SCHEMA_VERSION, str(error_type or "")[:120], self._now(),
                 ),
             )
@@ -894,9 +900,11 @@ class SessionStore:
         for row in rows:
             item = dict(row)
             item["metrics"] = self._decode_json(item.pop("metrics_json", "{}"), {})
-            item["metadata"] = safe_metadata(
-                self._decode_json(item.pop("payload_json", "{}"), {})
-            )
+            payload = self._decode_json(item.pop("payload_json", "{}"), {})
+            item["metadata"] = safe_metadata(payload) if isinstance(payload, dict) else {}
+            details = safe_error_details(payload.get("error_details")) if isinstance(payload, dict) else {}
+            if details:
+                item["error_details"] = details
             events.append(item)
         return events
 

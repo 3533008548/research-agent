@@ -26,6 +26,7 @@ import uvicorn
 from api.app import create_app, mount_react_frontend
 from api.redis_runs import RedisChatRunBroker, RedisChatRunManager, RedisChatRunWorker
 from config import Config
+from llm_client import LLMRequestFailedError
 from session_store import SessionStore
 
 
@@ -80,6 +81,22 @@ class _E2EAgent:
 
     def step(self, message: str, *, session_id: str, cancel_event, on_token, **_kwargs) -> str:
         self.calls.append({"message": message, "session_id": session_id})
+        if message == "__error__":
+            raise RuntimeError("浏览器 E2E 受控失败")
+        if message == "__http401__":
+            # Exercise the real broker/SSE/API diagnostic path without any
+            # external request. Unknown fields must not reach persisted runs.
+            error = LLMRequestFailedError("模型 API 返回 401：受控认证失败")
+            error.error_details = {
+                "code": "LLM_HTTP_ERROR", "phase": "response_headers",
+                "exception_type": "LLMRequestFailedError", "cause_type": "HTTPError",
+                "http_status": 401, "elapsed_ms": 512.4, "deadline_ms": 45000,
+                "queue_wait_ms": 0, "attempts": 1, "retries_used": 0,
+                "request_id": "req-browser-fixture-401",
+                "response_body": "E2E_PRIVATE_RESPONSE_DO_NOT_RENDER",
+                "api_key": "E2E_PRIVATE_KEY_DO_NOT_RENDER",
+            }
+            raise error
         if message == "__slow__":
             on_token("旧会话片段")
             cancel_event.wait(timeout=4)
@@ -110,6 +127,12 @@ def create_e2e_app(data_dir: str, redis_url: str = ""):
         worker_thread.start()
     app = create_app(agent=agent, title="科研助手 API 浏览器 E2E", chat_run_manager=manager)
     app.state.e2e_uses_redis = bool(redis_url)
+
+    @app.post("/__e2e__/documents", include_in_schema=False)
+    def e2e_create_document(payload: dict) -> dict:
+        # This fixture-only route seeds the same isolated store read by the
+        # production document API; no model or user runtime is involved.
+        return app.state.research_document_store.save(payload["title"], payload["content"])
 
     @app.get("/__e2e__/state", include_in_schema=False)
     def e2e_state() -> dict:

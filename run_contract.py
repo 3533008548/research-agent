@@ -9,6 +9,8 @@ orchestrators and SQLite tables.
 from __future__ import annotations
 
 from typing import Any
+import math
+import re
 
 
 RUN_EVENT_SCHEMA_VERSION = 1
@@ -36,6 +38,60 @@ TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "partial_
 TERMINAL_EVENT_STAGES = frozenset({"run", "completed", "cancelled", "failed", "delivery", "orchestrator"})
 RUN_KINDS = frozenset({"chat", "research", "daily", "experiment"})
 RESEARCH_SCOPES = frozenset({"both", "local", "public"})
+
+LLM_ERROR_CODES = frozenset({
+    "LLM_HTTP_ERROR", "LLM_DEADLINE_EXCEEDED", "LLM_STREAM_TIMEOUT",
+    "LLM_CONNECTION_ERROR", "LLM_RESPONSE_TIMEOUT", "LLM_CONNECT_TIMEOUT", "LLM_QUEUE_TIMEOUT", "LLM_QUEUE_FULL",
+    "LLM_CIRCUIT_OPEN", "LLM_STREAM_INTERRUPTED", "LLM_REQUEST_FAILED",
+})
+_ERROR_PHASES = frozenset({"queue", "connect", "response_headers", "stream_read", "retry", "unknown"})
+_EXCEPTION_TYPES = frozenset({
+    "LLMClientError", "LLMRequestTimeoutError", "LLMRequestFailedError",
+    "LLMQueueFullError", "LLMCircuitOpenError", "HTTPError", "_RetryableHTTPError",
+    "ReadTimeout", "ConnectTimeout", "Timeout", "ConnectionError",
+    "ChunkedEncodingError", "ReadTimeoutError", "ConnectTimeoutError",
+    "ProtocolError", "TimeoutError", "ConnectionResetError", "SSLError",
+    "RequestException", "JSONDecodeError", "RuntimeError", "OSError",
+})
+
+
+def safe_error_details(source: object) -> dict[str, Any]:
+    """Allow operational diagnostics, never exception text, URLs or response bodies."""
+    if not isinstance(source, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    if isinstance(source.get("code"), str) and source["code"] in LLM_ERROR_CODES:
+        safe["code"] = source["code"]
+    if isinstance(source.get("phase"), str) and source["phase"] in _ERROR_PHASES:
+        safe["phase"] = source["phase"]
+    for key in ("exception_type", "cause_type"):
+        if isinstance(source.get(key), str) and source[key] in _EXCEPTION_TYPES:
+            safe[key] = source[key]
+    status = source.get("http_status")
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        safe["http_status"] = status
+    for key in ("elapsed_ms", "deadline_ms", "queue_wait_ms", "attempts", "retries_used"):
+        value = source.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        maximum = 1000 if key in {"attempts", "retries_used"} else 604_800_000
+        if 0 <= value <= maximum and math.isfinite(value):
+            safe[key] = int(value) if key in {"attempts", "retries_used"} else round(value, 1)
+    request_id = source.get("request_id")
+    if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", request_id):
+        if not any(word in request_id.lower() for word in ("bearer", "authorization", "api_key", "api-key", "sk-")):
+            safe["request_id"] = request_id
+    return safe
+
+
+def latest_error_details(events: list[dict] | None) -> dict[str, Any]:
+    for event in reversed(events or []):
+        if not isinstance(event, dict):
+            continue
+        details = safe_error_details(event.get("error_details"))
+        if details:
+            return details
+    return {}
 
 
 _SAFE_METRIC_KEYS = frozenset({

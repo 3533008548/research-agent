@@ -303,6 +303,7 @@ class ChatRunResponse(BaseModel):
     duration_ms: float | None = None
     metrics: dict[str, int | float] = Field(default_factory=dict)
     error_type: str = ""
+    error_details: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
     completed_at: str | None = None
@@ -362,6 +363,7 @@ class RunResponse(BaseModel):
     duration_ms: float | None = None
     metrics: dict[str, int | float] = Field(default_factory=dict)
     error_type: str = ""
+    error_details: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
     completed_at: str | None = None

@@ -1,5 +1,8 @@
+import type { ReactNode } from "react";
 import { durationLabel, runKindLabel, stageLabel, statusLabel, toolLabel } from "../lib/labels";
+import { failedRunEvent, runEventDescription } from "../lib/runErrors";
 import type { Run, RunEvent } from "../types";
+import { RunErrorDetails } from "./RunErrorDetails";
 
 /**
  * The run inspector: what the current run is doing, and the events it
@@ -10,6 +13,8 @@ import type { Run, RunEvent } from "../types";
  * this shows the machinery that produced it.
  */
 export function RunInspector({
+  hidden = false,
+  children,
   run,
   events,
   onCancel,
@@ -17,6 +22,8 @@ export function RunInspector({
   onOpenRunCenter,
   cancelling,
 }: {
+  hidden?: boolean;
+  children?: ReactNode;
   run: Run | null;
   events: RunEvent[];
   onCancel: () => void;
@@ -25,7 +32,8 @@ export function RunInspector({
   cancelling: boolean;
 }) {
   return (
-    <aside className="run-inspector" aria-label="运行检查器">
+    <aside id="run-inspector" className="run-inspector" aria-label="运行检查器" hidden={hidden}>
+      <div className="run-inspector-content">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">运行检查器</p>
@@ -43,10 +51,10 @@ export function RunInspector({
         <>
           <dl className="run-summary">
             <div><dt>类型</dt><dd>{runKindLabel(run.kind)}</dd></div>
-            <div><dt>耗时</dt><dd>{durationLabel(run.duration_ms) || "进行中"}</dd></div>
+            <div><dt>耗时</dt><dd>{durationLabel(run.duration_ms) || (["queued", "running", "cancelling"].includes(run.status) ? "进行中" : "未记录")}</dd></div>
             {run.model && <div><dt>模型</dt><dd>{run.model}</dd></div>}
           </dl>
-          {!["completed", "cancelled", "failed"].includes(run.status) && (
+          {!["completed", "cancelled", "failed", "partial_failed"].includes(run.status) && (
             <button
               className="button button-secondary button-full"
               type="button"
@@ -69,25 +77,23 @@ export function RunInspector({
           <ol className="run-events">
             {events.map((event, index) => (
               <li key={`${event.type}-${index}`} className="run-event">
-                <span className={`event-dot event-${event.type}`} aria-hidden="true" />
+                <span className={`event-dot event-${failedRunEvent(event) ? "error" : event.type}`} aria-hidden="true" />
                 <div>
                   <strong>
-                    {event.type === "tool" ? toolLabel(event.tool) : statusLabel(event.status)}
+                    {event.type === "tool" ? toolLabel(event.tool) : statusLabel(event.status || (failedRunEvent(event) ? "failed" : undefined))}
                   </strong>
-                  <p>
-                    {event.type === "tool"
-                      ? `工具${event.status === "completed" ? "已完成" : "正在执行"}${durationLabel(event.duration_ms) ? ` · ${durationLabel(event.duration_ms)}` : ""}`
-                      : event.type === "error"
-                        ? event.error_type || "运行出错"
-                        : stageLabel(event.stage, event.type === "done" ? "已生成最终结果" : "任务状态更新")}
-                  </p>
+                  <p>{runEventDescription(event, event.type === "tool"
+                    ? `工具${event.status === "completed" ? "已完成" : "正在执行"}${durationLabel(event.duration_ms) ? ` · ${durationLabel(event.duration_ms)}` : ""}`
+                    : stageLabel(event.stage, "任务状态更新"))}</p>
                 </div>
               </li>
             ))}
           </ol>
-          {run.error_type && <p className="run-error">错误类型：{run.error_type}</p>}
+          <RunErrorDetails runId={run.run_id} errorType={run.error_type} details={run.error_details} />
         </>
       )}
+      </div>
+      {children}
     </aside>
   );
 }

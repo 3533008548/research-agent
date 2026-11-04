@@ -3880,7 +3880,7 @@ class TestResearchOrchestration(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_critic_timeout_keeps_completed_evidence_report(self):
+    def test_critic_timeout_keeps_partial_evidence_report_with_unknown_quality(self):
         from llm_client import LLMRequestTimeoutError
         from session_store import SessionStore
 
@@ -3903,20 +3903,22 @@ class TestResearchOrchestration(unittest.TestCase):
                      patch.object(orchestrator, "_run_workers", return_value=[self._worker_result("public")]):
                     result = orchestrator.run("研究 TSN", thread_id=session["thread_id"], scope="public")
 
-                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.status, "partial_failed")
                 self.assertIn("自动质检已跳过：LLMRequestTimeoutError", result.answer)
+                self.assertIn("基于证据的结论 [E1]", result.answer)
                 self.assertTrue(any(
                     stage.get("stage") == "critic" and stage.get("status") == "skipped"
                     for stage in result.trace["stages"]
                 ))
                 saved = store.get_research_run(result.run_id)
-                self.assertEqual(saved["status"], "completed")
+                self.assertEqual(saved["status"], "partial_failed")
+                self.assertEqual(saved["critique"]["verdict"], "unknown")
                 self.assertEqual(len(saved["evidence"]), 1)
             finally:
                 store.close()
 
 
-    def test_synthesis_timeout_returns_completed_cited_evidence_fallback(self):
+    def test_synthesis_timeout_returns_partial_cited_evidence_fallback_with_unknown_quality(self):
         from llm_client import LLMRequestTimeoutError
         from session_store import SessionStore
 
@@ -3941,7 +3943,7 @@ class TestResearchOrchestration(unittest.TestCase):
                         scope="public",
                     )
 
-                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.status, "partial_failed")
                 self.assertIn("[E1]", result.answer)
                 self.assertIn("突发负载", result.answer)
                 self.assertIn("限制", result.answer)
@@ -3954,7 +3956,8 @@ class TestResearchOrchestration(unittest.TestCase):
                     for stage in result.trace["stages"]
                 ))
                 saved = store.get_research_run(result.run_id)
-                self.assertEqual(saved["status"], "completed")
+                self.assertEqual(saved["status"], "partial_failed")
+                self.assertEqual(saved["critique"]["verdict"], "unknown")
                 self.assertEqual(len(saved["evidence"]), 1)
             finally:
                 store.close()
@@ -4399,6 +4402,36 @@ class TestCancellationPropagation(unittest.TestCase):
 
 class TestToolCatalog(unittest.TestCase):
     """工具声明必须在 Schema、运行时和分发器之间保持同源。"""
+
+    def test_profile_read_replace_and_remove_through_runtime(self):
+        from tool_runtime import ToolExecutionContext, ToolRuntime
+        from user_profile import ProfileManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ProfileManager(str(Path(tmp) / "profile.md"))
+            runtime = ToolRuntime(ToolExecutionContext())
+            self.assertIn("已更新", runtime.execute(
+                "update_profile", {"action": "add_paper", "content": "Paper A: old"},
+                profile_manager=profile,
+            ))
+            self.assertIn("Paper A: old", runtime.execute(
+                "read_profile", {"section": "已读论文"}, profile_manager=profile,
+            ))
+            self.assertIn("已更新", runtime.execute(
+                "update_profile", {
+                    "action": "replace_entry", "section": "已读论文",
+                    "content": "Paper A: old", "replacement": "Paper A: corrected",
+                }, profile_manager=profile,
+            ))
+            self.assertEqual(profile.read_section("已读论文"), ["Paper A: corrected"])
+            self.assertIn("已更新", runtime.execute(
+                "update_profile", {"action": "remove_entry", "section": "已读论文", "content": "Paper A: corrected"},
+                profile_manager=profile,
+            ))
+            self.assertEqual(profile.read_section("已读论文"), [])
+            self.assertIn("未知画像操作", runtime.execute(
+                "update_profile", {"action": "unknown", "content": "x"}, profile_manager=profile,
+            ))
 
     def test_catalog_filters_capabilities_and_returns_independent_schemas(self):
         from tool_catalog import TOOL_NAMES, get_tool_schemas
@@ -5391,9 +5424,71 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 agent.memory.close()
                 agent.sessions.close()
 
-    def test_new_paper_route_denies_document_write_tools_on_first_pass(self):
+    def test_default_chat_keeps_the_optional_build_arguments_omitted(self):
         from config import Config
         from research_agent import ResearchAgent
+
+        class _FakeApp:
+            def invoke(self, _state, config):
+                return {"messages": [{"role": "assistant", "content": "完成"}]}
+
+        # Deliberately no **kwargs: integrations using the default call shape
+        # must not be forced to accept optional policy or budget arguments.
+        def build_default(
+            usage, on_token=None, event_callback=None, cancel_event=None,
+            run_id="", session_id="", steer_provider=None,
+        ):
+            return _FakeApp()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+            try:
+                with patch.object(agent, "_build_app", side_effect=build_default):
+                    self.assertEqual(agent.step("请检索一个问题"), "完成")
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_scoped_chat_uses_the_real_graph_builder_entry(self):
+        from config import Config
+        from research_agent import MAX_AGENT_TOOL_ROUNDS, ResearchAgent
+
+        class _FakeApp:
+            def invoke(self, _state, config):
+                return {"messages": [{"role": "assistant", "content": "完成"}]}
+
+        cases = (
+            ("把这份方案保存成科研档案", {"save_research_document"}),
+            ("【复现实验项目确认】\nproject_id=experiment-abcdef123456\n已确认实验设置。",
+             {"update_experiment_project"}),
+            ("超时发生时系统应如何处理？", set()),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ResearchAgent(Config(
+                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
+            ))
+            try:
+                for message, allowed_tools in cases:
+                    with self.subTest(message=message):
+                        # Keep _build_app real; autospec also checks the actual
+                        # build_graph signature instead of swallowing kwargs.
+                        with patch("research_agent.build_graph", autospec=True, return_value=_FakeApp()) as build:
+                            self.assertEqual(agent.step(message), "完成")
+                        self.assertEqual(build.call_args.kwargs["allowed_tool_names"], allowed_tools)
+                        self.assertEqual(build.call_args.kwargs["tool_round_budget"], MAX_AGENT_TOOL_ROUNDS)
+                        self.assertEqual(
+                            agent.sessions.get_chat_run(agent.get_last_trace(agent.thread_id)["chat_run_id"])["status"],
+                            "completed",
+                        )
+            finally:
+                agent.memory.close()
+                agent.sessions.close()
+
+    def test_new_paper_route_denies_document_write_tools_on_first_pass(self):
+        from config import Config
+        from research_agent import MAX_AGENT_TOOL_ROUNDS, ResearchAgent
         from research_document_routing import route_research_document_request
 
         class _FakeApp:
@@ -5408,26 +5503,26 @@ class TestAuditRegressionFixes(unittest.TestCase):
             agent = ResearchAgent(Config(
                 deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
             ))
-            captured = {}
-
-            def fake_build(_usage, *_args, **kwargs):
-                captured.update(kwargs)
-                return _FakeApp()
-
             try:
-                with patch.object(agent, "_build_app", side_effect=fake_build):
+                with patch("research_agent.build_graph", autospec=True, return_value=_FakeApp()) as build:
                     self.assertEqual(agent.step(envelope), "请确认拟修改项。")
+                captured = build.call_args.kwargs
                 self.assertEqual(
                     captured["allowed_tool_names"],
                     {"list_indexed_papers", "review_new_paper_impact_on_research_document"},
                 )
+                self.assertEqual(captured["tool_round_budget"], MAX_AGENT_TOOL_ROUNDS)
             finally:
                 agent.memory.close()
                 agent.sessions.close()
 
     def test_safe_patch_route_uses_document_only_tools_and_extra_bounded_budget(self):
         from config import Config
-        from research_agent import RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS, ResearchAgent
+        from research_agent import (
+            RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS,
+            RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS,
+            ResearchAgent,
+        )
         from research_document_routing import route_research_document_request
 
         class _FakeApp:
@@ -5446,15 +5541,10 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
             ))
             app = _FakeApp()
-            captured = {}
-
-            def fake_build(_usage, *_args, **kwargs):
-                captured.update(kwargs)
-                return app
-
             try:
-                with patch.object(agent, "_build_app", side_effect=fake_build):
+                with patch("research_agent.build_graph", autospec=True, return_value=app) as build:
                     self.assertEqual(agent.step(envelope), "已写入。")
+                captured = build.call_args.kwargs
                 self.assertEqual(
                     captured["allowed_tool_names"],
                     {
@@ -5463,6 +5553,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
                         "apply_research_document_patch",
                     },
                 )
+                self.assertEqual(captured["tool_round_budget"], RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS)
                 self.assertEqual(app.config["recursion_limit"], RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS)
             finally:
                 agent.memory.close()
@@ -5493,15 +5584,10 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
             ))
             app = _FakeApp()
-            captured = {}
-
-            def fake_build(_usage, *_args, **kwargs):
-                captured.update(kwargs)
-                return app
-
             try:
-                with patch.object(agent, "_build_app", side_effect=fake_build):
+                with patch("research_agent.build_graph", autospec=True, return_value=app) as build:
                     self.assertEqual(agent.step(envelope), "✅ 已安全更新研究档案")
+                captured = build.call_args.kwargs
                 self.assertEqual(
                     captured["allowed_tool_names"],
                     {
@@ -5509,6 +5595,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
                         "apply_research_document_patch",
                     },
                 )
+                self.assertEqual(captured["tool_round_budget"], RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS)
                 self.assertFalse(captured["enable_verify"])
                 # Two rounds could not even fit the ideal path (read context ->
                 # read dossier -> apply patch), so any retry tripped the limit.

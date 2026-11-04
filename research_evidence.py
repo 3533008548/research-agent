@@ -484,7 +484,10 @@ def audit_citations(report: str, evidence: list[dict[str, Any]]) -> dict[str, An
         if isinstance(item.get("evidence_unit"), dict)
     }
     markers = extract_citation_markers(report)
-    unknown: list[str] = []
+    # The visible citation is a claim of source existence too. Omitting the
+    # hidden annotation must not hide an invented evidence ID from the gate.
+    visible_refs = set(re.findall(r"\[(E\d+)\]", report))
+    unknown: list[str] = sorted(visible_refs - known_ids)
     weak: list[str] = []
     upgraded: list[str] = []
     for marker in markers:

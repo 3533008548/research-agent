@@ -62,6 +62,7 @@ _PRESENTATION = {
     "list_indexed_papers": ("索引论文列表", 3_000),
     "delete_paper": ("论文删除", 3_000),
     "update_profile": ("用户画像更新", 3_000),
+    "read_profile": ("用户画像读取", 6_000),
     "memory_search": ("记忆检索", 1_500),
 }
 

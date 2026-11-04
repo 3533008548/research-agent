@@ -1,22 +1,24 @@
 # RAG 向量化重构与 Qwen3 迁移方案
 
-选定嵌入模型 **Qwen3-Embedding** 后的整体优化方案，围绕六个目标：
+最初以 **Qwen3-Embedding** 为候选模型制定的整体优化方案，围绕六个目标：
 架构清晰、可读性强、运行速度、可维护、用户体验、功能提升。
+
+> 2026-10-23 状态校对：当前仓库配置为 `intfloat/multilingual-e5-small`、384 维、512 token、`papers_e5` 集合，重排器为 `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`。Qwen3 保留为可选后端，没有切为当前默认。以下 2026-09 的性能数字、论文数、集合与模型下载情况是历史记录，本次未重新运行评测或检查用户缓存。
 
 ## 实施状态
 
 | 阶段 | 状态 | 实测结果 |
 |---|---|---|
-| P0 配置化与可插拔 | ✅ 完成 | `embeddings.py` + `config.yaml` 的 `rag.embedding.*`；197 测试通过 |
-| P1 Qwen3 接入 | ✅ 模型已下载，❌ 实测后**不切换** | 权重在 `runtime/derived/cache/huggingface`（1.2 GB，离线可加载）。对照评测显示收益在噪声内，见下方"Qwen3 对照实测" |
+| P0 配置化与可插拔 | ✅ 完成 | `embeddings.py` + `config.yaml` 的 `rag.embedding.*`；配置与构造参数已贯通 |
+| P1 Qwen3 接入 | ✅ 后端已实现，未切为默认 | 历史评测曾下载模型并决定不切换，见下方“Qwen3 对照实测”；当前缓存是否仍在需另查 |
 | P1 按 token 分块 | ✅ 完成 | `limit_chunks_to_tokens()`，入库前用模型分词器复核 |
 | P1 papers_v2 迁移（256 上限） | ✅ 完成、已删除 | **788 → 1158 块；截断 45% → 0%**；2026-09-28 被 512 版本取代后删除。需要时用 `build_length_probe.py` 重建（约 48 秒） |
-| P1.5 papers 重建（512 上限） | ✅ 完成并上线 | **17 篇 / 794 块**（比 256 版少 31%）；段落级 R@1 5.9% → **38.2%**。`papers_v2` 转作回滚备份 |
+| P1.5 papers 重建（512 上限） | ✅ 历史迁移完成，当前已由 E5 集合取代 | 当时 **17 篇 / 794 块**（比 256 版少 31%）；段落级 R@1 5.9% → **38.2%**。当前配置使用 `papers_e5`，不据旧记录判断用户现存回滚集合 |
 | P2 嵌入通道提速 | ✅ 完成 | 复用 ONNX 会话 + 按批内最长填充；**单条查询编码 595 ms → 2.5 ms**，数值与 ChromaDB 完全一致（最大绝对误差 0.0），无需重建索引 |
 | P2 词法检索倒排化 | ✅ 完成 | 倒排表缓存，**lexical 168 ms → 19 ms**；BM25 打分与全量扫描逐条一致 |
 | P2.5 词法索引持久化 | ⬜ 未开始 | 索引目前是进程内缓存，冷启动首次查询仍需建表 |
-| P3 类拆分 | ⬜ 未开始 | `PaperStore` 仍约 800 行、8 项职责 |
-| P4 体验与功能增强 | ⬜ 未开始 | 进度反馈、预热、指令感知、Qwen3-Reranker |
+| P3 类拆分 | 🟡 已部分完成 | `papers/chunking.py`、`lexical.py`、`rerank.py`、`hybrid.py`、`metrics.py` 已抽出；`paper_store.py` 仍保留存储门面与编排，继续拆分按依赖需要推进 |
+| P4 体验与功能增强 | 🟡 已部分完成 | 后台嵌入预热和超时关键词降级已有实现；重建进度体验及 Qwen3 专属指令、长上下文、Reranker 保留为可选后续项 |
 
 > 说明：P1 的"消除截断"收益已通过**当前模型 + 按 token 分块**拿到，
 > 不依赖 Qwen3 是否下载成功。Qwen3 带来的是检索质量提升，属于额外收益。
@@ -100,7 +102,9 @@
 
 ---
 
-## 一、现状诊断（问题 → 代码位置 → 影响）
+## 一、原始诊断（历史快照，当前状态以上表为准）
+
+配置化、token 守卫、倒排缓存、ONNX 会话复用和部分模块拆分已实现；本表保留当时的问题与旧行号，不能直接作为当前待办清单。当前明确保留的优化选项包括倒排索引持久化、查询向量缓存，以及有收益证据时继续拆分存储与编排职责。
 
 | # | 问题 | 位置 | 影响 |
 |---|---|---|---|
@@ -117,7 +121,7 @@
 
 ---
 
-## 二、目标架构（模块拆分）
+## 二、目标架构（部分已实现，完整形态为后续选项）
 
 ```
 调用方 (tools / agent / routes)
@@ -148,7 +152,27 @@ Chunker（按 token 计数，保留公式保护） + ChromaDB 持久化
 
 ---
 
-## 三、配置化设计（config.yaml）
+## 三、当前配置与未来候选
+
+当前 `config.yaml` 的关键配置：
+
+```yaml
+rag:
+  embedding:
+    model: intfloat/multilingual-e5-small
+    dimensions: 384
+    max_length: 512
+    batch_size: 32
+    device: cpu
+    collection: papers_e5
+  reranker:
+    enabled: true
+    model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+    candidate_limit: 12
+    max_length: 256
+```
+
+以下是原 Qwen3 候选设计，不是当前生效配置；切换前仍需对同一语料、同一标注集评测并创建新集合：
 
 ```yaml
 rag:
@@ -161,25 +185,25 @@ rag:
     device: cpu                         # 有 GPU 时改 cuda
   reranker:
     enabled: true
-    model: Qwen/Qwen3-Reranker-0.6B     # 与嵌入同族，效果一致
+    model: Qwen/Qwen3-Reranker-0.6B     # 待单独评测，不因同族而假定效果一致
     candidate_limit: 20
 ```
 
-`Config` 增加对应字段，`PaperStore` 构造函数接收 `embedding_model` / `embedding_dimensions`，
+`Config` 已有对应字段，`PaperStore` 构造函数已接收 `embedding_model` / `embedding_dimensions`，
 与现有 `reranker_*` 参数保持同一风格。
 
 ---
 
 ## 四、分阶段实施（按风险从低到高）
 
-### P0 — 配置化与可插拔（低风险，建议先做）
+### P0 — 配置化与可插拔（已完成，保留原步骤）
 1. 抽出 `Embedder` Protocol + `MiniLMEmbedder`（包装现有实现，行为不变）。
 2. `config.yaml` 增加 `rag.embedding.*`，`Config` 与构造函数透传。
 3. 修正模块 docstring；把魔数提取为命名常量（`SECTION_BONUS`、`BM25_K1`、`BM25_B` 等）。
 4. 定义 `Store` Protocol，`NoOpStore` 改为实现它。
 > 此阶段**不改变任何行为**，纯结构性改造，可独立回滚。
 
-### P1 — 接入 Qwen3 并迁移集合
+### P1 — 接入 Qwen3 并迁移集合（后端已实现，默认切换未采用）
 1. 新增 `Qwen3Embedder`（首次下载约 0.6–1.2GB，需网络）。
 2. 维度 384 → 1024，ChromaDB **必须新建集合**（维度创建时固定）：
    - 建 `papers_v2` → 全量重索引 → 校验条数 → 原子切换 → 保留 `papers` 作回滚备份。
@@ -197,20 +221,20 @@ rag:
 5. Qwen3 批处理（与 MiniLM 不同，Qwen3 上增大 batch 确实提速）。
 6. 可选：用 MRL 把粗排向量降到 256/512 维，减少内存与搜索耗时。
 
-### P3 — 类拆分重构
-按第二节把 `PaperStore` 拆成 6 个模块，保持外部 API 不变，逐步迁移调用点。
+### P3 — 类拆分重构（部分完成）
+切块、词法、重排、融合与指标模块已经抽出。进一步拆出 VectorIndex 或 PaperRepository 是可选后续重构，保持外部 API 不变，不为凑模块数量搬移代码。
 
 ### P4 — 体验与功能增强
 1. **重建索引进度反馈**：Qwen3 在 CPU 上比 MiniLM 慢约 20–40 倍，必须让用户看到进度与预计耗时。
-2. **启动预热**：沿用现有 `start_embedding_warmup` 思路，后台加载，避免首次查询卡顿。
+2. **启动预热（已实现）**：`start_embedding_warmup` 在后台加载；交互查询超过预算时可回退关键词候选。
 3. **指令感知**：Qwen3 支持给查询加 instruction 前缀（如"检索与该方法相关的论文段落"），
    官方称可带来 1%–5% 提升。
 4. **长上下文**：32k 上下文后可按"章节/整段"索引，不再被迫碎切成 1000 字符。
-5. Reranker 换同族 `Qwen3-Reranker`，与嵌入模型语义空间更一致。
+5. 可选评测 `Qwen3-Reranker`；只有实测收益足以覆盖资源成本时才考虑替换当前重排器。
 
 ---
 
-## 五、预期收益
+## 五、原 Qwen3 候选的预期收益（历史估算，不代表当前配置）
 
 | 维度 | 现状（实测） | 迁移后（预期） |
 |---|---|---|

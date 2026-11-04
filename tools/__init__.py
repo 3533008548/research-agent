@@ -29,7 +29,7 @@ from tools.research_documents import (
 )
 from tools.experiment_projects import handle_update_experiment_project
 from tools.describe import handle_describe_image
-from tools.profile_tool import handle_update_profile
+from tools.profile_tool import handle_read_profile, handle_update_profile
 from cancellation import raise_if_cancelled
 from tool_catalog import TOOL_NAMES, get_tool_definition
 
@@ -63,6 +63,7 @@ _TOOL_HANDLERS = {
     "list_indexed_papers": handle_list_indexed,
     "delete_paper": handle_delete_paper,
     "update_profile": handle_update_profile,
+    "read_profile": handle_read_profile,
 }
 
 _EXECUTABLE_TOOL_NAMES = frozenset({*_TOOL_HANDLERS, "memory_search"})

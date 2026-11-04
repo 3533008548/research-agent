@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -23,12 +24,16 @@ from mcp_client import ExternalToolRegistry, McpServerSpec
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _spec() -> McpServerSpec:
+def _spec(data_dir: str) -> McpServerSpec:
     return McpServerSpec(
         name="self",
         command=sys.executable,
         args=(str(PROJECT_ROOT / "mcp_server.py"),),
-        env={"PYTHONPATH": str(PROJECT_ROOT), "MCP_LOG_LEVEL": "WARNING"},
+        env={
+            "APP_DATA_DIR": data_dir,
+            "PYTHONPATH": str(PROJECT_ROOT),
+            "MCP_LOG_LEVEL": "WARNING",
+        },
         timeout_seconds=60.0,
     )
 
@@ -38,16 +43,17 @@ class McpClientEndToEndTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.registry = ExternalToolRegistry([_spec()])
+        runtime = tempfile.TemporaryDirectory(prefix="mcp-client-e2e-")
+        # Class cleanups also run after setup failures. Register the runtime
+        # first so the registry closes before its data directory is removed.
+        cls.addClassCleanup(runtime.cleanup)
+        cls.registry = ExternalToolRegistry([_spec(runtime.name)])
+        cls.addClassCleanup(cls.registry.stop)
+        cls.addClassCleanup(cls.registry.unpublish_from_catalog)
         # The server warms its vector store before serving, so the first
         # handshake is slow on a cold model cache.
         cls.registry.start(timeout_seconds=180.0)
         cls.registry.publish_to_catalog()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.registry.unpublish_from_catalog()
-        cls.registry.stop()
 
     def test_tools_are_discovered(self):
         names = {tool.remote_name for tool in self.registry.tools()}

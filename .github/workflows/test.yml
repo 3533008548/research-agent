@@ -67,7 +67,8 @@ jobs:
           tests.test_conversation_reference tests.test_paper_matching
           tests.test_paper_scope tests.test_relation_review
           tests.test_repository_preparation tests.test_repository_sources
-          tests.test_ci_test_coverage -v
+          tests.test_ci_test_coverage tests.test_llm_diagnostics
+          tests.test_error_diagnostics_contract tests.test_user_profile -v
 
       - name: Run offline release quality gate
         run: python -m evals.release_gate --strict
