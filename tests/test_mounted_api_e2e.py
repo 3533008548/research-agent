@@ -142,13 +142,14 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             "document.documentElement.scrollWidth <= window.innerWidth + 1"
         ))
 
-    def _wait_for_run_status(self, expected: str) -> dict:
+    def _wait_for_run_status(self, expected: str, run_id: str | None = None) -> dict:
         deadline = time.monotonic() + 8
         latest: dict = {}
         while time.monotonic() < deadline:
             state = self._state()
-            if state["runs"]:
-                latest = state["runs"][-1]
+            runs = [run for run in state["runs"] if run_id is None or run["run_id"] == run_id]
+            if runs:
+                latest = runs[-1]
                 if latest["status"] == expected:
                     return latest
             time.sleep(0.1)
@@ -165,19 +166,117 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         run = self._wait_for_run_status("completed")
         self.assertEqual(run["answer"], "来自 FastAPI：API 客户端测试")
 
-    def test_switching_session_cancels_old_fastapi_run(self) -> None:
+    def test_switching_sessions_keeps_runs_and_drafts_isolated(self) -> None:
+        cancelled = []
+        self.page.on("request", lambda request: cancelled.append(request.url)
+                     if request.url.endswith("/cancel") else None)
         self._send("__slow__")
         self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=8_000)
 
         self._new_session()
-        self._wait_for_run_status("cancelled")
         self.page.get_by_text("旧会话片段", exact=True).wait_for(state="detached", timeout=3_000)
-
         self._send("新会话请求")
+        # The second request is accepted even while A is running (a single
+        # Redis consumer may queue it until A completes).
+        self.page.get_by_text("新会话请求", exact=True).wait_for(timeout=3_000)
+        self.page.locator(".session-item").filter(has_text="浏览器 E2E 会话").click()
+        self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=3_000)
+        self.page.get_by_text("新会话请求", exact=True).wait_for(state="detached")
+        self.page.locator(".session-item").filter(has_text="新会话").click()
         self.page.get_by_text("来自 FastAPI：新会话请求", exact=True).wait_for(timeout=8_000)
+        self.page.locator("textarea").first.fill("B 的草稿")
+        self.page.locator(".session-item").filter(has_text="浏览器 E2E 会话").click()
+        self.page.get_by_text("慢请求完成", exact=True).wait_for(timeout=8_000)
+        self.assertEqual(self.page.locator("textarea").first.input_value(), "")
+        self.page.locator(".session-item").filter(has_text="新会话").click()
+        self.assertEqual(self.page.locator("textarea").first.input_value(), "B 的草稿")
+        self.assertEqual(self.page.get_by_text("慢请求完成", exact=True).count(), 0)
+        self.assertEqual(cancelled, [])
         state = self._state()
         self.assertEqual(len(state["calls"]), 2)
         self.assertNotEqual(state["calls"][0]["session_id"], state["calls"][1]["session_id"])
+        self.assertTrue(all(run["status"] == "completed" for run in state["runs"]))
+
+    def test_switch_before_create_run_response_does_not_cancel_it(self) -> None:
+        pending = []
+
+        def delay_response(route):
+            response = route.fetch()
+            pending.append((route, response))
+
+        self.page.route("**/api/v1/runs", delay_response)
+        self._send("__slow__")
+        deadline = time.monotonic() + 5
+        while not pending and time.monotonic() < deadline:
+            self.page.wait_for_timeout(20)
+        self.assertTrue(pending)
+        self._new_session()
+        self.page.wait_for_function("document.querySelectorAll('.session-item').length === 2")
+        route, response = pending.pop()
+        route.fulfill(response=response)
+        self.page.unroute("**/api/v1/runs", delay_response)
+        self._send("B 不受延迟影响")
+        self.page.get_by_text("来自 FastAPI：B 不受延迟影响", exact=True).wait_for(timeout=8_000)
+        self.assertEqual(self.page.get_by_text("慢请求完成", exact=True).count(), 0)
+        self.page.locator(".session-item").filter(has_text="浏览器 E2E 会话").click()
+        self.page.get_by_text("慢请求完成", exact=True).wait_for(timeout=8_000)
+        self.assertTrue(all(run["status"] == "completed" for run in self._state()["runs"]))
+
+    def test_reload_reconnects_running_session_and_restores_completed_history(self) -> None:
+        self._send("__slow__")
+        self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=8_000)
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=3_000)
+        self.page.get_by_text("慢请求完成", exact=True).wait_for(timeout=8_000)
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.get_by_text("慢请求完成", exact=True).wait_for(timeout=3_000)
+        self.assertEqual(self.page.get_by_text("慢请求完成", exact=True).count(), 1)
+        self.assertEqual(len(self._state()["calls"]), 1)
+
+    def test_explicit_stop_still_cancels_selected_session(self) -> None:
+        self._send("__slow__")
+        self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=8_000)
+        first_run = self._state()["runs"][0]
+        self._new_session()
+        self.page.wait_for_function("document.querySelectorAll('.session-item').length === 2")
+        self._send("__slow__")
+        self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=3_000)
+        self.assertEqual(len(self._state()["runs"]), 2)
+        self.assertTrue(all(run["status"] == "running" for run in self._state()["runs"]))
+        self.assertEqual(self.page.locator(".session-item .status-running").count(), 2)
+        self.page.locator(".session-item").filter(has_text="浏览器 E2E 会话").click()
+        self.page.get_by_role("button", name="暂停任务", exact=True).first.click()
+        self._wait_for_run_status("cancelled", first_run["run_id"])
+        self.page.locator(".session-item").filter(has_text="新会话").click()
+        self.page.get_by_text("慢请求完成", exact=True).wait_for(timeout=8_000)
+        other_run = next(run for run in self._state()["runs"] if run["run_id"] != first_run["run_id"])
+        self.assertEqual(other_run["status"], "completed")
+
+    def test_late_history_response_does_not_change_selected_session(self) -> None:
+        self.page.locator(".session-item.active").wait_for()
+        response = self.page.request.post(f"{self.base_url}/api/v1/sessions", data={"title": "B 延迟历史"})
+        session_id = response.json()["thread_id"]
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.wait_for_function("document.querySelectorAll('.session-item').length === 2")
+        pending = []
+
+        def delay_history(route):
+            pending.append((route, route.fetch()))
+
+        self.page.route(f"**/sessions/{session_id}/messages", delay_history)
+        self.page.locator(".session-item").filter(has_text="B 延迟历史").click()
+        deadline = time.monotonic() + 5
+        while not pending and time.monotonic() < deadline:
+            self.page.wait_for_timeout(20)
+        self.assertTrue(pending)
+        self.page.locator(".session-item").filter(has_text="浏览器 E2E 会话").click()
+        self.page.locator("textarea").first.fill("A 保留的草稿")
+        route, response = pending.pop()
+        route.fulfill(response=response)
+        # Wait until the rest of B's load finishes, then check it only updated B.
+        self.page.wait_for_timeout(200)
+        self.assertIn("浏览器 E2E 会话", self.page.locator(".session-item.active").inner_text())
+        self.assertEqual(self.page.locator("textarea").first.input_value(), "A 保留的草稿")
 
     def test_workspace_layout_keeps_sessions_and_tools_in_the_left_rail(self) -> None:
         # Use the fixture's real session API so navigation remains usable;

@@ -68,7 +68,7 @@ jobs:
           tests.test_paper_scope tests.test_relation_review
           tests.test_repository_preparation tests.test_repository_sources
           tests.test_ci_test_coverage tests.test_llm_diagnostics
-          tests.test_error_diagnostics_contract tests.test_user_profile -v
+          tests.test_error_diagnostics_contract tests.test_user_profile tests.test_run_dispatcher -v
 
       - name: Run offline release quality gate
         run: python -m evals.release_gate --strict
@@ -138,7 +138,7 @@ jobs:
           npm run build
 
       - name: Run browser regressions
-        run: python -m unittest tests.test_mounted_api_e2e -v
+        run: python -m unittest tests.test_run_dispatcher tests.test_mounted_api_e2e -v
 
   container-smoke:
     name: Docker build and health check

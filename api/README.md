@@ -24,15 +24,42 @@ API 请求 -> SQLite 运行记录（queued）-> Redis 优先级队列 -> api-wor
 - 取消操作会写入 Redis 取消标记；worker 监测到标记后，将现有的协作式取消令牌传给 Agent。
 - 对话与深度研究运行中可追加一条文本补充。补充会持久化到 SQLite，并只在下一个模型或研究
   节点被消费；它不会中断已经发出的模型请求，也不会写入普通会话历史或 SSE 事件内容。
-- Redis Consumer Group 会保留 worker 异常退出时未确认的任务；其他 worker 会在两分钟后认领。
+- Redis Consumer Group 会保留 worker 异常退出时未确认的任务；重启后的 worker 会在空闲时间达到默认两分钟阈值后认领。活跃执行和已预取的等待任务独立续租，不因处理时间长而被重复认领。
 - `GET /api/v1/metrics` 输出 Prometheus 文本指标：Redis 队列积压、worker 心跳、
   各类运行任务的状态计数和 API 进程运行时长。它不输出用户输入、模型回答、论文信息或工具参数。
 
-当前 Compose 配置故意只运行一个 `api-worker`，因为 SQLite 仍是主要用户数据存储。
-FastAPI API 实例可以横向扩展：它们只向共享 Redis 队列投递任务。单个 worker 进程中，
-聊天消费者和后台消费者共享同一个模型客户端，已有的交互保留并发槽可避免长时间后台任务
-挤占聊天请求。SQLite 尚未替换为多写入者的任务/状态存储前，请不要扩容 `api-worker`；
-届时还应增加 Redis 分布式模型信号量。
+当前 Compose 只运行一个 `api-worker` 进程，使用有界线程池并发执行。默认普通对话
+`CHAT_RUN_CONCURRENCY=2`、深度研究 `RESEARCH_RUN_CONCURRENCY=2`（范围 1–8）；每日检索和
+论文复现各保持 1。所有任务共享同一个模型客户端及其信号量，增加任务并发不会绕过模型请求上限。
+
+调度按 `session_id` 串行，聊天、深度研究和复现共用会话互斥；相同项目也不能同时执行。
+SQLite 中尚未结束的最早任务决定会话顺序，避免重启后新消息越过尚未认领的旧消息。
+每类最多预取“执行名额 + 32”项，等待会话的任务不占执行线程；超出窗口的任务保留在 Redis。
+因此极端积压时仍可能出现队首阻塞，当前不承诺所有等待会话都能立即取得名额。
+SSE 的 `session_wait` 与 `capacity_wait` 阶段分别表示等待本会话上一轮和等待任务执行名额。
+
+worker 独立更新心跳和 Redis PEL 空闲计时，续租和确认都原子检查消费者身份。
+未成功处理并保存结果的异常不再在 `finally` 中无条件确认；已保存终态的任务重投时直接确认，
+不再次调用 Agent。进程退出先停止接单，继续给正在执行的任务续租并等待结束；未执行的预取项
+留待重启认领。Compose 的停止宽限期耗尽时仍可能被强制终止。
+
+数据目录内的 `api-worker.lock` 使用操作系统锁保护整个 worker 生命周期，不随租约超时失效，
+进程退出后自动释放。不能删除锁文件来强制启动第二个 worker，也不要把多个不同数据目录的
+worker 指向同一组 Redis 队列。该限制避免旧进程尚在写工具文件时新进程并行重放。
+这是单进程并发方案，不是分布式执行权隔离；任务崩溃重放仍不能保证所有外部工具副作用恰好一次。
+多进程扩容需要跨进程状态存储、模型信号量和工具写入的幂等/执行权校验。
+
+并发回归使用独立 Redis，不挂载应用数据：
+
+```powershell
+docker compose -p research-agent-concurrency-test -f tests/redis.compose.yml up -d
+$env:E2E_REDIS_URL = "redis://127.0.0.1:16389/0"
+python -m unittest tests.test_run_dispatcher tests.test_mounted_api_e2e -v
+docker compose -p research-agent-concurrency-test -f tests/redis.compose.yml down
+```
+
+测试包含跨会话重叠、同会话顺序、跨类型互斥、并发上限、排队取消、长任务续租、重复投递、
+死消费者认领和结果保存后发布失败。真实 Agent 图的并发持久化测试只模拟模型响应。
 
 Compose 把 Redis 的 AOF/RDB 持久化目录挂载到 `runtime/derived/redis/`。这里包含活动队列与消费组状态，不能当作可重建缓存清理。`scripts/backup_runtime.py`（包括 `--include-derived`）不备份 Redis；维护时应先停止接单与定时投递、排空任务，再正常停止应用、worker 和 Redis，分别保存同一停机时间点的 primary 与整个 Redis 持久化目录。恢复时先加载匹配的 Redis 数据，再启动任务处理，避免旧队列与新 SQLite 混用。完整步骤见 [README 的运行时数据目录](../README.md#运行时数据目录)。
 

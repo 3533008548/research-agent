@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 
 import {
   cancelRun,
@@ -9,35 +9,28 @@ import {
   getRun,
   getSessionMessages,
   getSessionUsage,
+  listSessionRuns,
   listSessions,
   streamRun,
   uploadWorkspaceFile,
 } from "../api";
 import { userFacingError } from "../lib/errors";
-import { appendRunEvent, displayMessages, type DisplayMessage, type ResearchMode } from "../lib/labels";
+import { appendRunEvent, displayMessages, type ResearchMode } from "../lib/labels";
+import { useSessionConversationState } from "./useSessionConversationState";
 import type { Notice } from "../lib/workspace";
 import type {
-  ResearchScope,
   Run,
-  RunEvent,
   Session,
-  SessionUsage,
-  WorkspaceUpload,
 } from "../types";
 
 const ACTIVE_SESSION_KEY = "research-agent.active-session";
+const isPendingRun = (run: Run | null | undefined) => Boolean(
+  run && ["queued", "running", "cancelling"].includes(run.status),
+);
 
 /**
- * The conversation: sessions, the transcript, the composer and the run that
- * is currently streaming.
- *
- * Extracted from `App.tsx` without behaviour change.  Everything here shares
- * one lifecycle — a message starts a run, the run streams tokens into the
- * transcript, and the transcript belongs to a session — so keeping it in one
- * hook avoids threading a dozen pieces of state between separate ones.
- *
- * The two workbench-tab setters come in from outside because switching to
- * the chat tab is how the user comes back to the conversation.
+ * Session navigation only changes the visible conversation. Each run keeps
+ * its own stream and session-bound setters until it finishes or is stopped.
  */
 export function useConversation({
   apiKey,
@@ -54,34 +47,129 @@ export function useConversation({
   const [activeSessionId, setActiveSessionId] = useState<string | null>(
     () => localStorage.getItem(ACTIVE_SESSION_KEY),
   );
-  const [messages, setMessages] = useState<DisplayMessage[]>([]);
-  const [sessionUsage, setSessionUsage] = useState<SessionUsage | null>(null);
-  const [draft, setDraft] = useState("");
-  const [mode, setMode] = useState<ResearchMode>("chat");
-  const [researchScope, setResearchScope] = useState<ResearchScope>("both");
-  const [currentRun, setCurrentRun] = useState<Run | null>(null);
-  const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
-  const [isSending, setIsSending] = useState(false);
-  const [isCancelling, setIsCancelling] = useState(false);
-  const [attachment, setAttachment] = useState<WorkspaceUpload | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
-  const requestGenerationRef = useRef(0);
+  const { state, getSession, bindSession, sessionRunStatuses } = useSessionConversationState(activeSessionId);
+  const { messages, sessionUsage, draft, mode, researchScope, currentRun, runEvents,
+    isCancelling, attachment, isUploading } = state;
+  const isSending = state.isSending || state.loading || isPendingRun(currentRun);
+  const { setMessages, setSessionUsage, setDraft, setMode, setResearchScope, setCurrentRun,
+    setRunEvents, setIsSending, setIsCancelling, setAttachment, setIsUploading } = bindSession(activeSessionId);
+  const activeSessionRef = useRef(activeSessionId);
+  const streams = useRef(new Map<string, AbortController>());
+  const navigation = useRef(0);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
+  useEffect(() => () => {
+    // Unmounting disconnects observers; only the stop button cancels work.
+    for (const controller of streams.current.values()) controller.abort();
+    streams.current.clear();
+  }, []);
+
+  const observeRun = useCallback(async (sessionId: string, run: Run, streamUrl: string, restoring = false) => {
+    if (streams.current.has(run.run_id)) return;
+    const controller = new AbortController();
+    streams.current.set(run.run_id, controller);
+    const { setMessages, setCurrentRun, setRunEvents, setIsSending, setSessionUsage } = bindSession(sessionId);
+    const complete = (answer?: string) => setMessages((current) => {
+      const last = current.at(-1);
+      return last?.role === "assistant" && last.streaming
+        ? [...current.slice(0, -1), { ...last, content: answer ?? last.content, streaming: false }]
+        : current;
+    });
+    setCurrentRun(run);
+    setIsSending(true);
+    try {
+      await streamRun(apiKey, streamUrl, (event) => {
+        setRunEvents((current) => appendRunEvent(current, event));
+        if (event.type === "token") {
+          setMessages((current) => {
+            const last = current.at(-1);
+            return last?.role === "assistant" && last.streaming
+              ? [...current.slice(0, -1), { ...last, content: last.content + (event.text || "") }]
+              : current;
+          });
+        }
+        if (event.type === "status" || event.type === "done") {
+          const completed = event.type === "done" && event.status === "completed";
+          setCurrentRun((current) => current && {
+            ...current, status: event.status || current.status,
+            error_type: completed ? "" : event.error_type || current.error_type,
+            error_details: completed ? undefined : event.error_details || current.error_details,
+          });
+        }
+        if (event.type === "done") complete(event.answer);
+        if (event.type === "error") {
+          complete(`运行未能完成：${event.error_type || "RunError"}。可点击「查看运行详情」了解当前状态。`);
+          setCurrentRun((current) => current && {
+            ...current, status: "failed", error_type: event.error_type || "RunError",
+            error_details: event.error_details || current.error_details,
+          });
+        }
+      }, controller.signal);
+      if (controller.signal.aborted) return;
+      const detail = await getRun(apiKey, run.run_id);
+      setCurrentRun(detail);
+      complete(detail.answer || undefined);
+      if (isPendingRun(detail)) bindSession(sessionId).setLoaded(false);
+      // History and run status are separate snapshots. On reconnect, reload
+      // the final transcript so a completion during loading is not duplicated.
+      if (restoring && !isPendingRun(detail)) {
+        setMessages(displayMessages(await getSessionMessages(apiKey, sessionId)));
+      }
+      const [refreshedSessions, usage] = await Promise.all([
+        listSessions(apiKey), getSessionUsage(apiKey, sessionId),
+      ]);
+      // A background refresh must not drop a session created (or resurrect
+      // one deleted) while the list request was in flight.
+      const refreshedById = new Map(refreshedSessions.map((session) => [session.thread_id, session]));
+      setSessions((current) => current.map((session) => refreshedById.get(session.thread_id) || session));
+      setSessionUsage(usage);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      // A broken event connection does not prove the server task failed.
+      // Reloading this session reconnects to its persisted run.
+      bindSession(sessionId).setLoaded(false);
+      complete();
+      if (activeSessionRef.current === sessionId) {
+        setNotice({ kind: "error", text: userFacingError(error) });
+      }
+    } finally {
+      streams.current.delete(run.run_id);
+      setIsSending(false);
+    }
+  }, [apiKey, bindSession, setNotice]);
+
   const loadSession = useCallback(async (sessionId: string) => {
-    const [history, usage] = await Promise.all([
-      getSessionMessages(apiKey, sessionId),
-      getSessionUsage(apiKey, sessionId),
-    ]);
+    activeSessionRef.current = sessionId;
     setActiveSessionId(sessionId);
     localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
-    setMessages(displayMessages(history));
-    setSessionUsage(usage);
-    setCurrentRun(null);
-    setRunEvents([]);
-  }, [apiKey]);
+    const cached = getSession(sessionId);
+    if (cached.loaded || cached.loading || cached.isSending) return;
+    const target = bindSession(sessionId);
+    target.setLoading(true);
+    try {
+      const [history, usage] = await Promise.all([
+        getSessionMessages(apiKey, sessionId), getSessionUsage(apiKey, sessionId),
+      ]);
+      const runs = await listSessionRuns(apiKey, sessionId);
+      const run = runs.find((item) => ["chat", "research"].includes(item.kind));
+      const pending = run && isPendingRun(run);
+      const restored = displayMessages(history);
+      if (pending) {
+        restored.push({ id: `assistant-${run.run_id}`, role: "assistant", content: "", streaming: true });
+      } else if (run?.answer && restored.at(-1)?.role === "user") {
+        restored.push({ id: `assistant-${run.run_id}`, role: "assistant", content: run.answer });
+      }
+      target.setMessages(restored);
+      target.setSessionUsage(usage);
+      target.setCurrentRun(run || null);
+      target.setRunEvents([]);
+      target.setLoaded(true);
+      if (pending) void observeRun(sessionId, run, `/api/v1/runs/${encodeURIComponent(run.run_id)}/events`, true);
+    } finally {
+      target.setLoading(false);
+    }
+  }, [apiKey, bindSession, getSession, observeRun]);
 
   async function uploadAttachment(file: File) {
     if (isUploading || isSending) {
@@ -91,6 +179,7 @@ export function useConversation({
     try {
       const upload = await uploadWorkspaceFile(apiKey, file);
       setAttachment(upload);
+      if (activeSessionRef.current !== activeSessionId) return;
       setNotice({
         kind: "info",
         text: upload.duplicate
@@ -113,12 +202,13 @@ export function useConversation({
   }
 
   async function selectSession(sessionId: string) {
-    if (sessionId === activeSessionId) {
+    if (sessionId === activeSessionRef.current && getSession(sessionId).loaded) {
       return;
     }
     try {
-      await abandonActiveRunForNavigation();
+      const selection = ++navigation.current;
       await loadSession(sessionId);
+      if (selection != navigation.current) return;
       setActiveWorkbenchTabId("chat");
       setNotice(null);
     } catch (error) {
@@ -128,10 +218,12 @@ export function useConversation({
 
   async function startSession() {
     try {
-      await abandonActiveRunForNavigation();
+      const selection = ++navigation.current;
       const session = await createSession(apiKey);
       setSessions((current) => [session, ...current]);
+      if (selection != navigation.current) return;
       await loadSession(session.thread_id);
+      if (selection != navigation.current) return;
       setActiveWorkbenchTabId("chat");
       setNotice(null);
     } catch (error) {
@@ -151,6 +243,7 @@ export function useConversation({
         await loadSession(remaining[0].thread_id);
       } else {
         localStorage.removeItem(ACTIVE_SESSION_KEY);
+        activeSessionRef.current = null;
         setActiveSessionId(null);
         setMessages([]);
         setSessionUsage(null);
@@ -160,26 +253,6 @@ export function useConversation({
     } catch (error) {
       setNotice({ kind: "error", text: userFacingError(error) });
     }
-  }
-
-  function appendToken(text: string) {
-    setMessages((current) => {
-      const last = current.at(-1);
-      if (last?.role !== "assistant" || !last.streaming) {
-        return [...current, { id: `stream-${Date.now()}`, role: "assistant", content: text, streaming: true }];
-      }
-      return [...current.slice(0, -1), { ...last, content: last.content + text }];
-    });
-  }
-
-  function completeAnswer(answer: string | undefined) {
-    setMessages((current) => {
-      const last = current.at(-1);
-      if (last?.role === "assistant" && last.streaming) {
-        return [...current.slice(0, -1), { ...last, content: answer ?? last.content, streaming: false }];
-      }
-      return current;
-    });
   }
 
   async function sendMessage(
@@ -233,13 +306,9 @@ export function useConversation({
       return;
     }
 
-    if (isSending) {
+    if (isSending || getSession(activeSessionId).isSending || getSession(activeSessionId).loading) {
       return;
     }
-
-    const requestGeneration = requestGenerationRef.current + 1;
-    requestGenerationRef.current = requestGeneration;
-    const isCurrentRequest = () => requestGenerationRef.current === requestGeneration;
 
     const requestMode: ResearchMode = resumeResearch ? "research" : (requestedMode || mode);
     if (requestMode === "research" && pendingAttachment) {
@@ -254,6 +323,7 @@ export function useConversation({
       setDraft("");
     }
     setIsSending(true);
+    setCurrentRun(null);
     setNotice(null);
     setRunEvents([]);
     setMessages((current) => [
@@ -267,14 +337,10 @@ export function useConversation({
         apiKey, requestMode, activeSessionId, content, pendingAttachment?.upload_id,
         researchScope, resumeResearch,
       );
-      if (!isCurrentRequest()) {
-        await cancelRun(apiKey, started.run_id).catch(() => undefined);
-        return;
-      }
       if (!resumeResearch) {
         setAttachment(null);
       }
-      setCurrentRun({
+      const run: Run = {
         run_id: started.run_id,
         kind: started.kind,
         session_id: started.session_id,
@@ -290,85 +356,19 @@ export function useConversation({
         completed_at: null,
         events: [],
         steers: [],
-      });
-      const controller = new AbortController();
-      abortRef.current = controller;
-      await streamRun(apiKey, started.stream_url, (runEvent) => {
-        if (!isCurrentRequest()) {
-          return;
-        }
-        setRunEvents((current) => appendRunEvent(current, runEvent));
-        if (runEvent.type === "token") {
-          appendToken(runEvent.text || "");
-        }
-        if (runEvent.type === "status" || runEvent.type === "done") {
-          const completed = runEvent.type === "done" && runEvent.status === "completed";
-          setCurrentRun((current) => current && {
-            ...current,
-            status: runEvent.status || current.status,
-            error_type: completed ? "" : runEvent.error_type || current.error_type,
-            error_details: completed ? undefined : runEvent.error_details || current.error_details,
-          });
-        }
-        if (runEvent.type === "done") {
-          completeAnswer(runEvent.answer);
-        }
-        if (runEvent.type === "error") {
-          completeAnswer(`运行未能完成：${runEvent.error_type || "RunError"}。可点击「查看运行详情」了解当前状态。`);
-          setCurrentRun((current) => current && {
-            ...current,
-            status: "failed",
-            error_type: runEvent.error_type || "RunError",
-            error_details: runEvent.error_details || current.error_details,
-          });
-        }
-      }, controller.signal);
-      if (!isCurrentRequest()) {
-        return;
-      }
-      const detail = await getRun(apiKey, started.run_id);
-      if (!isCurrentRequest()) {
-        return;
-      }
-      setCurrentRun(detail);
-      completeAnswer(detail.answer || undefined);
-      const [refreshedSessions, usage] = await Promise.all([
-        listSessions(apiKey),
-        getSessionUsage(apiKey, activeSessionId),
-      ]);
-      setSessions(refreshedSessions);
-      setSessionUsage(usage);
+      };
+      await observeRun(activeSessionId, run, started.stream_url);
     } catch (error) {
-      if (!isCurrentRequest()) {
-        return;
-      }
       const message = userFacingError(error);
-      completeAnswer(`⚠️ ${message}`);
-      setNotice({ kind: "error", text: message });
-      setCurrentRun((current) => current && { ...current, status: "failed" });
+      setMessages((current) => {
+        const last = current.at(-1);
+        return last?.role === "assistant" && last.streaming
+          ? [...current.slice(0, -1), { ...last, content: `⚠️ ${message}`, streaming: false }]
+          : current;
+      });
+      if (activeSessionRef.current === activeSessionId) setNotice({ kind: "error", text: message });
     } finally {
-      if (isCurrentRequest()) {
-        abortRef.current = null;
-        setIsSending(false);
-      }
-    }
-  }
-
-  async function abandonActiveRunForNavigation() {
-    requestGenerationRef.current += 1;
-    const activeRun = currentRun;
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setIsSending(false);
-    setIsCancelling(false);
-    setCurrentRun(null);
-    setRunEvents([]);
-    if (activeRun && !["completed", "cancelled", "failed"].includes(activeRun.status)) {
-      try {
-        await cancelRun(apiKey, activeRun.run_id);
-      } catch {
-        // Navigation must not be blocked when the server has already ended the run.
-      }
+      setIsSending(false);
     }
   }
 
@@ -420,6 +420,7 @@ export function useConversation({
       if (selected) {
         await loadSession(selected.thread_id);
       } else {
+        activeSessionRef.current = null;
         setActiveSessionId(null);
         setMessages([]);
         setSessionUsage(null);
@@ -435,6 +436,7 @@ export function useConversation({
   }, [apiKey, loadSession]);
 
   return {
+    sessionRunStatuses,
     canSteerCurrentRun,
     loadWorkspace,
     sessions,
@@ -463,16 +465,11 @@ export function useConversation({
     setSessionUsage,
     messageListRef,
     uploadInputRef,
-    abortRef,
-    requestGenerationRef,
     loadSession,
     selectSession,
     startSession,
     removeActiveSession,
-    appendToken,
-    completeAnswer,
     sendMessage,
-    abandonActiveRunForNavigation,
     stopCurrentRun,
     retryCurrentChat,
     uploadAttachment,

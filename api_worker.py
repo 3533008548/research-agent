@@ -9,7 +9,9 @@ task is already waiting on a source or model request.
 from __future__ import annotations
 
 import os
+import signal
 import threading
+from pathlib import Path
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from api.redis_runs import (
@@ -23,6 +25,7 @@ from api.redis_runs import (
     RedisResearchRunBroker,
     RedisResearchRunWorker,
 )
+from api.run_dispatcher import RunDispatcher, worker_process_lock
 from config import Config
 from daily_orchestrator import DailyResearchOrchestrator
 from experiment_projects import ExperimentProjectStore
@@ -67,6 +70,13 @@ def main() -> None:
     if not redis_url:
         raise RuntimeError("REDIS_URL is required for api_worker")
     cfg = Config.load()
+    with worker_process_lock(Path(cfg.checkpoint_db).parent / "api-worker.lock"):
+        run_worker(cfg, redis_url)
+
+
+def run_worker(cfg, redis_url: str) -> None:
+    chat_concurrency = worker_concurrency("CHAT_RUN_CONCURRENCY", 2)
+    research_concurrency = worker_concurrency("RESEARCH_RUN_CONCURRENCY", 2)
     agent = ResearchAgent(cfg=cfg)
     warm_rag_before_consuming(agent)
     chat_broker = RedisChatRunBroker(redis_url)
@@ -120,23 +130,25 @@ def main() -> None:
         claim_idle_ms=int(os.getenv("EXPERIMENT_RUN_CLAIM_IDLE_MS", "120000")),
     )
 
-    # Independent consumers keep a long source fetch or background synthesis
-    # from blocking chat dispatch. All three share ``agent.llm_client``; its
-    # existing interactive-reserved permits therefore arbitrate model capacity
-    # in one place. API replicas remain safe because they only enqueue.
-    workers = (chat_worker, research_worker, daily_worker, experiment_worker)
-    threads = [
-        threading.Thread(
-            target=worker.run_forever,
-            name=f"api-{name}-consumer",
-            daemon=False,
-        )
-        for name, worker in zip(("chat", "research", "daily", "experiment"), workers, strict=True)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    # All executors share the Agent and its process-wide model semaphore.
+    # Each kind's admission queue is bounded; chat/research share session ordering.
+    dispatcher = RunDispatcher({
+        "chat": (chat_worker, chat_concurrency),
+        "research": (research_worker, research_concurrency),
+        "daily": (daily_worker, 1),
+        "experiment": (experiment_worker, 1),
+    })
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    dispatcher.run_forever(stop)
+
+
+def worker_concurrency(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if not 1 <= value <= 8:
+        raise ValueError(f"{name} must be between 1 and 8")
+    return value
 
 
 if __name__ == "__main__":

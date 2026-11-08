@@ -1,6 +1,7 @@
-import { useState, type Dispatch, type FormEvent, type RefObject, type SetStateAction } from "react";
+import { useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
 
 import {
+  cancelRun,
   createDailyKeyword,
   createDailyRun,
   deleteDailyKeyword,
@@ -38,22 +39,30 @@ export function useDailyWorkspace({
   setNotice,
   setWorkbenchTabs,
   setActiveWorkbenchTabId,
-  setCurrentRun,
-  isSending,
-  setIsSending,
-  setRunEvents,
-  abortRef,
 }: {
   apiKey: string;
   setNotice: (notice: Notice) => void;
   setWorkbenchTabs: Dispatch<SetStateAction<WorkbenchTab[]>>;
   setActiveWorkbenchTabId: (tabId: string) => void;
-  setCurrentRun: Dispatch<SetStateAction<Run | null>>;
-  isSending: boolean;
-  setIsSending: (value: boolean) => void;
-  setRunEvents: Dispatch<SetStateAction<RunEvent[]>>;
-  abortRef: RefObject<AbortController | null>;
 }) {
+  const [currentRun, setCurrentRun] = useState<Run | null>(null);
+  const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
+  const [isSending, setIsSending] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
+
+  async function stopDailyRun() {
+    if (!currentRun || !isSending || isCancelling) return;
+    setIsCancelling(true);
+    try {
+      const result = await cancelRun(apiKey, currentRun.run_id);
+      setCurrentRun((current) => current && { ...current, status: result.status });
+    } catch (error) {
+      setNotice({ kind: "error", text: userFacingError(error) });
+    } finally {
+      setIsCancelling(false);
+    }
+  }
+
   const [dailyDigest, setDailyDigest] = useState<DailyDigest>({ progress: "", papers: [] });
   const [dailyRuns, setDailyRuns] = useState<Run[]>([]);
   const [dailyLoading, setDailyLoading] = useState(false);
@@ -184,7 +193,6 @@ export function useDailyWorkspace({
         steers: [],
       });
       const controller = new AbortController();
-      abortRef.current = controller;
       await streamRun(apiKey, started.stream_url, (runEvent) => {
         setRunEvents((current) => appendRunEvent(current, runEvent));
         if (runEvent.type === "status" || runEvent.type === "done") {
@@ -208,7 +216,6 @@ export function useDailyWorkspace({
       setNotice({ kind: "error", text: message });
       setCurrentRun((current) => current && { ...current, status: "failed" });
     } finally {
-      abortRef.current = null;
       setIsSending(false);
       setDailyAction(null);
     }
@@ -230,6 +237,11 @@ export function useDailyWorkspace({
   }
 
   return {
+    dailyCurrentRun: currentRun,
+    dailyRunEvents: runEvents,
+    dailySending: isSending,
+    dailyCancelling: isCancelling,
+    stopDailyRun,
     dailyDigest,
     loadKeywords,
     replaceDailyRuns,

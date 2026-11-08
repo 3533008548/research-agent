@@ -64,6 +64,8 @@ services:
     environment:
       APP_DATA_DIR: /app/runtime
       REDIS_URL: redis://redis:6379/0
+      CHAT_RUN_CONCURRENCY: ${CHAT_RUN_CONCURRENCY:-2}
+      RESEARCH_RUN_CONCURRENCY: ${RESEARCH_RUN_CONCURRENCY:-2}
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Shanghai
     volumes:

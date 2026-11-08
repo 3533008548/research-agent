@@ -69,6 +69,7 @@ export function App() {
 
   const {
     canSteerCurrentRun,
+    sessionRunStatuses,
     sessions,
     activeSessionId,
     messages,
@@ -85,14 +86,10 @@ export function App() {
     setDraft,
     setMode,
     setResearchScope,
-    setCurrentRun,
-    setRunEvents,
-    setIsSending,
     setAttachment,
     setSessionUsage,
     messageListRef,
     uploadInputRef,
-    abortRef,
     loadWorkspace,
     selectSession,
     startSession,
@@ -109,6 +106,11 @@ export function App() {
   });
 
   const {
+    dailyCurrentRun,
+    dailyRunEvents,
+    dailySending,
+    dailyCancelling,
+    stopDailyRun,
     dailyDigest,
     dailyRuns,
     dailyLoading,
@@ -132,11 +134,6 @@ export function App() {
     setNotice,
     setWorkbenchTabs,
     setActiveWorkbenchTabId,
-    setCurrentRun,
-    isSending,
-    setIsSending,
-    setRunEvents,
-    abortRef,
   });
 
   const {
@@ -313,14 +310,17 @@ export function App() {
     ? methodReconstruction(activeWorkbenchTab.project)
     : null;
 
+  const inspectingDaily = activeWorkbenchTab?.kind === "daily" || activeWorkbenchTab?.kind === "dailyRun";
+  const inspectedRun = inspectingDaily ? dailyCurrentRun : currentRun;
+  const inspectedEvents = inspectingDaily ? dailyRunEvents : runEvents;
   const documentActive = activeWorkbenchTab?.kind === "document";
   const runInProgress =
-    isSending ||
+    isSending || dailySending ||
     ["running", "queued", "cancelling"].includes(currentRun?.status ?? "");
   const docFocusMode = documentActive && !runInProgress;
   const layout = useWorkspaceLayout({ docFocusMode });
   const activeSessionTitle = sessions.find((session) => session.thread_id === activeSessionId)?.title || "对话";
-  const runNeedsAttention = currentRun && ["failed", "partial_failed"].includes(currentRun.status);
+  const runNeedsAttention = inspectedRun && ["failed", "partial_failed"].includes(inspectedRun.status);
 
   return (
     <main className="app-shell">
@@ -333,6 +333,7 @@ export function App() {
           hidden={!layout.leftVisible}
           sessions={sessions}
           activeSessionId={activeSessionId}
+          sessionRunStatuses={sessionRunStatuses}
           isSending={isSending}
           openWorkspacePanel={openWorkspacePanel}
           workspaceLoading={workspaceLoading}
@@ -414,14 +415,14 @@ export function App() {
               </div>
             ))}
           </div>
-            {currentRun && (
+            {inspectedRun && (
               <button
                 type="button"
-                className={`run-status-button status status-${currentRun.status}`}
+                className={`run-status-button status status-${inspectedRun.status}`}
                 onClick={layout.showRight}
-                aria-label={`查看运行详情：${statusLabel(currentRun.status)}`}
+                aria-label={`查看运行详情：${statusLabel(inspectedRun.status)}`}
                 title="查看运行详情"
-              >{statusLabel(currentRun.status)}</button>
+              >{statusLabel(inspectedRun.status)}</button>
             )}
             <button
               type="button"
@@ -446,7 +447,7 @@ export function App() {
           {notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
           {!layout.rightVisible && runNeedsAttention && (
             <p className="run-alert" role="status">
-              <span>任务{statusLabel(currentRun.status)}{currentRun.error_type ? `：${currentRun.error_type}` : ""}</span>
+              <span>任务{statusLabel(inspectedRun.status)}{inspectedRun.error_type ? `：${inspectedRun.error_type}` : ""}</span>
               <button className="text-button" type="button" onClick={layout.showRight}>查看运行详情</button>
             </p>
           )}
@@ -519,7 +520,7 @@ export function App() {
               action={dailyAction}
               searchDraft={dailySearchDraft}
               runs={dailyRuns}
-              isSending={isSending}
+              isSending={dailySending}
               onSearchDraftChange={setDailySearchDraft}
               onStartDailyAction={(kind) => void startDailyAction(kind)}
               onLoadDailyCenter={() => void loadDailyCenter()}
@@ -556,12 +557,12 @@ export function App() {
 
           <RunInspector
             hidden={!layout.rightVisible}
-            run={currentRun}
-            events={runEvents}
-            onCancel={() => void stopCurrentRun()}
+            run={inspectedRun}
+            events={inspectedEvents}
+            onCancel={() => void (inspectingDaily ? stopDailyRun() : stopCurrentRun())}
             onRetry={() => void retryCurrentChat()}
             onOpenRunCenter={() => void openRunCenter()}
-            cancelling={isCancelling}
+            cancelling={inspectingDaily ? dailyCancelling : isCancelling}
           >
             {layout.rightResizeProps && <SidebarResizeHandle {...layout.rightResizeProps} />}
           </RunInspector>

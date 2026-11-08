@@ -113,6 +113,8 @@ export function statusLabel(status: string | undefined): string {
 export function stageLabel(stage: string | undefined, fallback: string): string {
   const labels: Record<string, string> = {
     steer_queued: "已收到运行中补充，等待下一节点使用",
+    session_wait: "等待本会话上一轮任务完成",
+    capacity_wait: "等待任务执行名额",
     steer_consumed: "运行中补充已在下一节点使用",
   };
   return labels[stage || ""] || stage || fallback;

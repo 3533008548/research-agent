@@ -26,6 +26,7 @@ export function SessionSidebar({
   children,
   sessions,
   activeSessionId,
+  sessionRunStatuses,
   isSending,
   openWorkspacePanel,
   workspaceLoading,
@@ -66,6 +67,7 @@ export function SessionSidebar({
   children?: ReactNode;
   sessions: Session[];
   activeSessionId: string | null;
+  sessionRunStatuses: Record<string, string>;
   isSending: boolean;
   openWorkspacePanel: string | null;
   workspaceLoading: string | null;
@@ -117,6 +119,11 @@ export function SessionSidebar({
             onClick={() => void onSelectSession(session.thread_id)}
           >
             <strong title={session.title}>{session.title}</strong>
+            {sessionRunStatuses[session.thread_id] && (
+              <span className={`status status-${sessionRunStatuses[session.thread_id]}`}>
+                {statusLabel(sessionRunStatuses[session.thread_id])}
+              </span>
+            )}
             <span title={session.preview || "尚未开始"}>{session.preview || "尚未开始"}</span>
           </button>
         ))}

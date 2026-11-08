@@ -451,7 +451,8 @@ def build_graph(
                         chunk = _json.loads(data_str)
                     except Exception:
                         continue
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    # A final usage-only frame can have an empty choices list.
+                    delta = (chunk.get("choices") or [{}])[0].get("delta", {})
                     token = delta.get("content", "")
                     if token:
                         full_text += token

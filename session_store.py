@@ -58,6 +58,26 @@ class SessionStore:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._init_db()
 
+    @_synchronized
+    def first_pending_run(self, thread_id: str) -> str | None:
+        """Durable session FIFO, including jobs outside the admission buffer.
+
+        Chat and research must not overtake an older unclaimed task after a
+        worker restart or when one kind's bounded buffer is full.
+        """
+        row = self._conn.execute(
+            """SELECT run_id FROM (
+                SELECT run_id, created_at, status FROM chat_runs WHERE thread_id = ?
+                UNION ALL
+                SELECT run_id, created_at, status FROM research_runs WHERE thread_id = ?
+                UNION ALL
+                SELECT run_id, created_at, status FROM experiment_runs WHERE thread_id = ?
+            ) WHERE status NOT IN ('completed', 'cancelled', 'failed', 'partial_failed')
+            ORDER BY created_at, run_id LIMIT 1""",
+            (thread_id, thread_id, thread_id),
+        ).fetchone()
+        return str(row["run_id"]) if row else None
+
     def _init_db(self) -> None:
         self._conn.executescript(
             """

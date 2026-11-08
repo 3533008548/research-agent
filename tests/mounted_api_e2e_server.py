@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 import uvicorn
 
 from api.app import create_app, mount_react_frontend
+from api.run_dispatcher import RunDispatcher
 from api.redis_runs import RedisChatRunBroker, RedisChatRunManager, RedisChatRunWorker
 from config import Config
 from llm_client import LLMRequestFailedError
@@ -42,6 +43,7 @@ class _E2EAgent:
         self._thread_id = str(self.sessions.create("浏览器 E2E 会话")["thread_id"])
         self._traces: dict[str, dict] = {}
         self.calls: list[dict[str, str]] = []
+        self._histories: dict[str, list[dict]] = {}
         self.profile = SimpleNamespace(read=lambda: "")
         self.runtime_status = {"daily_ready": True, "daily_progress": "", "daily_message": ""}
 
@@ -65,8 +67,8 @@ class _E2EAgent:
                 self._thread_id = str(remaining[0]["thread_id"])
         return deleted
 
-    def get_history(self, _session_id: str) -> list[dict]:
-        return []
+    def get_history(self, session_id: str) -> list[dict]:
+        return list(self._histories.get(session_id, []))
 
     @staticmethod
     def get_usage(_session_id: str) -> dict[str, int | float]:
@@ -81,6 +83,8 @@ class _E2EAgent:
 
     def step(self, message: str, *, session_id: str, cancel_event, on_token, **_kwargs) -> str:
         self.calls.append({"message": message, "session_id": session_id})
+        history = self._histories.setdefault(session_id, [])
+        history.append({"role": "user", "content": message})
         if message == "__error__":
             raise RuntimeError("浏览器 E2E 受控失败")
         if message == "__http401__":
@@ -104,12 +108,14 @@ class _E2EAgent:
                 self._traces[session_id] = {"outcome": "cancelled"}
                 return "已取消"
             self._traces[session_id] = {"outcome": "success"}
+            history.append({"role": "assistant", "content": "慢请求完成"})
             return "慢请求完成"
 
         prefix = "来自 FastAPI："
         on_token(prefix)
         on_token(message)
         self._traces[session_id] = {"outcome": "success"}
+        history.append({"role": "assistant", "content": f"{prefix}{message}"})
         return f"{prefix}{message}"
 
 
@@ -123,7 +129,8 @@ def create_e2e_app(data_dir: str, redis_url: str = ""):
         broker.ping()
         manager = RedisChatRunManager(agent, broker)
         worker = RedisChatRunWorker(agent, broker, consumer="browser-e2e-worker", claim_idle_ms=100)
-        worker_thread = threading.Thread(target=worker.run_forever, name="browser-e2e-worker", daemon=True)
+        dispatcher = RunDispatcher({"chat": (worker, 2)})
+        worker_thread = threading.Thread(target=dispatcher.run_forever, name="browser-e2e-worker", daemon=True)
         worker_thread.start()
     app = create_app(agent=agent, title="科研助手 API 浏览器 E2E", chat_run_manager=manager)
     app.state.e2e_uses_redis = bool(redis_url)

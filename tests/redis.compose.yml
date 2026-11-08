@@ -1,0 +1,7 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:16389:6379"
+    # Isolated, disposable test Redis; never mounts the application's runtime.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
