@@ -7,9 +7,6 @@ import {
   type DailyRunDetail,
   type DailyPaperStatus,
   type DailyRunKind,
-  type ExperimentFileContent,
-  type ExperimentProject,
-  type ExperimentProjectDetail,
   type Message,
   type Paper,
   type ResearchDocument,
@@ -21,6 +18,7 @@ import {
   type RunStart,
   type RunSteer,
   type ResearchScope,
+  type ResearchProject,
   type Session,
   type SessionUsage,
   type UserProfile,
@@ -29,6 +27,24 @@ import {
 } from "./types";
 
 const API_PREFIX = "/api/v1";
+
+export function listResearchProjects(apiKey: string): Promise<Array<Pick<ResearchProject, "project_id" | "question">>> {
+  return request("/research-projects", apiKey);
+}
+
+export function getResearchProject(apiKey: string, id: string): Promise<ResearchProject> {
+  return request(`/research-projects/${encodeURIComponent(id)}`, apiKey);
+}
+
+export function getResearchReport(apiKey: string, id: string, reportId: string): Promise<{ version: number; snapshot: { report: string } }> {
+  return request(`/research-projects/${encodeURIComponent(id)}/reports/${encodeURIComponent(reportId)}`, apiKey);
+}
+
+export function controlResearchProject(apiKey: string, id: string, action: string, message = ""): Promise<ResearchProject> {
+  return request(`/research-projects/${encodeURIComponent(id)}/controls`, apiKey, {
+    method: "POST", body: JSON.stringify({ action, message, event_id: crypto.randomUUID() }),
+  });
+}
 
 function headers(apiKey: string, includeJson = false): Headers {
   const result = new Headers({ Accept: "application/json" });
@@ -159,49 +175,6 @@ export function listPapers(apiKey: string): Promise<Paper[]> {
   return request("/workspace/papers", apiKey);
 }
 
-export function listExperimentProjects(apiKey: string): Promise<ExperimentProject[]> {
-  return request("/workspace/experiments", apiKey);
-}
-
-export function getExperimentProject(apiKey: string, projectId: string): Promise<ExperimentProjectDetail> {
-  return request(`/workspace/experiments/${encodeURIComponent(projectId)}`, apiKey);
-}
-
-export function getExperimentFile(
-  apiKey: string,
-  projectId: string,
-  relativePath: string,
-): Promise<ExperimentFileContent> {
-  return request(
-    `/workspace/experiments/${encodeURIComponent(projectId)}/files/${relativePath.split("/").map(encodeURIComponent).join("/")}`,
-    apiKey,
-  );
-}
-
-export function deleteExperimentProject(apiKey: string, projectId: string): Promise<void> {
-  return request(`/workspace/experiments/${encodeURIComponent(projectId)}`, apiKey, { method: "DELETE" });
-}
-
-export function searchExperimentRepositoryCandidates(apiKey: string, projectId: string): Promise<ExperimentProjectDetail> {
-  return request(`/workspace/experiments/${encodeURIComponent(projectId)}/repository-candidates`, apiKey, { method: "POST" });
-}
-
-export function connectExperimentRepository(
-  apiKey: string,
-  projectId: string,
-  repositoryUrl: string,
-  relationship: "user_provided" | "official_confirmed" | "community" | "candidate_unverified" = "user_provided",
-): Promise<ExperimentProjectDetail> {
-  return request(`/workspace/experiments/${encodeURIComponent(projectId)}/repository`, apiKey, {
-    method: "PUT",
-    body: JSON.stringify({ repository_url: repositoryUrl, relationship }),
-  });
-}
-
-export function useExperimentMethodReconstruction(apiKey: string, projectId: string): Promise<ExperimentProjectDetail> {
-  return request(`/workspace/experiments/${encodeURIComponent(projectId)}/method-reconstruction`, apiKey, { method: "POST" });
-}
-
 export function listDailyKeywords(apiKey: string): Promise<DailyKeyword[]> {
   return request("/workspace/daily-keywords", apiKey);
 }
@@ -308,23 +281,6 @@ export function createDailyRun(
       kind: "daily",
       daily_kind: dailyKind,
       keyword: dailyKind === "search" ? keyword?.trim() || undefined : undefined,
-    }),
-  });
-}
-
-export function createExperimentRun(
-  apiKey: string,
-  sessionId: string,
-  paperId: string,
-  projectId?: string,
-  action: "generate" | "prepare_repository" | "reconstruct_method" = "generate",
-): Promise<RunStart> {
-  return request("/runs", apiKey, {
-    method: "POST",
-    body: JSON.stringify({
-      kind: "experiment", session_id: sessionId, paper_id: paperId,
-      project_id: projectId || undefined,
-      experiment_action: action === "generate" ? undefined : action,
     }),
   });
 }

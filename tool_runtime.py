@@ -102,6 +102,13 @@ class ToolRuntime:
             self._emit("tool_failed", tool=name, error_type="ToolAccessDenied")
             return f"Tool is not available in this {self.context.run_kind} role: {name}"
 
+        if name == "read_pdf" and self.context.run_kind == "research":
+            remote = str(args.get("url_or_path", "")).strip().lower().startswith(("https://", "http://"))
+            scope = self.context.research_scope
+            if (scope == "local" and remote) or (scope == "public" and not remote):
+                self._emit("tool_failed", tool=name, error_type="SourceScopeDenied")
+                return "❌ PDF 来源超出了用户指定的研究范围。"
+
         self._ensure_active("before_tool")
         started_at = time.perf_counter()
         self._emit("tool_started", tool=name)

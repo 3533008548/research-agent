@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -13,7 +13,6 @@ from api.auth import APIKeyAuthenticator
 from api.routes import router
 from api.run_manager import ChatRunManager
 from badcase_store import BadcaseStore
-from experiment_projects import ExperimentProjectStore
 from paper_relations import PaperRelationStore
 from research_documents import ResearchDocumentStore
 from scheduler import Scheduler
@@ -39,7 +38,6 @@ def create_app(
     chat_run_manager=None,
     research_run_manager=None,
     daily_run_manager=None,
-    experiment_run_manager=None,
     badcase_store=None,
     api_key: str | None = None,
     require_api_key: bool = False,
@@ -54,7 +52,6 @@ def create_app(
     # unavailable run kind instead of silently starting local background work.
     app.state.research_run_manager = research_run_manager
     app.state.daily_run_manager = daily_run_manager
-    app.state.experiment_run_manager = experiment_run_manager
     app.state.badcase_store = badcase_store or _default_badcase_store(agent)
     app.state.api_authenticator = APIKeyAuthenticator(api_key, required=require_api_key)
     # The React workbench needs the same local, user-owned data as the agent.
@@ -65,7 +62,6 @@ def create_app(
     app.state.workspace_paths = paths
     app.state.workspace_uploads = WorkspaceUploadStore(paths) if paths else None
     app.state.research_document_store = ResearchDocumentStore(paths) if paths else None
-    app.state.experiment_project_store = ExperimentProjectStore(paths) if paths else None
     app.state.paper_relation_store = PaperRelationStore(paths) if paths else None
     app.state.workspace_scheduler = (
         getattr(daily_run_manager, "scheduler", None)
@@ -98,9 +94,20 @@ def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str 
             name="react-assets",
         )
 
+    @app.api_route(
+        "/api/{api_path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
+    )
+    def missing_api_route(api_path: str) -> None:
+        # Keep removed/unknown API endpoints out of the SPA fallback.
+        raise HTTPException(status_code=404, detail="API route not found")
+
     @app.get(normalized_path or "/", include_in_schema=False)
     @app.get(f"{normalized_path}/{{client_path:path}}" if normalized_path else "/{client_path:path}", include_in_schema=False)
     def react_client(client_path: str = "") -> FileResponse:
+        if client_path == "api" or client_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API route not found")
         # A client-side route should receive the SPA shell.  Static assets are
         # matched by the earlier mount and therefore never reach this handler.
         return FileResponse(index)

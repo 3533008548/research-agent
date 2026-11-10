@@ -65,6 +65,10 @@ class _Entry:
 
     @property
     def resources(self) -> set[str]:
+        if getattr(self.job, "job_id", ""):
+            # Workers use isolated contexts. Only duplicate delivery of the same
+            # durable invocation is exclusive; no parent holds a session slot.
+            return {f"research_job:{self.job.job_id}"}
         result = {f"run:{self.job.run_id}"}
         for name in ("session_id", "project_id"):
             value = getattr(self.job, name, None)
@@ -227,6 +231,9 @@ class RunDispatcher:
                     self._dispatch()
                     if time.monotonic() >= metrics_at:
                         for worker in self.workers.values():
+                            maintain = getattr(worker, "maintain", None)
+                            if maintain:
+                                maintain()
                             worker.publish_retrieval_metrics()
                         metrics_at = time.monotonic() + 5
                 except QueueUnavailableError:

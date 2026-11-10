@@ -14,7 +14,7 @@ from collections import Counter
 from typing import Any
 
 
-QUALITY_VERSION = 2
+QUALITY_VERSION = 3
 DEFAULT_CHUNK_MAX_CHARS = 1_200
 _CHUNK_TOLERANCE = 120
 _FRAGMENT_MAX_CHARS = 24
@@ -117,6 +117,21 @@ def assess_document_map(
     if empty_pages:
         issue("warning", "empty_pages", "这些页面没有提取到元素，可能是扫描页或版式异常。", pages=empty_pages)
 
+    unresolved = [page["page"] for page in pages if any(
+        item.get("status") == "failed" for item in page.get("extraction_diagnostics", [])
+    )]
+    if unresolved:
+        issue("error", "unresolved_visual_text",
+              "算法正文或扫描内容未恢复；请检查 OCR 语言包或核对原页，不能视为完整入库。", pages=unresolved)
+    lost_native = [page["page"] for page in pages if page.get("missing_native_blocks", 0)]
+    if lost_native:
+        issue("error", "native_text_loss", "原 PDF 文本层有内容未进入页面元素，拒绝不完整入库。", pages=lost_native)
+    ocr_pages = [page["page"] for page in pages if any(
+        item.get("status") == "ocr" for item in page.get("extraction_diagnostics", [])
+    )]
+    if ocr_pages:
+        issue("warning", "ocr_transcription", "部分内容来自 OCR，数学符号和行号需要核对原页。", pages=ocr_pages)
+
     chunks = [chunk for chunk in list(document_map.get("chunks") or []) if isinstance(chunk, dict)]
     usable_chunks = [chunk for chunk in chunks if str(chunk.get("text") or "").strip()]
     if not usable_chunks:
@@ -165,7 +180,7 @@ def assess_document_map(
     expected_text_ids = {
         str(element.get("id"))
         for element in elements
-        if element.get("kind") == "text"
+        if element.get("kind") in {"text", "algorithm", "ocr_text"}
         and not element.get("is_heading")
         and not element.get("is_caption")
         and not element.get("is_boilerplate")
@@ -199,7 +214,7 @@ def assess_document_map(
     text_chars = sum(
         len(str(chunk.get("text") or ""))
         for chunk in usable_chunks
-        if str(chunk.get("kind") or "text") == "text"
+        if str(chunk.get("kind") or "text") in {"text", "algorithm", "ocr_text"}
     )
     if text_chars < 80 and not any(str(chunk.get("kind") or "") in {"table", "figure"} for chunk in usable_chunks):
         issue("error", "insufficient_text", "可检索正文不足 80 个字符。")

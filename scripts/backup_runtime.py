@@ -74,8 +74,10 @@ def main() -> int:
             shutil.copytree(paths.papers_dir, staging / "primary/papers")
         if paths.research_documents_dir.exists():
             shutil.copytree(paths.research_documents_dir, staging / "primary/research_documents")
-        if paths.experiment_projects_dir.exists():
-            shutil.copytree(paths.experiment_projects_dir, staging / "primary/experiment_projects")
+        # Preserve artifacts from the retired reproduction feature in backups.
+        legacy_projects = paths.primary_dir / "experiment_projects"
+        if legacy_projects.exists():
+            shutil.copytree(legacy_projects, staging / "primary/experiment_projects")
         if args.include_derived:
             for source, relative in (
                 (paths.chroma_dir, "derived/chroma"),

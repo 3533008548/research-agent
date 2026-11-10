@@ -55,7 +55,6 @@ _PRESENTATION = {
     "apply_research_document_ledger_patch": ("更新证据与假设账本", 3_000),
     "review_research_document_innovation": ("科研档案创新性审查", 12_000),
     "review_new_paper_impact_on_research_document": ("新论文综合审查", 14_000),
-    "update_experiment_project": ("复现实验确认", 2_500),
     "describe_image": ("图像分析", 2_000),
     "query_papers": ("论文检索", 5_000),
     "list_papers": ("本地论文列表", 3_000),

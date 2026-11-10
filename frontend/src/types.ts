@@ -13,7 +13,7 @@ export interface Session {
   updated_at: string;
 }
 
-export type RunKind = "chat" | "research" | "daily" | "experiment";
+export type RunKind = "chat" | "research" | "daily";
 export type DailyRunKind = "daily" | "retry" | "search" | "resume";
 export type DailyPaperStatus = "new" | "want_read" | "read" | "skipped";
 export type ResearchScope = "both" | "local" | "public";
@@ -77,6 +77,7 @@ export interface RunSteer {
 }
 
 export interface Run {
+  research?: ResearchProject | null;
   run_id: string;
   kind: RunKind;
   session_id: string | null;
@@ -99,6 +100,30 @@ export interface Run {
    */
   events: RunEvent[];
   steers: RunSteer[];
+}
+
+export interface ResearchProject {
+  project_id: string;
+  origin_session_id: string;
+  question: string;
+  goal_version: number;
+  updated_at: string;
+  execution_state: string;
+  end_reason: string;
+  criteria: string[];
+  claims: Array<{ id?: string; text: string; status: string; support?: string[]; opposition?: string[]; limitations?: string }>;
+  gaps: Array<string | { id?: string; text?: string; question?: string }>;
+  waiting_for: string[];
+  report: string;
+  report_version: number;
+  delivery_status?: "pending" | "draft" | "reviewed" | "needs_revision" | "incomplete";
+  partial_report?: { version: number; text: string; error: string } | null;
+  last_failure?: { version: number; role: string; error: string } | null;
+  claims_version: number;
+  reports?: Array<{ report_id: string; version: number; created_at: string }>;
+  evidence: Array<{ id: string; stable_id: string; source: string; excerpt: string }>;
+  budget: { max_calls: number; calls: number; max_tokens: number; tokens: number };
+  jobs?: Array<{ job_id: string; role: string; state: string; version: number; attempts?: number; result?: { error?: string }; payload: { question?: string; gap?: string } }>;
 }
 
 export interface ResearchDocument {
@@ -177,42 +202,6 @@ export interface ResearchDocumentDetail extends ResearchDocument {
   sections: ResearchDocumentSection[];
   versions: ResearchDocumentVersion[];
   ledger: ResearchDocumentLedger;
-}
-
-export interface ExperimentFile {
-  path: string;
-  size_bytes: number;
-  sha256: string;
-}
-
-export interface ExperimentProject {
-  project_id: string;
-  paper_id: string;
-  paper_title: string;
-  status: string;
-  reproduction_level: string;
-  implementation_path: string;
-  summary: string;
-  revision: number;
-  latest_run_id: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface ExperimentProjectDetail extends ExperimentProject {
-  spec: Record<string, unknown>;
-  validation: {
-    valid?: boolean;
-    checks?: Array<{ name?: string; passed?: boolean }>;
-    errors?: string[];
-  };
-  files: ExperimentFile[];
-}
-
-export interface ExperimentFileContent {
-  path: string;
-  content: string;
-  sha256: string;
 }
 
 export interface Paper {

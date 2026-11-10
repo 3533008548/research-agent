@@ -379,11 +379,15 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
     existing_ids = _existing_paper_ids(paper_store, paths, title, pdf_path.name) if paper_store else []
     images: list[str] = []
     try:
+        from pdf_ocr import attach_visual_assets
+
         images = extract_images(
             str(pdf_path), max_pages=max_pages, output_dir=paths.images_dir,
         )
         if images:
             attach_image_assets(parsed_document, images)
+        images.extend(attach_visual_assets(parsed_document, pdf_path, paths.images_dir))
+        if images:
             document_map, quality = _quality_checked_document_map(
                 parsed_document,
                 paper_id=paper_id,
@@ -397,6 +401,9 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
     quality["attempts"] = 2 if parser_label == "备用文本解析" else 1
     quality["parser"] = parser_label
     result = reader.render_document(parsed_document)
+    warnings = [item["message"] for item in quality.get("issues", []) if item.get("severity") == "warning"]
+    if warnings:
+        result += "\n\n⚠️ 解析质量提示：" + "；".join(warnings)
     if images:
         result += "\n\n🖼️ **提取的图片**:\n" + "\n".join(f"  - {item}" for item in images)
 

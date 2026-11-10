@@ -20,7 +20,7 @@ from runtime_paths import RuntimePaths
 
 
 SOURCE_MAP_VERSION = 2
-DOCUMENT_MAP_VERSION = 3
+DOCUMENT_MAP_VERSION = 4
 DEFAULT_CHUNK_MAX_CHARS = 1_200
 _CHUNK_SOFT_OVERFLOW = 120
 _MIN_TEXT_CHUNK_CHARS = 160
@@ -349,11 +349,18 @@ def build_retrieval_chunks(
         elements = list(page_record.get("elements") or [])
         for element in elements:
             kind = str(element.get("kind") or "")
-            if kind not in {"table", "figure"}:
+            if kind not in {"table", "figure", "algorithm", "ocr_text"}:
                 continue
             label = str(element.get("label") or kind)
             caption = str(element.get("caption") or "").strip()
-            if kind == "table":
+            if kind in {"algorithm", "ocr_text"}:
+                prefix = caption or label
+                if element.get("extraction_method") == "ocr":
+                    prefix += " [OCR 转写；符号需核对原页]"
+                parts = [prefix + "\n" + part for part in _split_logical_text(
+                    str(element.get("text") or ""), target_chars=max(200, max_chars - len(prefix) - 1),
+                )]
+            elif kind == "table":
                 content = "\n".join(part for part in (label, caption, str(element.get("text") or "")) if part)
                 parts = _split_table_text(content, max_chars)
             else:
@@ -575,6 +582,10 @@ def related_context(
         and page_end > page_start
     ) else f"p.{page_start}"
     locator = f"{page_locator} · {target_label}"
+    if (primary or {}).get("extraction_method") == "ocr":
+        locator += " · OCR 转写，符号需核对原页"
+        if primary.get("asset_path"):
+            rows.insert(0, f"原页区域（可用 describe_image 核对）：{primary['asset_path']}")
     return "\n".join(rows), locator
 
 

@@ -45,7 +45,7 @@ _DFLT = {
     "api_queue_size": 20,
     "api_connect_timeout_seconds": 3.05,
     "api_read_timeout_seconds": 30,
-    "api_request_deadline_seconds": 45,
+    "api_request_deadline_seconds": 180,
     "api_max_retries": 2,
     "api_circuit_failure_threshold": 3,
     "api_circuit_recovery_seconds": 120,
@@ -95,7 +95,7 @@ class Config:
     api_queue_size: int = 20
     api_connect_timeout_seconds: float = 3.05
     api_read_timeout_seconds: int = 30
-    api_request_deadline_seconds: int = 45
+    api_request_deadline_seconds: int = 180
     api_max_retries: int = 2
     api_circuit_failure_threshold: int = 3
     api_circuit_recovery_seconds: int = 120
@@ -392,7 +392,7 @@ class Config:
             api_queue_size=max(0, int(cfg.get("api_queue_size", 20))),
             api_connect_timeout_seconds=max(1.0, float(cfg.get("api_connect_timeout_seconds", 3.05))),
             api_read_timeout_seconds=max(3, int(cfg.get("api_read_timeout_seconds", 30))),
-            api_request_deadline_seconds=max(5, int(cfg.get("api_request_deadline_seconds", 45))),
+            api_request_deadline_seconds=max(5, int(cfg.get("api_request_deadline_seconds", 180))),
             api_max_retries=max(0, int(cfg.get("api_max_retries", 2))),
             api_circuit_failure_threshold=max(1, int(cfg.get("api_circuit_failure_threshold", 3))),
             api_circuit_recovery_seconds=max(10, int(cfg.get("api_circuit_recovery_seconds", 120))),

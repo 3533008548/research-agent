@@ -20,17 +20,12 @@ from api.redis_runs import (
     RedisDailyRunBroker,
     RedisDailyRunManager,
     RedisDailyRunWorker,
-    RedisExperimentRunBroker,
-    RedisExperimentRunWorker,
     RedisResearchRunBroker,
     RedisResearchRunWorker,
 )
 from api.run_dispatcher import RunDispatcher, worker_process_lock
 from config import Config
 from daily_orchestrator import DailyResearchOrchestrator
-from experiment_projects import ExperimentProjectStore
-from repository_preparation import RepositoryPreparationOrchestrator
-from experiment_reproduction import ExperimentOrchestrator
 from research_agent import ResearchAgent
 from scheduler import Scheduler
 
@@ -82,8 +77,7 @@ def run_worker(cfg, redis_url: str) -> None:
     chat_broker = RedisChatRunBroker(redis_url)
     research_broker = RedisResearchRunBroker(redis_url)
     daily_broker = RedisDailyRunBroker(redis_url)
-    experiment_broker = RedisExperimentRunBroker(redis_url)
-    for broker in (chat_broker, research_broker, daily_broker, experiment_broker):
+    for broker in (chat_broker, research_broker, daily_broker):
         broker.ping()
     chat_worker = RedisChatRunWorker(
         agent, chat_broker,
@@ -114,21 +108,6 @@ def run_worker(cfg, redis_url: str) -> None:
     startup_daily_run_id = enqueue_enabled_daily_run(cfg, daily_manager)
     if startup_daily_run_id:
         print(f"      📰 已提交每日自动检索: {startup_daily_run_id}")
-    experiment_worker = RedisExperimentRunWorker(
-        ExperimentOrchestrator(
-            paper_store=agent.paper_store,
-            project_store=ExperimentProjectStore(cfg.runtime_paths),
-            llm_client=agent.llm_client,
-            model=agent.model,
-            paths=cfg.runtime_paths,
-        ),
-        agent.sessions,
-        experiment_broker,
-        repository_preparer=RepositoryPreparationOrchestrator(
-            project_store=ExperimentProjectStore(cfg.runtime_paths),
-        ),
-        claim_idle_ms=int(os.getenv("EXPERIMENT_RUN_CLAIM_IDLE_MS", "120000")),
-    )
 
     # All executors share the Agent and its process-wide model semaphore.
     # Each kind's admission queue is bounded; chat/research share session ordering.
@@ -136,7 +115,6 @@ def run_worker(cfg, redis_url: str) -> None:
         "chat": (chat_worker, chat_concurrency),
         "research": (research_worker, research_concurrency),
         "daily": (daily_worker, 1),
-        "experiment": (experiment_worker, 1),
     })
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):

@@ -683,6 +683,9 @@ class PaperStore:
         to see that a stage stopped being reached.
         """
         top_k = max(1, min(int(top_k), 20))
+        exact = self._query_algorithm_label(query_text, top_k, paper_ids, section)
+        if exact:
+            return exact
         candidate_k = min(
             HYBRID_CANDIDATE_LIMIT,
             max(
@@ -747,6 +750,36 @@ class PaperStore:
             reranked = ranked
         return reranked[:top_k]
 
+    def _query_algorithm_label(self, query_text, top_k, paper_ids, section):
+        """Resolve an explicit algorithm locator inside an explicit paper scope.
+
+        Numeric labels are identifiers, not semantic relevance hints. Query
+        only algorithm elements, so a passing prose mention cannot displace the
+        actual body. Unscoped questions still use normal hybrid retrieval.
+        """
+        if not paper_ids:
+            return []
+        digits = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+                  "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
+        labels = re.findall(
+            r"(?:\balgorithm\s*|算法\s*)(\d+|[一二三四五六七八九十])(?![\d.一二三四五六七八九十百])",
+            query_text, re.I,
+        )
+        numbers = {digits.get(label, label) for label in labels}
+        if not numbers:
+            return []
+        filters = [{"paper_id": {"$in": list(paper_ids)}}, {"element_kind": "algorithm"}]
+        if section:
+            filters.append({"section": section})
+        raw = self._collection.get(where={"$and": filters}, include=["documents", "metadatas"])
+        results = []
+        for text, metadata in zip(raw.get("documents") or [], raw.get("metadatas") or []):
+            match = re.match(r"(?:Algorithm|算法)\s*(\d+)\b", text or "", re.I)
+            if match and match.group(1) in numbers:
+                results.append({**metadata, "text": text, "retrieval": "keyword",
+                                "keyword_score": 1.0, "exact_algorithm_label": match.group(0)})
+        return sorted(results, key=lambda item: (item.get("paper_id", ""), item.get("chunk_index", 0)))[:top_k]
+
     def _invalidate_lexical_index(self) -> None:
         """Drop the cached BM25 structures after any corpus mutation."""
         self._lexical_revision += 1
@@ -804,6 +837,9 @@ class PaperStore:
         section: Optional[str] = None,
     ) -> list[dict]:
         """基于 BM25 的本地正文检索，用于混合召回和嵌入模型初始化期间。"""
+        exact = self._query_algorithm_label(query_text, max(1, min(int(top_k), 20)), paper_ids, section)
+        if exact:
+            return exact
         if self._collection.count() == 0:
             return []
         terms = self._query_terms(query_text)

@@ -312,23 +312,6 @@ def _raw_tool_schemas() -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name": "update_experiment_project",
-                "description": "将用户明确确认的论文复现实验前提写入独立实验项目，同时更新规格、配置和 README。仅在用户明确确认某个 experiment- 项目的待确认项时调用；不得编造论文参数、下载数据或声称已完成训练。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string", "description": "实验项目 ID，格式 experiment-…"},
-                        "confirmed_items": {"type": "array", "items": {"type": "string"}, "description": "用户明确确认的事实或决定；每项简洁、可执行"},
-                        "resolved_unknowns": {"type": "array", "items": {"type": "string"}, "description": "被这些确认项解决的原待确认项，必须与项目中的原文完全一致"},
-                        "summary": {"type": "string", "description": "这次写入的简短说明"},
-                    },
-                    "required": ["project_id", "confirmed_items"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "describe_image",
                 "description": "用 DeepSeek 视觉模型描述论文图片（架构图/流程图/实验图）。",
                 "parameters": {

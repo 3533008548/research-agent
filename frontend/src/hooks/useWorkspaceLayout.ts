@@ -111,7 +111,7 @@ export function useWorkspaceLayout({ docFocusMode }: { docFocusMode: boolean }) 
     workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible,
   }), [workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible]);
   const leftResizable = leftVisible && widths.mode !== "stacked" && widths.leftBounds.max > widths.leftBounds.min;
-  const rightResizable = rightVisible && widths.mode === "desktop" && widths.rightBounds.max > widths.rightBounds.min;
+  const rightResizable = rightVisible && widths.mode !== "stacked" && widths.rightBounds.max > widths.rightBounds.min;
 
   useLayoutEffect(() => {
     const drag = dragRef.current;
@@ -131,7 +131,7 @@ export function useWorkspaceLayout({ docFocusMode }: { docFocusMode: boolean }) 
     // Viewport-only changes never take this path and retain both requests.
     const next = { ...preferencesRef.current };
     if (leftVisible && widths.mode !== "stacked") next.leftWidth = widths.leftWidth;
-    if (rightVisible && widths.mode === "desktop") next.rightWidth = widths.rightWidth;
+    if (rightVisible && widths.mode !== "stacked") next.rightWidth = widths.rightWidth;
     next[side === "left" ? "leftWidth" : "rightWidth"] = width;
     updatePreferences(next, persist);
   };
@@ -200,15 +200,6 @@ export function useWorkspaceLayout({ docFocusMode }: { docFocusMode: boolean }) 
     finishDrag();
     updatePreferences({ ...preferencesRef.current, rightVisibility: "shown" });
   };
-  const resetLayout = () => {
-    finishDrag();
-    updatePreferences(defaultLayoutPreferences(), false);
-    try {
-      localStorage.removeItem(WORKSPACE_LAYOUT_KEY);
-    } catch {
-      // Defaults are applied in memory even when storage cannot be changed.
-    }
-  };
 
   const workspaceStyle = {
     "--left-width": `${widths.leftWidth}px`,
@@ -217,7 +208,7 @@ export function useWorkspaceLayout({ docFocusMode }: { docFocusMode: boolean }) 
   return {
     workspaceRef, workspaceStyle, layoutMode: widths.mode,
     leftVisible, rightVisible, leftWidth: widths.leftWidth, rightWidth: widths.rightWidth,
-    toggleLeft, toggleRight, showRight, resetLayout,
+    toggleLeft, toggleRight, showRight,
     leftResizeProps: resizeProps("left"), rightResizeProps: resizeProps("right"),
   };
 }

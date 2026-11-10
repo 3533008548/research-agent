@@ -38,7 +38,7 @@ it("keeps breakpoint boundaries consistent for pointer resizing", () => {
 });
 
 it("keeps the center usable for every visibility combination and requested width", () => {
-  for (const workspaceWidth of [1121, 1280, 1440, 1700]) {
+  for (const workspaceWidth of [761, 800, 914, 915, 1000, 1120, 1121, 1280, 1440, 1700]) {
     for (const leftVisible of [false, true]) {
       for (const rightVisible of [false, true]) {
         for (const [leftWidth, rightWidth] of [[190, 245], [240, 310], [420, 480]]) {
@@ -46,7 +46,10 @@ it("keeps the center usable for every visibility combination and requested width
             workspaceWidth, viewportWidth: workspaceWidth,
             preferences: { ...defaultLayoutPreferences(), leftWidth, rightWidth }, leftVisible, rightVisible,
           });
-          assert.ok(resolved.centerWidth >= 480);
+          assert.ok(resolved.centerWidth >= (workspaceWidth >= 915 ? 480 : 320));
+          if (leftVisible) assert.ok(resolved.leftWidth >= 190);
+          if (rightVisible) assert.ok(resolved.rightWidth >= 245);
+          assert.equal(resolved.leftWidth + resolved.centerWidth + resolved.rightWidth, workspaceWidth);
           assert.ok(resolved.leftWidth <= 420 && resolved.rightWidth <= 480);
           assert.ok(resolved.leftWidth >= resolved.leftBounds.min && resolved.leftWidth <= resolved.leftBounds.max);
           assert.ok(resolved.rightWidth >= resolved.rightBounds.min && resolved.rightWidth <= resolved.rightBounds.max);
@@ -69,16 +72,16 @@ it("fits the actual workspace and restores requested widths after compression", 
   assert.ok(compressed.centerWidth >= 480);
   assert.deepEqual([preferences.leftWidth, preferences.rightWidth], [420, 480]);
   assert.deepEqual([resolve(1700).leftWidth, resolve(1700).rightWidth], [420, 480]);
-  assert.ok(resolve(800).centerWidth >= 480);
+  assert.ok(resolve(800).centerWidth >= 320);
   assert.equal(resolve(300).centerWidth, 300);
 });
 
-it("releases inline space for a bottom or stacked inspector without changing preferences", () => {
+it("keeps the inspector in its column until mobile layout without changing preferences", () => {
   const preferences = { ...defaultLayoutPreferences(), leftWidth: 420, rightWidth: 480 };
   const compact = resolveWorkspaceWidths({ workspaceWidth: 800, viewportWidth: 800, preferences, leftVisible: true, rightVisible: true });
-  assert.equal(compact.rightWidth, 0);
-  assert.equal(compact.leftWidth, 320);
-  assert.equal(compact.centerWidth, 480);
+  assert.equal(compact.rightWidth, 245);
+  assert.equal(compact.leftWidth, 190);
+  assert.equal(compact.centerWidth, 365);
   const stacked = resolveWorkspaceWidths({ workspaceWidth: 390, viewportWidth: 390, preferences, leftVisible: true, rightVisible: true });
   assert.equal(stacked.leftWidth, 0);
   assert.equal(stacked.rightWidth, 0);

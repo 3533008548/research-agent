@@ -17,8 +17,9 @@ api_resilience:
   interactive_reserved_slots: 1
   queue_size: 20
   connect_timeout_seconds: 3.05
+  # 单次读取停滞与整个请求预算分别限制；长回答不再在旧的 45 秒处被切断。
   read_timeout_seconds: 30
-  request_deadline_seconds: 45
+  request_deadline_seconds: 180
   max_retries: 2
   circuit_failure_threshold: 3
   circuit_recovery_seconds: 120

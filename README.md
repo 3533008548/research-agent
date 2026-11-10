@@ -25,7 +25,6 @@
 | 🖼 **多模态看图** | DeepSeek 视觉模型描述 + 图注附带 + 描述缓存（省 token） |
 | 📰 **每日速递** | OpenAlex + OpenAIRE + DBLP 并行限时的后台推送，支持重试和待读清单管理 |
 | 🧭 **深度研究** | 规划 → 三个角色研究员并行取证 → 结构化证据 → 综合 → 质检 → 最多一次修订；双层引用与定位精度审计 |
-| 🧪 **论文复现** | 以页面级证据为边界生成实验规格与代码骨架；上游仓库只克隆不执行；不把未验证结果称为复现成功 |
 | 🔌 **MCP Server** | 把检索能力以标准 MCP 协议发布出去，5 个只读工具；其他 Agent 可直接接入本项目 |
 | 🔌 **MCP Client** | 反向消费外部 MCP Server；外部工具经同一份工具目录与同一运行时，自动继承白名单/取消/限长 |
 | 📁 **研究档案** | 将研究方案、假设或决策记录保存为可检索 Markdown 与可下载 Word 文档；按需读取，不注入会话摘要或用户画像 |
@@ -106,18 +105,18 @@ Docker 的 `api-worker` 会在开始消费任务前预热本地 RAG 嵌入模型
 `frontend/` 是独立的 React + TypeScript + Vite 客户端；它只调用 FastAPI 的版本化接口，
 不直接访问 SQLite、Redis 或 Agent 实现。当前它覆盖会话、对话、深度研究（来源范围选择、继续未完成任务）、SSE 流式输出、
 取消任务、PDF/图片上传、研究档案、论文库、每日检索（执行、重试、继续、阅读状态、
-按次报告标签页）、论文代码复现、用户画像和运行中心 / Badcase。运行中心还显示当前会话的持久化 Token 统计。
+按次报告标签页）、用户画像和运行中心 / Badcase。运行中心还显示当前会话的持久化 Token 统计。
 失败或取消的普通对话可在运行检查器中重新发送；对任务的新补充会在下一编排节点生效。
 切换或新建会话不会取消原会话的任务，可在其他会话继续提交问题；切回后显示各自的进度和回复，刷新页面后会重新连接所选会话仍在运行的任务。只有显式点击“暂停任务”或删除所属会话才会请求取消任务。草稿与暂存附件在当前页面内按会话保留。标准 Redis 部署默认允许两个普通对话任务和两个深度研究任务并行；同一会话按顺序执行，所有任务仍共享模型请求并发额度。会话列表显示当前页面已观察任务的排队、执行与完成状态。
 普通对话的模型失败可在运行检查器或历史运行中查看具体错误代码、阶段、最后 HTTP 状态、耗时与预算、实际重试次数及请求 ID。诊断会持久化；旧记录缺失的信息不会自动补回。HTTP 200 仅代表收到响应头，后续流式读取仍可能超时。
 
-聊天与深度研究选择位于输入框工具区。工作台标签行两端的按钮可独立显示／隐藏会话侧栏和运行检查器；桌面可拖动侧栏内边界调宽，也可聚焦边界后用方向键、Home／End 调整。宽度与显隐偏好保存在当前浏览器，“布局选项”菜单可恢复默认；较窄窗口中运行区移到底部，手机宽度使用纵向排列。侧栏文字随宽度换行，档案内部布局按工作台实际宽度适配。问题记录和验证范围见[前端布局优化与回归防护方案](前端布局优化与回归防护方案.md)。
+输入框工具区可选择“对话”或“多 Agent 研究”；研究进度、暂停／恢复操作和阶段报告仅在选择研究模式后显示在中间对话区，右侧保留运行检查器。输入框默认单行高度，随输入自动增高至上限，清空后缩回；消息滚动区域延伸至右侧栏边缘，滚动条轨道透明、滑块灰色。用户消息以气泡区分，助手回复使用无框正文，不再显示身份文字和头像。工作台标签行两端的按钮可独立显示／隐藏会话侧栏和运行检查器；桌面可拖动侧栏内边界调宽，也可聚焦边界后用方向键、Home／End 调整。宽度与显隐偏好保存在当前浏览器，已移除恢复默认布局菜单。大于 760px 的窗口保持横向三栏，缩小时压缩栏宽、放大时恢复期望宽度；手机宽度使用纵向排列。长研究问题在页面内换行选择，公式、代码和宽表格在内容块内部滚动。侧栏文字随宽度换行，档案内部布局按工作台实际宽度适配。问题记录和验证范围见[前端布局优化与回归防护方案](前端布局优化与回归防护方案.md)。
 
 前端按**数据归属**拆分：每个业务域一个 hook（`useConversation` 拥有会话与正在跑的 run，
-`useDailyWorkspace` / `useRunCenter` / `useDocuments` / `useExperiments` 各自拥有自己的状态），
+`useDailyWorkspace` / `useRunCenter` / `useDocuments` 各自拥有自己的状态），
 工作台面板负责展示与交互，栏宽和显隐由独立的 `useWorkspaceLayout` 管理；hook 之间通过显式参数共享必要状态。
 
-生产构建由 FastAPI 从根路径 `/` 托管。深度研究、每日检索、论文复现和跨进程可恢复的对话需要 Redis 与独立 worker；没有 Redis 时仅保留进程内普通对话，不适合作为标准部署。最简部署方式为上面的 Docker Compose。前端开发时，在三个终端中运行：
+生产构建由 FastAPI 从根路径 `/` 托管。深度研究、每日检索和跨进程可恢复的对话需要 Redis 与独立 worker；没有 Redis 时仅保留进程内普通对话，不适合作为标准部署。最简部署方式为上面的 Docker Compose。前端开发时，在三个终端中运行：
 
 ```powershell
 # 终端 1：任务 worker
@@ -148,7 +147,7 @@ $env:APP_DATA_DIR = "D:\\research-agent-data"
 python -m uvicorn api_server:app --host 127.0.0.1 --port 7860
 ```
 
-`runtime/primary/` 保存 SQLite、论文 PDF、用户画像、研究档案、复现实验项目、已确认论文关系与设置；`runtime/derived/` 中的 Chroma 索引和 PDF 图片可以重建，但该目录下并非所有数据都是缓存。Compose 把 Redis 的 AOF/RDB 持久化文件挂载在 `runtime/derived/redis/`，其中保存活动任务队列与运行事件，不能按缓存删除。`runtime/primary/paper_relations.json` 是小型、可审阅的论文关系索引；`runtime/primary/db/badcases.db` 是本地 Badcase 候选池，只保存脱敏运行快照和人工分类。旧版根目录数据不会自动移动，可先预览再迁移：
+`runtime/primary/` 保存 SQLite、论文 PDF、用户画像、研究档案、已确认论文关系与设置；`runtime/derived/` 中的 Chroma 索引和 PDF 图片可以重建，但该目录下并非所有数据都是缓存。Compose 把 Redis 的 AOF/RDB 持久化文件挂载在 `runtime/derived/redis/`，其中保存活动任务队列与运行事件，不能按缓存删除。`runtime/primary/paper_relations.json` 是小型、可审阅的论文关系索引；`runtime/primary/db/badcases.db` 是本地 Badcase 候选池，只保存脱敏运行快照和人工分类。旧版根目录数据不会自动移动，可先预览再迁移：
 
 ```bash
 python scripts/migrate_runtime.py
@@ -166,6 +165,12 @@ python scripts/backup_runtime.py --output backups/
 清理或重建索引时应明确选中 `derived/chroma/`、`derived/images/` 等目标，不要递归清空整个 `derived/`。上面的维护流程需要运维人员主动执行，启动、迁移和索引重建不会自动替用户备份或删除 Redis 数据。
 
 PDF 阅读器或分块规则升级后，重建本地索引：
+
+PDF 解析会保留超过半页的正常正文，并对有算法标题和边框、但缺少文本层的算法区域执行本地 OCR；扫描页也会尝试 OCR。算法正文独立切块，保留标题、页码、区域坐标、提取方式及原页裁剪图。OCR 转写不保证数学符号完全准确，逐行解释时应通过 `describe_image` 核对原图。无法定位算法正文、OCR 失败或原生文本丢失会阻止入库，备用文本解析也不能绕过检查；原有索引保留。该检测依赖可识别的版式，不保证发现任意 PDF 的所有漏读。
+
+Docker 镜像包含 Tesseract 和中英文语言包。直接运行 Python 时需安装 Tesseract，或将 `TESSDATA_PREFIX` 指向含 `eng.traineddata` 的目录；`PDF_OCR_LANGUAGE` 默认 `eng`，中文扫描内容可设为 `eng+chi_sim`（需相应语言包）。升级代码不会自动修复旧索引，需重建后再检索。
+
+限定论文的查询若明确指定 `Algorithm 4` 或“算法四”，会优先读取对应编号的算法正文，避免被其他算法的相似描述挤出结果。重建脚本使用当前配置的嵌入模型和集合，可追加 `--file 完整文件名.pdf` 只修复一篇论文。
 
 ```powershell
 python scripts/reindex_local_papers.py --data-dir runtime --max-pages 20
@@ -247,7 +252,7 @@ Web UI 顶部的会话栏可新建、切换和删除会话。删除前必须勾�
 
 每份档案还带有独立的 `research_ledger.json`“证据与假设账本”。它保存研究问题、假设、创新候选或决策，以及支持/冲突/适用条件论文定位和可证伪条件；它不复制论文正文，也不会直接改写档案。账本中 `supported` 必须有可定位证据，正文变更导致的旧关联会显示为“待复核”。档案页不再堆叠“安全修改、比对论文、证据与假设、创新性审查”等预设按钮：直接输入自然语言请求即可。规则路由会把明显的修改、论文比对、账本梳理和创新性审查请求关联到当前档案并给出流程提示；其中“新导入论文 + 修改档案”会固定进入一次性的综合影响审查，先给出重叠/借鉴、可行性影响、创新性候选和逐章节拟修改项，待你确认后才允许写入。论文标题或 ID 不明确时不会猜测“最新一篇”，而会要求你指定。路由不是写入授权，Agent 仍须在写入前获得你的明确确认。
 
-在 React 工作台的“论文库”中，可对已解析论文点击“复现实验”。系统会以页面级解析证据为边界，提取可追溯的实验规格、待确认项和 Python 代码骨架，并保存到独立的 `runtime/primary/experiment_projects/` 项目页；它不会自动下载数据、运行训练或把未验证结果称为论文复现成功。项目页的“代码来源”可按论文标题检索 GitHub 候选，或直接连接用户提供的 GitHub 地址；候选永远不会被自动表述为官方实现。连接后点击“同步并分析上游代码”，系统会将记录的 commit 克隆到项目独立目录，并生成 README、依赖文件和训练入口清单；该步骤仍不会安装依赖、下载数据或执行仓库。若没有可用代码且你主动选择“按论文方法还原”，系统会创建单独的运行任务，基于论文页面级证据和已确认事实生成可编辑参考实现，并记录方法组件的证据定位、工程假设和待确认项；该产物始终标为近似方法还原，不是原作者代码复现，也不代表论文指标已复现。
+代码复现功能已移除，包括实验项目页、仓库准备和按论文方法还原。旧版生成的 `runtime/primary/experiment_projects/` 文件保留在磁盘，备份脚本仍会收录；升级不会自动删除已有研究资料。
 
 ### 🔌 作为 MCP Server：把检索能力发布出去
 
@@ -303,7 +308,7 @@ python scripts/export_badcase_template.py --candidate-id bc-xxxxxxxxxxxx
 
 删除会话时，关联的 Badcase 候选也会一并删除；如需长期保留某个问题，应先将其转写为合成评测样例。
 
-浏览器中的“科研档案”“用户画像”“论文库”“论文复现”“每日检索关键词”和“设置”均在左侧折叠区打开；论文库会显示每篇论文的已确认关系数，点击“关系审查”会把带源论文 ID 的只读审查指令放入对话框。研究档案、每日检索报告和实验项目会在中间工作台中以标签页打开。普通对话、深度研究、每日检索和论文复现均进入统一运行中心，可暂停、查看事件和在适用时重试或继续。
+浏览器中的“科研档案”“用户画像”“论文库”“每日检索关键词”和“设置”均在左侧折叠区打开；论文库会显示每篇论文的已确认关系数，点击“关系审查”会把带源论文 ID 的只读审查指令放入对话框。研究档案、每日检索报告会在中间工作台中以标签页打开。普通对话、深度研究和每日检索均进入统一运行中心，可暂停、查看事件和在适用时重试或继续。
 
 ---
 
@@ -320,10 +325,8 @@ python -m unittest tests.test_core tests.test_chunking \
   tests.test_dependency_lock_coverage tests.test_mcp_client \
   tests.test_mcp_client_e2e tests.test_mcp_client_wiring \
   tests.test_research_evidence tests.test_research_gates \
-  tests.test_experiment_reproduction \
   tests.test_conversation_reference tests.test_paper_matching \
   tests.test_paper_scope tests.test_relation_review \
-  tests.test_repository_preparation tests.test_repository_sources \
   tests.test_ci_test_coverage tests.test_llm_diagnostics \
   tests.test_error_diagnostics_contract tests.test_user_profile
 
@@ -460,7 +463,7 @@ Verify 失败时仅将反馈保存在当前重试链路；本轮完成、跳过�
 primary/db/          → checkpoint、memory、daily、badcases SQLite 数据
 primary/papers/      → 原始论文 PDF
 primary/research_documents/ → 用户研究档案：Markdown 原稿与 Word 导出
-primary/experiment_projects/ → 论文复现实验：证据规格、代码文件与版本快照
+primary/experiment_projects/ → 旧版复现产物（仅保留与备份，不再提供功能入口）
 primary/paper_relations.json → 用户确认的论文关系：一跳检索提示与证据锚点
 primary/profile.md   → 用户画像
 primary/settings.json→ Web UI 用户设置
@@ -517,10 +520,10 @@ research_agent/
 ├── research_orchestrator.py # 有边界的 Planner / Researcher / Critic 闭环
 ├── session_store.py       # 会话目录、研究运行记录、Token 统计与 checkpoint 联动删除
 ├── api_server.py         # FastAPI 入口与 React 生产构建托管
-├── api_worker.py         # Redis 队列消费者：对话、研究、每日检索、论文复现
+├── api_worker.py         # Redis 队列消费者：对话、研究、每日检索
 ├── frontend/             # React + TypeScript 客户端（根路径 /，仅经 FastAPI 调用后端）
 │   └── src/
-│       ├── hooks/        # useConversation / useExperiments / useDailyWorkspace
+│       ├── hooks/        # useConversation / useDocuments / useDailyWorkspace
 │       │                 # useRunCenter / useDocuments / useWorkspaceChrome
 │       ├── components/   # workspace/ 下的面板、侧栏、聊天面板 + runcenter/
 │       └── lib/          # 纯函数：timeline 归约、labels 词汇、workspace 类型

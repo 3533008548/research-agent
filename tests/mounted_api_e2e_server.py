@@ -25,7 +25,7 @@ import uvicorn
 
 from api.app import create_app, mount_react_frontend
 from api.run_dispatcher import RunDispatcher
-from api.redis_runs import RedisChatRunBroker, RedisChatRunManager, RedisChatRunWorker
+from api.redis_runs import RedisChatRunBroker, RedisChatRunManager, RedisChatRunWorker, RedisResearchRunBroker, RedisResearchRunManager
 from config import Config
 from llm_client import LLMRequestFailedError
 from session_store import SessionStore
@@ -111,6 +111,16 @@ class _E2EAgent:
             history.append({"role": "assistant", "content": "慢请求完成"})
             return "慢请求完成"
 
+        if message == "__recover__":
+            # The transport recovery tests cover replay; this fixture checks
+            # that done.answer replaces a stale draft across SSE and reload.
+            on_token("恢复前的不完整草稿")
+            cancel_event.wait(timeout=1)
+            answer = "自动恢复后的完整回答。"
+            self._traces[session_id] = {"outcome": "success"}
+            history.append({"role": "assistant", "content": answer})
+            return answer
+
         prefix = "来自 FastAPI："
         on_token(prefix)
         on_token(message)
@@ -124,15 +134,19 @@ def create_e2e_app(data_dir: str, redis_url: str = ""):
     cfg = Config.load({"data_dir": data_dir, "rag_enabled": False})
     agent = _E2EAgent(cfg)
     manager = None
+    research_manager = None
     if redis_url:
         broker = RedisChatRunBroker(redis_url, prefix=f"research-agent-e2e-{uuid.uuid4().hex}")
         broker.ping()
         manager = RedisChatRunManager(agent, broker)
+        # Control-plane fixture: research jobs remain queued so lifecycle UI
+        # checks are deterministic and never call a real model.
+        research_manager = RedisResearchRunManager(agent, RedisResearchRunBroker(redis_url, prefix=broker.prefix))
         worker = RedisChatRunWorker(agent, broker, consumer="browser-e2e-worker", claim_idle_ms=100)
         dispatcher = RunDispatcher({"chat": (worker, 2)})
         worker_thread = threading.Thread(target=dispatcher.run_forever, name="browser-e2e-worker", daemon=True)
         worker_thread.start()
-    app = create_app(agent=agent, title="科研助手 API 浏览器 E2E", chat_run_manager=manager)
+    app = create_app(agent=agent, title="科研助手 API 浏览器 E2E", chat_run_manager=manager, research_run_manager=research_manager)
     app.state.e2e_uses_redis = bool(redis_url)
 
     @app.post("/__e2e__/documents", include_in_schema=False)

@@ -57,6 +57,10 @@ class SessionStore:
         # metadata update instead of failing an otherwise valid chat run.
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._init_db()
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS research_projects (
+            project_id TEXT PRIMARY KEY, origin_session_id TEXT NOT NULL,
+            document TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        self._conn.commit()
 
     @_synchronized
     def first_pending_run(self, thread_id: str) -> str | None:
@@ -70,11 +74,10 @@ class SessionStore:
                 SELECT run_id, created_at, status FROM chat_runs WHERE thread_id = ?
                 UNION ALL
                 SELECT run_id, created_at, status FROM research_runs WHERE thread_id = ?
-                UNION ALL
-                SELECT run_id, created_at, status FROM experiment_runs WHERE thread_id = ?
+                AND run_id NOT IN (SELECT project_id FROM research_projects)
             ) WHERE status NOT IN ('completed', 'cancelled', 'failed', 'partial_failed')
             ORDER BY created_at, run_id LIMIT 1""",
-            (thread_id, thread_id, thread_id),
+            (thread_id, thread_id),
         ).fetchone()
         return str(row["run_id"]) if row else None
 
@@ -149,24 +152,6 @@ class SessionStore:
             );
             CREATE INDEX IF NOT EXISTS idx_chat_runs_thread_updated
                 ON chat_runs(thread_id, updated_at DESC);
-            CREATE TABLE IF NOT EXISTS experiment_runs (
-                run_id TEXT PRIMARY KEY,
-                thread_id TEXT NOT NULL,
-                project_id TEXT NOT NULL,
-                action TEXT NOT NULL DEFAULT 'reproduce',
-                status TEXT NOT NULL,
-                summary_text TEXT NOT NULL DEFAULT '',
-                duration_ms REAL,
-                metrics_json TEXT NOT NULL DEFAULT '{}',
-                error_type TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT,
-                FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id)
-                    ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_experiment_runs_thread_updated
-                ON experiment_runs(thread_id, updated_at DESC);
             CREATE TABLE IF NOT EXISTS agent_run_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
@@ -523,12 +508,6 @@ class SessionStore:
         item["answer"] = item.pop("answer_text", "")
         return item
 
-    @classmethod
-    def _experiment_row(cls, row: sqlite3.Row) -> dict[str, Any]:
-        item = dict(row)
-        item["metrics"] = cls._decode_json(item.pop("metrics_json", "{}"), {})
-        item["answer"] = item.pop("summary_text", "")
-        return item
 
     @staticmethod
     def _safe_event_metrics(metrics: dict[str, Any] | None) -> dict[str, int | float]:
@@ -605,81 +584,13 @@ class SessionStore:
         ).fetchall()
         return [self._chat_row(row) for row in rows]
 
-    @_synchronized
-    def create_experiment_run(
-        self,
-        thread_id: str,
-        project_id: str,
-        *,
-        action: str = "reproduce",
-        status: str = "queued",
-    ) -> dict[str, Any]:
-        if not self.get(thread_id):
-            raise KeyError(f"会话不存在: {thread_id}")
-        if status not in {"queued", "running", "cancelling"}:
-            raise ValueError(f"实验复现运行的初始状态无效: {status}")
-        now = self._now()
-        run_id = f"experiment-{uuid.uuid4().hex[:12]}"
-        with self._conn:
-            self._conn.execute(
-                "INSERT INTO experiment_runs "
-                "(run_id, thread_id, project_id, action, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (run_id, thread_id, str(project_id)[:120], str(action)[:40], status, now, now),
-            )
-        return self.get_experiment_run(run_id) or {}
-
-    @_synchronized
-    def get_experiment_run(self, run_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM experiment_runs WHERE run_id=?", (run_id,)
-        ).fetchone()
-        return self._experiment_row(row) if row else None
-
-    @_synchronized
-    def list_experiment_runs(self, thread_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM experiment_runs WHERE thread_id=? "
-            "ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?",
-            (thread_id, max(1, min(int(limit), 100))),
-        ).fetchall()
-        return [self._experiment_row(row) for row in rows]
-
-    @_synchronized
-    def has_active_experiment_run(self, project_id: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM experiment_runs WHERE project_id=? "
-            "AND status NOT IN ('completed', 'failed', 'cancelled', 'partial_failed') LIMIT 1",
-            (project_id,),
-        ).fetchone()
-        return bool(row)
-
-    @_synchronized
-    def delete_experiment_runs_for_project(self, project_id: str) -> int:
-        """Remove terminal run metadata after the user deletes its project files."""
-        rows = self._conn.execute(
-            "SELECT run_id FROM experiment_runs WHERE project_id=?", (project_id,)
-        ).fetchall()
-        run_ids = [str(row["run_id"]) for row in rows]
-        if not run_ids:
-            return 0
-        placeholders = ",".join("?" for _ in run_ids)
-        with self._conn:
-            self._conn.execute(
-                f"DELETE FROM agent_run_events WHERE run_id IN ({placeholders})", run_ids,
-            )
-            self._conn.execute(f"DELETE FROM run_steers WHERE run_id IN ({placeholders})", run_ids)
-            cursor = self._conn.execute(
-                "DELETE FROM experiment_runs WHERE project_id=?", (project_id,)
-            )
-        return int(cursor.rowcount)
 
     @_synchronized
     def run_status_counts(self) -> dict[str, dict[str, int]]:
         """Return global, payload-free operational counts for API metrics."""
-        counts: dict[str, dict[str, int]] = {"chat": {}, "research": {}, "experiment": {}}
+        counts: dict[str, dict[str, int]] = {"chat": {}, "research": {}}
         for kind, table in (
-            ("chat", "chat_runs"), ("research", "research_runs"), ("experiment", "experiment_runs"),
+            ("chat", "chat_runs"), ("research", "research_runs"),
         ):
             rows = self._conn.execute(
                 f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
@@ -687,48 +598,6 @@ class SessionStore:
             counts[kind] = {str(row["status"]): int(row["count"]) for row in rows}
         return counts
 
-    @_synchronized
-    def update_experiment_run(
-        self,
-        run_id: str,
-        *,
-        status: str | None = None,
-        summary: str | None = None,
-        duration_ms: float | None = None,
-        metrics: dict[str, Any] | None = None,
-        error_type: str | None = None,
-    ) -> dict[str, Any] | None:
-        existing = self.get_experiment_run(run_id)
-        if not existing:
-            return None
-        now = self._now()
-        values: dict[str, Any] = {"run_id": run_id, "updated_at": now}
-        sets = ["updated_at=:updated_at"]
-        if status is not None:
-            values["status"] = str(status)[:40]
-            sets.append("status=:status")
-            if status in {"completed", "failed", "cancelled", "partial_failed"}:
-                values["completed_at"] = now
-                sets.append("completed_at=:completed_at")
-        if summary is not None:
-            values["summary"] = str(summary)[:2_000]
-            sets.append("summary_text=:summary")
-        if duration_ms is not None:
-            values["duration_ms"] = round(float(duration_ms), 1)
-            sets.append("duration_ms=:duration_ms")
-        if metrics is not None:
-            values["metrics_json"] = json.dumps(
-                self._safe_event_metrics(metrics), ensure_ascii=False, separators=(",", ":"),
-            )
-            sets.append("metrics_json=:metrics_json")
-        if error_type is not None:
-            values["error_type"] = str(error_type)[:120]
-            sets.append("error_type=:error_type")
-        with self._conn:
-            self._conn.execute(
-                f"UPDATE experiment_runs SET {', '.join(sets)} WHERE run_id=:run_id", values,
-            )
-        return self.get_experiment_run(run_id)
 
     @_synchronized
     def update_chat_run(
@@ -874,7 +743,7 @@ class SessionStore:
     ) -> None:
         if not self.get(thread_id):
             return
-        if run_kind not in {"chat", "research", "experiment"}:
+        if run_kind not in {"chat", "research"}:
             raise ValueError(f"未知运行类型: {run_kind}")
         compact_summary = " ".join(str(summary or "").split())[:240]
         safe_event_type = infer_persisted_event_type(

@@ -20,12 +20,13 @@ import { useSessionConversationState } from "./useSessionConversationState";
 import type { Notice } from "../lib/workspace";
 import type {
   Run,
+  ResearchProject,
   Session,
 } from "../types";
 
 const ACTIVE_SESSION_KEY = "research-agent.active-session";
 const isPendingRun = (run: Run | null | undefined) => Boolean(
-  run && ["queued", "running", "cancelling"].includes(run.status),
+  run && !run.research && ["queued", "running", "cancelling"].includes(run.status),
 );
 
 /**
@@ -58,6 +59,15 @@ export function useConversation({
   const navigation = useRef(0);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  const syncResearchProject = useCallback((project: ResearchProject) => {
+    const status = ({ active: "running", paused: "paused", stopped: "cancelled", waiting: "waiting", needs_input: "needs_input" } as Record<string, string>)[project.execution_state]
+      || (project.end_reason === "fulfilled" ? "completed" : "partial_failed");
+    const target = getSession(project.origin_session_id).currentRun;
+    if (target?.run_id !== project.project_id || target.updated_at >= project.updated_at) return;
+    bindSession(project.origin_session_id).setCurrentRun(current => current?.run_id === project.project_id
+      ? { ...current, status, answer: project.report, research: project, updated_at: project.updated_at } : current);
+  }, [getSession, bindSession]);
 
   useEffect(() => () => {
     // Unmounting disconnects observers; only the stop button cancels work.
@@ -153,7 +163,7 @@ export function useConversation({
       ]);
       const runs = await listSessionRuns(apiKey, sessionId);
       const run = runs.find((item) => ["chat", "research"].includes(item.kind));
-      const pending = run && isPendingRun(run);
+      const pending = run && !run.research && isPendingRun(run);
       const restored = displayMessages(history);
       if (pending) {
         restored.push({ id: `assistant-${run.run_id}`, role: "assistant", content: "", streaming: true });
@@ -357,7 +367,17 @@ export function useConversation({
         events: [],
         steers: [],
       };
-      await observeRun(activeSessionId, run, started.stream_url);
+      if (started.kind === "research" && started.project_id) {
+        const detail = await getRun(apiKey, started.run_id);
+        setCurrentRun(detail);
+        setMessages(current => {
+          const last = current.at(-1);
+          return last?.streaming ? [...current.slice(0, -1), { ...last, streaming: false,
+            content: "多 Agent 研究已启动。可在对话区查看判断、证据和阶段报告，或暂停、调整目标。选择输入框中的“对话”可继续聊天。" }] : current;
+        });
+      } else {
+        await observeRun(activeSessionId, run, started.stream_url);
+      }
     } catch (error) {
       const message = userFacingError(error);
       setMessages((current) => {
@@ -436,6 +456,7 @@ export function useConversation({
   }, [apiKey, loadSession]);
 
   return {
+    syncResearchProject,
     sessionRunStatuses,
     canSteerCurrentRun,
     loadWorkspace,

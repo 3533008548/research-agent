@@ -27,7 +27,6 @@ from tools.research_documents import (
     handle_save_research_document,
     handle_search_research_documents,
 )
-from tools.experiment_projects import handle_update_experiment_project
 from tools.describe import handle_describe_image
 from tools.profile_tool import handle_read_profile, handle_update_profile
 from cancellation import raise_if_cancelled
@@ -56,7 +55,6 @@ _TOOL_HANDLERS = {
     "compare_papers_to_research_document": handle_compare_papers_to_research_document,
     "review_research_document_innovation": handle_review_research_document_innovation,
     "review_new_paper_impact_on_research_document": handle_review_new_paper_impact_on_research_document,
-    "update_experiment_project": handle_update_experiment_project,
     "describe_image": handle_describe_image,
     "query_papers": handle_query_papers,
     "list_papers": handle_list_papers,

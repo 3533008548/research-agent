@@ -114,6 +114,11 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertIsNotNone(box, selector)
         return box["width"]
 
+    def _set_viewport(self, size):
+        self.page.set_viewport_size(size)
+        # ResizeObserver and React must commit width changes before measuring.
+        self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+
     def _wait_for_width(self, selector: str, expected: float) -> None:
         self.page.wait_for_function(
             "({selector, expected}) => Math.abs(document.querySelector(selector).getBoundingClientRect().width - expected) <= 2",
@@ -142,6 +147,116 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             "document.documentElement.scrollWidth <= window.innerWidth + 1"
         ))
 
+    def _assert_panes_contain_content(self):
+        for selector in (".conversation", ".message-list", ".run-inspector-content", ".research-workbench"):
+            if not self.page.locator(selector).count():
+                continue
+            self.assertTrue(self.page.locator(selector).evaluate(
+                "el => el.scrollWidth <= el.clientWidth + 1"
+            ), f"{selector} must not scroll the entire pane horizontally")
+        self._assert_no_horizontal_page_overflow()
+
+    def test_right_sidebar_stays_beside_chat_when_leaving_a_wide_window(self):
+        # Cross the old 1120px breakpoint in both directions, including a
+        # browser zoom-equivalent CSS viewport and a short restored window.
+        for width, height in ((1440, 900), (1121, 800), (1120, 800), (1000, 600),
+                              (915, 600), (761, 600), (1280, 720), (1440, 900)):
+            with self.subTest(viewport=(width, height)):
+                self._set_viewport({"width": width, "height": height})
+                self.page.wait_for_function("document.querySelector('.workspace').clientWidth === innerWidth")
+                center = self.page.locator(".conversation").bounding_box()
+                right = self.page.locator(".run-inspector").bounding_box()
+                self.assertAlmostEqual(right["y"], center["y"], delta=1)
+                self.assertGreaterEqual(right["x"], center["x"] + center["width"] - 1)
+                self.assertLessEqual(right["y"] + right["height"], height + 1)
+                self._assert_panes_contain_content()
+
+    def test_long_markdown_scrolls_locally_without_widening_chat(self):
+        formula = " + ".join(f"x_{{{i}}}" for i in range(55))
+        content = ("布局边界测试\n\n" + "long_identifier_" * 70 + "\n\n行内公式：$" + formula + "$\n\n$$\n" + formula + "\n$$\n\n"
+                   + "```text\n" + "very_long_code_" * 80 + "\n```\n\n"
+                   + "| " + " | ".join(f"Column_{i}" for i in range(24)) + " |\n"
+                   + "| " + " | ".join("---" for _ in range(24)) + " |\n"
+                   + "| " + " | ".join("data" for _ in range(24)) + " |")
+        self.page.route("**/api/v1/sessions/*/messages", lambda route: route.fulfill(
+            json=[{"role": "assistant", "content": content}]))
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.locator(".message-body .katex-display").wait_for()
+        for width in (1440, 1000, 761, 390, 1440):
+            self._set_viewport({"width": width, "height": 800})
+            self._assert_panes_contain_content()
+            for selector in (".message-body pre", ".message-body table", ".message-body .katex-display"):
+                self.assertTrue(self.page.locator(selector).evaluate("""el => {
+                    const rect = el.getBoundingClientRect();
+                    const body = el.closest('.message-body').getBoundingClientRect();
+                    const needsScroll = el.scrollWidth > el.clientWidth;
+                    el.scrollLeft = el.scrollWidth;
+                    return rect.left >= body.left - 1 && rect.right <= body.right + 1
+                        && (!needsScroll || el.scrollLeft > 0);
+                }"""), selector)
+            if width == 1000 and os.getenv("E2E_ARTIFACT_DIR"):
+                self.page.locator(".message-body .katex-display").scroll_into_view_if_needed()
+                self.page.screenshot(path=str(Path(os.environ["E2E_ARTIFACT_DIR"]) / "long-math-restored-window.png"))
+
+    def test_long_research_questions_and_reports_stay_inside_the_conversation(self):
+        question = ("请核查这个研究假设并比较适用条件和反例。" * 12
+                    + "A Theory of Traffic Regulators for Deterministic Networks " * 6
+                    + "unbroken_identifier_" * 35)
+        formula = " + ".join(f"x_{{{i}}}" for i in range(45))
+        report = "$$\n" + formula + "\n$$\n\n```text\n" + "wide_report_" * 90 + "\n```"
+        projects = [{
+            "project_id": f"layout-{i}", "question": question + f" / 方案 {i}",
+            "origin_session_id": "layout-only", "goal_version": i + 1, "updated_at": "2026-11-10",
+            "execution_state": "paused", "end_reason": "", "waiting_for": [], "criteria": [],
+            "claims": [], "gaps": [], "evidence": [], "report": report, "report_version": i + 1,
+            "budget": {"calls": 2, "max_calls": 40, "tokens": 500, "max_tokens": 20000},
+        } for i in range(3)]
+        self.page.route("**/api/v1/research-projects", lambda route: route.fulfill(json=projects))
+        self.page.route("**/api/v1/research-projects/*", lambda route: route.fulfill(
+            json=next(p for p in projects if route.request.url.endswith(p["project_id"]))))
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.get_by_label("任务类型").select_option("research")
+        self.page.locator(".research-workbench .katex-display").wait_for()
+        self.assertEqual(self.page.locator(".run-inspector .research-workbench").count(), 0)
+        trigger = self.page.get_by_label("选择研究问题", exact=True)
+        options = self.page.get_by_role("group", name="研究问题列表", exact=True)
+        for width, height in ((1440, 900), (1120, 800), (1000, 600), (761, 600), (390, 844), (1440, 900)):
+            with self.subTest(viewport=(width, height)):
+                self._set_viewport({"width": width, "height": height})
+                trigger.click()
+                options.wait_for(state="visible")
+                options.scroll_into_view_if_needed()
+                self._assert_panes_contain_content()
+                self.assertTrue(options.evaluate("""el => {
+                    const rect = el.getBoundingClientRect();
+                    const pane = el.closest('.message-list').getBoundingClientRect();
+                    return rect.left >= pane.left - 1 && rect.right <= pane.right + 1
+                        && rect.top >= -1 && rect.bottom <= innerHeight + 1
+                        && el.scrollWidth <= el.clientWidth + 1 && el.scrollHeight > el.clientHeight;
+                }"""))
+                self.assertEqual(options.get_by_role("button").last.inner_text(), projects[-1]["question"])
+                if width == 1000 and os.getenv("E2E_ARTIFACT_DIR"):
+                    self.page.screenshot(path=str(Path(os.environ["E2E_ARTIFACT_DIR"]) / "research-picker-restored-window.png"))
+                options.get_by_role("button").last.click()
+                options.wait_for(state="hidden")
+                self.assertIn("方案 2", trigger.inner_text())
+                self.assertTrue(trigger.evaluate("el => el === document.activeElement"))
+                # Native disclosure keyboard behavior and Escape dismissal.
+                trigger.press("Enter")
+                options.wait_for(state="visible")
+                trigger.press("Tab")
+                self.page.keyboard.press("Space")
+                options.wait_for(state="hidden")
+                self.assertIn("方案 0", trigger.inner_text())
+                trigger.press("Enter")
+                options.wait_for(state="visible")
+                trigger.press("Tab")
+                self.page.keyboard.press("Escape")
+                options.wait_for(state="hidden")
+                self.assertTrue(trigger.evaluate("el => el === document.activeElement"))
+                self._assert_panes_contain_content()
+        self.assertEqual(self._state()["calls"], [])
+
     def _wait_for_run_status(self, expected: str, run_id: str | None = None) -> dict:
         deadline = time.monotonic() + 8
         latest: dict = {}
@@ -165,6 +280,90 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(state["calls"][0]["message"], "API 客户端测试")
         run = self._wait_for_run_status("completed")
         self.assertEqual(run["answer"], "来自 FastAPI：API 客户端测试")
+
+    def test_chat_layout_uses_edge_scrollbar_and_compact_composer(self):
+        self._set_viewport({"width": 1700, "height": 900})
+        self.page.route("**/api/v1/sessions/*/messages", lambda route: route.fulfill(json=[
+            {"role": "user", "content": "解释算法四的输入和输出"},
+            {"role": "assistant", "content": "算法说明。\n\n" * 70},
+        ]))
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.locator(".message-user").wait_for()
+        self.assertEqual(self.page.locator(".message-avatar, .message-role, .layout-menu").count(), 0)
+        self.assertEqual(self.page.locator(".research-workbench").count(), 0)
+        self.assertTrue(self.page.locator(".message-user .message-body").evaluate(
+            "e => getComputedStyle(e).borderTopStyle === 'solid'"))
+        self.assertTrue(self.page.locator(".message-assistant .message-body").evaluate(
+            "e => getComputedStyle(e).borderTopStyle === 'none'"))
+        message = self.page.get_by_label("消息", exact=True)
+        compact = message.bounding_box()["height"]
+        self.assertLessEqual(compact, 40)
+        self.assertGreater(self.page.locator(".composer").bounding_box()["width"], 860)
+        for width in (1700, 1000, 761):
+            self._set_viewport({"width": width, "height": 800})
+            self.page.wait_for_function("""() => {
+                const list = document.querySelector('.message-list').getBoundingClientRect();
+                const right = document.querySelector('.run-inspector').getBoundingClientRect();
+                return Math.abs(list.right - right.left) < 2;
+            }""")
+            self.assertIn("rgba(0, 0, 0, 0)", self.page.locator(".message-list").evaluate(
+                "e => getComputedStyle(e).scrollbarColor"))
+        message.fill("很多输入内容\n" * 40)
+        self.assertGreater(message.bounding_box()["height"], compact + 40)
+        self.assertLessEqual(message.bounding_box()["height"], 181)
+        message.fill("短输入")
+        self.assertLessEqual(message.bounding_box()["height"], 40)
+        self._set_viewport({"width": 1700, "height": 900})
+        if os.getenv("E2E_ARTIFACT_DIR"):
+            self.page.screenshot(path=str(Path(os.environ["E2E_ARTIFACT_DIR"]) / "compact-chat.png"))
+        self.page.get_by_label("任务类型").select_option("research")
+        self.page.locator(".message-list .research-workbench").wait_for()
+        self.assertEqual(self.page.locator(".run-inspector .research-workbench").count(), 0)
+        self.page.get_by_label("任务类型").select_option("chat")
+        self.assertEqual(self.page.locator(".research-workbench").count(), 0)
+        self.assertEqual(self._state()["calls"], [])
+
+    def test_recovered_answer_replaces_partial_draft_and_survives_reload(self):
+        self._send("__recover__")
+        self.page.get_by_text("恢复前的不完整草稿", exact=True).wait_for(timeout=8_000)
+        self.page.get_by_text("自动恢复后的完整回答。", exact=True).wait_for(timeout=8_000)
+        self.assertEqual(self.page.get_by_text("恢复前的不完整草稿", exact=True).count(), 0)
+        run = self._wait_for_run_status("completed")
+        self.assertEqual(run["answer"], "自动恢复后的完整回答。")
+        self.assertEqual(len(self._state()["calls"]), 1)
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.get_by_text("自动恢复后的完整回答。", exact=True).wait_for(timeout=8_000)
+        self.assertEqual(self.page.get_by_text("恢复前的不完整草稿", exact=True).count(), 0)
+
+    @unittest.skipUnless(os.getenv("E2E_REDIS_URL"), "persistent research needs Redis")
+    def test_persistent_research_controls_release_chat_and_survive_reload(self):
+        self._set_viewport({"width": 1440, "height": 1000})
+        self.page.get_by_label("消息", exact=True).fill("核对方案的适用条件与反例")
+        self.page.get_by_label("任务类型").select_option("research")
+        self.page.get_by_role("button", name="开始研究", exact=True).click()
+        self.page.get_by_text("多 Agent 研究已启动。", exact=False).wait_for(timeout=10000)
+        workbench = self.page.get_by_role("region", name="持续研究工作台")
+        workbench.get_by_role("button", name="暂停研究", exact=True).wait_for(timeout=10000)
+        self.page.get_by_label("任务类型").select_option("chat")
+        self.page.get_by_label("消息", exact=True).fill("研究继续时我想问另一个问题")
+        self.page.get_by_role("button", name="发送", exact=True).click()
+        self.page.get_by_text("来自 FastAPI：研究继续时我想问另一个问题", exact=True).wait_for()
+        self.page.get_by_label("任务类型").select_option("research")
+        workbench.get_by_role("button", name="暂停研究", exact=True).click()
+        workbench.get_by_text("已暂停", exact=True).wait_for()
+        workbench.get_by_label("补充约束或材料标识").fill("只比较同样负载")
+        workbench.get_by_role("button", name="更新研究目标", exact=True).click()
+        self.page.wait_for_timeout(300)
+        workbench.get_by_text("已暂停", exact=True).wait_for()
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.get_by_label("任务类型").select_option("research")
+        workbench.get_by_text("已暂停", exact=True).wait_for(timeout=10000)
+        workbench.get_by_role("button", name="恢复研究", exact=True).click()
+        workbench.get_by_text("持续推进中", exact=True).wait_for()
+        self._assert_no_horizontal_page_overflow()
+        artifact_dir = os.getenv("E2E_ARTIFACT_DIR")
+        if artifact_dir:
+            self.page.screenshot(path=str(Path(artifact_dir) / "persistent-research-desktop.png"))
 
     def test_switching_sessions_keeps_runs_and_drafts_isolated(self) -> None:
         cancelled = []
@@ -278,6 +477,19 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertIn("浏览器 E2E 会话", self.page.locator(".session-item.active").inner_text())
         self.assertEqual(self.page.locator("textarea").first.input_value(), "A 保留的草稿")
 
+    def test_paper_library_keeps_relation_review_without_reproduction(self) -> None:
+        self.page.locator(".session-item.active").wait_for()
+        self.page.route("**/api/v1/workspace/papers", lambda route: route.fulfill(json=[{
+            "paper_id": "paper-library-test", "title": "已有论文", "chunks": 3,
+            "indexed_at": "2026-11-10", "relation_count": 0,
+        }]))
+        self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="关系审查", exact=True).first.wait_for()
+        self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
+        self.page.get_by_role("button", name="关系审查", exact=True).first.click()
+        self.assertIn("【论文关系审查】", self.page.locator("textarea").first.input_value())
+
     def test_workspace_layout_keeps_sessions_and_tools_in_the_left_rail(self) -> None:
         # Use the fixture's real session API so navigation remains usable;
         # repeated wide characters exercise the longest persisted titles.
@@ -300,12 +512,12 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
 
         for width, height, layout in (
             (1440, 900, "three_columns"),
-            (1000, 900, "inspector_below"),
-            (1000, 600, "inspector_below"),
+            (1000, 900, "three_columns"),
+            (1000, 600, "three_columns"),
             (390, 844, "stacked"),
         ):
             with self.subTest(viewport=f"{width}x{height}"):
-                self.page.set_viewport_size({"width": width, "height": height})
+                self._set_viewport({"width": width, "height": height})
                 self.page.evaluate("window.scrollTo(0, 0)")
                 boxes = self.page.evaluate("""() => {
                     const box = (selector) => {
@@ -345,14 +557,6 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
                     self.assertLessEqual(left["right"], center["x"] + 1)
                     self.assertLessEqual(center["right"], right["x"] + 1)
                     self.assertLessEqual(boxes["composer"]["bottom"], height + 1)
-                elif layout == "inspector_below":
-                    self.assertAlmostEqual(left["y"], center["y"], delta=1)
-                    self.assertLessEqual(left["right"], center["x"] + 1)
-                    self.assertGreaterEqual(right["y"], max(left["bottom"], center["bottom"]) - 1)
-                    self.assertAlmostEqual(right["x"], boxes["workspace"]["x"], delta=1)
-                    self.assertAlmostEqual(right["width"], boxes["workspace"]["width"], delta=1)
-                    self.assertLessEqual(boxes["composer"]["bottom"], right["y"] + 1)
-                    self.assertLessEqual(right["bottom"], height + 1)
                 else:
                     self.assertGreaterEqual(center["y"], left["bottom"] - 1)
                     self.assertGreaterEqual(right["y"], center["bottom"] - 1)
@@ -379,7 +583,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self._state()["calls"], [])
 
     def test_composer_mode_switch_keeps_draft_and_fits_a_short_window(self) -> None:
-        self.page.set_viewport_size({"width": 1000, "height": 600})
+        self._set_viewport({"width": 1000, "height": 600})
         composer = self.page.locator(".composer")
         message = composer.get_by_role("textbox", name="消息", exact=True)
         message.fill("保留这份研究草稿\n" * 9)
@@ -403,14 +607,14 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             const composer = document.querySelector('.composer').getBoundingClientRect();
             const messages = document.querySelector('.message-list').getBoundingClientRect();
             const inspector = document.querySelector('.run-inspector').getBoundingClientRect();
-            return composer.bottom <= inspector.top + 1 && messages.height >= 40;
+            return composer.bottom <= innerHeight + 1 && messages.height >= 40 && inspector.top === 0;
         }""")
         send = composer.get_by_role("button", name="开始研究", exact=True)
         self.assertTrue(send.is_visible())
         self.assertLessEqual(send.bounding_box()["y"] + send.bounding_box()["height"], 600)
 
     def test_sidebars_resize_show_hide_and_restore_saved_preferences(self) -> None:
-        self.page.set_viewport_size({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1440, "height": 900})
         response = self.page.request.post(
             f"{self.base_url}/api/v1/sessions", data={"title": "W" * 20},
         )
@@ -452,17 +656,17 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertFalse(self.page.locator(".run-inspector").is_visible())
         self.page.get_by_role("button", name="显示运行检查器", exact=True).click()
         self._wait_for_width(".run-inspector", 480)
-        self.page.set_viewport_size({"width": 1121, "height": 900})
+        self._set_viewport({"width": 1121, "height": 900})
         self.page.wait_for_function("""() => {
             const width = selector => document.querySelector(selector).getBoundingClientRect().width;
             return width('.conversation') >= 479 && width('.session-sidebar') >= 189
                 && width('.run-inspector') >= 244;
         }""")
         self._assert_no_horizontal_page_overflow()
-        self.page.set_viewport_size({"width": 390, "height": 844})
+        self._set_viewport({"width": 390, "height": 844})
         self._assert_no_horizontal_page_overflow()
         self.assertFalse(self.page.get_by_role("separator", name="调整会话侧栏宽度", exact=True).is_visible())
-        self.page.set_viewport_size({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1440, "height": 900})
         self._wait_for_width(".session-sidebar", 420)
         self._wait_for_width(".run-inspector", 480)
 
@@ -476,14 +680,12 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertGreater(keyboard_width, 190)
         self.page.reload(wait_until="domcontentloaded")
         self._wait_for_width(".session-sidebar", keyboard_width)
-        self.page.get_by_label("布局选项", exact=True).click()
-        self.page.get_by_role("button", name="恢复默认布局", exact=True).click()
-        self._wait_for_width(".session-sidebar", 240)
-        self._wait_for_width(".run-inspector", 310)
+        self.assertEqual(self.page.get_by_label("布局选项", exact=True).count(), 0)
+        self.assertEqual(self.page.get_by_role("button", name="恢复默认布局", exact=True).count(), 0)
         self.assertEqual(self._state()["calls"], [])
 
     def test_document_uses_workbench_width_and_respects_explicit_inspector_visibility(self) -> None:
-        self.page.set_viewport_size({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1440, "height": 900})
         title = "浏览器档案：验证侧栏伸缩后的正文阅读与研究工具重排"
         response = self.page.request.post(
             f"{self.base_url}/__e2e__/documents",
@@ -521,7 +723,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self._state()["calls"], [])
 
     def test_hidden_inspector_leaves_failure_details_reachable(self) -> None:
-        self.page.set_viewport_size({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1440, "height": 900})
         self.page.get_by_role("button", name="隐藏运行检查器", exact=True).click()
         self.page.locator(".run-inspector").wait_for(state="hidden")
         self._send("__error__")
@@ -535,7 +737,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(len(self._state()["calls"]), 1)
 
     def test_auto_hidden_inspector_finishes_an_active_drag_before_mouseup(self) -> None:
-        self.page.set_viewport_size({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1440, "height": 900})
         title = "运行结束时自动隐藏的档案拖动测试"
         response = self.page.request.post(
             f"{self.base_url}/__e2e__/documents",
@@ -582,16 +784,13 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(len(self._state()["calls"]), 1)
 
     def test_tall_research_composer_and_notice_leave_messages_and_send_reachable(self) -> None:
-        self.page.set_viewport_size({"width": 1000, "height": 600})
+        self._set_viewport({"width": 1000, "height": 600})
         composer = self.page.locator(".composer")
         message = composer.get_by_role("textbox", name="消息", exact=True)
-        message.fill("研究草稿\n" * 12)
+        message.fill("研究草稿")
         composer.get_by_role("combobox", name="任务类型", exact=True).select_option("research")
         original_height = message.bounding_box()["height"]
-        # A native textarea drag stores the user's chosen height as an inline
-        # style. Exercise that height together with the CSS upper bound;
-        # filling many lines alone does not resize this textarea.
-        message.evaluate("element => { element.style.height = '10rem'; }")
+        message.fill("研究草稿\n" * 12)
         self.assertGreater(message.bounding_box()["height"], original_height + 20)
         composer.locator("input[type=file]").set_input_files({
             "name": "layout-not-supported.txt", "mimeType": "text/plain",
@@ -605,7 +804,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             const messages = rect('.message-list');
             const composer = rect('.composer');
             const inspector = rect('.run-inspector');
-            return messages.height >= 40 && composer.bottom <= inspector.top + 1
+            return messages.height >= 40 && composer.bottom <= innerHeight + 1 && inspector.top === 0
                 && inspector.bottom <= innerHeight + 1;
         }""", timeout=3_000)
         send = composer.get_by_role("button", name="开始研究", exact=True)
@@ -622,7 +821,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
 
 
     def test_http_error_diagnostics_survive_detail_reload_without_private_payloads(self) -> None:
-        self.page.set_viewport_size({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1440, "height": 900})
         self._send("__http401__")
         run = self._wait_for_run_status("failed")
         run_id = run["run_id"]

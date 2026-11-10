@@ -12,6 +12,7 @@ export interface WorkspaceLayoutPreferences {
 
 export const WORKSPACE_LAYOUT_KEY = "research-agent.workspace-layout.v1";
 export const CENTER_MIN_WIDTH = 480;
+export const COMPACT_CENTER_MIN_WIDTH = 320;
 export const SIDEBAR_LIMITS = {
   left: { min: 190, max: 420, initial: 240 },
   right: { min: 245, max: 480, initial: 310 },
@@ -89,16 +90,19 @@ export function resolveWorkspaceWidths({
   rightVisible: boolean;
 }): ResolvedWorkspaceWidths {
   const width = Number.isFinite(workspaceWidth) ? Math.max(0, workspaceWidth) : 0;
-  const mode = workspaceLayoutMode(viewportWidth);
+  const mode = workspaceLayoutMode(Math.min(viewportWidth, width));
   const leftInRow = leftVisible && mode !== "stacked";
-  const rightInRow = rightVisible && mode === "desktop";
+  const rightInRow = rightVisible && mode !== "stacked";
   let leftWidth = leftInRow ? clampSidebarWidth("left", preferences.leftWidth) : 0;
   let rightWidth = rightInRow ? clampSidebarWidth("right", preferences.rightWidth) : 0;
-  const budget = Math.max(0, width - CENTER_MIN_WIDTH);
+  const leftMin = leftInRow ? SIDEBAR_LIMITS.left.min : 0;
+  const rightMin = rightInRow ? SIDEBAR_LIMITS.right.min : 0;
+  // Keep both rails beside chat in restored desktop windows. Only compact
+  // widths relax the reading width; saved preferences remain untouched.
+  const centerMin = Math.max(COMPACT_CENTER_MIN_WIDTH, Math.min(CENTER_MIN_WIDTH, width - leftMin - rightMin));
+  const budget = Math.max(0, width - centerMin);
 
   if (leftWidth + rightWidth > budget) {
-    const leftMin = leftInRow ? SIDEBAR_LIMITS.left.min : 0;
-    const rightMin = rightInRow ? SIDEBAR_LIMITS.right.min : 0;
     const minTotal = leftMin + rightMin;
     if (budget >= minTotal) {
       // A stable allocation makes a requested 10px keyboard change remain a

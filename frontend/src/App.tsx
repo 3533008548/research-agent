@@ -4,15 +4,11 @@ import {
   updateWorkspaceSettings,
 } from "./api";
 import {
-  experimentCodeSource,
-  methodReconstruction,
-  repositoryPreparation,
   statusLabel,
 } from "./lib/labels";
 import { ChatPanel } from "./components/workspace/ChatPanel";
 import { RunInspector } from "./components/RunInspector";
 import { DailyPanel } from "./components/workspace/DailyPanel";
-import { ExperimentPanel } from "./components/workspace/ExperimentPanel";
 import { DocumentPanel } from "./components/workspace/DocumentPanel";
 import { DailyRunPanel, ProfilePanel } from "./components/workspace/SimplePanels";
 import { RunsPanel } from "./components/workspace/RunsPanel";
@@ -23,7 +19,6 @@ import { useDailyWorkspace } from "./hooks/useDailyWorkspace";
 import { useDocuments } from "./hooks/useDocuments";
 import { useRunCenter } from "./hooks/useRunCenter";
 import { useWorkspaceChrome } from "./hooks/useWorkspaceChrome";
-import { useExperiments } from "./hooks/useExperiments";
 import { useWorkspaceLayout } from "./hooks/useWorkspaceLayout";
 import { SidebarResizeHandle } from "./components/SidebarResizeHandle";
 import { SessionSidebar } from "./components/workspace/SessionSidebar";
@@ -78,6 +73,7 @@ export function App() {
     mode,
     researchScope,
     currentRun,
+    syncResearchProject,
     runEvents,
     isSending,
     isCancelling,
@@ -189,34 +185,6 @@ export function App() {
     sendMessage,
   });
 
-  const {
-    experiments,
-    refreshExperiments,
-    experimentStarting,
-    experimentFiles,
-    repositoryUrlDraft,
-    repositoryRelationship,
-    setRepositoryUrlDraft,
-    setRepositoryRelationship,
-    selectExperimentProject,
-    openExperimentFile,
-    startPaperReproduction,
-    retryExperimentProject,
-    searchExperimentRepositories,
-    connectExperimentCodeRepository,
-    prepareExperimentRepository,
-    startExperimentMethodReconstruction,
-    prepareExperimentConfirmation,
-    removeExperimentProject,
-  } = useExperiments({
-    apiKey,
-    activeSessionId,
-    setNotice,
-    setDraft,
-    setWorkbenchTabs,
-    setActiveWorkbenchTabId,
-    closeWorkbenchTab,
-  });
 
   const {
     toggleWorkspacePanel,
@@ -235,7 +203,6 @@ export function App() {
     setDraft,
     setWorkbenchTabs,
     setActiveWorkbenchTabId,
-    refreshExperiments,
     loadKeywords,
   });
 
@@ -246,10 +213,6 @@ export function App() {
   const selectedDocumentId = activeWorkbenchTab?.kind === "document"
     ? activeWorkbenchTab.document.document_id
     : null;
-  const selectedExperimentId = activeWorkbenchTab?.kind === "experiment"
-    ? activeWorkbenchTab.project.project_id
-    : null;
-  const selectedExperimentFile = selectedExperimentId ? experimentFiles[selectedExperimentId] : null;
   useEffect(() => {
     const list = messageListRef.current;
     if (list) {
@@ -300,16 +263,6 @@ export function App() {
     setApiKey(nextKey);
   }
 
-  const activeExperimentSource = activeWorkbenchTab?.kind === "experiment"
-    ? experimentCodeSource(activeWorkbenchTab.project)
-    : null;
-  const activeRepositoryPreparation = activeWorkbenchTab?.kind === "experiment"
-    ? repositoryPreparation(activeWorkbenchTab.project)
-    : null;
-  const activeMethodReconstruction = activeWorkbenchTab?.kind === "experiment"
-    ? methodReconstruction(activeWorkbenchTab.project)
-    : null;
-
   const inspectingDaily = activeWorkbenchTab?.kind === "daily" || activeWorkbenchTab?.kind === "dailyRun";
   const inspectedRun = inspectingDaily ? dailyCurrentRun : currentRun;
   const inspectedEvents = inspectingDaily ? dailyRunEvents : runEvents;
@@ -341,9 +294,6 @@ export function App() {
           selectedDocumentId={selectedDocumentId}
           profile={profile}
           papers={papers}
-          experiments={experiments}
-          selectedExperimentId={selectedExperimentId}
-          experimentStarting={experimentStarting}
           dailyRuns={dailyRuns}
           keywords={keywords}
           keywordDraft={keywordDraft}
@@ -358,8 +308,6 @@ export function App() {
           onRemoveResearchDocument={(document) => void removeResearchDocument(document)}
           onOpenProfile={() => void openProfile()}
           onPreparePaperRelationReview={(paper) => preparePaperRelationReview(paper)}
-          onStartPaperReproduction={(paper) => void startPaperReproduction(paper)}
-          onSelectExperimentProject={(projectId) => void selectExperimentProject(projectId)}
           onSelectDailyRun={(runId) => void selectDailyRun(runId)}
           onOpenDailyCenter={() => void openDailyCenter()}
           onAddDailyKeyword={(event) => void addDailyKeyword(event)}
@@ -373,7 +321,7 @@ export function App() {
           {layout.leftResizeProps && <SidebarResizeHandle {...layout.leftResizeProps} />}
         </SessionSidebar>
 
-        <section className={`conversation ${documentActive ? "conversation-doc" : ""}`} aria-label="研究工作台">
+        <section className={`conversation ${documentActive ? "conversation-doc" : activeWorkbenchTab?.kind === "chat" ? "conversation-chat" : ""}`} aria-label="研究工作台">
           <div className="workbench-header">
             <button
               type="button"
@@ -398,7 +346,6 @@ export function App() {
                   {tab.kind === "profile" && <span aria-hidden="true">◉</span>}
                   {tab.kind === "daily" && <span aria-hidden="true">◌</span>}
                   {tab.kind === "dailyRun" && <span aria-hidden="true">▧</span>}
-                  {tab.kind === "experiment" && <span aria-hidden="true">⌘</span>}
                   {tab.kind === "runs" && <span aria-hidden="true">◫</span>}
                   <span>{tab.kind === "chat" ? activeSessionTitle : tab.title}</span>
                 </button>
@@ -433,15 +380,6 @@ export function App() {
               aria-label={layout.rightVisible ? "隐藏运行检查器" : "显示运行检查器"}
               title={layout.rightVisible ? "隐藏运行检查器" : "显示运行检查器"}
             ><SidebarIcon side="right" /></button>
-            <details className="layout-menu">
-              <summary aria-label="布局选项" title="布局选项">⋯</summary>
-              <div className="layout-menu-content">
-                <button type="button" onClick={(event) => {
-                  layout.resetLayout();
-                  event.currentTarget.closest("details")?.removeAttribute("open");
-                }}>恢复默认布局</button>
-              </div>
-            </details>
           </div>
 
           {notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
@@ -463,28 +401,6 @@ export function App() {
               onSubmitRequest={(event, doc) => void submitResearchDocumentRequest(event, doc)}
               onDownload={(doc) => void downloadDocument(doc)}
               onRemove={(doc) => void removeResearchDocument(doc)}
-            />
-          ) : activeWorkbenchTab?.kind === "experiment" ? (
-            <ExperimentPanel
-              project={activeWorkbenchTab.project}
-              source={activeExperimentSource}
-              preparation={activeRepositoryPreparation}
-              reconstruction={activeMethodReconstruction}
-              starting={experimentStarting}
-              selectedFile={selectedExperimentFile}
-              repositoryUrlDraft={repositoryUrlDraft}
-              repositoryRelationship={repositoryRelationship}
-              onRepositoryUrlDraftChange={setRepositoryUrlDraft}
-              onRepositoryRelationshipChange={setRepositoryRelationship}
-              onRefresh={(projectId) => void selectExperimentProject(projectId)}
-              onRetry={(project) => void retryExperimentProject(project)}
-              onRemove={(project) => void removeExperimentProject(project)}
-              onSearchRepositories={(project) => void searchExperimentRepositories(project)}
-              onConnectRepository={(project, url, relationship) => void connectExperimentCodeRepository(project, url, relationship)}
-              onPrepareRepository={(project) => void prepareExperimentRepository(project)}
-              onStartMethodReconstruction={(project) => void startExperimentMethodReconstruction(project)}
-              onPrepareConfirmation={(project) => prepareExperimentConfirmation(project)}
-              onOpenFile={(projectId, path) => void openExperimentFile(projectId, path)}
             />
           ) : activeWorkbenchTab?.kind === "dailyRun" ? (
             <DailyRunPanel title={activeWorkbenchTab.title} detail={activeWorkbenchTab.detail} />
@@ -530,6 +446,8 @@ export function App() {
 
           ) : (
             <ChatPanel
+              apiKey={apiKey}
+              onResearchChange={syncResearchProject}
               messages={messages}
               draft={draft}
               mode={mode}

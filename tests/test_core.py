@@ -199,6 +199,59 @@ class TestFastAPIService(unittest.TestCase):
         self.store.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_retired_reproduction_api_is_unavailable_even_with_spa_mount(self):
+        from fastapi.testclient import TestClient
+        from api.app import create_app, mount_react_frontend
+
+        dist = Path(self.tmp) / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html>workbench</html>", encoding="utf-8")
+        app = create_app(agent=self.agent)
+        mount_react_frontend(app, dist)
+        with TestClient(app) as client:
+            session_id = client.post("/api/v1/sessions", json={"title": "保留对话"}).json()["thread_id"]
+            for action in ("generate", "prepare_repository", "reconstruct_method"):
+                response = client.post("/api/v1/runs", json={
+                    "kind": "experiment", "session_id": session_id,
+                    "paper_id": "paper-old", "project_id": "experiment-old",
+                    "experiment_action": action,
+                })
+                self.assertEqual(response.status_code, 422)
+            for method, path in (
+                ("GET", "/workspace/experiments"),
+                ("GET", "/workspace/experiments/experiment-old"),
+                ("GET", "/workspace/experiments/experiment-old/files/README.md"),
+                ("POST", "/workspace/experiments/experiment-old/repository-candidates"),
+                ("PUT", "/workspace/experiments/experiment-old/repository"),
+                ("POST", "/workspace/experiments/experiment-old/method-reconstruction"),
+                ("DELETE", "/workspace/experiments/experiment-old"),
+                ("GET", "/runs/experiment-old"),
+                ("GET", "/runs/experiment-old/events"),
+                ("POST", "/runs/experiment-old/cancel"),
+            ):
+                with self.subTest(method=method, path=path):
+                    self.assertEqual(client.request(method, "/api/v1" + path).status_code, 404)
+            self.assertEqual(client.get("/workbench").status_code, 200)
+            self.assertEqual(client.get(f"/api/v1/sessions/{session_id}/runs").json(), [])
+
+    def test_legacy_reproduction_rows_survive_upgrade_without_blocking_chat(self):
+        from session_store import SessionStore
+
+        session_id = self.store.create("升级前会话")["thread_id"]
+        db_path = self.store.db_path
+        self.store.close()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""CREATE TABLE experiment_runs (
+                run_id TEXT PRIMARY KEY, thread_id TEXT, status TEXT, created_at TEXT)""")
+            conn.execute("INSERT INTO experiment_runs VALUES (?, ?, ?, ?)",
+                         ("experiment-old", session_id, "queued", "2000-01-01T00:00:00"))
+        self.store = SessionStore(db_path)
+        run = self.store.create_chat_run(session_id, "fake-model", status="queued")
+        self.assertEqual(self.store.first_pending_run(session_id), run["run_id"])
+        self.assertNotIn("experiment", self.store.run_status_counts())
+        with sqlite3.connect(db_path) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM experiment_runs").fetchone()[0], "queued")
+
     def test_chat_run_streams_sse_and_persists_final_answer(self):
         from fastapi.testclient import TestClient
         from api.app import create_app
@@ -772,7 +825,7 @@ class TestFastAPIService(unittest.TestCase):
         from api.redis_runs import RedisResearchRunManager, RedisResearchRunWorker
 
         broker = self._FakeResearchBroker()
-        manager = RedisResearchRunManager(self.agent, broker)
+        manager = RedisResearchRunManager(self.agent, broker, persistent=False)
         session_id = self.agent.create_session("研究队列") ["thread_id"]
         started = manager.start(session_id, "RAG 重排方法", "public")
         self.assertEqual(started["status"], "queued")
@@ -1584,7 +1637,7 @@ class TestVerifyNode(unittest.TestCase):
                 return None
 
             @staticmethod
-            def iter_lines(decode_unicode=True):
+            def iter_lines(decode_unicode=True, **_kwargs):
                 return iter([
                     'data: {"choices":[{"delta":{"reasoning_content":"先梳理问题。"}}]}',
                     'data: {"choices":[{"delta":{"content":"已完成。"}}]}',
@@ -1882,7 +1935,7 @@ class TestVerifyNode(unittest.TestCase):
             def raise_for_status(self):
                 return None
 
-            def iter_lines(self, decode_unicode=True):
+            def iter_lines(self, decode_unicode=True, **_kwargs):
                 if self.should_fail:
                     raise requests.exceptions.ChunkedEncodingError("interrupted")
                 return iter([
@@ -4438,6 +4491,7 @@ class TestToolCatalog(unittest.TestCase):
         from tools import TOOL_NAMES as executable_names
 
         self.assertEqual(TOOL_NAMES, executable_names)
+        self.assertNotIn("update_experiment_project", TOOL_NAMES)
         all_schemas = get_tool_schemas()
         self.assertEqual(
             {schema["function"]["name"] for schema in all_schemas}, TOOL_NAMES,
@@ -4823,6 +4877,10 @@ class TestRuntimePaths(unittest.TestCase):
             )
             output = root / "backups"
 
+            legacy_projects = paths.primary_dir / "experiment_projects"
+            legacy_projects.mkdir()
+            (legacy_projects / "old-result.txt").write_text("preserved", encoding="utf-8")
+
             subprocess.run(
                 [
                     sys.executable, "scripts/backup_runtime.py",
@@ -4840,6 +4898,7 @@ class TestRuntimePaths(unittest.TestCase):
                 self.assertIn("runtime/primary/paper_relations.json", archive.namelist())
                 self.assertIn("runtime/primary/papers/paper.pdf", archive.namelist())
                 self.assertIn("runtime/primary/research_documents/research-doc-backup/document.md", archive.namelist())
+                self.assertEqual(archive.read("runtime/primary/experiment_projects/old-result.txt"), b"preserved")
 
 
 class TestResearchBenchmark(unittest.TestCase):
@@ -5178,7 +5237,7 @@ class TestRequestTracing(unittest.TestCase):
             def raise_for_status(self):
                 return None
 
-            def iter_lines(self, decode_unicode=True):
+            def iter_lines(self, decode_unicode=True, **_kwargs):
                 for line in self.lines:
                     if isinstance(line, BaseException):
                         raise line
@@ -5461,8 +5520,6 @@ class TestAuditRegressionFixes(unittest.TestCase):
 
         cases = (
             ("把这份方案保存成科研档案", {"save_research_document"}),
-            ("【复现实验项目确认】\nproject_id=experiment-abcdef123456\n已确认实验设置。",
-             {"update_experiment_project"}),
             ("超时发生时系统应如何处理？", set()),
         )
         with tempfile.TemporaryDirectory() as tmp:

@@ -54,7 +54,7 @@ export function RunInspector({
             <div><dt>耗时</dt><dd>{durationLabel(run.duration_ms) || (["queued", "running", "cancelling"].includes(run.status) ? "进行中" : "未记录")}</dd></div>
             {run.model && <div><dt>模型</dt><dd>{run.model}</dd></div>}
           </dl>
-          {!["completed", "cancelled", "failed", "partial_failed"].includes(run.status) && (
+          {!run.research && !["completed", "cancelled", "failed", "partial_failed"].includes(run.status) && (
             <button
               className="button button-secondary button-full"
               type="button"

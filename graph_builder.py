@@ -32,6 +32,7 @@ from llm_client import (
     LLMCircuitOpenError,
     LLMQueueFullError,
     LLMRequestTimeoutError,
+    LLMStreamError,
     RequestPolicy,
     RequestPriority,
 )
@@ -270,7 +271,15 @@ def build_graph(
 
     # ═══ LLM 节点 ═══
 
+    # Once a visible draft needs replay, keep later attempts private. The run's
+    # final answer replaces that draft through the existing done event, avoiding
+    # duplicated text and replay of already-completed tool nodes.
+    buffer_stream_output = False
+
     def llm_node(state: AgentState) -> dict:
+        nonlocal buffer_stream_output
+        metadata = dict(state.get("metadata") or {})
+        metadata.pop("stream_incomplete", None)
         ensure_active("llm")
         messages = sanitize_model_messages(
             list(state.get("messages", [])),
@@ -416,14 +425,18 @@ def build_graph(
             full_text = ""
             reasoning_content = ""
             tool_calls_acc = {}
+            finish_reason = None
+            attempt_usage = None
+            saved_partial = ""
+            stream_failed = False
 
             def _consume_stream(response) -> bool:
                 # ``+=`` rebinds both strings in this nested function.  They
                 # must therefore be declared nonlocal; otherwise a stream
                 # containing DeepSeek's first reasoning delta fails before
                 # any visible answer is emitted.
-                nonlocal full_text, reasoning_content
-                lines = iter(response.iter_lines(decode_unicode=True))
+                nonlocal full_text, reasoning_content, finish_reason, attempt_usage
+                lines = iter(response.iter_lines(chunk_size=1, decode_unicode=True))
                 while True:
                     ensure_active("stream_read")
                     if llm_client:
@@ -440,49 +453,94 @@ def build_graph(
                     try:
                         line = next(lines)
                     except StopIteration:
-                        # 正常 EOF 但未收到协议结束标记，也属于不完整流，不能当作成功。
-                        return False
-                    if not line or not line.startswith("data: "):
+                        # EOF without a successful terminal choice is incomplete.
+                        return finish_reason in {"stop", "tool_calls"}
+                    if not line or not line.startswith("data:"):
                         continue
-                    data_str = line[6:]
+                    data_str = line[5:].strip()
                     if data_str == "[DONE]":
                         return True
                     try:
                         chunk = _json.loads(data_str)
-                    except Exception:
-                        continue
+                    except (ValueError, TypeError):
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR") from None
+                    if not isinstance(chunk, dict) or chunk.get("error"):
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
                     # A final usage-only frame can have an empty choices list.
-                    delta = (chunk.get("choices") or [{}])[0].get("delta", {})
+                    choices = chunk.get("choices") or [{}]
+                    if not isinstance(choices, list) or not isinstance(choices[0], dict):
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    if not isinstance(delta, dict):
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
+                    if choice.get("finish_reason") is not None and not isinstance(choice["finish_reason"], str):
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    if isinstance(chunk.get("usage"), dict):
+                        attempt_usage = chunk["usage"]
                     token = delta.get("content", "")
                     if token:
+                        if not isinstance(token, str):
+                            raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
                         full_text += token
-                        stream_callback(token)
+                        if not buffer_stream_output:
+                            stream_callback(token)
                     reasoning_delta = delta.get("reasoning_content", "")
                     if reasoning_delta:
+                        if not isinstance(reasoning_delta, str):
+                            raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
                         reasoning_content += reasoning_delta
-                    for tc in delta.get("tool_calls", []):
+                    tool_deltas = delta.get("tool_calls") or []
+                    if not isinstance(tool_deltas, list):
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
+                    for tc in tool_deltas:
+                        if not isinstance(tc, dict):
+                            raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
                         idx = tc.get("index", 0)
+                        function = tc.get("function") or {}
+                        if (not isinstance(idx, int) or not isinstance(function, dict)
+                                or (tc.get("id") is not None and not isinstance(tc["id"], str))
+                                or any(function.get(key) is not None and not isinstance(function[key], str)
+                                       for key in ("name", "arguments"))):
+                            raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
                         if idx not in tool_calls_acc:
                             tool_calls_acc[idx] = {"id": tc.get("id", ""), "function": {"name": "", "arguments": ""}}
                         if tc.get("id"):
                             tool_calls_acc[idx]["id"] = tc["id"]
-                        if tc.get("function", {}).get("name"):
-                            tool_calls_acc[idx]["function"]["name"] += tc["function"]["name"]
-                        if tc.get("function", {}).get("arguments"):
-                            tool_calls_acc[idx]["function"]["arguments"] += tc["function"]["arguments"]
-                    if token_usage and "usage" in chunk:
-                        u = chunk["usage"]
-                        for k in ("prompt", "completion", "total"):
-                            token_usage[k] += u.get(f"{k}_tokens", 0)
-                        token_usage["calls"] += 1
-                        token_usage["last_prompt"] = u.get("prompt_tokens", 0)
-                        cached = (u.get("prompt_tokens_details", {}).get("cached_tokens")
-                                  or u.get("prompt_cache_hit_tokens", 0))
-                        token_usage["cached"] = token_usage.get("cached", 0) + cached
-                        missed = u.get("prompt_tokens", 0) - cached
-                        cost = missed / 1e6 * 1 + cached / 1e6 * 0.02 + u.get("completion_tokens", 0) / 1e6 * 2
-                        token_usage["cost"] = token_usage.get("cost", 0) + cost
-                        token_usage["last_round_cost"] = cost
+                        if function.get("name"):
+                            tool_calls_acc[idx]["function"]["name"] += function["name"]
+                        if function.get("arguments"):
+                            tool_calls_acc[idx]["function"]["arguments"] += function["arguments"]
+                    if finish_reason not in {None, "stop", "tool_calls"}:
+                        code = {"length": "LLM_OUTPUT_TRUNCATED", "content_filter": "LLM_CONTENT_FILTERED"}.get(finish_reason, "LLM_STREAM_INTERRUPTED")
+                        raise LLMStreamError(code, retryable=finish_reason != "content_filter")
+
+            def record_attempt_usage():
+                if token_usage is not None and attempt_usage is not None:
+                    u = attempt_usage
+                    for k in ("prompt", "completion", "total"):
+                        token_usage[k] = token_usage.get(k, 0) + u.get(f"{k}_tokens", 0)
+                    token_usage["calls"] = token_usage.get("calls", 0) + 1
+                    token_usage["last_prompt"] = u.get("prompt_tokens", 0)
+                    cached = ((u.get("prompt_tokens_details") or {}).get("cached_tokens")
+                              or u.get("prompt_cache_hit_tokens", 0))
+                    token_usage["cached"] = token_usage.get("cached", 0) + cached
+                    missed = u.get("prompt_tokens", 0) - cached
+                    cost = missed / 1e6 * 1 + cached / 1e6 * 0.02 + u.get("completion_tokens", 0) / 1e6 * 2
+                    token_usage["cost"] = token_usage.get("cost", 0) + cost
+                    token_usage["last_round_cost"] = cost
+
+            def validate_tool_calls():
+                if not full_text.strip() and not tool_calls_acc:
+                    raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
+                for call in tool_calls_acc.values():
+                    try:
+                        arguments = _json.loads(call["function"]["arguments"])
+                    except (ValueError, TypeError):
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR") from None
+                    if not isinstance(arguments, dict) or not call["id"] or not call["function"]["name"]:
+                        raise LLMStreamError("LLM_STREAM_PROTOCOL_ERROR")
 
             while True:
                 stop_watch = watch_stream_cancellation(resp)
@@ -492,6 +550,7 @@ def build_graph(
                         raise requests.exceptions.ChunkedEncodingError(
                             "stream ended before [DONE]"
                         )
+                    validate_tool_calls()
                     if llm_client:
                         llm_client.finish_stream(resp, success=True)
                     break
@@ -516,6 +575,17 @@ def build_graph(
                                 pass
                         emit("request_cancelled", stage="stream")
                         raise RequestCancelledError("模型流式响应已取消") from exc
+                    # A transport close after a valid terminal choice cannot
+                    # truncate its already-complete content. Still validate any
+                    # tool arguments before allowing the graph to execute them.
+                    if finish_reason in {"stop", "tool_calls"} and not isinstance(exc, LLMStreamError):
+                        try:
+                            validate_tool_calls()
+                        except LLMStreamError as invalid:
+                            exc = invalid
+                        else:
+                            llm_client.finish_stream(resp, success=True)
+                            break
                     if llm_client:
                         # Snapshot HTTP status and the low-level read failure
                         # before closing/replaying a stream. A replay may fail
@@ -532,11 +602,27 @@ def build_graph(
                             resp.close()
                         except Exception:
                             pass
-                    # 未输出任何 token 时可以安全重放同一模型请求；有内容后不重放，避免重复。
+                    record_attempt_usage()
+                    attempt_usage = None
+                    # Retry just this model invocation, retaining the existing
+                    # tool results in payload. Never re-enter prior tool nodes.
                     if (
-                        not full_text and llm_client
+                        llm_client and getattr(exc, "retryable", True)
+                        and getattr(request_budget, "remaining_seconds", lambda: 1)() > 0
                         and request_budget.reserve_retry()
                     ):
+                        saved_partial = full_text or saved_partial
+                        buffer_stream_output = buffer_stream_output or bool(full_text)
+                        full_text, reasoning_content = "", ""
+                        tool_calls_acc.clear()
+                        finish_reason = None
+                        _api_status("正在自动恢复模型输出，已有内容保留，完成后更新回复")
+                        emit("llm_stream_recovery_started", error_details=getattr(stream_error, "error_details", {}),
+                             **request_budget.metrics())
+                        if isinstance(exc, LLMStreamError) and exc.code == "LLM_OUTPUT_TRUNCATED":
+                            payload = {**payload, "messages": [*messages, {
+                                "role": "system", "content": "请在输出预算内给出完整且简洁的回答，优先结论与必要证据，避免重复展开。",
+                            }]}
                         retry_args = {
                             "stream": True,
                             "on_status": _api_status,
@@ -549,18 +635,24 @@ def build_graph(
                         except RequestCancelledError:
                             raise
                         except Exception as retry_error:
-                            emit_request_failed(retry_error)
-                            raise
-                        continue
+                            # Preserve the earlier draft even if replay fails
+                            # before response headers (for example, HTTP 503).
+                            stream_error = retry_error
+                        else:
+                            continue
+                    full_text = full_text or saved_partial
+                    tool_calls_acc.clear()
+                    stream_failed = True
                     if not full_text:
                         emit_request_failed(stream_error)
                         raise stream_error from exc
                     emit_request_failed(stream_error)
-                    interruption = "\n\n⚠️ 输出中断，已保留以上内容。发送 `/retry` 可重新请求。"
+                    interruption = "\n\n⚠️ 输出中断，自动恢复未能完成，已保留以上内容。可在运行详情中查看原因并重试。"
                     full_text += interruption
-                    stream_callback(interruption)
+                    if not buffer_stream_output:
+                        stream_callback(interruption)
                     if token_usage is not None:
-                        token_usage["api_status"] = "⚠️ 流式输出中断，可发送 /retry"
+                        token_usage["api_status"] = "⚠️ 流式输出自动恢复未完成"
                     break
                 except BaseException:
                     # 客户端断开、回调取消等非 requests 异常也不能遗留 SSE 连接或并发槽。
@@ -573,6 +665,7 @@ def build_graph(
                             pass
                     raise
                 finally:
+                    record_attempt_usage()
                     stop_watch()
             assistant_msg = {"role": "assistant", "content": full_text or None}
             if reasoning_content:
@@ -591,7 +684,9 @@ def build_graph(
                     duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
                     **request_budget.metrics(),
                 )
-            return {"messages": [assistant_msg]}
+            if stream_failed:
+                metadata["stream_incomplete"] = True
+            return {"messages": [assistant_msg], "metadata": metadata}
 
         # 非流式模式
         data = resp.json()
@@ -623,12 +718,14 @@ def build_graph(
             duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
             **request_budget.metrics(),
         )
-        return {"messages": [assistant_msg]}
+        return {"messages": [assistant_msg], "metadata": metadata}
 
     # ═══ 路由 ═══
 
     def router(state: AgentState) -> str:
         ensure_active("route")
+        if state.get("metadata", {}).get("stream_incomplete"):
+            return END
         messages = state.get("messages", [])
         if not messages:
             return END

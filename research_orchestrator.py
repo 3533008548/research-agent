@@ -31,7 +31,7 @@ from research_evidence import (
     split_tool_evidence,
     strip_citation_markers,
 )
-from run_contract import TERMINAL_STAGE_STATUSES, execution_metadata
+from run_contract import TERMINAL_STAGE_STATUSES, execution_metadata, safe_error_details
 from tool_runtime import ToolExecutionContext
 
 
@@ -676,6 +676,8 @@ class ResearchOrchestrator:
         cancel_event: threading.Event | None,
         run_id: str = "",
         steer_context: str = "",
+        max_tool_rounds: int = RESEARCH_WORKER_MAX_TOOL_ROUNDS,
+        autonomous: bool = False,
     ) -> dict[str, Any]:
         self._ensure_active(cancel_event)
         usage = self._empty_usage()
@@ -703,7 +705,7 @@ class ResearchOrchestrator:
             enable_verify=False,
             system_prompt=worker_prompt,
             allowed_tool_names=spec.allowed_tools,
-            max_tool_rounds=RESEARCH_WORKER_MAX_TOOL_ROUNDS,
+            max_tool_rounds=max_tool_rounds,
             tool_argument_normalizer=self._worker_tool_argument_normalizer(query, spec),
             tool_context=ToolExecutionContext(
                 run_kind="research",
@@ -719,22 +721,39 @@ class ResearchOrchestrator:
             llm_client=self.llm_client,
         )
         try:
-            result = app.invoke(
-                {
-                    "messages": [{
-                        "role": "user",
-                        "content": self._worker_input(query, plan, spec, steer_context=steer_context),
-                    }],
-                    "metadata": {"session_id": worker_id},
-                },
-                config={"configurable": {"thread_id": worker_id}, "recursion_limit": 8},
-            )
+            failure = {}
+            invocation = {"configurable": {"thread_id": worker_id}, "recursion_limit": max(8, max_tool_rounds * 3 + 5)}
+            try:
+                result = app.invoke(
+                    {
+                        "messages": [{
+                            "role": "user",
+                            "content": (query + "\n" + spec.instruction + "\n" + steer_context) if autonomous else self._worker_input(query, plan, spec, steer_context=steer_context),
+                        }],
+                        "metadata": {"session_id": worker_id},
+                    },
+                    config=invocation,
+                )
+            except RequestCancelledError:
+                raise
+            except Exception as exc:
+                if not autonomous:
+                    raise
+                # Successful tool rounds are already checkpointed. A later
+                # model failure must not discard their source evidence.
+                result = app.get_state(invocation).values or {}
+                failure = {"error": getattr(exc, "code", None) or (
+                    "budget" if type(exc).__name__ == "ResearchBudgetExceeded" else type(exc).__name__),
+                    "error_details": safe_error_details(getattr(exc, "error_details", {}))}
             messages = result.get("messages", [])
             answer = str(messages[-1].get("content") or "") if messages else ""
-            evidence = self._evidence_from_messages(messages, spec.role)
+            evidence = self._evidence_from_messages(messages, spec.role, unlimited=autonomous)
             retrieval_failed = any(event.get("type") == "tool_failed" for event in events) or any(
                 message.get("role") == "tool"
-                and str(message.get("content") or "").lstrip().startswith(("❌", "⏳"))
+                and (str(message.get("content") or "").lstrip().startswith("❌") or (
+                    str(message.get("content") or "").lstrip().startswith("⏳")
+                    and not split_tool_evidence(str(message.get("content") or ""),
+                                                researcher=spec.role, source_type="query_papers")))
                 for message in messages
             )
             retrieval_queries = []
@@ -754,9 +773,10 @@ class ResearchOrchestrator:
                     if isinstance(arguments, dict) and isinstance(arguments.get("query"), str):
                         retrieval_queries.append(arguments["query"][:500])
             return {
+                **failure,
                 "role": spec.role,
                 "label": spec.label,
-                "status": "completed",
+                "status": "partial_failed" if failure else "completed",
                 "message": f"获得 {len(evidence)} 条证据",
                 "answer": answer,
                 "evidence": evidence,
@@ -979,8 +999,9 @@ class ResearchOrchestrator:
         return value if isinstance(value, dict) else {}
 
     @staticmethod
-    def _evidence_from_messages(messages: list[dict], role: str) -> list[dict[str, Any]]:
+    def _evidence_from_messages(messages: list[dict], role: str, *, unlimited: bool = False) -> list[dict[str, Any]]:
         tool_names: dict[str, str] = {}
+        tool_sources: dict[str, str] = {}
         cards: list[dict[str, Any]] = []
         for message in messages:
             if message.get("role") == "assistant":
@@ -989,31 +1010,58 @@ class ResearchOrchestrator:
                         tool_names[str(call.get("id", ""))] = str(
                             call.get("function", {}).get("name", "tool")
                         )
+                        if unlimited:
+                            args = call.get("function", {}).get("arguments", {})
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except (ValueError, TypeError):
+                                    args = {}
+                            if isinstance(args, dict):
+                                tool_sources[str(call.get("id", ""))] = str(args.get("url_or_path") or "")
             if message.get("role") != "tool":
                 continue
-            content = " ".join(str(message.get("content") or "").split())
-            if not content or content.startswith(("❌", "📭", "⏳")):
+            content = str(message.get("content") or "").strip()
+            if not content or content.startswith(("❌", "📭")):
+                continue
+            if unlimited and content.startswith("Tool is not available in this "):
                 continue
             tool = tool_names.get(str(message.get("tool_call_id", "")), "tool")
+            if unlimited and tool == "read_pdf":
+                raw = str(message.get("content") or "").split("\n\n🖼️ **提取的图片**", 1)[0].split("\n\n---\n", 1)[0]
+                pages = re.split(r"━━━ 第 (\d+) 页 ━━━", raw)
+                if len(pages) > 1:
+                    source = tool_sources.get(str(message.get("tool_call_id", ""))) or ResearchOrchestrator._source_label(content, tool)
+                    for index in range(1, len(pages), 2):
+                        cards.append({"id": "", "researcher": role, "source_type": tool,
+                            "source": source, "excerpt": pages[index + 1].strip(),
+                            "source_anchor": {"kind": "page", "page": int(pages[index])},
+                            "uncertainty": "PDF 解析文本；需核对版式、表格与适用条件。"})
+                    continue
             structured_cards = split_tool_evidence(
-                content, researcher=role, source_type=tool,
+                content, researcher=role, source_type=tool, unlimited=unlimited,
             )
             if structured_cards:
+                if content.startswith("⏳"):
+                    for card in structured_cards:
+                        card["uncertainty"] += " 本次为降级关键词检索，尚未完成语义检索。"
                 cards.extend(structured_cards)
                 continue
+            if content.startswith("⏳"):
+                continue  # A pure waiting message is not source evidence.
             card = {
                 "id": "",
                 "researcher": role,
                 "source_type": tool,
                 "source": ResearchOrchestrator._source_label(content, tool),
-                "excerpt": content[:700],
+                "excerpt": content if unlimited else content[:700],
                 "uncertainty": "来自工具检索结果，需结合原文核验。",
             }
             quality = ResearchOrchestrator._search_evidence_quality(content, tool)
             if quality:
                 card["relevance"] = quality
             cards.append(card)
-        return cards[:6]
+        return cards if unlimited else cards[:6]
 
     @staticmethod
     def _source_label(content: str, tool: str) -> str:

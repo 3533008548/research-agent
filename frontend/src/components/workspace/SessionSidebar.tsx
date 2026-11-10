@@ -4,7 +4,6 @@ import { statusLabel } from "../../lib/labels";
 import { WorkspacePanel } from "../WorkspacePanel";
 import type {
   DailyKeyword,
-  ExperimentProject,
   Paper,
   ResearchDocument,
   Run,
@@ -34,9 +33,6 @@ export function SessionSidebar({
   selectedDocumentId,
   profile,
   papers,
-  experiments,
-  selectedExperimentId,
-  experimentStarting,
   dailyRuns,
   keywords,
   keywordDraft,
@@ -51,8 +47,6 @@ export function SessionSidebar({
   onRemoveResearchDocument,
   onOpenProfile,
   onPreparePaperRelationReview,
-  onStartPaperReproduction,
-  onSelectExperimentProject,
   onSelectDailyRun,
   onOpenDailyCenter,
   onAddDailyKeyword,
@@ -75,9 +69,6 @@ export function SessionSidebar({
   selectedDocumentId: string | null;
   profile: UserProfile | null;
   papers: Paper[];
-  experiments: ExperimentProject[];
-  selectedExperimentId: string | null;
-  experimentStarting: string | null;
   dailyRuns: Run[];
   keywords: DailyKeyword[];
   keywordDraft: string;
@@ -92,8 +83,6 @@ export function SessionSidebar({
   onRemoveResearchDocument: (document: ResearchDocument) => void;
   onOpenProfile: () => void;
   onPreparePaperRelationReview: (paper: Paper) => void;
-  onStartPaperReproduction: (paper: Paper) => void;
-  onSelectExperimentProject: (projectId: string) => void;
   onSelectDailyRun: (runId: string) => void;
   onOpenDailyCenter: () => void;
   onAddDailyKeyword: (event: FormEvent<HTMLFormElement>) => void;
@@ -190,19 +179,11 @@ export function SessionSidebar({
                   </div>
                   <div className="paper-actions">
                     <button
-                      className="text-button paper-reproduce-button"
+                      className="text-button paper-action-button"
                       type="button"
                       onClick={() => onPreparePaperRelationReview(paper)}
                     >
                       关系审查
-                    </button>
-                    <button
-                      className="text-button paper-reproduce-button"
-                      type="button"
-                      onClick={() => void onStartPaperReproduction(paper)}
-                      disabled={Boolean(experimentStarting)}
-                    >
-                      {experimentStarting === paper.paper_id ? "生成中…" : "复现实验"}
                     </button>
                   </div>
                 </div>
@@ -230,32 +211,6 @@ export function SessionSidebar({
           )}
         </WorkspacePanel>
 
-        <WorkspacePanel
-          title="复现实验"
-          open={openWorkspacePanel === "experiments"}
-          onToggle={() => void onToggleWorkspacePanel("experiments")}
-        >
-          {workspaceLoading === "experiments" ? (
-            <p className="panel-hint">正在读取实验项目…</p>
-          ) : experiments.length ? (
-            <div className="workspace-list">
-              {experiments.map((project) => (
-                <button
-                  key={project.project_id}
-                  className={`workspace-list-item ${selectedExperimentId === project.project_id ? "selected" : ""}`}
-                  type="button"
-                  onClick={() => void onSelectExperimentProject(project.project_id)}
-                  title={project.paper_title}
-                >
-                  <strong>{project.paper_title}</strong>
-                  <span>{project.reproduction_level === "exact" ? "精确复现规格" : project.reproduction_level === "approximate" ? "近似复现规格" : "待确认规格"} · {project.status}</span>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p className="panel-hint">在“论文库”中选择一篇已解析论文，再点击“复现实验”。</p>
-          )}
-        </WorkspacePanel>
 
         <WorkspacePanel
           title="每日检索"

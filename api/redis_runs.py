@@ -331,6 +331,7 @@ class QueuedResearchRun:
     query: str
     scope: str
     resume: bool = False
+    job_id: str = ""
 
 
 class RedisResearchRunBroker(RedisChatRunBroker):
@@ -346,6 +347,7 @@ class RedisResearchRunBroker(RedisChatRunBroker):
 
     def enqueue(
         self, run_id: str, session_id: str, query: str, scope: str, *, resume: bool = False,
+        job_id: str = "",
     ) -> str:
         try:
             item_id = self._redis.xadd(
@@ -353,6 +355,7 @@ class RedisResearchRunBroker(RedisChatRunBroker):
                 {
                     "run_id": run_id, "session_id": session_id, "query": query,
                     "scope": scope, "resume": "1" if resume else "0",
+                    "job_id": job_id,
                 },
             )
             return str(item_id)
@@ -367,6 +370,7 @@ class RedisResearchRunBroker(RedisChatRunBroker):
                 session_id=str(fields["session_id"]), query=str(fields["query"]),
                 scope=str(fields.get("scope") or "both"),
                 resume=str(fields.get("resume") or "").strip().lower() in {"1", "true", "yes"},
+                job_id=str(fields.get("job_id") or ""),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -401,47 +405,6 @@ class RedisDailyRunBroker(RedisChatRunBroker):
         try:
             return QueuedDailyRun(
                 message_id=str(message_id), run_id=str(fields["run_id"]), kind=str(fields["kind"]),
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
-
-
-@dataclass(frozen=True)
-class QueuedExperimentRun:
-    message_id: str
-    run_id: str
-    session_id: str
-    project_id: str
-    action: str = "generate"
-
-
-class RedisExperimentRunBroker(RedisChatRunBroker):
-    """Redis stream for bounded paper-to-code reproduction preparation."""
-
-    @property
-    def queue_key(self) -> str:
-        return f"{self.prefix}:experiment-runs"
-
-    @property
-    def group_name(self) -> str:
-        return f"{self.prefix}:experiment-workers"
-
-    def enqueue(self, run_id: str, session_id: str, project_id: str, *, action: str = "generate") -> str:
-        try:
-            return str(self._redis.xadd(
-                self.queue_key,
-                {"run_id": run_id, "session_id": session_id, "project_id": project_id, "action": action},
-            ))
-        except Exception as exc:
-            raise QueueUnavailableError("could not enqueue experiment run") from exc
-
-    @staticmethod
-    def _decode_job(message_id: str, fields: dict[str, Any]) -> QueuedExperimentRun | None:
-        try:
-            return QueuedExperimentRun(
-                message_id=str(message_id), run_id=str(fields["run_id"]),
-                session_id=str(fields["session_id"]), project_id=str(fields["project_id"]),
-                action=str(fields.get("action") or "generate"),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -543,6 +506,8 @@ class _RedisRunWorker:
         self.broker.publish(run_id, event)
 
     def session_ready(self, job) -> bool:
+        if getattr(job, "job_id", ""):
+            return True
         session_id = getattr(job, "session_id", None)
         if not session_id:
             return True
@@ -786,9 +751,47 @@ class _RedisRunStream:
 class RedisResearchRunManager(_RedisRunStream):
     """HTTP-side coordinator for deep-research runs."""
 
-    def __init__(self, agent, broker: RedisResearchRunBroker) -> None:
+    def __init__(self, agent, broker: RedisResearchRunBroker, *, persistent: bool = True) -> None:
         self.agent = agent
         self.broker = broker
+        from research_projects import ResearchProjects
+        self.projects = ResearchProjects(agent.sessions.db_path)
+        self.persistent = persistent
+
+    def flush_outbox(self):
+        for job in self.projects.outbox():
+            project = self.projects.get(job["project_id"])
+            if project and project["execution_state"] == "active":
+                self.broker.enqueue(job["project_id"], project["origin_session_id"], "", project["scope"], job_id=job["job_id"])
+                self.projects.mark_sent(job["job_id"])
+
+    @staticmethod
+    def project_run(project):
+        state = project["execution_state"]
+        status = {"active": "running", "stopped": "cancelled", "paused": "paused",
+                  "waiting": "waiting", "needs_input": "needs_input", "budget_exhausted": "partial_failed"}.get(state)
+        if not status:
+            status = "completed" if project["end_reason"] == "fulfilled" else "partial_failed"
+        return {"run_id": project["project_id"], "project_id": project["project_id"], "thread_id": project["origin_session_id"],
+                "query": project["question"], "status": status, "final_answer": project["report"],
+                "evidence": project["evidence"], "plan": {"completion_criteria": project["criteria"]},
+                "created_at": project["created_at"], "updated_at": project["updated_at"],
+                "trace": {"usage": {"calls": project["budget"]["calls"], "total": project["budget"]["tokens"]}},
+                "research": project}
+
+    def sync_project(self, project):
+        run = self.project_run(project)
+        self.agent.sessions.update_research_run(run["run_id"], status=run["status"],
+            final_answer=run["final_answer"], evidence=run["evidence"], plan=run["plan"], trace=run["trace"])
+        return run
+
+    def control(self, project_id, action, *, message="", event_id=None):
+        project = self.projects.control(project_id, action, message=message, event_id=event_id)
+        self.sync_project(project)
+        self.flush_outbox()
+        self.broker.publish(project_id, {"type": "status", "status": self.project_run(project)["status"],
+            "stage": "research_" + action, "goal_version": project["goal_version"]})
+        return project
 
     def start(
         self, session_id: str, query: str, scope: str = "both", *, resume: bool = False,
@@ -797,6 +800,20 @@ class RedisResearchRunManager(_RedisRunStream):
             raise KeyError(session_id)
         if scope not in {"both", "local", "public"}:
             raise ValueError("invalid research scope")
+        if self.persistent:
+            if resume:
+                projects = self.projects.list(session_id)
+                if projects:
+                    project = self.control(projects[0]["project_id"], "resume")
+                    return self.project_run(project)
+                # Older finite runs remain resumable through their old executor.
+            else:
+                if not query.strip():
+                    raise ValueError("research query is blank")
+                run = self.agent.sessions.create_research_run(session_id, query, status="queued")
+                project = self.projects.create(run["run_id"], session_id, query, scope)
+                self.flush_outbox()
+                return self.sync_project(project)
         if resume:
             run = self.agent.sessions.get_latest_research_run(session_id)
             if run is None:
@@ -831,12 +848,18 @@ class RedisResearchRunManager(_RedisRunStream):
         return self.get(run_id) or run
 
     def get(self, run_id: str) -> dict[str, Any] | None:
+        project = self.projects.get(run_id)
+        if project:
+            return self.project_run(project)
         return self.agent.sessions.get_research_run(run_id)
 
     def list_for_session(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        return self.agent.sessions.list_research_runs(session_id, limit=limit)
+        runs = self.agent.sessions.list_research_runs(session_id, limit=limit)
+        return [self.get(str(run["run_id"])) or run for run in runs]
 
     def cancel(self, run_id: str) -> dict[str, Any] | None:
+        if self.projects.get(run_id):
+            return self.project_run(self.control(run_id, "stop"))
         run = self.get(run_id)
         if not run or run.get("status") in _TERMINAL_STATUSES:
             return run
@@ -852,11 +875,29 @@ class RedisResearchRunManager(_RedisRunStream):
 
     def cancel_for_session(self, session_id: str) -> None:
         for run in self.list_for_session(session_id, limit=100):
+            if self.projects.get(str(run["run_id"])):
+                continue  # Research questions outlive their originating conversation.
             if run.get("status") not in _TERMINAL_STATUSES:
                 self.cancel(str(run["run_id"]))
 
     def stream(self, run_id: str) -> Iterator[str]:
+        if self.projects.get(run_id):
+            return self._project_stream(run_id)
         return self._stream(run_id, answer_key="final_answer")
+
+    def _project_stream(self, run_id):
+        cursor = "0-0"
+        while True:
+            project = self.projects.get(run_id)
+            run = self.project_run(project)
+            events, cursor = self.broker.events(run_id, cursor)
+            for event in events:
+                if event.get("goal_version") == project["goal_version"] and event.get("type") != "done":
+                    yield format_sse(event)
+            yield format_sse({"type": "status", "status": run["status"], "stage": "research"})
+            if project["execution_state"] != "active":
+                yield format_sse({"type": "done", "status": run["status"], "answer": run["final_answer"]})
+                return
 
 
 class RedisResearchRunWorker(_RedisRunWorker):
@@ -867,6 +908,7 @@ class RedisResearchRunWorker(_RedisRunWorker):
         claim_idle_ms: int = 120_000,
     ) -> None:
         self.agent = agent
+        self.project_manager = RedisResearchRunManager(agent, broker)
         super().__init__(
             broker,
             consumer=consumer or f"research-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}",
@@ -874,6 +916,22 @@ class RedisResearchRunWorker(_RedisRunWorker):
         )
 
     def _process(self, job: QueuedResearchRun) -> None:
+        if job.job_id:
+            from autonomous_research import AutonomousResearch
+            manager = self.project_manager
+            task = AutonomousResearch(self.agent, manager.projects).execute(
+                job.job_id, getattr(self._execution_local, "cancel_event", None), check=self._check_execution)
+            self._check_execution()
+            project = manager.projects.get(job.run_id)
+            if project:
+                current = manager.sync_project(project)
+                if task:
+                    self.agent.sessions.add_run_event(project["origin_session_id"], job.run_id, "research",
+                        task["role"], task["role"], current["status"], summary="研究任务状态已更新", event_type="status")
+                self._publish(job.run_id, {"type": "status", "status": current["status"],
+                    "stage": task["role"] if task else "research", "goal_version": project["goal_version"]})
+            manager.flush_outbox()
+            return
         run = self.agent.sessions.get_research_run(job.run_id)
         if not run or run.get("thread_id") != job.session_id or run.get("status") in _TERMINAL_STATUSES:
             return
@@ -936,7 +994,22 @@ class RedisResearchRunWorker(_RedisRunWorker):
             stop_monitor.set()
             monitor.join(timeout=0.2)
 
+    def maintain(self):
+        # Detect a concrete paper becoming available without waking an LLM to
+        # poll. Explicit material events use the same idempotent control path.
+        waiting = [p for p in self.project_manager.projects.list() if p["execution_state"] == "waiting"]
+        if waiting:
+            available = {"paper:" + str(p["paper_id"]) for p in self.agent._paper_store.list_papers()}
+            for project in waiting:
+                for material in set(project["waiting_for"]) & available:
+                    self.project_manager.control(project["project_id"], "material", message=material,
+                        event_id=f"material:{project['project_id']}:{project['goal_version']}:{material}")
+        self.project_manager.flush_outbox()
+
     def _finish_cancelled(self, job: QueuedResearchRun) -> None:
+        if job.job_id:
+            self.project_manager.control(job.run_id, "stop")
+            return
         self.agent.sessions.update_research_run(job.run_id, status="cancelled", final_answer="")
         self.agent.sessions.add_run_event(
             job.session_id, job.run_id, "research", "api_worker", "run", "cancelled",
@@ -1083,220 +1156,6 @@ class RedisDailyRunWorker(_RedisRunWorker):
         self.scheduler.update_daily_run(job.run_id, status="cancelled")
         self.scheduler.add_daily_agent_event(
             job.run_id, "orchestrator", "cancelled", "", event_type="done",
-        )
-        self._publish(job.run_id, {"type": "done", "status": "cancelled"})
-        self.broker.clear_cancel(job.run_id)
-
-
-class RedisExperimentRunManager(_RedisRunStream):
-    """Create a durable reproduction project, then queue its bounded generation run."""
-
-    def __init__(self, agent, project_store, broker: RedisExperimentRunBroker) -> None:
-        self.agent = agent
-        self.project_store = project_store
-        self.broker = broker
-
-    def start(
-        self,
-        session_id: str,
-        paper_id: str = "",
-        *,
-        project_id: str = "",
-        action: str = "generate",
-    ) -> dict[str, Any]:
-        if not self.agent.sessions.get(session_id):
-            raise KeyError(session_id)
-        if action not in {"generate", "prepare_repository", "reconstruct_method"}:
-            raise ValueError("未知的复现实验操作")
-        selected_project_id = str(project_id or "").strip()
-        if selected_project_id:
-            project = self.project_store.read(selected_project_id)
-            if project is None:
-                raise ValueError("复现实验项目不存在")
-            supplied_paper_id = str(paper_id or "").strip()
-            if supplied_paper_id and supplied_paper_id != str(project.get("paper_id") or ""):
-                raise ValueError("复现实验项目与指定论文不一致")
-            if action in {"generate", "reconstruct_method"}:
-                project = self.project_store.mark_queued(
-                    selected_project_id,
-                    summary=(
-                        "正在依据论文页面级证据生成方法还原参考实现。"
-                        if action == "reconstruct_method" else "正在重新生成实验规格与代码。"
-                    ),
-                )
-        else:
-            if action != "generate":
-                raise ValueError("此复现实验操作必须指定已有项目")
-            normalized = str(paper_id or "").strip()
-            paper = next(
-                (item for item in self.agent.paper_store.list_papers() if str(item.get("paper_id") or "") == normalized),
-                None,
-            )
-            if paper is None:
-                raise ValueError("未找到已索引论文；请先在论文库中完成 PDF 解析和索引")
-            project = self.project_store.create(paper)
-        run = self.agent.sessions.create_experiment_run(
-            session_id, project["project_id"], action=action, status="queued",
-        )
-        run_id = str(run["run_id"])
-        try:
-            self.broker.enqueue(run_id, session_id, project["project_id"], action=action)
-            self.broker.publish(run_id, {"type": "status", "status": "queued", "run_id": run_id})
-        except QueueUnavailableError:
-            self.agent.sessions.update_experiment_run(
-                run_id, status="failed", error_type="QueueUnavailableError",
-            )
-            raise
-        self.agent.sessions.add_run_event(
-            session_id, run_id, "experiment", "api", "queue", "queued",
-            summary=(
-                "上游仓库准备任务已进入队列" if action == "prepare_repository"
-                else "论文方法还原任务已进入队列" if action == "reconstruct_method"
-                else "论文代码复现任务已进入队列"
-            ),
-            metadata=execution_metadata(
-                "experiment", runner="redis-worker", model=str(self.agent.model),
-                toolset=(
-                    "repository-prepare" if action == "prepare_repository"
-                    else "paper-method-reconstruction" if action == "reconstruct_method"
-                    else "paper-evidence-codegen"
-                ),
-            ),
-        )
-        return self.get(run_id) or run
-
-    def get(self, run_id: str) -> dict[str, Any] | None:
-        return self.agent.sessions.get_experiment_run(run_id)
-
-    def list_for_session(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        return self.agent.sessions.list_experiment_runs(session_id, limit=limit)
-
-    def cancel(self, run_id: str) -> dict[str, Any] | None:
-        run = self.get(run_id)
-        if not run or run.get("status") in _TERMINAL_STATUSES:
-            return run
-        self.broker.request_cancel(run_id)
-        updated = self.agent.sessions.update_experiment_run(run_id, status="cancelling")
-        if updated:
-            self.broker.publish(run_id, {"type": "status", "status": "cancelling", "run_id": run_id})
-            self.agent.sessions.add_run_event(
-                updated["thread_id"], run_id, "experiment", "api", "cancel", "cancelling",
-                summary="已请求取消论文代码复现任务",
-            )
-        return updated
-
-    def cancel_for_session(self, session_id: str) -> None:
-        for run in self.list_for_session(session_id, limit=100):
-            if run.get("status") not in _TERMINAL_STATUSES:
-                self.cancel(str(run["run_id"]))
-
-    def stream(self, run_id: str) -> Iterator[str]:
-        return self._stream(run_id)
-
-
-class RedisExperimentRunWorker(_RedisRunWorker):
-    """Generate projects, prepare repositories or reconstruct methods; never run generated code."""
-
-    def __init__(
-        self, orchestrator, sessions, broker: RedisExperimentRunBroker, *, repository_preparer=None, consumer: str | None = None,
-        claim_idle_ms: int = 120_000,
-    ) -> None:
-        self.orchestrator = orchestrator
-        self.repository_preparer = repository_preparer
-        self.sessions = sessions
-        super().__init__(
-            broker,
-            consumer=consumer or f"experiment-worker-{os.getpid()}-{uuid.uuid4().hex[:8]}",
-            claim_idle_ms=claim_idle_ms,
-        )
-
-    def _process(self, job: QueuedExperimentRun) -> None:
-        run = self.sessions.get_experiment_run(job.run_id)
-        if not run or run.get("thread_id") != job.session_id or run.get("project_id") != job.project_id:
-            return
-        if run.get("status") in _TERMINAL_STATUSES:
-            return
-        if self.broker.cancel_requested(job.run_id):
-            self._finish_cancelled(job)
-            return
-        self.sessions.update_experiment_run(job.run_id, status="running")
-        self._publish(job.run_id, {"type": "status", "status": "running", "run_id": job.run_id})
-        action = job.action if job.action in {"generate", "prepare_repository", "reconstruct_method"} else "generate"
-        self.sessions.add_run_event(
-            job.session_id, job.run_id, "experiment", "api_worker", "run", "running",
-            summary=(
-                "开始固定并分析上游仓库" if action == "prepare_repository"
-                else "开始依据论文证据还原方法实现" if action == "reconstruct_method"
-                else "开始从论文证据生成复现实验项目"
-            ),
-        )
-        cancel_event, stop_monitor, monitor = self._cancel_monitor(job.run_id)
-        try:
-            if action == "prepare_repository":
-                if self.repository_preparer is None:
-                    raise RuntimeError("repository preparer is unavailable")
-                result = self.repository_preparer.prepare(
-                    job.project_id, run_id=job.run_id, cancel_event=cancel_event,
-                    on_progress=lambda event: self._publish(job.run_id, _safe_status_event(event)),
-                )
-            elif action == "reconstruct_method":
-                result = self.orchestrator.reconstruct_method(
-                    job.project_id, run_id=job.run_id, cancel_event=cancel_event,
-                    on_progress=lambda event: self._publish(job.run_id, _safe_status_event(event)),
-                )
-            else:
-                result = self.orchestrator.reproduce(
-                    job.project_id, run_id=job.run_id, cancel_event=cancel_event,
-                    on_progress=lambda event: self._publish(job.run_id, _safe_status_event(event)),
-                )
-            self._check_execution()
-            self.sessions.update_experiment_run(
-                job.run_id, status=result.status, summary=result.summary,
-                duration_ms=result.metrics.get("duration_ms"), metrics=result.metrics,
-                error_type=result.error_type,
-            )
-            self.sessions.add_run_event(
-                job.session_id, job.run_id, "experiment", "api_worker", "run", result.status,
-                summary=result.summary, metrics=result.metrics,
-                error_type=result.error_type, event_type="done",
-            )
-            self._publish(job.run_id, {"type": "done", "status": result.status, "answer": result.summary})
-        except RequestCancelledError:
-            self._check_execution()
-            self._finish_cancelled(job)
-        except QueueUnavailableError:
-            raise
-        except Exception as exc:
-            self._check_execution()
-            if action == "prepare_repository" and self.repository_preparer is not None:
-                try:
-                    self.repository_preparer.project_store.record_repository_preparation_failure(
-                        job.project_id, run_id=job.run_id, reason=str(exc) or type(exc).__name__,
-                    )
-                except Exception:
-                    # The run error remains durable even if the project snapshot cannot be updated.
-                    pass
-            self.sessions.update_experiment_run(job.run_id, status="failed", error_type=type(exc).__name__)
-            self.sessions.add_run_event(
-                job.session_id, job.run_id, "experiment", "api_worker", "run", "failed",
-                summary=(
-                    "上游仓库准备失败" if action == "prepare_repository"
-                    else "论文方法还原任务失败" if action == "reconstruct_method"
-                    else "论文代码复现任务失败"
-                ),
-                error_type=type(exc).__name__, event_type="error",
-            )
-            self._publish(job.run_id, {"type": "error", "error_type": type(exc).__name__})
-            self._publish(job.run_id, {"type": "done", "status": "failed"})
-        finally:
-            stop_monitor.set()
-            monitor.join(timeout=0.2)
-
-    def _finish_cancelled(self, job: QueuedExperimentRun) -> None:
-        self.sessions.update_experiment_run(job.run_id, status="cancelled", summary="复现任务已取消")
-        self.sessions.add_run_event(
-            job.session_id, job.run_id, "experiment", "api_worker", "run", "cancelled",
-            summary="论文代码复现任务已取消", event_type="done",
         )
         self._publish(job.run_id, {"type": "done", "status": "cancelled"})
         self.broker.clear_cancel(job.run_id)

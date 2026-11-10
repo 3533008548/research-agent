@@ -30,7 +30,6 @@ export function useWorkspaceChrome({
   setDraft,
   setWorkbenchTabs,
   setActiveWorkbenchTabId,
-  refreshExperiments,
   loadKeywords,
 }: {
   apiKey: string;
@@ -51,7 +50,6 @@ export function useWorkspaceChrome({
   setDraft: (value: string) => void;
   setWorkbenchTabs: (updater: (current: WorkbenchTab[]) => WorkbenchTab[]) => void;
   setActiveWorkbenchTabId: (tabId: string) => void;
-  refreshExperiments: () => Promise<void>;
   loadKeywords: () => Promise<void>;
 }) {
   async function toggleWorkspacePanel(panel: WorkspacePanel) {
@@ -68,8 +66,6 @@ export function useWorkspaceChrome({
         setProfile(await getWorkspaceProfile(apiKey));
       } else if (panel === "papers") {
         setPapers(await listPapers(apiKey));
-      } else if (panel === "experiments") {
-        await refreshExperiments();
       } else if (panel === "keywords") {
         await loadKeywords();
       } else {

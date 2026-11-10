@@ -149,7 +149,6 @@ _EXPLICIT_EVIDENCE_MARKERS = (
 _RESEARCH_DOCUMENT_TERMS = ("科研档案", "研究档案")
 _RESEARCH_DOCUMENT_ACTIONS = ("保存", "存档", "导出", "生成")
 _RESEARCH_DOCUMENT_CONTENT_TERMS = ("方案", "计划", "假设", "决策记录")
-_EXPERIMENT_CONFIRMATION_MARKER = "【复现实验项目确认】"
 
 
 def should_force_research_document_save(user_input: str) -> bool:
@@ -168,12 +167,6 @@ def should_force_research_document_save(user_input: str) -> bool:
     return any(term in text for term in _RESEARCH_DOCUMENT_TERMS) or any(
         term in text for term in _RESEARCH_DOCUMENT_CONTENT_TERMS
     )
-
-
-def should_force_experiment_project_update(user_input: str) -> bool:
-    """The workbench inserts this marker only after the user edits a confirmation draft."""
-    text = str(user_input or "")
-    return _EXPERIMENT_CONFIRMATION_MARKER in text and "project_id=experiment-" in text
 
 
 def should_answer_without_tools(user_input: str) -> bool:
@@ -509,7 +502,6 @@ class ResearchAgent:
                         pass
                 return notes
 
-            force_experiment_project_update = should_force_experiment_project_update(user_input)
             force_research_document_save = should_force_research_document_save(user_input)
             routed_tool_scope = allowed_tools_for_routed_request(user_input)
             routed_document_intent = routed_research_document_intent(user_input)
@@ -524,11 +516,7 @@ class ResearchAgent:
                 graph_tool_round_budget = MAX_AGENT_TOOL_ROUNDS
             full_document_patch = routed_document_intent == "full_patch"
             forced_tool_name = ""
-            if force_experiment_project_update:
-                allowed_tool_names = {"update_experiment_project"}
-                forced_tool_name = "update_experiment_project"
-                _record_event({"type": "tool_policy", "policy": "forced_experiment_project_update"})
-            elif force_research_document_save:
+            if force_research_document_save:
                 allowed_tool_names = {"save_research_document"}
                 forced_tool_name = "save_research_document"
                 _record_event({"type": "tool_policy", "policy": "forced_research_document_save"})
@@ -1060,6 +1048,7 @@ class ResearchAgent:
             "llm_request_started": ("single_agent", "model", "running", "模型请求已开始"),
             "llm_response_headers": ("single_agent", "model", "running", "模型服务已响应"),
             "llm_request_finished": ("single_agent", "model", "completed", "模型请求已完成"),
+            "llm_stream_recovery_started": ("single_agent", "model", "recovering", "正在自动恢复模型输出，完成后更新回复"),
             "llm_request_failed": ("single_agent", "model", "failed", "模型请求失败，可重试"),
             "llm_status": ("single_agent", "model", "waiting", "模型请求正在排队或重试"),
             "first_token": ("single_agent", "model", "streaming", "已收到首个输出片段"),

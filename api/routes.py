@@ -21,14 +21,11 @@ from api.schemas import (
     DailyKeywordResponse,
     DailyPaperStatusUpdateRequest,
     DailyRunDetailResponse,
-    ExperimentFileContentResponse,
-    ExperimentRepositoryConnectRequest,
-    ExperimentProjectDetailResponse,
-    ExperimentProjectResponse,
     PaperRelationResponse,
     PaperResponse,
     ProfileResponse,
     ResearchDocumentDetailResponse,
+    ResearchControlRequest,
     ResearchDocumentLedgerResponse,
     ResearchDocumentRouteRequest,
     ResearchDocumentRouteResponse,
@@ -48,14 +45,6 @@ from api.schemas import (
     WorkspaceSettingsUpdateRequest,
     WorkspaceUploadResponse,
 )
-from repository_sources import (
-    RepositoryLookupError,
-    RepositorySourceError,
-    find_github_repositories_in_document,
-    inspect_github_repository,
-    search_github_repositories,
-)
-from paper_artifacts import load_document_map
 from research_document_routing import route_research_document_request
 from run_contract import bounded_timing_metrics, latest_error_details
 from workspace_uploads import UploadValidationError
@@ -134,7 +123,7 @@ def _research_payload(run: dict, events: list[dict] | None = None) -> dict:
         and isinstance(value, (int, float)) and not isinstance(value, bool)
     }
     duration = trace.get("duration_ms") if isinstance(trace, dict) else None
-    return _run_response(
+    payload = _run_response(
         run,
         kind="research",
         session_id=run["thread_id"],
@@ -144,6 +133,51 @@ def _research_payload(run: dict, events: list[dict] | None = None) -> dict:
         error_type=str(trace.get("error_type") or "")[:120] if isinstance(trace, dict) else "",
         events=events,
     )
+    if run.get("research"):
+        payload["research"] = run["research"]
+        payload["project_id"] = run["run_id"]
+    return payload
+
+
+@router.get("/research-projects", dependencies=[Depends(require_api_key)])
+def list_research_projects(request: Request):
+    manager = request.app.state.research_run_manager
+    projects = manager.projects.list() if manager and hasattr(manager, "projects") else []
+    return [{key: project[key] for key in ("project_id", "question", "origin_session_id",
+        "execution_state", "goal_version", "updated_at")} for project in projects]
+
+
+@router.get("/research-projects/{project_id}", dependencies=[Depends(require_api_key)])
+def get_research_project(project_id: str, request: Request):
+    manager = request.app.state.research_run_manager
+    project = manager.projects.get(project_id) if manager and hasattr(manager, "projects") else None
+    if not project:
+        raise HTTPException(status_code=404, detail="research project not found")
+    return {**project, "jobs": manager.projects.jobs(project_id), "reports": manager.projects.reports(project_id)}
+
+
+@router.get("/research-projects/{project_id}/reports/{report_id}", dependencies=[Depends(require_api_key)])
+def get_research_report(project_id: str, report_id: str, request: Request):
+    manager = request.app.state.research_run_manager
+    report = manager.projects.report(project_id, report_id) if manager and hasattr(manager, "projects") else None
+    if not report:
+        raise HTTPException(status_code=404, detail="research report not found")
+    return report
+
+
+@router.post("/research-projects/{project_id}/controls", dependencies=[Depends(require_api_key)])
+def control_research_project(project_id: str, payload: ResearchControlRequest, request: Request):
+    manager = request.app.state.research_run_manager
+    if not manager or not hasattr(manager, "projects"):
+        raise HTTPException(status_code=503, detail="research queue unavailable")
+    try:
+        return manager.control(project_id, payload.action, message=payload.message, event_id=payload.event_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="research project not found") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except QueueUnavailableError:
+        raise HTTPException(status_code=503, detail="research saved; queue temporarily unavailable") from None
 
 
 def _daily_payload(run: dict, events: list[dict] | None = None) -> dict:
@@ -161,21 +195,6 @@ def _daily_payload(run: dict, events: list[dict] | None = None) -> dict:
         },
         error_type=error_text.split(":", 1)[0][:120] if error_text else "",
         events=events,
-    )
-
-
-def _experiment_payload(run: dict, events: list[dict] | None = None) -> dict:
-    return _run_response(
-        run,
-        kind="experiment",
-        session_id=run["thread_id"],
-        project_id=str(run.get("project_id") or ""),
-        answer=run.get("answer", ""),
-        duration_ms=run.get("duration_ms"),
-        metrics=run.get("metrics", {}),
-        error_type=run.get("error_type", ""),
-        events=events,
-        completed_at=run.get("completed_at"),
     )
 
 
@@ -268,8 +287,6 @@ def _manager_for_run(request: Request, run_id: str):
         return request.app.state.research_run_manager
     if run_id.startswith("daily-"):
         return request.app.state.daily_run_manager
-    if run_id.startswith("experiment-"):
-        return request.app.state.experiment_run_manager
     return None
 
 
@@ -293,8 +310,6 @@ def _run_payload(request: Request, run: dict, events: list[dict] | None = None) 
         payload = _research_payload(run, events)
     elif run_id.startswith("daily-"):
         payload = _daily_payload(run, events)
-    elif run_id.startswith("experiment-"):
-        payload = _experiment_payload(run, events)
     else:
         payload = _chat_payload(run, events)
     thread_id = str(run.get("thread_id") or "")
@@ -329,13 +344,6 @@ def _research_documents(request: Request):
     store = getattr(request.app.state, "research_document_store", None)
     if store is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="research document service unavailable")
-    return store
-
-
-def _experiment_projects(request: Request):
-    store = getattr(request.app.state, "experiment_project_store", None)
-    if store is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="experiment project service unavailable")
     return store
 
 
@@ -478,16 +486,6 @@ def route_research_document(document_id: str, payload: ResearchDocumentRouteRequ
     return route_research_document_request(document, payload.message)
 
 
-def _experiment_project_payload(project: dict) -> dict:
-    return {
-        key: project.get(key, "")
-        for key in (
-            "project_id", "paper_id", "paper_title", "status", "reproduction_level", "summary",
-            "implementation_path", "revision", "latest_run_id", "created_at", "updated_at",
-        )
-    }
-
-
 @router.get(
     "/workspace/profile",
     response_model=ProfileResponse,
@@ -499,121 +497,6 @@ def get_workspace_profile(request: Request) -> dict:
     if profile is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="profile service unavailable")
     return {"content": str(profile.read() or "")}
-
-
-@router.get(
-    "/workspace/experiments",
-    response_model=list[ExperimentProjectResponse],
-    dependencies=[Depends(require_api_key)],
-)
-def list_experiment_projects(request: Request, limit: int = 50) -> list[dict]:
-    return [_experiment_project_payload(project) for project in _experiment_projects(request).list(limit=limit)]
-
-
-@router.get(
-    "/workspace/experiments/{project_id}",
-    response_model=ExperimentProjectDetailResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def get_experiment_project(project_id: str, request: Request) -> dict:
-    project = _experiment_projects(request).read(project_id)
-    if project is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="experiment project not found")
-    return {**_experiment_project_payload(project), "spec": project.get("spec", {}), "validation": project.get("validation", {}), "files": project.get("files", [])}
-
-
-@router.get(
-    "/workspace/experiments/{project_id}/files/{relative_path:path}",
-    response_model=ExperimentFileContentResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def get_experiment_file(project_id: str, relative_path: str, request: Request) -> dict:
-    file = _experiment_projects(request).read_file(project_id, relative_path)
-    if file is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="experiment file not found")
-    return file
-
-
-def _require_idle_experiment_project(project_id: str, request: Request) -> None:
-    if request.app.state.agent.sessions.has_active_experiment_run(project_id):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="实验任务仍在运行，请先取消或等待完成")
-
-
-@router.post(
-    "/workspace/experiments/{project_id}/repository-candidates",
-    response_model=ExperimentProjectDetailResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def search_experiment_repository_candidates(project_id: str, request: Request) -> dict:
-    """Search GitHub by paper title; each result stays an unverified candidate."""
-    _require_idle_experiment_project(project_id, request)
-    store = _experiment_projects(request)
-    project = store.read(project_id)
-    if project is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="experiment project not found")
-    try:
-        document_map = load_document_map(_workspace_paths(request), str(project.get("paper_id") or ""))
-        candidates = find_github_repositories_in_document(document_map or {})
-        if not candidates:
-            candidates = search_github_repositories(str(project.get("paper_title") or ""))
-        return store.record_repository_candidates(project_id, candidates=candidates)
-    except RepositorySourceError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-    except RepositoryLookupError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-
-
-@router.put(
-    "/workspace/experiments/{project_id}/repository",
-    response_model=ExperimentProjectDetailResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def connect_experiment_repository(
-    project_id: str,
-    payload: ExperimentRepositoryConnectRequest,
-    request: Request,
-) -> dict:
-    """Inspect and pin one GitHub repository without cloning or executing it."""
-    _require_idle_experiment_project(project_id, request)
-    store = _experiment_projects(request)
-    if store.read(project_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="experiment project not found")
-    try:
-        repository = inspect_github_repository(payload.repository_url)
-        return store.connect_repository(project_id, repository=repository, relationship=payload.relationship)
-    except RepositorySourceError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-    except RepositoryLookupError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-
-
-@router.post(
-    "/workspace/experiments/{project_id}/method-reconstruction",
-    response_model=ExperimentProjectDetailResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def select_method_reconstruction(project_id: str, request: Request) -> dict:
-    """Select the paper-only path without claiming the source code is closed."""
-    _require_idle_experiment_project(project_id, request)
-    try:
-        return _experiment_projects(request).use_method_reconstruction(project_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="experiment project not found") from exc
-
-
-@router.delete(
-    "/workspace/experiments/{project_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_api_key)],
-)
-def delete_experiment_project(project_id: str, request: Request) -> Response:
-    """Delete a terminal experiment project together with its persisted files."""
-    sessions = request.app.state.agent.sessions
-    _require_idle_experiment_project(project_id, request)
-    if not _experiment_projects(request).delete(project_id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="experiment project not found")
-    sessions.delete_experiment_runs_for_project(project_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get(
@@ -843,9 +726,6 @@ def delete_session(session_id: str, request: Request) -> Response:
     research_manager = request.app.state.research_run_manager
     if research_manager:
         research_manager.cancel_for_session(session_id)
-    experiment_manager = request.app.state.experiment_run_manager
-    if experiment_manager:
-        experiment_manager.cancel_for_session(session_id)
     if not request.app.state.agent.delete_session(session_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found")
     request.app.state.badcase_store.delete_for_session(session_id)
@@ -897,9 +777,7 @@ def list_session_runs(session_id: str, request: Request, limit: int = 20) -> lis
     chat_runs = _manager(request).list_for_session(session_id, limit=limit)
     research_manager = request.app.state.research_run_manager
     research_runs = research_manager.list_for_session(session_id, limit=limit) if research_manager else []
-    experiment_manager = request.app.state.experiment_run_manager
-    experiment_runs = experiment_manager.list_for_session(session_id, limit=limit) if experiment_manager else []
-    all_runs = [*chat_runs, *research_runs, *experiment_runs]
+    all_runs = [*chat_runs, *research_runs]
     all_runs.sort(key=lambda item: (str(item.get("updated_at") or ""), str(item.get("created_at") or "")), reverse=True)
     return [_run_payload(request, item) for item in all_runs[:max(1, min(limit, 100))]]
 
@@ -973,25 +851,6 @@ def create_run(payload: RunCreateRequest, request: Request) -> dict:
                 payload.session_id, payload.query or "", payload.scope, resume=payload.resume,
             )
             session_id = payload.session_id
-        elif payload.kind == "experiment":
-            has_project = bool((payload.project_id or "").strip())
-            if not payload.session_id or not ((payload.paper_id or "").strip() or has_project):
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="experiment requires session_id and paper_id or project_id")
-            if payload.experiment_action in {"prepare_repository", "reconstruct_method"} and not has_project:
-                detail = (
-                    "repository preparation requires project_id"
-                    if payload.experiment_action == "prepare_repository"
-                    else "method reconstruction requires project_id"
-                )
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
-            manager = request.app.state.experiment_run_manager
-            if manager is None:
-                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="experiment queue unavailable")
-            run = manager.start(
-                payload.session_id, payload.paper_id or "", project_id=payload.project_id or "",
-                action=payload.experiment_action,
-            )
-            session_id = payload.session_id
         else:
             manager = request.app.state.daily_run_manager
             if manager is None:
@@ -1024,7 +883,7 @@ def get_run(run_id: str, request: Request) -> dict:
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
     events = []
-    if run_id.startswith(("chat-", "research-", "experiment-")):
+    if run_id.startswith(("chat-", "research-")):
         events = request.app.state.agent.sessions.get_run_events(run_id, run["thread_id"])
     return _run_payload(request, run, _timeline_events(request, run_id, run, events))
 
@@ -1046,7 +905,7 @@ def create_run_steer(run_id: str, payload: RunSteerCreateRequest, request: Reque
     run = manager.get(run_id) if manager else None
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
-    if run.get("status") not in {"queued", "running"}:
+    if run.get("status") not in {"queued", "running", "waiting", "needs_input"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="only queued or running tasks can receive guidance",
@@ -1060,6 +919,11 @@ def create_run_steer(run_id: str, payload: RunSteerCreateRequest, request: Reque
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from None
+    if run.get("research"):
+        manager.control(run_id, "steer", message=payload.message, event_id=f"steer:{steer['steer_id']}")
+        request.app.state.agent.sessions.consume_run_steers(run_id, thread_id, stage="research_lead")
+        steer["status"] = "consumed"
+        steer["consumed_stage"] = "research_lead"
     run_kind = "research" if run_id.startswith("research-") else "chat"
     request.app.state.agent.sessions.add_run_event(
         thread_id, run_id, run_kind, "user", "steer", str(run.get("status") or "running"),
@@ -1126,7 +990,7 @@ def create_badcase(
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
     events = []
-    if run_id.startswith(("chat-", "research-", "experiment-")):
+    if run_id.startswith(("chat-", "research-")):
         events = request.app.state.agent.sessions.get_run_events(run_id, run["thread_id"])
     candidate, created = request.app.state.badcase_store.create_candidate(
         _run_payload(request, run, events),
@@ -1159,7 +1023,9 @@ def stream_run_events(run_id: str, request: Request) -> StreamingResponse:
 def cancel_run(run_id: str, request: Request) -> dict:
     try:
         manager = _manager_for_run(request, run_id)
-        run = manager.cancel(run_id) if manager else None
+        if manager is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
+        run = manager.cancel(run_id)
     except QueueUnavailableError:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="run queue unavailable") from None
     if run is None:

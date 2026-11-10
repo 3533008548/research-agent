@@ -4,18 +4,14 @@ import { describe, it } from "node:test";
 import {
   appendRunEvent,
   badcaseCategoryLabel,
-  codeSourceLabel,
   dailyPaperStatusLabel,
   dailyRunTitle,
   displayMessages,
   durationLabel,
-  experimentCodeSource,
   ledgerKindLabel,
   ledgerRelationLabel,
   ledgerStatusLabel,
-  methodReconstruction,
   modeLabel,
-  repositoryPreparation,
   runKindLabel,
   stageLabel,
   statusLabel,
@@ -67,12 +63,11 @@ describe("runKindLabel and modeLabel", () => {
     assert.equal(runKindLabel("chat"), "对话");
     assert.equal(runKindLabel("research"), "深度研究");
     assert.equal(runKindLabel("daily"), "每日检索");
-    assert.equal(runKindLabel("experiment"), "论文复现");
   });
 
   it("distinguishes the two chat modes", () => {
     assert.equal(modeLabel("chat"), "对话");
-    assert.equal(modeLabel("research"), "深度研究");
+    assert.equal(modeLabel("research"), "多 Agent 研究");
   });
 });
 
@@ -127,47 +122,6 @@ describe("daily labels", () => {
       "每日检索 · 2026-10-21",
     );
     assert.equal(dailyRunTitle({} as never), "每日检索 · 未命名");
-  });
-});
-
-describe("experiment source derivation", () => {
-  it("reports a project with no checked source as not checked", () => {
-    const source = experimentCodeSource({ spec: {} } as never);
-    assert.equal(source.mode, "not_checked");
-    assert.equal(codeSourceLabel(source), "尚未检查");
-  });
-
-  it("names a confirmed official repository", () => {
-    const source = experimentCodeSource({
-      spec: { code_source: { mode: "repository", relationship: "official_confirmed" } },
-    } as never);
-    assert.equal(codeSourceLabel(source), "官方实现（已确认）");
-  });
-
-  it("names a repository that is still unverified", () => {
-    const source = experimentCodeSource({
-      spec: { code_source: { mode: "repository", relationship: "candidate_unverified" } },
-    } as never);
-    assert.equal(codeSourceLabel(source), "GitHub 候选（待核验）");
-  });
-
-  it("distinguishes the search and reconstruction modes", () => {
-    assert.equal(
-      codeSourceLabel({ mode: "repository_search", status: "candidates_found" }),
-      "已找到候选",
-    );
-    assert.equal(
-      codeSourceLabel({ mode: "repository_search", status: "none" }),
-      "未找到候选",
-    );
-    assert.equal(codeSourceLabel({ mode: "method_reconstruction" }), "按论文方法还原");
-  });
-
-  it("treats a malformed preparation payload as absent", () => {
-    assert.equal(repositoryPreparation({ spec: {} } as never), null);
-    assert.equal(repositoryPreparation({ spec: { repository_preparation: [] } } as never), null);
-    assert.equal(methodReconstruction({ spec: {} } as never), null);
-    assert.equal(methodReconstruction({ spec: { method_reconstruction: "x" } } as never), null);
   });
 });
 

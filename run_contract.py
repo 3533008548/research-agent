@@ -36,13 +36,14 @@ TERMINAL_STAGE_STATUSES = frozenset({
 PERSISTED_EVENT_TYPES = frozenset({"status", "tool", "done", "error"})
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "partial_failed"})
 TERMINAL_EVENT_STAGES = frozenset({"run", "completed", "cancelled", "failed", "delivery", "orchestrator"})
-RUN_KINDS = frozenset({"chat", "research", "daily", "experiment"})
+RUN_KINDS = frozenset({"chat", "research", "daily"})
 RESEARCH_SCOPES = frozenset({"both", "local", "public"})
 
 LLM_ERROR_CODES = frozenset({
     "LLM_HTTP_ERROR", "LLM_DEADLINE_EXCEEDED", "LLM_STREAM_TIMEOUT",
     "LLM_CONNECTION_ERROR", "LLM_RESPONSE_TIMEOUT", "LLM_CONNECT_TIMEOUT", "LLM_QUEUE_TIMEOUT", "LLM_QUEUE_FULL",
     "LLM_CIRCUIT_OPEN", "LLM_STREAM_INTERRUPTED", "LLM_REQUEST_FAILED",
+    "LLM_OUTPUT_TRUNCATED", "LLM_CONTENT_FILTERED", "LLM_STREAM_PROTOCOL_ERROR",
 })
 _ERROR_PHASES = frozenset({"queue", "connect", "response_headers", "stream_read", "retry", "unknown"})
 _EXCEPTION_TYPES = frozenset({

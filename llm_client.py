@@ -48,6 +48,15 @@ class LLMRequestFailedError(LLMClientError):
     pass
 
 
+class LLMStreamError(requests.RequestException):
+    """A protocol-level incomplete response, without retaining upstream text."""
+
+    def __init__(self, code="LLM_STREAM_INTERRUPTED", *, retryable=True):
+        super().__init__(code)
+        self.code = code
+        self.retryable = retryable
+
+
 class _RetryableHTTPError(Exception):
     def __init__(self, response: requests.Response):
         self.response = response
@@ -68,6 +77,7 @@ def _safe_cause_type(error: BaseException | None) -> str:
         "ChunkedEncodingError": "ChunkedEncodingError", "ProtocolError": "ChunkedEncodingError",
         "HTTPError": "HTTPError", "_RetryableHTTPError": "HTTPError",
         "RequestException": "RequestException", "OSError": "OSError",
+        "LLMStreamError": "RequestException",
     }
     seen: set[int] = set()
     result = ""
@@ -102,6 +112,7 @@ class RequestPolicy:
     # pressure rather than a bad main-model endpoint, so it must not open the
     # shared circuit used by interactive requests.
     counts_toward_circuit: bool = True
+    read_timeout_seconds: float | None = None
 
 
 @dataclass
@@ -113,6 +124,7 @@ class RequestBudget:
     purpose: str = "chat"
     priority: RequestPriority = RequestPriority.INTERACTIVE
     counts_toward_circuit: bool = True
+    read_timeout_seconds: float | None = None
     retries_used: int = 0
     queue_wait_seconds: float = 0.0
     attempts: int = 0
@@ -222,7 +234,7 @@ class LLMClient:
         queue_size: int = 20,
         connect_timeout_seconds: float = 3.05,
         read_timeout_seconds: float = 30,
-        request_deadline_seconds: float = 45,
+        request_deadline_seconds: float = 180,
         max_retries: int = 2,
         circuit_failure_threshold: int = 3,
         circuit_recovery_seconds: int = 120,
@@ -333,7 +345,7 @@ class LLMClient:
                         json=payload,
                         timeout=(
                             min(self.connect_timeout_seconds, remaining),
-                            min(self.read_timeout_seconds, remaining),
+                            min(budget.read_timeout_seconds or self.read_timeout_seconds, remaining),
                         ),
                         stream=stream,
                     )
@@ -477,6 +489,7 @@ class LLMClient:
             purpose=policy.purpose,
             priority=policy.priority,
             counts_toward_circuit=policy.counts_toward_circuit,
+            read_timeout_seconds=policy.read_timeout_seconds,
         )
 
     def stream_error(self, budget: RequestBudget, error: BaseException, response=None) -> LLMRequestTimeoutError:
@@ -486,6 +499,8 @@ class LLMClient:
         budget.note_failure(error, phase="stream_read")
         cause = budget.last_cause_type
         code = "LLM_STREAM_TIMEOUT" if cause in {"ReadTimeout", "ConnectTimeout", "Timeout"} else "LLM_STREAM_INTERRUPTED"
+        if isinstance(error, LLMStreamError):
+            code = error.code
         if budget.remaining_seconds() <= 0:
             code = "LLM_DEADLINE_EXCEEDED"
         return LLMRequestTimeoutError(
@@ -505,7 +520,7 @@ class LLMClient:
         remaining = budget.remaining_seconds()
         if remaining <= 0:
             return False
-        timeout = max(0.001, min(self.read_timeout_seconds, remaining))
+        timeout = max(0.001, min(budget.read_timeout_seconds or self.read_timeout_seconds, remaining))
         raw = getattr(response, "raw", None)
         # requests / urllib3 在不同版本中的 socket 层级略有差异；找不到时仍保留
         # requests.post 设置的初始读超时，下一次收到事件后会再次检查 deadline。

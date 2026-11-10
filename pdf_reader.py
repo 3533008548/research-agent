@@ -10,6 +10,8 @@
 import re
 import os
 import sys
+import unicodedata
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
@@ -119,16 +121,24 @@ class PaperReader:
             section = "未标注"
 
             for index in range(pages_to_read):
+                from pdf_ocr import extract_visual_text
+
                 page_number = index + 1
                 text_blocks = self._extract_text_blocks(text_pdf[index])
+                visual_elements, diagnostics = extract_visual_text(text_pdf[index], text_blocks)
+                for number, element in enumerate(visual_elements, 1):
+                    element.update(id=f"p{page_number:03d}-v{number:02d}", page=page_number,
+                                   order=30_000 + number, section=section)
                 table_elements = (
                     self._extract_table_elements(table_pdf.pages[index], page_number, text_blocks)
                     if table_pdf is not None else []
                 )
-                table_boxes = [element["bbox"] for element in table_elements]
+                # Geometry alone is not evidence that a table/algorithm contains
+                # a block's text. Keep partially captured blocks as lossless fallback.
                 text_blocks = [
                     block for block in text_blocks
-                    if not any(self._center_in_box(block["bbox"], box) for box in table_boxes)
+                    if not any(self._block_represented(block, element)
+                               for element in table_elements + visual_elements)
                 ]
                 text_elements, section = self._text_elements(
                     text_blocks, page_number, section,
@@ -136,13 +146,27 @@ class PaperReader:
                 figure_elements = self._extract_figure_elements(
                     text_pdf[index], page_number, text_blocks,
                 )
-                elements = text_elements + table_elements + figure_elements
+                elements = text_elements + table_elements + figure_elements + visual_elements
                 self._link_related_elements(elements)
-                pages.append({"page": page_number, "elements": elements})
+                # Compare against the independent raw text layer, not just the
+                # elements that survived filtering. This catches pre-chunk loss.
+                represented = "\n".join(str(e.get("text") or "") for e in elements)
+                missing_native = sum(
+                    not self._block_represented(
+                        {"text": raw[4], "bbox": [0, 0, 1, 1]},
+                        {"text": represented, "bbox": [0, 0, 1, 1]},
+                    )
+                    for raw in text_pdf[index].get_text("blocks")
+                    if str(raw[4]).strip() and raw[1] < text_pdf[index].rect.height * 0.94
+                )
+                pages.append({"page": page_number, "elements": elements,
+                              "extraction_diagnostics": diagnostics,
+                              "missing_native_blocks": missing_native})
 
         self._link_table_continuations(pages)
         return {
             "version": 1,
+            "extraction_version": 2,
             "source_file": source.name,
             "metadata_title": str(metadata.get("title") or "").strip(),
             "total_pages": total_pages,
@@ -179,6 +203,10 @@ class PaperReader:
                     caption = str(element.get("caption") or "").strip()
                     if caption:
                         lines.extend(["", f"🖼️ **{label}**：{caption}"])
+                elif kind in {"algorithm", "ocr_text"}:
+                    note = " [OCR 转写；符号需核对原页]" if element.get("extraction_method") == "ocr" else ""
+                    lines.extend(["", str(element.get("caption") or element.get("label")) + note,
+                                  str(element.get("text") or "")])
             page_texts.append("\n".join(lines).strip())
 
         full_text = "\n\n".join(page_texts)
@@ -210,7 +238,7 @@ class PaperReader:
         blocks = []
         for x0, y0, x1, y1, text, *_ in page.get_text("blocks"):
             content = " ".join(text.split())
-            if not content or y0 >= page_height * 0.94 or y1 - y0 > page_height * 0.5:
+            if not content or y0 >= page_height * 0.94:
                 continue
             blocks.append({
                 "text": content,
@@ -339,6 +367,15 @@ class PaperReader:
                 "related_ids": [],
             })
         return elements
+
+    @staticmethod
+    def _block_represented(block: dict, element: dict) -> bool:
+        if not PaperReader._center_in_box(block["bbox"], element["bbox"]):
+            return False
+        def characters(text):
+            return Counter(c for c in unicodedata.normalize("NFKC", text).casefold()
+                           if not c.isspace())
+        return not (characters(block["text"]) - characters(str(element.get("text") or "")))
 
     @staticmethod
     def _table_markdown(header: list[str], rows: list[list[str]]) -> str:

@@ -1,6 +1,5 @@
 import type {
   DailyRunDetail,
-  ExperimentProjectDetail,
   ResearchDocumentDetail,
   Run,
   UserProfile,
@@ -19,7 +18,6 @@ export type WorkspacePanel =
   | "documents"
   | "profile"
   | "papers"
-  | "experiments"
   | "keywords"
   | "settings";
 
@@ -31,7 +29,6 @@ export type WorkbenchTab =
   | { id: "profile"; kind: "profile"; title: string; profile: UserProfile }
   | { id: "daily"; kind: "daily"; title: string }
   | { id: string; kind: "dailyRun"; title: string; detail: DailyRunDetail }
-  | { id: string; kind: "experiment"; title: string; project: ExperimentProjectDetail }
   | { id: "runs"; kind: "runs"; title: string };
 
 export type RunKind = Run["kind"];

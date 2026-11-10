@@ -131,43 +131,6 @@ class ResearchDocumentDetailResponse(ResearchDocumentResponse):
     ledger: ResearchDocumentLedgerResponse
 
 
-class ExperimentFileResponse(BaseModel):
-    path: str
-    size_bytes: int
-    sha256: str
-
-
-class ExperimentProjectResponse(BaseModel):
-    project_id: str
-    paper_id: str
-    paper_title: str
-    status: str
-    reproduction_level: str
-    implementation_path: str = "not_checked"
-    summary: str = ""
-    revision: int
-    latest_run_id: str = ""
-    created_at: str
-    updated_at: str
-
-
-class ExperimentProjectDetailResponse(ExperimentProjectResponse):
-    spec: dict[str, Any] = Field(default_factory=dict)
-    validation: dict[str, Any] = Field(default_factory=dict)
-    files: list[ExperimentFileResponse] = Field(default_factory=list)
-
-
-class ExperimentFileContentResponse(BaseModel):
-    path: str
-    content: str
-    sha256: str
-
-
-class ExperimentRepositoryConnectRequest(BaseModel):
-    repository_url: str = Field(min_length=12, max_length=500)
-    relationship: Literal["user_provided", "official_confirmed", "community", "candidate_unverified"] = "user_provided"
-
-
 class PaperResponse(BaseModel):
     paper_id: str
     title: str
@@ -311,9 +274,9 @@ class ChatRunResponse(BaseModel):
 
 
 class RunCreateRequest(BaseModel):
-    """Canonical create contract for chat, research, daily and experiment work."""
+    """Canonical create contract for chat, research and daily work."""
 
-    kind: Literal["chat", "research", "daily", "experiment"]
+    kind: Literal["chat", "research", "daily"]
     session_id: str | None = Field(default=None, max_length=120)
     message: str | None = Field(default=None, max_length=12_000)
     upload_id: str | None = Field(default=None, max_length=80)
@@ -322,9 +285,6 @@ class RunCreateRequest(BaseModel):
     resume: bool = False
     daily_kind: Literal["daily", "retry", "search", "resume"] | None = None
     keyword: str | None = Field(default=None, max_length=500)
-    paper_id: str | None = Field(default=None, max_length=120)
-    project_id: str | None = Field(default=None, max_length=120)
-    experiment_action: Literal["generate", "prepare_repository", "reconstruct_method"] = "generate"
 
 
 class RunStartResponse(BaseModel):
@@ -340,6 +300,12 @@ class RunSteerCreateRequest(BaseModel):
     """A user message that should guide an already-running task at its next node."""
 
     message: str = Field(min_length=1, max_length=12_000)
+
+
+class ResearchControlRequest(BaseModel):
+    action: Literal["pause", "stop", "resume", "steer", "material"]
+    message: str = Field(default="", max_length=12_000)
+    event_id: str | None = Field(default=None, max_length=120)
 
 
 class RunSteerResponse(BaseModel):
@@ -369,6 +335,7 @@ class RunResponse(BaseModel):
     completed_at: str | None = None
     events: list[dict[str, Any]] = Field(default_factory=list)
     steers: list[RunSteerResponse] = Field(default_factory=list)
+    research: dict[str, Any] | None = None
 
 class CancelRunResponse(BaseModel):
     run_id: str

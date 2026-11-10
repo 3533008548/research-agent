@@ -13,12 +13,8 @@ const MarkdownContent = lazy(() => import("../MarkdownContent"));
  */
 export function ChatMessage({ message }: { message: DisplayMessage }) {
   return (
-    <article className={`message message-${message.role}`}>
-      <div className="message-avatar" aria-hidden="true">
-        {message.role === "user" ? "你" : "研"}
-      </div>
+    <article className={`message message-${message.role}`} aria-label={message.role === "user" ? "用户消息" : "助手回复"}>
       <div className="message-body">
-        <p className="message-role">{message.role === "user" ? "你" : "Research Agent"}</p>
         {message.content ? (
           <Suspense fallback={<p className="markdown-loading">{message.content}</p>}>
             <MarkdownContent content={message.content} />

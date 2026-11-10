@@ -118,6 +118,14 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
             document_map = load_document_map(paths, str(r["paper_id"]))
             if document_map is not None:
                 context, locator = related_context(document_map, element_id)
+        if not locator:
+            # Older indexes have page metadata without document-map element IDs.
+            # Preserve that provenance; never infer a page from source prose.
+            page, page_end = r.get("page"), r.get("page_end")
+            if type(page) is int and page > 0:
+                locator = f"p.{page}"
+                if type(page_end) is int and page_end > page:
+                    locator += f"–{page_end}"
         if r.get("retrieval") == "keyword":
             metric = f"关键词分: {r['keyword_score']}"
         elif r.get("retrieval") == "hybrid":

@@ -37,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=os.getenv("APP_DATA_DIR", "runtime"))
     parser.add_argument("--max-pages", type=int, default=20)
+    parser.add_argument("--file", action="append", dest="files",
+                        help="只重建指定的论文文件名，可重复；文件必须在运行时论文目录内")
     return parser
 
 
@@ -48,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
     paths = RuntimePaths.from_root(args.data_dir)
     paths.ensure_initialized()
     pdf_files = sorted(paths.papers_dir.glob("*.pdf"))
+    if args.files:
+        selected_names = set(args.files)
+        known_names = {path.name for path in pdf_files}
+        if selected_names - known_names:
+            build_parser().error("--file 必须是已有本地 PDF 的完整文件名")
+        pdf_files = [path for path in pdf_files if path.name in selected_names]
     if not pdf_files:
         print("没有可重建的本地 PDF。")
         return 0
@@ -55,7 +63,17 @@ def main(argv: list[str] | None = None) -> int:
     relation_store = PaperRelationStore(paths)
     # Passing the relation store lets delete_paper clear edges that were not
     # carried over; remap runs first so valid ones survive the new paper_id.
-    store = PaperStore(persist_dir=str(paths.chroma_dir), relation_store=relation_store)
+    from config import Config
+    cfg = Config.load()
+    store = PaperStore(
+        persist_dir=str(paths.chroma_dir), relation_store=relation_store,
+        embedding_model=cfg.rag_embedding_model,
+        embedding_dimensions=cfg.rag_embedding_dimensions,
+        embedding_max_length=cfg.rag_embedding_max_length,
+        embedding_batch_size=cfg.rag_embedding_batch_size,
+        embedding_device=cfg.rag_embedding_device,
+        collection_name=cfg.rag_embedding_collection,
+    )
     existing = [
         (str(item.get("title") or ""), str(item.get("paper_id") or ""))
         for item in store.list_papers()
@@ -104,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
                     str(pdf_path), max_pages=args.max_pages, output_dir=paths.images_dir,
                 )
                 attach_image_assets(parsed_document, images)
+                from pdf_ocr import attach_visual_assets
+                attach_visual_assets(parsed_document, pdf_path, paths.images_dir)
             except Exception:
                 # A PDF can still have useful text and tables when image rendering fails.
                 pass

@@ -131,6 +131,7 @@ class TestRunDispatcher(unittest.TestCase):
         self.b = self.store.create("B")["thread_id"]
         self.stop = threading.Event()
         self.thread = None
+        self.project_stores = []
 
     def make_broker(self):
         return _Broker()
@@ -142,6 +143,8 @@ class TestRunDispatcher(unittest.TestCase):
         if self.thread:
             self.thread.join(timeout=8)
             self.assertFalse(self.thread.is_alive(), "dispatcher did not drain")
+        for projects in self.project_stores:
+            projects.close()
         self.store.close()
         self.tmp.cleanup()
 
@@ -305,8 +308,9 @@ class TestRedisRunDispatcher(TestRunDispatcher):
 
     def test_chat_and_research_share_session_exclusion(self):
         research = RedisResearchRunBroker(os.environ["E2E_REDIS_URL"], prefix=self.prefix)
-        manager = RedisResearchRunManager(self.agent, research)
+        manager = RedisResearchRunManager(self.agent, research, persistent=False)
         worker = RedisResearchRunWorker(self.agent, research, consumer="research", claim_idle_ms=1000)
+        self.project_stores.extend([manager.projects, worker.project_manager.projects])
         self.manager.start(self.a, "A1")
         time.sleep(0.005)
         manager.start(self.a, "R")
@@ -320,8 +324,9 @@ class TestRedisRunDispatcher(TestRunDispatcher):
 
     def test_two_research_sessions_overlap(self):
         broker = RedisResearchRunBroker(os.environ["E2E_REDIS_URL"], prefix=self.prefix)
-        manager = RedisResearchRunManager(self.agent, broker)
+        manager = RedisResearchRunManager(self.agent, broker, persistent=False)
         worker = RedisResearchRunWorker(self.agent, broker, consumer="research", claim_idle_ms=1000)
+        self.project_stores.extend([manager.projects, worker.project_manager.projects])
         runs = [manager.start(sid, query) for sid, query in ((self.a, "A1"), (self.b, "B"))]
         self.start(workers={"research": (worker, 2)})
         self.assertTrue(self.agent.started["A1"].wait(3))

@@ -118,7 +118,7 @@ def anchor_is_precise(anchor: Any) -> bool:
     return str(anchor.get("kind") or "none") in _PRECISE_ANCHOR_KINDS
 
 
-def split_tool_evidence(content: str, *, researcher: str, source_type: str) -> list[dict[str, Any]]:
+def split_tool_evidence(content: str, *, researcher: str, source_type: str, unlimited: bool = False) -> list[dict[str, Any]]:
     """Split a tool response into source-specific cards when its format permits.
 
     ``search_papers`` and ``query_papers`` render one numbered record per
@@ -131,7 +131,7 @@ def split_tool_evidence(content: str, *, researcher: str, source_type: str) -> l
         if cards:
             return cards
     if source_type == "query_papers":
-        cards = _split_local_query(content, researcher)
+        cards = _split_local_query(content, researcher, unlimited=unlimited)
         if cards:
             return cards
     return []
@@ -332,7 +332,7 @@ def _split_public_search(content: str, researcher: str) -> list[dict[str, Any]]:
     return cards
 
 
-def _split_local_query(content: str, researcher: str) -> list[dict[str, Any]]:
+def _split_local_query(content: str, researcher: str, *, unlimited: bool = False) -> list[dict[str, Any]]:
     pattern = re.compile(
         r"^\s*(?P<number>\d+)\.\s+\[(?P<label>[^\]]+)\]\s*.*?\n\s*(?P<text>.+?)"
         r"(?=^\s*\d+\.\s+\[|\Z)",
@@ -343,7 +343,9 @@ def _split_local_query(content: str, researcher: str) -> list[dict[str, Any]]:
         label = _normalise_text(match.group("label"))
         parts = [part.strip() for part in label.split(" · ") if part.strip()]
         title = parts[0] if parts else label
-        text = _normalise_text(match.group("text"))[:900]
+        text = _normalise_text(match.group("text"))
+        if not unlimited:
+            text = text[:900]
         cards.append({
             "id": "",
             "researcher": researcher,

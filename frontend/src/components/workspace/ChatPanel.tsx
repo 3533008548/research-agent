@@ -1,8 +1,9 @@
-import type { Dispatch, FormEvent, SetStateAction } from "react";
+import { useLayoutEffect, useRef, type Dispatch, type FormEvent, type SetStateAction } from "react";
 
 import { ChatMessage } from "../ChatMessage";
+import { ResearchWorkbench } from "../ResearchWorkbench";
 import { modeLabel, type DisplayMessage, type ResearchMode } from "../../lib/labels";
-import type { ResearchScope, Run, WorkspaceUpload } from "../../types";
+import type { ResearchProject, ResearchScope, Run, WorkspaceUpload } from "../../types";
 
 /**
  * The chat tab: the transcript, the composer and the mode switch.
@@ -13,6 +14,8 @@ import type { ResearchScope, Run, WorkspaceUpload } from "../../types";
  * an attachment cannot be added at that point.
  */
 export function ChatPanel({
+  apiKey,
+  onResearchChange,
   messages,
   draft,
   mode,
@@ -35,6 +38,8 @@ export function ChatPanel({
   stopCurrentRun,
   selectAttachment,
 }: {
+  apiKey: string;
+  onResearchChange: (project: ResearchProject) => void;
   messages: DisplayMessage[];
   draft: string;
   mode: ResearchMode;
@@ -62,19 +67,49 @@ export function ChatPanel({
   stopCurrentRun: () => void;
   selectAttachment: (event: React.ChangeEvent<HTMLInputElement>) => void;
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const researchRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const resize = () => {
+      textarea.style.height = "0px";
+      const limit = Math.max(36, Math.min(180, window.innerHeight * 0.22));
+      textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 36), limit)}px`;
+    };
+    resize();
+    let width = textarea.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (textarea.clientWidth !== width) { width = textarea.clientWidth; resize(); }
+    });
+    observer.observe(textarea);
+    window.addEventListener("resize", resize);
+    return () => { observer.disconnect(); window.removeEventListener("resize", resize); };
+  }, [draft, activeSessionId, mode]);
+  useLayoutEffect(() => {
+    if (mode === "research") researchRef.current?.scrollIntoView({ block: "start" });
+  }, [mode, activeSessionId]);
+
   return (
       <>
         <div className="message-list" ref={messageListRef} aria-live="polite">
+          <div className="message-thread">
           {isLoading ? (
             <p className="empty-state">正在加载会话…</p>
           ) : messages.length ? (
             messages.map((message) => <ChatMessage key={message.id} message={message} />)
-          ) : (
+          ) : mode === "chat" ? (
             <div className="empty-state">
               <h2>{activeSessionId ? "从一个研究问题、论文或假设开始。" : "新建一个会话，开始研究。"}</h2>
-              <p>{activeSessionId ? "对话用于快速讨论；深度研究会收集本地与公开证据。" : "展开左侧会话栏，点击“新建会话”。"}</p>
+              <p>{activeSessionId ? "在输入框中选择对话或多 Agent 研究。" : "展开左侧会话栏，点击“新建会话”。"}</p>
             </div>
-          )}
+          ) : null}
+          {mode === "research" && <div ref={researchRef} className="chat-research">
+            <ResearchWorkbench apiKey={apiKey}
+              currentId={currentRun?.kind === "research" ? currentRun.project_id || undefined : undefined}
+              onChange={onResearchChange} />
+          </div>}
+          </div>
         </div>
 
         <form className="composer" aria-label="消息输入区" onSubmit={(event) => void sendMessage(event)}>
@@ -95,13 +130,14 @@ export function ChatPanel({
             </div>
           )}
           <textarea
+            ref={textareaRef}
             aria-label="消息"
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder={canSteerCurrentRun
               ? "补充当前任务的约束、线索或更正…"
-              : mode === "research" ? "输入研究问题，开始深度研究…" : "提出问题，开始对话…"}
-            rows={3}
+              : mode === "research" ? "输入研究问题，开始多 Agent 研究…" : "提出问题，开始对话…"}
+            rows={1}
             disabled={(!canSteerCurrentRun && isSending) || !activeSessionId}
           />
           <div className="composer-toolbar">
@@ -171,6 +207,7 @@ export function ChatPanel({
               </button>
             </div>
           )}
+          {mode === "research" && <p className="composer-hint">多 Agent 协作取证与核验，可在对话区查看进度、暂停或继续研究。</p>}
           {(canSteerCurrentRun || attachment) && (
             <p className="composer-hint">
               {canSteerCurrentRun
