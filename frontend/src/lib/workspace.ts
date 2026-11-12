@@ -1,6 +1,5 @@
 import type {
   DailyRunDetail,
-  ResearchDocumentDetail,
   Run,
   UserProfile,
 } from "../types";
@@ -15,7 +14,6 @@ import type {
 export type ResearchMode = "chat" | "research";
 
 export type WorkspacePanel =
-  | "documents"
   | "profile"
   | "papers"
   | "keywords"
@@ -25,7 +23,9 @@ export type Notice = { kind: "error" | "info"; text: string } | null;
 
 export type WorkbenchTab =
   | { id: "chat"; kind: "chat"; title: string }
-  | { id: string; kind: "document"; title: string; document: ResearchDocumentDetail }
+  | { id: "library"; kind: "library"; title: string }
+  | { id: "settings"; kind: "settings"; title: string }
+  | { id: string; kind: "paper"; title: string; documentId: string }
   | { id: "profile"; kind: "profile"; title: string; profile: UserProfile }
   | { id: "daily"; kind: "daily"; title: string }
   | { id: string; kind: "dailyRun"; title: string; detail: DailyRunDetail }

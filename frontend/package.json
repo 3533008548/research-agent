@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/copy-pdf-assets.mjs",
+    "prebuild": "node scripts/copy-pdf-assets.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "node --experimental-strip-types --test src/lib/*.test.ts",
@@ -11,6 +13,7 @@
   },
   "dependencies": {
     "katex": "^0.16.22",
+    "pdfjs-dist": "^6.5.438",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",

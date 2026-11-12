@@ -1,0 +1,58 @@
+{
+  "name": "research-assistant-desktop",
+  "version": "0.2.0",
+  "private": true,
+  "description": "科研助手桌面客户端",
+  "author": "Research Assistant",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis",
+    "postinstall": "install-electron"
+  },
+  "build": {
+    "appId": "org.researchassistant.desktop",
+    "productName": "Research Assistant",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "startup.html",
+      "package.json",
+      "icon.png",
+      "tray.png",
+      "icon.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "../build/desktop-backend/research-backend",
+        "to": "backend"
+      },
+      {
+        "from": "../frontend/dist",
+        "to": "frontend"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "signAndEditExecutable": false,
+      "icon": "icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false,
+      "packElevateHelper": false,
+      "allowElevation": false
+    },
+    "electronDist": "node_modules/electron/dist"
+  },
+  "devDependencies": {
+    "electron": "^45.3.1",
+    "electron-builder": "^26.18.0"
+  }
+}

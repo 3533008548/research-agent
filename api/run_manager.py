@@ -91,6 +91,7 @@ class ChatRunManager:
                 on_token=on_token,
                 steer_provider=consume_steers,
                 on_steer=on_steer,
+                on_progress=active.append,
             )
             trace = self.agent.get_last_trace(active.session_id) or {}
             status = self._status_from_trace(trace, active.cancel_event)

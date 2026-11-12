@@ -47,11 +47,6 @@ class RuntimePaths:
     def papers_dir(self) -> Path:
         return self.primary_dir / "papers"
 
-    @property
-    def research_documents_dir(self) -> Path:
-        """User-owned research plans and their Word exports; never treated as chat memory."""
-        return self.primary_dir / "research_documents"
-
 
     @property
     def paper_relations_file(self) -> Path:
@@ -118,7 +113,6 @@ class RuntimePaths:
         for directory in (
             self.database_dir,
             self.papers_dir,
-            self.research_documents_dir,
             self.chroma_dir,
             self.images_dir,
             self.paper_artifacts_dir,

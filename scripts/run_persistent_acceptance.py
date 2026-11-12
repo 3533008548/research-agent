@@ -21,7 +21,7 @@ BASE_QUESTION = """请核查这个研究假设，而不是预设它成立：ATS 
 1. A Theory of Traffic Regulators for Deterministic Networks with Application to Interleaved Regulators，paper_e8dfcd49ae14。
 2. ATS and Redundancy: Avoiding Unbounded Latencies，paper_59532395e9ac。
 请查找原文支持和反例，说明定理的准确前提、冗余网络中的风险、可行缓解措施及代价。结论要有论文名和页码或可核对的原文位置，区分事实、推断与尚不能证明的部分。
-两篇原 PDF 目前不在下载目录中，但其完整逐页解析和检索索引可用；优先使用 query_papers 按给定 paper_id 查询，若证据确实不足请具体说明。不要联网找新文献或修改科研档案、画像。完成可核验的阶段结论后结束。"""
+两篇原 PDF 目前不在下载目录中，但其完整逐页解析和检索索引可用；优先使用 query_papers 按给定 paper_id 查询，若证据确实不足请具体说明。不要联网找新文献或修改用户画像。完成可核验的阶段结论后结束。"""
 
 STEER = """补充验收要求：分别区分逐流 FIFO 与聚合 FIFO、所有流的总最坏时延与每条流的最坏时延；讨论最大驻留时间限制时，必须区分成功交付帧的时延与丢帧代价。仍只依据这两篇论文，不把有限时长仿真称为对所有网络的普遍证明。"""
 

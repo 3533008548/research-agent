@@ -9,7 +9,7 @@ import pymupdf
 
 from pdf_reader import PaperReader
 from paper_artifacts import build_document_map, related_context
-from paper_quality import prepare_document_map
+from paper_quality import prepare_document_map, verify_index_round_trip
 
 
 class TestPdfIntegrity(unittest.TestCase):
@@ -17,6 +17,82 @@ class TestPdfIntegrity(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "algorithm.pdf"
+
+    def token_store(self):
+        from paper_store import PaperStore
+        from types import SimpleNamespace
+        store = PaperStore.__new__(PaperStore)
+        store._embed_fn = SimpleNamespace(tokenize=list)
+        store.embedding_max_length = 256
+        store._collection = MagicMock()
+        store._invalidate_lexical_index = MagicMock()
+        return store
+
+    def test_token_split_map_matches_index_and_preserves_chinese_provenance(self):
+        import copy
+        from paper_artifacts import write_document_map, load_document_map
+        from runtime_paths import RuntimePaths
+
+        text = "时间敏感网络通过多径冗余保障可靠性。" * 55
+        doc = {"paper_id": "p", "title": "中文论文", "chunks": [
+            {"id": "p001-c01", "text": text, "kind": "text", "page": 1, "page_end": 2,
+             "source_element_ids": ["p001-t01", "p002-t01"], "related_ids": ["p002-b01"]},
+            {"id": "p003-c01", "text": text, "kind": "text", "page": 3,
+             "source_element_ids": ["p003-t01"], "related_ids": []},
+        ]}
+        before = copy.deepcopy(doc)
+        store = self.token_store()
+        store.index_document_map(doc)
+        written = store._collection.add.call_args.kwargs
+        store._collection.get.return_value = {
+            "ids": written["ids"], "documents": written["documents"], "metadatas": written["metadatas"],
+        }
+        readback = store.get_paper_chunks("p")
+        self.assertGreater(len(readback), len(before["chunks"]))
+        self.assertTrue(verify_index_round_trip(doc, readback)["accepted"])
+        self.assertFalse(verify_index_round_trip(before, readback)["accepted"])
+        self.assertEqual([c["element_id"] for c in readback], [c["id"] for c in doc["chunks"]])
+        self.assertEqual(len(set(c["id"] for c in doc["chunks"])), len(doc["chunks"]))
+        self.assertTrue(all(len(c["text"]) <= 256 for c in doc["chunks"]))
+        for parent in before["chunks"]:
+            children = [c for c in doc["chunks"] if c["parent_chunk_id"] == parent["id"]]
+            coverage = set()
+            base = children[0]["char_start"]
+            for child in children:
+                self.assertEqual(child["source_element_ids"], parent["source_element_ids"])
+                self.assertEqual(child["related_ids"], parent["related_ids"])
+                self.assertEqual(child.get("page_end"), parent.get("page_end"))
+                start = child["char_start"] - base
+                self.assertEqual(parent["text"][start:start + len(child["text"])], child["text"])
+                coverage.update(range(start, start + len(child["text"])))
+            self.assertEqual(coverage, set(range(len(parent["text"]))))
+        paths = RuntimePaths.from_root(self.tmp.name)
+        write_document_map(paths, paper_id="p", document_map=doc)
+        self.assertTrue(verify_index_round_trip(load_document_map(paths, "p"), readback)["accepted"])
+        # Repeated indexing of the final map must not split or rename it again.
+        final = copy.deepcopy(doc)
+        store.index_document_map(doc)
+        self.assertEqual([c["id"] for c in doc["chunks"]], [c["id"] for c in final["chunks"]])
+
+    def test_failed_write_does_not_change_document_map(self):
+        import copy
+        doc = {"chunks": [{"id": "c1", "text": "中" * 700}]}
+        before = copy.deepcopy(doc)
+        store = self.token_store()
+        store._collection.add.side_effect = RuntimeError("write failed")
+        with self.assertRaisesRegex(RuntimeError, "write failed"):
+            store.index_document_map(doc)
+        self.assertEqual(doc, before)
+
+    def test_round_trip_rejects_lost_duplicate_and_truncated_chunks(self):
+        doc = {"chunks": [{"id": "a", "text": "完整内容甲"}, {"id": "b", "text": "完整内容乙"}]}
+        complete = [{"element_id": c["id"], "text": c["text"]} for c in doc["chunks"]]
+        self.assertTrue(verify_index_round_trip(doc, complete)["accepted"])
+        for corrupted in (complete[:1], [complete[0], complete[0]], [complete[0], {"element_id": "b", "text": "完整"}]):
+            result = verify_index_round_trip(doc, corrupted)
+            self.assertFalse(result["accepted"])
+            self.assertIn("预期 2 块", result["issues"][0]["message"])
+        self.assertFalse(verify_index_round_trip({"chunks": [doc["chunks"][0]] * 2}, complete[:1])["accepted"])
 
     def make_panel(self, *, raster=False, tall=False):
         with pymupdf.open() as doc:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -94,24 +95,25 @@ class ToolRuntime:
     ) -> str:
         """Run one existing tool without exposing its arguments or result to traces."""
         name = str(name or "")[:80]
+        call_id = uuid.uuid4().hex
         definition = get_tool_definition(name)
         if definition is None:
-            self._emit("tool_failed", tool=name or "unknown", error_type="UnknownTool")
+            self._emit("tool_failed", tool=name or "unknown", call_id=call_id, error_type="UnknownTool")
             return f"❌ 未知工具: {name or 'unknown'}"
         if not self._is_allowed(name):
-            self._emit("tool_failed", tool=name, error_type="ToolAccessDenied")
+            self._emit("tool_failed", tool=name, call_id=call_id, error_type="ToolAccessDenied")
             return f"Tool is not available in this {self.context.run_kind} role: {name}"
 
         if name == "read_pdf" and self.context.run_kind == "research":
             remote = str(args.get("url_or_path", "")).strip().lower().startswith(("https://", "http://"))
             scope = self.context.research_scope
             if (scope == "local" and remote) or (scope == "public" and not remote):
-                self._emit("tool_failed", tool=name, error_type="SourceScopeDenied")
+                self._emit("tool_failed", tool=name, call_id=call_id, error_type="SourceScopeDenied")
                 return "❌ PDF 来源超出了用户指定的研究范围。"
 
         self._ensure_active("before_tool")
         started_at = time.perf_counter()
-        self._emit("tool_started", tool=name)
+        self._emit("tool_started", tool=name, call_id=call_id)
         try:
             result = self._executor(
                 name,
@@ -130,6 +132,7 @@ class ToolRuntime:
             self._emit(
                 "tool_failed",
                 tool=name,
+                call_id=call_id,
                 duration_ms=round((time.perf_counter() - started_at) * 1_000, 1),
                 error_type="RequestCancelledError",
             )
@@ -138,6 +141,7 @@ class ToolRuntime:
             self._emit(
                 "tool_failed",
                 tool=name,
+                call_id=call_id,
                 duration_ms=round((time.perf_counter() - started_at) * 1_000, 1),
                 error_type=type(exc).__name__,
             )
@@ -145,8 +149,10 @@ class ToolRuntime:
 
         text = self._truncate_result(result, definition.result_limit)
         self._emit(
-            "tool_finished",
+            "tool_failed" if text.lstrip().startswith("❌") else "tool_finished",
             tool=name,
+            call_id=call_id,
+            **({"error_type": "ToolResultError"} if text.lstrip().startswith("❌") else {}),
             duration_ms=round((time.perf_counter() - started_at) * 1_000, 1),
             rag_keyword_fallback=name == "query_papers" and "关键词候选" in text,
         )

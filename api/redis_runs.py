@@ -433,7 +433,7 @@ class RedisChatRunManager:
             summary="API chat run queued for a durable worker",
             event_type="status",
             metadata=execution_metadata(
-                "chat", runner="redis-worker", model=str(self.agent.model), toolset="chat-default",
+                "chat", runner=getattr(self.broker, "runner_name", "redis-worker"), model=str(self.agent.model), toolset="chat-default",
             ),
         )
         return self.get(run_id) or run
@@ -640,25 +640,10 @@ class RedisChatRunWorker(_RedisRunWorker):
                 on_token=on_token,
                 steer_provider=consume_steers,
                 on_steer=on_steer,
+                on_progress=lambda event: self._publish(job.run_id, event),
             )
             self._check_execution()
             trace = self.agent.get_last_trace(job.session_id) or {}
-            # Only the existing trace's tool identifier and its lifecycle are
-            # exposed.  Arguments, search results and model text never enter
-            # the Redis event log.
-            for tool_event in trace.get("tool_trace", []):
-                tool_name = str(tool_event.get("tool") or "")[:80]
-                if tool_name:
-                    duration_ms = tool_event.get("duration_ms")
-                    metrics = {"duration_ms": duration_ms} if isinstance(duration_ms, (int, float)) else None
-                    self.agent.sessions.add_run_event(
-                        job.session_id, job.run_id, "chat", "single_agent", "tool", "completed",
-                        summary="工具调用已完成", metrics=metrics, event_type="tool",
-                    )
-                    self._publish(job.run_id, {
-                        "type": "tool", "tool": tool_name, "status": "completed",
-                        **({"duration_ms": round(float(duration_ms), 1)} if isinstance(duration_ms, (int, float)) else {}),
-                    })
             current = self.agent.sessions.get_chat_run(job.run_id) or run
             outcome = trace.get("outcome")
             result_status = "cancelled" if cancel_event.is_set() or outcome == "cancelled" else (
@@ -839,7 +824,7 @@ class RedisResearchRunManager(_RedisRunStream):
             event_type="status",
             metadata=execution_metadata(
                 "research",
-                runner="redis-worker",
+                runner=getattr(self.broker, "runner_name", "redis-worker"),
                 model=str(self.agent.model),
                 scope=scope,
                 toolset="research-resume" if resume else "research-bounded",
@@ -1047,7 +1032,7 @@ class RedisDailyRunManager(_RedisRunStream):
                 run_id, "orchestrator", "queued", "",
                 event_type="status",
                 metadata=execution_metadata(
-                    "daily", runner="redis-worker", toolset="daily-curated",
+                    "daily", runner=getattr(self.broker, "runner_name", "redis-worker"), toolset="daily-curated",
                 ),
             )
             return run
@@ -1070,7 +1055,7 @@ class RedisDailyRunManager(_RedisRunStream):
             run_id, "orchestrator", "queued", "",
             event_type="status",
             metadata=execution_metadata(
-                "daily", runner="redis-worker", toolset="daily-curated",
+                "daily", runner=getattr(self.broker, "runner_name", "redis-worker"), toolset="daily-curated",
             ),
         )
         return self.get(run_id) or run

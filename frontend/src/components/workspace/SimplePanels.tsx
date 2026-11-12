@@ -13,15 +13,15 @@ const MarkdownContent = lazy(() => import("../../MarkdownContent"));
  */
 export function ProfilePanel({ profile }: { profile: { content?: string } }) {
   return (
-    <article className="document-page" aria-label="用户画像">
-      <header className="document-page-heading">
+    <article className="workspace-page" aria-label="用户画像">
+      <header className="workspace-page-heading">
         <div>
           <p className="eyebrow">跨会话偏好</p>
           <h1>用户画像</h1>
-          <p className="document-page-meta">仅显示 Agent 已保存的稳定偏好，不包含完整对话内容。</p>
+          <p className="workspace-page-meta">仅显示 Agent 已保存的稳定偏好，不包含完整对话内容。</p>
         </div>
       </header>
-      <div className="document-page-content">
+      <div className="workspace-page-content">
         {profile.content ? (
           <Suspense fallback={<p className="markdown-loading">{profile.content}</p>}>
             <MarkdownContent content={profile.content} />
@@ -40,18 +40,18 @@ export function ProfilePanel({ profile }: { profile: { content?: string } }) {
  */
 export function DailyRunPanel({ title, detail }: { title: string; detail: DailyRunDetail }) {
   return (
-    <article className="document-page" aria-label={`每日检索报告：${title}`}>
-      <header className="document-page-heading">
+    <article className="workspace-page" aria-label={`每日检索报告：${title}`}>
+      <header className="workspace-page-heading">
         <div>
           <p className="eyebrow">每日检索报告</p>
           <h1>{title}</h1>
-          <p className="document-page-meta">
+          <p className="workspace-page-meta">
             <span className={`status status-${detail.status}`}>{statusLabel(detail.status)}</span>
             {" · "}{detail.run_id}
           </p>
         </div>
       </header>
-      <div className="document-page-content daily-report-page">
+      <div className="workspace-page-content daily-report-page">
         {detail.brief && (
           <section className="daily-report-brief">
             <h2>本次摘要</h2>

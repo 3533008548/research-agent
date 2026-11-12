@@ -11,7 +11,8 @@ daily_search:
 model: deepseek-flash
 vision_model: deepseek-flash
 agent:
-  verify_timeout_seconds: 8
+  # 核验需要等非流式响应生成完毕；独立预算包含排队与最多一次瞬时失败重试。
+  verify_timeout_seconds: 120
 api_resilience:
   max_concurrency: 4
   interactive_reserved_slots: 1

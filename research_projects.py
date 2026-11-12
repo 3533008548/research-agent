@@ -14,6 +14,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from run_contract import graph_activity_event
 
 
 def now():
@@ -51,6 +52,7 @@ class ResearchProjects:
             CREATE TABLE IF NOT EXISTS research_events (
                 event_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL,
                 payload TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS research_events_project_kind ON research_events(project_id, kind);
             CREATE TABLE IF NOT EXISTS research_reservations (
                 reservation_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, job_id TEXT NOT NULL,
                 tokens INTEGER NOT NULL, actual INTEGER, created_at TEXT NOT NULL);
@@ -103,6 +105,28 @@ class ResearchProjects:
                           (job_id, project["project_id"], project["goal_version"], role, "queued",
                            json.dumps(payload, ensure_ascii=False), now()))
         return job_id
+
+    def record_activity(self, job, event):
+        activity = graph_activity_event(event)
+        if activity is None:
+            return
+        with self.transaction():
+            project = self._get(job["project_id"])
+            if not project:
+                return
+            activity.update(agent=job["role"], job_id=job["job_id"],
+                            version=job["version"], attempt=job.get("attempts", 1))
+            self._event(job["project_id"], "activity", activity)
+            self._save(project)
+
+    def activity(self, project_id):
+        """Latest bounded operational events, separate from prompts and evidence."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT event_id,payload,created_at FROM research_events "
+                "WHERE project_id=? AND kind='activity' ORDER BY rowid DESC LIMIT 500", (project_id,)).fetchall()
+            return [{**json.loads(row["payload"]), "id": row["event_id"], "created_at": row["created_at"]}
+                    for row in reversed(rows)]
 
     def create(self, project_id, session_id, question, scope="both", *, max_calls=48, max_tokens=400000):
         with self.transaction():

@@ -336,11 +336,56 @@ class PaperStore:
         title: str = "Unknown",
         paper_id: Optional[str] = None,
     ) -> str:
-        """Index page-scoped chunks created by ``paper_artifacts.build_document_map``."""
+        """Index and update the map with the exact token-safe chunks persisted.
+
+        Callers must validate and save this final map, not the pre-token split.
+        The map is only changed after the write succeeds.
+        """
         resolved_title = str(document_map.get("title") or title)
         resolved_id = str(document_map.get("paper_id") or paper_id or "") or None
-        chunks = self._fit_chunks(list(document_map.get("chunks") or []))
+        original = list(document_map.get("chunks") or [])
+        source_ids = [str(chunk.get("id") or "") for chunk in original]
+        if any(not value for value in source_ids) or len(set(source_ids)) != len(source_ids):
+            raise ValueError("文档检索块缺少唯一 ID，未写入向量库")
+        # Offsets must be global: assigning zero independently to every split
+        # parent would interleave unrelated pages when reading chunks back.
+        positioned, cursor = [], 0
+        for chunk in original:
+            text = str(chunk.get("text") or "").strip()
+            positioned.append({**chunk, "text": text, "char_start": cursor, "char_end": cursor + len(text)})
+            cursor += len(text) + 2
+        fitted = self._fit_chunks(positioned)
+        from collections import Counter
+        counts = Counter(str(chunk.get("id") or "") for chunk in fitted)
+        used = set(source_ids)
+        parts: dict[str, int] = {}
+        chunks = []
+        for chunk in fitted:
+            parent_id = str(chunk["id"])
+            if counts[parent_id] > 1:
+                number = parts.get(parent_id, 0) + 1
+                child_id = f"{parent_id}-token{number:03d}"
+                while child_id in used:
+                    number += 1
+                    child_id = f"{parent_id}-token{number:03d}"
+                parts[parent_id] = number
+                used.add(child_id)
+                chunk = {**chunk, "id": child_id, "parent_chunk_id": parent_id}
+            chunks.append(chunk)
         resolved_id = self._index_chunks(chunks, title=resolved_title, paper_id=resolved_id)
+        document_map["chunks"] = chunks
+        if parts:
+            document_map.setdefault("pre_embedding_chunks", []).extend(original)
+            document_map["index_preparation"] = {
+                "input_chunks": len(original), "output_chunks": len(chunks),
+                "split_parents": len(parts), "max_tokens": self.embedding_max_length,
+            }
+        quality = document_map.get("quality")
+        if isinstance(quality, dict):
+            stats = quality.setdefault("stats", {})
+            stats["retrieval_chunks"] = len(chunks)
+            stats["text_characters"] = sum(len(c["text"]) for c in chunks
+                if c.get("kind", "text") in {"text", "algorithm", "ocr_text"})
         self._queue_relation_review(resolved_id, resolved_title, document_map)
         return resolved_id
 

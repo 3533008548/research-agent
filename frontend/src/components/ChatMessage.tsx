@@ -1,6 +1,7 @@
 import { lazy, Suspense } from "react";
 
 import type { DisplayMessage } from "../lib/labels";
+import { RunTimer } from "./RunTimer";
 
 const MarkdownContent = lazy(() => import("../MarkdownContent"));
 
@@ -15,6 +16,7 @@ export function ChatMessage({ message }: { message: DisplayMessage }) {
   return (
     <article className={`message message-${message.role}`} aria-label={message.role === "user" ? "用户消息" : "助手回复"}>
       <div className="message-body">
+        {message.role === "assistant" && message.timing && <RunTimer timing={message.timing} />}
         {message.content ? (
           <Suspense fallback={<p className="markdown-loading">{message.content}</p>}>
             <MarkdownContent content={message.content} />

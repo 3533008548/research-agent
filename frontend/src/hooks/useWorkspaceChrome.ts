@@ -2,11 +2,10 @@ import {
   getWorkspaceProfile,
   getWorkspaceSettings,
   listPapers,
-  listResearchDocuments,
 } from "../api";
 import { userFacingError } from "../lib/errors";
 import type { Notice, WorkbenchTab, WorkspacePanel } from "../lib/workspace";
-import type { Paper, ResearchDocument, UserProfile, WorkspaceSettings } from "../types";
+import type { Paper, UserProfile, WorkspaceSettings } from "../types";
 
 /**
  * The workspace chrome: opening a panel, loading what it shows, and the
@@ -19,7 +18,6 @@ import type { Paper, ResearchDocument, UserProfile, WorkspaceSettings } from "..
 export function useWorkspaceChrome({
   apiKey,
   setNotice,
-  setDocuments,
   setProfile,
   setPapers,
   setWorkspaceSettings,
@@ -34,7 +32,6 @@ export function useWorkspaceChrome({
 }: {
   apiKey: string;
   setNotice: (notice: Notice) => void;
-  setDocuments: (documents: ResearchDocument[]) => void;
   setProfile: (profile: UserProfile | null) => void;
   setPapers: (papers: Paper[]) => void;
   setWorkspaceSettings: (settings: WorkspaceSettings | null) => void;
@@ -60,9 +57,7 @@ export function useWorkspaceChrome({
     setOpenWorkspacePanel(panel);
     setWorkspaceLoading(panel);
     try {
-      if (panel === "documents") {
-        setDocuments(await listResearchDocuments(apiKey));
-      } else if (panel === "profile") {
+      if (panel === "profile") {
         setProfile(await getWorkspaceProfile(apiKey));
       } else if (panel === "papers") {
         setPapers(await listPapers(apiKey));

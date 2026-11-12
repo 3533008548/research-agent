@@ -35,7 +35,7 @@ def _service_without_store() -> RetrievalService:
 class ToolSurfaceTests(unittest.TestCase):
     def test_published_tools_are_read_only(self):
         # A write tool on a public surface has no quota and no audit trail.
-        forbidden = {"read_pdf", "delete_paper", "save_paper_relation", "apply_research_document_patch"}
+        forbidden = {"read_pdf", "delete_paper", "save_paper_relation"}
         self.assertEqual(set(READ_ONLY_TOOLS) & forbidden, set())
 
     def test_describe_matches_the_allow_list(self):

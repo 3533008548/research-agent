@@ -35,7 +35,7 @@ _DFLT = {
     "rag_reranker_max_length": 512,
     "ui_port": 7860,
     "ui_debug": False,
-    "verify_timeout_seconds": 8,
+    "verify_timeout_seconds": 120,
     "daily_request_timeout_seconds": 8,
     "daily_keyword_concurrency": 2,
     "daily_max_results_per_keyword": 3,
@@ -85,7 +85,7 @@ class Config:
     ui_port: int = 7860
     ui_debug: bool = False
     daily_search_enabled: bool = False
-    verify_timeout_seconds: int = 8
+    verify_timeout_seconds: int = 120
     daily_request_timeout_seconds: int = 8
     daily_keyword_concurrency: int = 2
     daily_max_results_per_keyword: int = 3
@@ -380,7 +380,7 @@ class Config:
             ui_port=cfg["ui_port"],
             ui_debug=cfg.get("ui_debug", False),
             daily_search_enabled=cfg.get("daily_search_enabled", False),
-            verify_timeout_seconds=max(3, int(cfg.get("verify_timeout_seconds", 8))),
+            verify_timeout_seconds=max(3, int(cfg.get("verify_timeout_seconds", 120))),
             daily_request_timeout_seconds=max(3, int(cfg.get("daily_request_timeout_seconds", 8))),
             daily_keyword_concurrency=max(1, min(2, int(cfg.get("daily_keyword_concurrency", 2)))),
             daily_max_results_per_keyword=max(1, min(5, int(cfg.get("daily_max_results_per_keyword", 3)))),

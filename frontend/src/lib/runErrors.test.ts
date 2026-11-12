@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { errorDetailRows, failedRunEvent, runEventDescription } from "./runErrors.ts";
+import { errorDetailRows, failedRunEvent, runEventDescription, runEventStatusLabel, verificationIncomplete, verificationNotice } from "./runErrors.ts";
 
 test("shows recorded HTTP and measured timing without guessing missing fields", () => {
   const rows = errorDetailRows({
@@ -36,4 +36,20 @@ test("failed terminal events retain failure presentation and prefer backend summ
   assert.equal(runEventDescription({ type: "done", status: "cancelled" }), "任务已取消");
   assert.equal(runEventDescription({ type: "done", status: "failed", summary: "模型流式响应超时" }), "模型流式响应超时");
   assert.equal(runEventDescription({ type: "done", status: "completed" }), "已生成最终结果");
+});
+
+test("verification timeout describes an incomplete check and keeps material waits distinct", () => {
+  const failure = { type: "status" as const, stage: "verify", status: "failed", error_type: "LLMRequestTimeoutError" };
+  assert.equal(runEventStatusLabel(failure), "核验超时");
+  assert.match(runEventDescription(failure), /不表示发现了事实错误/);
+  assert.equal(runEventStatusLabel({ type: "status", stage: "verify", status: "waiting" }), "等待模型服务");
+  assert.equal(runEventStatusLabel({ type: "status", stage: "research", status: "waiting" }), "");
+  assert.equal(verificationIncomplete([failure, { type: "done", status: "completed" }]), true);
+  assert.equal(verificationIncomplete([failure, { type: "status", stage: "verify", status: "completed" }]), false);
+});
+
+test("review completion does not hide unresolved verdicts or turn advice into a failure", () => {
+  assert.match(verificationNotice([{ type: "status", stage: "verify", status: "unresolved" }, { type: "done", status: "completed" }]), /修正上限/);
+  assert.equal(verificationIncomplete([{ type: "status", stage: "verify", status: "advisory" }]), false);
+  assert.match(runEventDescription({ type: "status", stage: "verify", status: "revision_requested" }), /一次定向修正/);
 });

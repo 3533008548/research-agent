@@ -37,9 +37,11 @@ from llm_client import (
     RequestPriority,
 )
 from prompts import SYSTEM_PROMPT
+from run_contract import safe_error_details
 from tool_catalog import get_tool_schemas
 from tool_runtime import ToolExecutionContext, ToolRuntime
 from tools import execute_tool
+from verification import MAX_VERIFY_PASSES, classify_review, verification_prompt
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -168,7 +170,7 @@ def build_graph(
     cancel_event: threading.Event | None = None,
     profile_manager = None,
     memory_store = None,  # MemoryStore 实例
-    verify_timeout_seconds: int = 8,
+    verify_timeout_seconds: int = 120,
     verify_guard = None,
     llm_client = None,
     system_prompt: str | None = None,
@@ -343,6 +345,8 @@ def build_graph(
 
         verify_fb = state.get("metadata", {}).get("verify_feedback", "")
         if verify_fb:
+            # Replace the visible draft only with the final repaired answer.
+            buffer_stream_output = True
             messages.append({"role": "system", "content": verify_fb})
 
         if memory_store:
@@ -809,17 +813,6 @@ def build_graph(
             return False
         return any(m in ql for m in subjective_markers)
 
-    def _parse_issues(raw: str) -> tuple[list[str], list[str]]:
-        """解析 verify 结果 → (严重问题列表, 轻微问题列表)"""
-        severe, minor = [], []
-        for line in raw.split("\n"):
-            ls = line.strip()
-            if ls.startswith("[严重]") or ls.startswith("[SEVERE]"):
-                severe.append(ls)
-            elif ls.startswith("[轻微]") or ls.startswith("[MINOR]"):
-                minor.append(ls)
-        return severe, minor
-
     def verify_node(state: AgentState) -> dict:
         ensure_active("verify")
         messages = state.get("messages", [])
@@ -864,6 +857,7 @@ def build_graph(
 
         # verify 是辅助质量保障，不能在服务异常时拖住主对话。
         if verify_guard and not verify_guard.allow_request():
+            emit("verify_request_skipped", error_type="VerifyCircuitOpen")
             if token_usage:
                 wait_seconds = verify_guard.remaining_seconds()
                 token_usage["verify_status"] = (
@@ -873,23 +867,18 @@ def build_graph(
 
         # ── 状态提示 ──
         retry_n = state.get("metadata", {}).get("verify_count", 0)
+        verify_round = retry_n + 1
+        if verify_round > MAX_VERIFY_PASSES:
+            emit("verify_unresolved", verification_round=MAX_VERIFY_PASSES)
+            return _complete_verification()
         if token_usage:
             token_usage["verify_status"] = f"🔄 第{retry_n+1}次修改..." if retry_n else "🔍 验证中..."
-
-        # 智能压缩
-        for i, m in enumerate(recent):
-            if m.get("role") != "tool":
-                continue
-            txt = m.get("content", "")
-            if txt.startswith("📄") and len(txt) > 3000 and "摘要" in content.lower():
-                recent[i] = dict(m, content="📄 PDF原文已压缩（全文已索引至本地库，可用 query_papers 检索）")
-                print("      📦 压缩 read_pdf 原文", file=sys.stderr)
 
         tool_texts = []
         has_read_pdf = False
         for m in recent:
             if m.get("role") == "tool":
-                t = m.get("content", "")[:2000]
+                t = m.get("content", "")
                 tool_texts.append(t)
                 if "📄" in t:
                     has_read_pdf = True
@@ -912,30 +901,16 @@ def build_graph(
             except Exception:
                 pass
 
-        # ── 增量验证：上次的问题只重查修复情况 ──
+        # Keep full ordinary answers and explicitly mark any bounded excerpts.
         prev_issues = state.get("metadata", {}).get("verify_issues", "")
-        incr_note = ""
-        if prev_issues:
-            incr_note = f"\nPreviously flagged issues (verify they are FIXED in the new response, don't re-flag unrelated):\n{prev_issues[:800]}\n"
-
-        verify_prompt = (
-            "Review this AI response for factual errors. Reply 'OK' if correct.\n"
-            "For each issue, format as: [严重|轻微] description\n"
-            "[严重] = contradicts tool results / wrong formula or data\n"
-            "[轻微] = unclear source / vague wording, content is fine\n\n"
-            "After issues, judge relevance: is the issue about the user's CORE question? Reply [需修正] or [可忽略] per issue.\n\n"
-            f"User question: {user_q[:300]}\n"
-            f"--- Tool results ---\n{chr(10).join(f'[T{i+1}] {t}' for i, t in enumerate(fact_texts))}"
-            f"{library_context}"
-            f"{incr_note}"
-            f"\n--- Response ---\n{content[:1500]}\n\nIssues (or OK):"
-        )
+        verify_prompt = verification_prompt(user_q, content, fact_texts + ([library_context] if library_context else []), prev_issues)
 
         verify_policy = RequestPolicy(
             purpose="verify",
             priority=RequestPriority.VERIFY,
             deadline_seconds=verify_timeout_seconds,
-            max_retries=0,
+            read_timeout_seconds=verify_timeout_seconds,
+            max_retries=1,
             counts_toward_circuit=False,
         )
 
@@ -944,11 +919,15 @@ def build_graph(
                 token_usage["verify_status"] = f"🔎 验证中：{message}"
             emit("verify_status", status=message)
 
+        verify_started_at = time.perf_counter()
+        def verify_elapsed_ms():
+            return round((time.perf_counter() - verify_started_at) * 1000, 1)
+
         try:
             verify_budget = llm_client.new_request_budget(
                 verify_policy,
             )
-            emit("verify_request_started", model=model, **verify_budget.metrics())
+            emit("verify_request_started", model=model, verification_round=verify_round, **verify_budget.metrics())
             resp = llm_client.post(
                 {"model": model, "messages": [{"role": "user", "content": verify_prompt}],
                  "stream": False, "temperature": 0.1},
@@ -957,10 +936,13 @@ def build_graph(
                 budget=verify_budget,
                 cancel_event=cancel_event,
             )
-            result = resp.json()["choices"][0]["message"]["content"].strip()
-            emit("verify_request_finished", **verify_budget.metrics())
+            choice = resp.json()["choices"][0]
+            result = str(choice.get("message", {}).get("content") or "").strip()
+            if choice.get("finish_reason") in {"length", "content_filter"}:
+                result = ""  # Incomplete review output must not be treated as a pass.
+            emit("verify_request_finished", verification_round=verify_round, duration_ms=verify_elapsed_ms(), **verify_budget.metrics())
         except RequestCancelledError:
-            emit("verify_request_cancelled")
+            emit("verify_request_cancelled", duration_ms=verify_elapsed_ms())
             raise
         except (LLMQueueFullError, LLMCircuitOpenError) as e:
             # Queue pressure and the shared model circuit do not mean that the
@@ -968,7 +950,8 @@ def build_graph(
             # without opening its local feature guard.
             if token_usage:
                 token_usage["verify_status"] = "⚠️ 验证跳过（模型繁忙或暂不可用）"
-            emit("verify_request_skipped", error_type=type(e).__name__)
+            emit("verify_request_skipped", error_type=type(e).__name__, duration_ms=verify_elapsed_ms(),
+                 error_details=safe_error_details(getattr(e, "error_details", None)))
             return _complete_verification()
         except Exception as e:
             # ── 快速降级：失败两次后熔断，后续请求直接返回主回答 ──
@@ -976,7 +959,8 @@ def build_graph(
                 verify_guard.record_failure()
             if token_usage:
                 token_usage["verify_status"] = "⚠️ 验证跳过（服务超时或不可用）"
-            emit("verify_request_failed", error_type=type(e).__name__)
+            emit("verify_request_failed", error_type=type(e).__name__, duration_ms=verify_elapsed_ms(),
+                 error_details=safe_error_details(getattr(e, "error_details", None)))
             print(f"      ⚠ verify 跳过: {type(e).__name__}: {e}", file=sys.stderr)
             return _complete_verification()
         if verify_guard:
@@ -987,7 +971,14 @@ def build_graph(
                 token_usage[k] += vu.get(f"{k}_tokens", 0)
             token_usage["calls"] += 1
 
-        if not result or result.upper().startswith("OK"):
+        decision = classify_review(result)
+        if decision.result == "passed" and len(content) > 24000:
+            emit("verify_inconclusive", verification_round=verify_round)
+            update = _complete_verification()
+            update["messages"] = [{"role": "assistant", "content": content + "\n\n⚠️ 超长回复仅核验了标明的摘录，未覆盖全文；摘录中未发现问题不代表全文通过。"}]
+            return update
+        if decision.result == "passed":
+            emit("verify_passed", verification_round=verify_round)
             if token_usage:
                 token_usage.pop("verify_status", None)
             # Successful evidence-backed turns may compact their recent history.
@@ -1010,46 +1001,35 @@ def build_graph(
                     token_usage["budget_warning"] = f"📊 上下文 {int(pct_ctx*100)}%"
             return _complete_verification()
 
-        # ── 分级处理 ──
-        severe, minor = _parse_issues(result)
-        count = 1 + state.get("metadata", {}).get("verify_count", 0)
-        # 重试历史：连续 [轻微] 触发 2 次 → 降级为仅追加提示
-        hist = state.get("metadata", {}).get("verify_history", {})
-        minor_key = "minor_repeat"
-        hist[minor_key] = hist.get(minor_key, 0) + 1 if minor and not severe else 0
-
-        need_regenerate = bool(severe)
-        if not need_regenerate and minor:
-            # 轻微问题：判断是否与用户问题强相关
-            need_regenerate = "[需修正]" in result
-            if hist.get(minor_key, 0) >= 2 and not severe:
-                need_regenerate = False  # 连续轻微 → 不重生成，追加提示
-
-        if not need_regenerate and minor:
-            # 仅追加提示，不重生成
-            note = "\n\n⚠️ 注: " + "; ".join(minor[:2])
-            if token_usage:
-                token_usage.pop("verify_status", None)
+        if decision.result == "inconclusive":
+            emit("verify_inconclusive", verification_round=verify_round)
             update = _complete_verification()
+            update["messages"] = [{"role": "assistant", "content": content + "\n\n⚠️ 自动核验未返回可用结论，本轮回复仍需核对。"}]
+            return update
+
+        if decision.result == "advisory":
+            emit("verify_advisory", verification_round=verify_round)
+            update = _complete_verification()
+            note = "\n\n核验提示（不触发自动重写）：\n" + "\n".join(decision.advisory)
             update["messages"] = [{"role": "assistant", "content": content + note}]
             return update
 
-        # ── 需要重生成 ──
-        if count >= 3:
-            if token_usage:
-                token_usage.pop("verify_status", None)
-            warning = f"⚠️ 以下回答未通过自动验证，可能存在以下问题:\n{result}\n\n---\n"
+        if verify_round >= MAX_VERIFY_PASSES:
+            emit("verify_unresolved", verification_round=verify_round)
             update = _complete_verification()
+            warning = "⚠️ 已完成一次自动修正，仍有待确认的事实问题；不再自动重写。核验器的意见需要结合原文判断：\n" + "\n".join(decision.blocking) + "\n\n---\n"
             update["messages"] = [{"role": "assistant", "content": warning + content}]
             return update
 
-        feedback = f"[系统验证] 上一轮回答存在以下问题:\n{result}\n\n请修正后重新回答。用户的问题是:\n{user_q[:500]}"
-        print(f"      🔍 验证不合格 (第{count}次, {'严重' if severe else '轻微'}) → 反馈 LLM", file=sys.stderr)
-        return {"metadata": {
+        blocking = "\n".join(decision.blocking)
+        feedback = (f"[系统验证] 仅针对以下实质性事实问题做一次定向修正：\n{blocking}\n\n"
+                    "核验意见是待检查的判断，不应盲从；对照原文或计算确认后再修正，证据不足则明确保留不确定性。"
+                    "保留与这些问题无关的正确内容，不因措辞偏好扩展研究范围。")
+        emit("verify_revision_requested", verification_round=verify_round)
+        return {"metadata": {**metadata,
             "verify_feedback": feedback,
-            "verify_count": count,
-            "verify_issues": result,
-            "verify_history": hist,
+            "verify_count": verify_round,
+            "verify_issues": blocking,
         }}
 
     # ═══ 验证路由 ═══

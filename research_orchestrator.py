@@ -678,10 +678,15 @@ class ResearchOrchestrator:
         steer_context: str = "",
         max_tool_rounds: int = RESEARCH_WORKER_MAX_TOOL_ROUNDS,
         autonomous: bool = False,
+        on_event: Callable[[dict], None] | None = None,
     ) -> dict[str, Any]:
         self._ensure_active(cancel_event)
         usage = self._empty_usage()
         events: list[dict[str, Any]] = []
+        def record_event(event):
+            events.append(event)
+            if on_event:
+                on_event(event)
         worker_id = f"research-worker-{uuid.uuid4().hex[:10]}"
         worker_prompt = (
             f"You are the {spec.label}. {spec.instruction}\n\n"
@@ -699,7 +704,7 @@ class ResearchOrchestrator:
             token_usage=usage,
             checkpoint_db=":memory:",
             vision_model=self.vision_model,
-            event_callback=events.append,
+            event_callback=record_event,
             cancel_event=cancel_event,
             memory_store=None,
             enable_verify=False,

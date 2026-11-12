@@ -108,8 +108,9 @@ _SAFE_METRIC_KEYS = frozenset({
     "file_count",
     "unknown_count",
     "validation_errors",
+    "verification_round",
 })
-_SAFE_METADATA_KEYS = frozenset({"protocol", "run_kind", "model", "runner", "scope", "toolset"})
+_SAFE_METADATA_KEYS = frozenset({"protocol", "run_kind", "model", "runner", "scope", "toolset", "tool", "call_id"})
 
 
 def safe_metrics(metrics: dict[str, Any] | None) -> dict[str, int | float]:
@@ -138,13 +139,54 @@ def safe_metadata(metadata: dict[str, Any] | None) -> dict[str, str]:
             continue
         if key == "protocol" and compact != RUN_EVENT_PROTOCOL:
             continue
-        if key in {"model", "runner", "toolset"} and not all(
+        if key in {"model", "runner", "toolset", "tool", "call_id"} and not all(
             character.isascii() and (character.isalnum() or character in "._:/-")
             for character in compact
         ):
             continue
         safe[key] = compact
     return safe
+
+
+def graph_activity_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Project graph lifecycle events; arguments and results never leave the graph."""
+    kind = event.get("type")
+    if kind in {"tool_started", "tool_finished", "tool_failed"}:
+        status = {"tool_started": "running", "tool_finished": "completed", "tool_failed": "failed"}[kind]
+        if event.get("error_type") == "RequestCancelledError":
+            status = "cancelled"
+        return {"type": "tool", "status": status, **safe_metadata({
+            "tool": event.get("tool"), "call_id": event.get("call_id"),
+        }), **bounded_timing_metrics(event),
+            **({"error_type": str(event["error_type"])[:120]} if event.get("error_type") else {})}
+    stages = {
+        "llm_request_started": ("model", "running"),
+        "llm_response_headers": ("model", "running"),
+        "first_token": ("model", "streaming"),
+        "llm_request_finished": ("model", "completed"),
+        "llm_request_failed": ("model", "failed"),
+        "llm_status": ("model", "waiting"),
+        "llm_stream_recovery_started": ("model", "recovering"),
+        "verify_request_started": ("verify", "running"),
+        "verify_request_finished": ("verify", "completed"),
+        "verify_request_failed": ("verify", "failed"),
+        "verify_request_skipped": ("verify", "skipped"),
+        "verify_request_cancelled": ("verify", "cancelled"),
+        "verify_status": ("verify", "waiting"),
+        "verify_passed": ("verify", "passed"),
+        "verify_advisory": ("verify", "advisory"),
+        "verify_revision_requested": ("verify", "revision_requested"),
+        "verify_unresolved": ("verify", "unresolved"),
+        "verify_inconclusive": ("verify", "inconclusive"),
+    }
+    if kind not in stages:
+        return None
+    stage, status = stages[kind]
+    details = safe_error_details(event.get("error_details"))
+    return {"type": "status", "stage": stage, "status": status, **bounded_timing_metrics(event),
+            **({"verification_round": event["verification_round"]} if event.get("verification_round") in (1, 2) else {}),
+            **({"error_type": str(event["error_type"])[:120]} if event.get("error_type") else {}),
+            **({"error_details": details} if details else {})}
 
 
 def execution_metadata(

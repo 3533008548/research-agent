@@ -14,7 +14,7 @@ from collections import Counter
 from typing import Any
 
 
-QUALITY_VERSION = 3
+QUALITY_VERSION = 4
 DEFAULT_CHUNK_MAX_CHARS = 1_200
 _CHUNK_TOLERANCE = 120
 _FRAGMENT_MAX_CHARS = 24
@@ -246,29 +246,43 @@ def assess_document_map(
 
 def verify_index_round_trip(document_map: dict[str, Any], indexed_chunks: list[dict[str, Any]]) -> dict[str, Any]:
     """Ensure the vector store received every generated retrieval chunk once."""
-    expected = {
+    expected_ids = [
         str(chunk.get("id") or "")
         for chunk in list(document_map.get("chunks") or [])
         if str(chunk.get("text") or "").strip()
-    }
-    actual = {str(chunk.get("element_id") or "") for chunk in indexed_chunks}
+    ]
+    actual_ids = [str(chunk.get("element_id") or "") for chunk in indexed_chunks]
+    expected, actual = set(expected_ids), set(actual_ids)
     missing = expected - actual
     unexpected = actual - expected
-    accepted = len(indexed_chunks) == len(expected) and not missing and not unexpected
+    expected_duplicates = len(expected_ids) - len(expected)
+    actual_duplicates = len(actual_ids) - len(actual)
+    expected_text = {str(c.get("id") or ""): str(c.get("text") or "").strip()
+                     for c in document_map.get("chunks", [])}
+    text_mismatch = sum(str(c.get("text") or "").strip() != expected_text.get(str(c.get("element_id") or ""))
+                        for c in indexed_chunks)
+    accepted = (bool(expected) and "" not in expected and "" not in actual
+                and len(indexed_chunks) == len(expected_ids) and not missing and not unexpected
+                and not expected_duplicates and not actual_duplicates and not text_mismatch)
     issues = []
     if not accepted:
         issues.append({
             "severity": "error",
             "code": "index_round_trip_mismatch",
-            "message": "向量库中的块数量或来源 ID 与待入库文档不一致。",
-            "expected_chunks": len(expected),
+            "message": (f"索引回读不一致：预期 {len(expected_ids)} 块，实际 {len(indexed_chunks)} 块；"
+                        f"缺失 {len(missing)}，多出 {len(unexpected)}，"
+                        f"重复 ID {expected_duplicates + actual_duplicates}，正文不符 {text_mismatch}。"),
+            "expected_chunks": len(expected_ids),
             "indexed_chunks": len(indexed_chunks),
             "missing": len(missing),
             "unexpected": len(unexpected),
+            "duplicate_expected_ids": expected_duplicates,
+            "duplicate_indexed_ids": actual_duplicates,
+            "text_mismatches": text_mismatch,
         })
     return {
         "accepted": accepted,
-        "expected_chunks": len(expected),
+        "expected_chunks": len(expected_ids),
         "indexed_chunks": len(indexed_chunks),
         "issues": issues,
     }

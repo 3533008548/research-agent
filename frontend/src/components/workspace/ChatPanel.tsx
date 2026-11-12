@@ -4,6 +4,7 @@ import { ChatMessage } from "../ChatMessage";
 import { ResearchWorkbench } from "../ResearchWorkbench";
 import { modeLabel, type DisplayMessage, type ResearchMode } from "../../lib/labels";
 import type { ResearchProject, ResearchScope, Run, WorkspaceUpload } from "../../types";
+import { useChatScroll } from "../../hooks/useChatScroll";
 
 /**
  * The chat tab: the transcript, the composer and the mode switch.
@@ -69,6 +70,9 @@ export function ChatPanel({
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const researchRef = useRef<HTMLDivElement>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
+  const newestUserId = [...messages].reverse().find(message => message.role === "user")?.id;
+  useChatScroll(messageListRef, threadRef, activeSessionId, newestUserId, mode);
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
@@ -93,7 +97,7 @@ export function ChatPanel({
   return (
       <>
         <div className="message-list" ref={messageListRef} aria-live="polite">
-          <div className="message-thread">
+          <div className="message-thread" ref={threadRef}>
           {isLoading ? (
             <p className="empty-state">正在加载会话…</p>
           ) : messages.length ? (

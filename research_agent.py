@@ -55,14 +55,10 @@ from conversation_reference import (
 from conversation_recall import render_session_recall, should_recall_session_history
 from graph_builder import build_graph
 from llm_client import LLMClient, LLMClientError
-from research_document_routing import (
-    allowed_tools_for_routed_request,
-    routed_research_document_intent,
-)
 from user_profile import ProfileManager
 from research_orchestrator import ResearchOrchestrator
 from resilience import CircuitBreaker
-from run_contract import execution_metadata, safe_error_details
+from run_contract import execution_metadata, safe_error_details, graph_activity_event
 from search_api import list_downloaded_papers
 from session_store import SessionStore
 from tool_catalog import get_tool_definition
@@ -107,7 +103,7 @@ def _budget_exhausted_answer(app: Any, thread_id: str) -> str:
     except Exception:  # noqa: BLE001 - reporting progress must never mask the limit
         steps = []
     if not steps:
-        return head + "请缩小问题范围后重试（例如先只处理档案的某一章）。"
+        return head + "请缩小问题范围后重试（例如先检索一篇指定论文）。"
     return (
         f"{head}\n\n已完成 {len(steps)} 次工具调用：{'、'.join(steps[-8:])}。\n"
         "这些结果仍保留在会话里 —— 直接说「继续」即可从中断处接着做，"
@@ -119,22 +115,12 @@ def _budget_exhausted_answer(app: Any, thread_id: str) -> str:
 # 不承担成本控制职责 —— 成本由 context_engine 的压缩兜住：上下文用到 50%
 # 就会折叠成"头+归档+尾"，token 数保持有界，所以轮数增长只是线性增加
 # 成本，不会像未压缩时那样 O(n²) 爆炸。
-# 因此这里给得很宽松：读一篇论文再更新科研档案的理想路径是 3~4 轮，
+# 因此这里给得很宽松：读一篇论文再核对关键论点的理想路径是 3~4 轮，
 # 30 轮意味着允许大量"工具返回未找到 → 换个关键词重试"的探索。
 MAX_AGENT_TOOL_ROUNDS = 30
-# 文档级确认补丁：一次 list、最多四次章节读取、一次原子补丁，再加余量。
-RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS = 13
-# 完整补丁：读上下文 → 读现有档案 → 提交补丁，理想 3 轮，给一倍余量。
-RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS = 6
 
 # 派生值：保留旧名字，让调用点和测试不必各自心算换算关系。
 MAX_AGENT_GRAPH_STEPS = graph_steps_for_tool_rounds(MAX_AGENT_TOOL_ROUNDS)
-RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS = graph_steps_for_tool_rounds(
-    RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS
-)
-RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS = graph_steps_for_tool_rounds(
-    RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS
-)
 
 
 _DIRECT_ENGINEERING_MARKERS = (
@@ -146,27 +132,6 @@ _EXPLICIT_EVIDENCE_MARKERS = (
     "论文", "文献", "引用", "原文", "最新进展", "最新研究", "搜索论文",
     "检索论文", "找论文", "doi", "arxiv", "paper", "作者", "哪篇",
 )
-_RESEARCH_DOCUMENT_TERMS = ("科研档案", "研究档案")
-_RESEARCH_DOCUMENT_ACTIONS = ("保存", "存档", "导出", "生成")
-_RESEARCH_DOCUMENT_CONTENT_TERMS = ("方案", "计划", "假设", "决策记录")
-
-
-def should_force_research_document_save(user_input: str) -> bool:
-    """Recognize an explicit request to persist a user-owned research document.
-
-    This is deliberately a narrow rule, not another intent model: the user
-    must ask to save/export and name either the archive itself or a research
-    artefact.  It prevents a model from substituting a profile summary for a
-    durable document after the user has explicitly asked for one.
-    """
-    text = " ".join(str(user_input or "").casefold().split())
-    if not text or any(marker in text for marker in ("不要保存", "不保存", "无需保存")):
-        return False
-    if not any(action in text for action in _RESEARCH_DOCUMENT_ACTIONS):
-        return False
-    return any(term in text for term in _RESEARCH_DOCUMENT_TERMS) or any(
-        term in text for term in _RESEARCH_DOCUMENT_CONTENT_TERMS
-    )
 
 
 def should_answer_without_tools(user_input: str) -> bool:
@@ -389,6 +354,7 @@ class ResearchAgent:
         run_id: str | None = None,
         steer_provider: Callable[[str], list[dict]] | None = None,
         on_steer: Callable[[str, int], None] | None = None,
+        on_progress: Callable[[dict], None] | None = None,
     ) -> str:
         """单轮推理：输入用户消息，返回 Agent 回复文本。
 
@@ -469,6 +435,9 @@ class ResearchAgent:
                     "at_ms": at_ms,
                 })
                 self._persist_chat_event(thread_id, chat_run_id, event, at_ms)
+                activity = graph_activity_event({**event, "at_ms": at_ms})
+                if on_progress and activity:
+                    on_progress(activity)
 
             def _on_token(token: str) -> None:
                 nonlocal first_token_ms
@@ -502,37 +471,9 @@ class ResearchAgent:
                         pass
                 return notes
 
-            force_research_document_save = should_force_research_document_save(user_input)
-            routed_tool_scope = allowed_tools_for_routed_request(user_input)
-            routed_document_intent = routed_research_document_intent(user_input)
-            if routed_document_intent == "full_patch":
-                graph_step_limit = RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS
-                graph_tool_round_budget = RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS
-            elif routed_document_intent == "safe_patch":
-                graph_step_limit = RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS
-                graph_tool_round_budget = RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS
-            else:
-                graph_step_limit = MAX_AGENT_GRAPH_STEPS
-                graph_tool_round_budget = MAX_AGENT_TOOL_ROUNDS
-            full_document_patch = routed_document_intent == "full_patch"
-            forced_tool_name = ""
-            if force_research_document_save:
-                allowed_tool_names = {"save_research_document"}
-                forced_tool_name = "save_research_document"
-                _record_event({"type": "tool_policy", "policy": "forced_research_document_save"})
-            elif routed_tool_scope is not None:
-                allowed_tool_names = set(routed_tool_scope)
-                _record_event({
-                    "type": "tool_policy",
-                    "policy": f"research_document_{routed_document_intent}_scope",
-                })
-            else:
-                allowed_tool_names = set() if should_answer_without_tools(user_input) else None
-            if (
-                allowed_tool_names is not None
-                and not force_research_document_save
-                and routed_tool_scope is None
-            ):
+            graph_step_limit = MAX_AGENT_GRAPH_STEPS
+            allowed_tool_names = set() if should_answer_without_tools(user_input) else None
+            if allowed_tool_names is not None:
                 _record_event({"type": "tool_policy", "policy": "direct_engineering_answer"})
             app = None
             try:
@@ -549,15 +490,9 @@ class ResearchAgent:
                     app = self._build_app(
                         usage, _on_token if on_token else None, _record_event,
                         cancel_event=cancel_event, allowed_tool_names=allowed_tool_names,
-                        force_tool_name=forced_tool_name or None,
                         run_id=chat_run_id, session_id=thread_id,
                         steer_provider=_consume_running_steers,
-                        enable_verify=not full_document_patch,
-                        max_tool_rounds=(
-                            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS
-                            if full_document_patch else None
-                        ),
-                        tool_round_budget=graph_tool_round_budget,
+                        tool_round_budget=MAX_AGENT_TOOL_ROUNDS,
                     )
                 result = app.invoke(
                     state,
@@ -626,7 +561,7 @@ class ResearchAgent:
                 self.sessions.touch(thread_id, user_input)
                 self.sessions.save_usage(thread_id, usage)
                 self._close_app(app)
-                tool_events = [event for event in trace_events if event.get("type") == "tool_finished"]
+                tool_events = [event for event in trace_events if event.get("type") in {"tool_finished", "tool_failed"}]
                 duration_ms = round((time.perf_counter() - started_at) * 1000, 1)
                 run_status = {
                     "success": "completed",
@@ -1043,6 +978,8 @@ class ResearchAgent:
         metrics = {"at_ms": at_ms}
         if isinstance(event.get("duration_ms"), (int, float)):
             metrics["duration_ms"] = event["duration_ms"]
+        if event.get("verification_round") in (1, 2):
+            metrics["verification_round"] = event["verification_round"]
 
         event_map = {
             "llm_request_started": ("single_agent", "model", "running", "模型请求已开始"),
@@ -1050,14 +987,19 @@ class ResearchAgent:
             "llm_request_finished": ("single_agent", "model", "completed", "模型请求已完成"),
             "llm_stream_recovery_started": ("single_agent", "model", "recovering", "正在自动恢复模型输出，完成后更新回复"),
             "llm_request_failed": ("single_agent", "model", "failed", "模型请求失败，可重试"),
-            "llm_status": ("single_agent", "model", "waiting", "模型请求正在排队或重试"),
+            "llm_status": ("single_agent", "model", "waiting", "正在等待模型服务"),
             "first_token": ("single_agent", "model", "streaming", "已收到首个输出片段"),
             "request_cancelled": ("single_agent", "run", "cancelled", "请求已取消"),
             "verify_request_started": ("verifier", "verify", "running", "事实核验已开始"),
-            "verify_request_finished": ("verifier", "verify", "completed", "事实核验已完成"),
+            "verify_request_finished": ("verifier", "verify", "completed", "核验模型已返回结果"),
+            "verify_passed": ("verifier", "verify", "passed", "本次核验未发现问题"),
+            "verify_advisory": ("verifier", "verify", "advisory", "有非阻断提示，保留回答，不触发自动重写"),
+            "verify_revision_requested": ("verifier", "verify", "revision_requested", "发现影响核心结论的事实问题，开始一次定向修正"),
+            "verify_unresolved": ("verifier", "verify", "unresolved", "仍有待确认问题，已达到一次自动修正上限"),
+            "verify_inconclusive": ("verifier", "verify", "inconclusive", "核验未返回可用结论，保留回复，不自动重写"),
             "verify_request_cancelled": ("verifier", "verify", "cancelled", "事实核验已取消"),
             "verify_request_skipped": ("verifier", "verify", "skipped", "事实核验暂时跳过"),
-            "verify_request_failed": ("verifier", "verify", "failed", "事实核验失败，已继续生成回复"),
+            "verify_request_failed": ("verifier", "verify", "failed", "事实核验未完成，已保留回复"),
             "verify_status": ("verifier", "verify", "waiting", "事实核验正在等待服务"),
             "run_steer_consumed": ("user", "steer", "consumed", "运行中补充已在下一节点使用"),
         }
@@ -1076,6 +1018,8 @@ class ResearchAgent:
                 "tool_failed": f"{label}失败，可重试",
             }[event_type]
             agent, stage, summary = "single_agent", "tool", message
+            if event.get("error_type") == "RequestCancelledError":
+                status, summary = "cancelled", f"{label}已取消"
         elif event_type in event_map:
             agent, stage, status, summary = event_map[event_type]
         else:
@@ -1085,6 +1029,7 @@ class ResearchAgent:
             thread_id, run_id, "chat", agent, stage, status,
             summary=summary,
             metrics=metrics,
+            metadata={"tool": event.get("tool"), "call_id": event.get("call_id")},
             error_type=str(event.get("error_type") or "")[:120],
             error_details=safe_error_details(event.get("error_details")),
             event_type=(

@@ -1,7 +1,8 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { controlResearchProject, getResearchProject, getResearchReport, listResearchProjects } from "../api";
 import type { ResearchProject } from "../types";
 import { ResearchProjectPicker } from "./ResearchProjectPicker";
+import { RunTimer } from "./RunTimer";
 
 const MarkdownContent = lazy(() => import("../MarkdownContent"));
 const states: Record<string, string> = {
@@ -26,6 +27,14 @@ export function ResearchWorkbench({ apiKey, currentId, onChange }: { apiKey: str
   const [projects, setProjects] = useState<Array<Pick<ResearchProject, "project_id" | "question">>>([]);
   const [selected, setSelected] = useState(currentId || "");
   const [project, setProject] = useState<ResearchProject | null>(null);
+  const timing = useMemo(() => {
+    // Persistent research timestamps include their UTC offset.
+    const start = Date.parse(project?.created_at || "");
+    const running = project?.execution_state === "active";
+    const end = running ? Date.now() : Date.parse(project?.updated_at || "");
+    return Number.isFinite(start) && Number.isFinite(end)
+      ? { elapsedMs: Math.max(0, end - start), sampledAt: Date.now(), running } : undefined;
+  }, [project?.created_at, project?.updated_at, project?.execution_state]);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -67,6 +76,7 @@ export function ResearchWorkbench({ apiKey, currentId, onChange }: { apiKey: str
   }
 
   return <section className="research-workbench" aria-label="持续研究工作台">
+    {timing && <RunTimer timing={timing} research />}
     <h3>多 Agent 研究</h3>
     <p className="composer-hint">1 位负责人 · 2 位研究员 · 1 位质检员</p>
     {error && <p role="alert">{error}</p>}

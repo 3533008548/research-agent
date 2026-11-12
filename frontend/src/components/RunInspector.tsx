@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
 import { durationLabel, runKindLabel, stageLabel, statusLabel, toolLabel } from "../lib/labels";
-import { failedRunEvent, runEventDescription } from "../lib/runErrors";
+import { failedRunEvent, runEventDescription, runEventStatusLabel } from "../lib/runErrors";
 import type { Run, RunEvent } from "../types";
 import { RunErrorDetails } from "./RunErrorDetails";
+import { RunActivity } from "./RunActivity";
 
 /**
  * The run inspector: what the current run is doing, and the events it
@@ -74,21 +75,27 @@ export function RunInspector({
               重新发送本轮问题
             </button>
           )}
-          <ol className="run-events">
-            {events.map((event, index) => (
+          <RunActivity run={run} events={events} />
+          <details className="run-stage-history"><summary>阶段记录</summary><ol className="run-events">
+            {events.filter(event => event.type !== "tool" && event.type !== "token").map((event, index) => (
               <li key={`${event.type}-${index}`} className="run-event">
                 <span className={`event-dot event-${failedRunEvent(event) ? "error" : event.type}`} aria-hidden="true" />
                 <div>
                   <strong>
-                    {event.type === "tool" ? toolLabel(event.tool) : statusLabel(event.status || (failedRunEvent(event) ? "failed" : undefined))}
+                    {event.stage === "verify" && event.verification_round ? `第 ${event.verification_round}/2 次核验 · ` : ""}
+                    {event.type === "tool" ? toolLabel(event.tool) : runEventStatusLabel(event) || statusLabel(event.status || (failedRunEvent(event) ? "failed" : undefined))}
                   </strong>
                   <p>{runEventDescription(event, event.type === "tool"
                     ? `工具${event.status === "completed" ? "已完成" : "正在执行"}${durationLabel(event.duration_ms) ? ` · ${durationLabel(event.duration_ms)}` : ""}`
                     : stageLabel(event.stage, "任务状态更新"))}</p>
+                  {failedRunEvent(event) && <details className="stage-error-details">
+                    <summary>查看失败原因</summary>
+                    <RunErrorDetails runId={run.run_id} errorType={event.error_type} details={event.error_details} />
+                  </details>}
                 </div>
               </li>
             ))}
-          </ol>
+          </ol></details>
           <RunErrorDetails runId={run.run_id} errorType={run.error_type} details={run.error_details} />
         </>
       )}

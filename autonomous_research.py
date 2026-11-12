@@ -213,7 +213,8 @@ class AutonomousResearch:
             spec = _WorkerSpec(project["scope"], role, allowed, instruction)
             result = orchestrator._run_worker(spec, project["question"], {}, cancel,
                 run_id=project["project_id"], steer_context=json.dumps(task, ensure_ascii=False) + "\n" + context,
-                max_tool_rounds=4, autonomous=True)
+                max_tool_rounds=4, autonomous=True,
+                on_event=lambda event: self.projects.record_activity(job, event))
             result["evidence"] = attach_evidence_units(result.get("evidence", []))
             if result.get("retrieval_failed") and not result["evidence"]:
                 result["error"] = "retrieval_failed"

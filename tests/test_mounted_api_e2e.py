@@ -103,11 +103,85 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             return json.loads(response.read().decode("utf-8"))
 
     def _send(self, text: str) -> None:
-        self.page.locator("textarea").first.fill(text)
-        self.page.get_by_role("button", name=re.compile("发送|submit", re.IGNORECASE)).click()
+        composer = self.page.locator(".composer")
+        composer.get_by_label("消息", exact=True).fill(text)
+        composer.get_by_role("button", name=re.compile("发送|submit", re.IGNORECASE)).click()
 
     def _new_session(self) -> None:
         self.page.get_by_role("button", name=re.compile("新建会话")).click()
+
+    def test_removed_dossier_keeps_profile_papers_and_chat_usable(self):
+        self.assertEqual(self.page.get_by_role("button", name="科研档案", exact=True).count(), 0)
+        response = self.page.request.get(f"{self.base_url}/api/v1/workspace/research-documents")
+        self.assertEqual(response.status, 404)
+        self.assertIn("application/json", response.headers["content-type"])
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_text("没有符合条件的论文，可导入 PDF 或调整搜索。", exact=True).wait_for()
+        self.page.get_by_role("button", name="设置", exact=True).click()
+        self.page.get_by_role("button", name="用户画像", exact=True).click()
+        profile = self.page.get_by_role("article", name="用户画像", exact=True)
+        profile.get_by_text("尚未形成用户画像。", exact=True).wait_for()
+        self.assertGreater(profile.bounding_box()["width"], 300)
+        self._assert_no_horizontal_page_overflow()
+        self.page.get_by_role("tab").first.click()
+        self._send("功能移除后的对话检查")
+        self.page.locator(".message-assistant").filter(has_text="来自 FastAPI：功能移除后的对话检查").wait_for()
+        self.assertEqual(len(self._state()["calls"]), 1)
+
+    def test_tool_activity_is_live_and_survives_reload(self):
+        self._set_viewport({"width": 1600, "height": 1000})
+        self._send("__tools__")
+        inspector = self.page.locator("#run-inspector")
+        running = inspector.locator(".tool-call-running")
+        running.filter(has_text="query_papers").wait_for(state="visible")
+        self.assertEqual(self._state()["runs"][0]["status"], "running")
+        running.filter(has_text="read_pdf").wait_for(state="visible")
+        self.assertEqual(inspector.locator(".tool-call-completed").count(), 1)
+        inspector.locator(".tool-call-failed").wait_for(state="visible")
+        self.assertEqual(self._state()["runs"][0]["status"], "running")
+        self.assertEqual(inspector.locator(".run-inspector-actions .status-running").count(), 1)
+        self.page.locator(".message-assistant").filter(has_text="工具状态测试完成").wait_for(state="visible")
+        self.page.reload(wait_until="domcontentloaded")
+        inspector.locator(".tool-call-failed").wait_for(state="visible")
+        self.assertEqual(inspector.locator(".tool-call").count(), 2)
+        self.assertIn("成功 1 · 失败 1", inspector.inner_text())
+        self.assertIn("工具返回了失败结果", inspector.inner_text())
+        self.assertNotIn("E2E_PRIVATE", inspector.inner_text())
+        self._assert_no_horizontal_page_overflow()
+        output = ROOT / "runtime" / "evaluations" / "run-activity"
+        output.mkdir(parents=True, exist_ok=True)
+        self.page.screenshot(path=str(output / "sidebar-tools.png"))
+
+    def test_verify_timeout_remains_visible_after_success_and_reload(self):
+        self._set_viewport({"width": 1440, "height": 1000})
+        self._send("__verify_timeout__")
+        self.page.get_by_text("已保留的正常回复", exact=True).wait_for()
+        inspector = self.page.locator("#run-inspector")
+        inspector.get_by_text("事实核验未完成，本轮回复未经完整核验。", exact=True).wait_for()
+        self.page.reload(wait_until="domcontentloaded")
+        inspector.get_by_text("事实核验未完成，本轮回复未经完整核验。", exact=True).wait_for()
+        inspector.locator(".run-stage-history > summary").click()
+        inspector.get_by_text("核验超时", exact=True).wait_for()
+        inspector.get_by_text("等待模型服务", exact=True).wait_for()
+        self.assertNotIn("等待材料", inspector.inner_text())
+        inspector.get_by_text("查看失败原因", exact=True).click()
+        inspector.get_by_text("45.00 秒", exact=True).wait_for()
+        self.assertIn("LLM_RESPONSE_TIMEOUT", inspector.inner_text())
+        self.assertNotIn("PRIVATE_DIAGNOSTIC", inspector.inner_text())
+        self.assertEqual(inspector.locator(".run-inspector-actions .status-completed").count(), 1)
+
+    def test_verification_rounds_and_unresolved_verdict_survive_reload(self):
+        self._set_viewport({"width": 1440, "height": 1000})
+        self._send("__verify_repair_limit__")
+        self.page.get_by_text("一次修正后的回复，仍有问题待确认。", exact=True).wait_for()
+        self.page.reload(wait_until="domcontentloaded")
+        inspector = self.page.locator("#run-inspector")
+        inspector.get_by_text("仍有待确认的事实问题；已达到一次自动修正上限。", exact=True).wait_for()
+        inspector.locator(".run-stage-history > summary").click()
+        inspector.get_by_text("第 1/2 次核验 · 定向修正中", exact=True).wait_for()
+        inspector.get_by_text("第 2/2 次核验 · 仍有待确认问题", exact=True).wait_for()
+        self.assertNotIn("核验通过", inspector.inner_text())
+        self.assertEqual(inspector.locator(".run-inspector-actions .status-completed").count(), 1)
 
     def _pane_width(self, selector: str) -> float:
         box = self.page.locator(selector).bounding_box()
@@ -323,6 +397,81 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self.page.locator(".research-workbench").count(), 0)
         self.assertEqual(self._state()["calls"], [])
 
+    def test_stream_follows_bottom_but_preserves_reading_position(self):
+        self._set_viewport({"width": 1440, "height": 800})
+        self._send("__scroll__")
+        self.page.get_by_text("流式新增第 2 段。", exact=True).wait_for()
+        list_el = self.page.locator(".message-list")
+        self.page.wait_for_function("""() => {
+            const e = document.querySelector('.message-list');
+            return e.scrollHeight > e.clientHeight + 100 && e.scrollHeight - e.clientHeight - e.scrollTop < 3;
+        }""")
+        # Use real wheel input, not DOM mutation, while tokens continue arriving.
+        list_el.hover()
+        self.page.mouse.wheel(0, -600)
+        self.page.wait_for_function("""() => {
+            const e = document.querySelector('.message-list');
+            return e.scrollHeight - e.clientHeight - e.scrollTop > 400;
+        }""")
+        self.page.wait_for_timeout(200)
+        position = list_el.evaluate("e => ({top: e.scrollTop, height: e.scrollHeight})")
+        self.page.wait_for_function("document.querySelector('.message-list').scrollHeight > " + str(position["height"] + 120))
+        self.assertAlmostEqual(list_el.evaluate("e => e.scrollTop"), position["top"], delta=3)
+        # Returning to the bottom explicitly resumes following new content.
+        self.page.mouse.wheel(0, 100000)
+        self.page.wait_for_timeout(250)
+        height = list_el.evaluate("e => e.scrollHeight")
+        self.page.wait_for_function("""height => {
+            const e = document.querySelector('.message-list');
+            return e.scrollHeight > height + 100 && e.scrollHeight - e.clientHeight - e.scrollTop < 3;
+        }""", arg=height)
+        self.page.mouse.wheel(0, -650)
+        self.page.wait_for_timeout(250)
+        top = list_el.evaluate("e => e.scrollTop")
+        self._wait_for_run_status("completed")
+        self.page.wait_for_timeout(250)
+        self.assertAlmostEqual(list_el.evaluate("e => e.scrollTop"), top, delta=3)
+
+    def test_timer_ticks_freezes_and_restores_after_reload(self):
+        self._send("__slow__")
+        timer = self.page.locator('.message-assistant [role="timer"]')
+        timer.wait_for()
+        self.assertEqual(timer.get_attribute("data-running"), "true")
+        first = timer.inner_text()
+        self.page.wait_for_function("text => document.querySelector('[role=timer]').textContent !== text", arg=first)
+        self.page.reload(wait_until="domcontentloaded")
+        timer.wait_for()
+        self.assertNotIn("00:00", timer.inner_text())
+        self.page.get_by_text("慢请求完成", exact=True).wait_for(timeout=8000)
+        self.page.wait_for_function("document.querySelector('[role=timer]').dataset.running === 'false'")
+        final = timer.inner_text()
+        self.page.wait_for_timeout(1200)
+        self.assertEqual(timer.inner_text(), final)
+        self.page.reload(wait_until="domcontentloaded")
+        timer.wait_for()
+        self.assertEqual(timer.inner_text(), final)
+        self.assertEqual(self.page.locator('.message-user [role="timer"]').count(), 0)
+        self.assertEqual(timer.evaluate("e => e.parentElement.firstElementChild === e"), True)
+        if os.getenv("E2E_ARTIFACT_DIR"):
+            self.page.screenshot(path=str(Path(os.environ["E2E_ARTIFACT_DIR"]) / "run-timer.png"))
+
+    def test_timer_stops_on_failure_and_cancellation(self):
+        self._send("__error__")
+        self._wait_for_run_status("failed")
+        timer = self.page.locator('.message-assistant [role="timer"]').last
+        self.page.wait_for_function("document.querySelector('[role=timer]').dataset.running === 'false'")
+        failed = timer.inner_text()
+        self._send("__slow__")
+        self.page.get_by_text("旧会话片段", exact=True).wait_for()
+        running_id = next(run["run_id"] for run in self._state()["runs"] if run["status"] == "running")
+        self.page.get_by_role("button", name="暂停任务", exact=True).first.click()
+        self._wait_for_run_status("cancelled", running_id)
+        self.page.wait_for_function("Array.from(document.querySelectorAll('[role=timer]')).every(e => e.dataset.running === 'false')")
+        cancelled = timer.inner_text()
+        self.page.wait_for_timeout(1200)
+        self.assertEqual(timer.inner_text(), cancelled)
+        self.assertEqual(self.page.locator('[role="timer"]').first.inner_text(), failed)
+
     def test_recovered_answer_replaces_partial_draft_and_survives_reload(self):
         self._send("__recover__")
         self.page.get_by_text("恢复前的不完整草稿", exact=True).wait_for(timeout=8_000)
@@ -334,6 +483,26 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.reload(wait_until="domcontentloaded")
         self.page.get_by_text("自动恢复后的完整回答。", exact=True).wait_for(timeout=8_000)
         self.assertEqual(self.page.get_by_text("恢复前的不完整草稿", exact=True).count(), 0)
+
+    @unittest.skipUnless(os.getenv("E2E_REDIS_URL"), "persistent research needs Redis")
+    def test_parallel_research_tool_activity_polls_and_persists(self):
+        self._set_viewport({"width": 1440, "height": 1000})
+        self.page.get_by_label("消息", exact=True).fill("研究工具记录测试")
+        self.page.get_by_label("任务类型").select_option("research")
+        self.page.get_by_role("button", name="开始研究", exact=True).click()
+        self.page.get_by_text("多 Agent 研究已启动。", exact=False).wait_for(timeout=10000)
+        response = self.page.request.post(f"{self.base_url}/__e2e__/research-activity", data={"phase": "start"})
+        self.assertEqual(response.status, 200)
+        inspector = self.page.locator("#run-inspector")
+        inspector.locator(".tool-call-running").filter(has_text="研究员一").wait_for(timeout=10000)
+        inspector.locator(".tool-call-running").filter(has_text="研究员二").wait_for(timeout=10000)
+        self.assertEqual(inspector.locator(".tool-call").count(), 2)
+        self.page.request.post(f"{self.base_url}/__e2e__/research-activity", data={"phase": "finish"})
+        inspector.get_by_text("执行中 0 · 成功 2 · 失败 0", exact=True).wait_for(timeout=10000)
+        self.page.reload(wait_until="domcontentloaded")
+        inspector.get_by_text("执行中 0 · 成功 2 · 失败 0", exact=True).wait_for(timeout=10000)
+        self.assertEqual(inspector.locator(".tool-call").count(), 2)
+        self._assert_no_horizontal_page_overflow()
 
     @unittest.skipUnless(os.getenv("E2E_REDIS_URL"), "persistent research needs Redis")
     def test_persistent_research_controls_release_chat_and_survive_reload(self):
@@ -483,8 +652,16 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             "paper_id": "paper-library-test", "title": "已有论文", "chunks": 3,
             "indexed_at": "2026-11-10", "relation_count": 0,
         }]))
+        import fitz
+        with fitz.open() as document:
+            document.new_page().insert_text((50, 80), "An indexed library paper")
+            uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                'file': {'name': '已有论文.pdf', 'mimeType': 'application/pdf', 'buffer': document.tobytes()},
+            })
+        self.assertEqual(uploaded.status, 201)
         self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
         self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("checkbox", name="选择 已有论文.pdf", exact=True).check()
         self.page.get_by_role("button", name="关系审查", exact=True).first.wait_for()
         self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
         self.page.get_by_role("button", name="关系审查", exact=True).first.click()
@@ -506,7 +683,9 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         sidebar = self.page.locator(".workspace > aside.session-sidebar")
         self.assertEqual(sidebar.count(), 1, "会话与工具必须共用工作区的一个侧栏列")
         self.assertEqual(sidebar.locator(".session-list").count(), 1)
-        self.assertEqual(sidebar.locator(".sidebar-utilities").count(), 1)
+        self.assertEqual(sidebar.locator(".sidebar-settings").count(), 1)
+        self.assertEqual(sidebar.get_by_role("button", name="每日检索", exact=True).count(), 0)
+        self.assertEqual(sidebar.get_by_role("button", name="用户画像", exact=True).count(), 0)
         self.assertEqual(self.page.locator(".workspace > *").count(), 3)
         self.assertEqual(self.page.locator(".topbar, .conversation-heading").count(), 0)
 
@@ -529,7 +708,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
                     };
                     return {
                         workspace: box('.workspace'), sidebar: box('.session-sidebar'),
-                        sessions: box('.session-list'), utilities: box('.sidebar-utilities'),
+                        sessions: box('.session-list'), utilities: box('.sidebar-settings'),
                         conversation: box('.conversation'), inspector: box('.run-inspector'),
                         composer: box('.composer'), viewport: window.innerWidth,
                         documentWidth: document.documentElement.scrollWidth,
@@ -573,7 +752,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
                 settings.scroll_into_view_if_needed()
                 self.assertTrue(settings.is_visible())
                 self.assertTrue(settings.evaluate("""button => {
-                    const panel = button.closest('.workspace-panel').getBoundingClientRect();
+                    const panel = button.closest('.session-sidebar').getBoundingClientRect();
                     const toggle = button.getBoundingClientRect();
                     return toggle.bottom <= panel.bottom + 1 && toggle.top >= panel.top - 1;
                 }"""), "矮窗口工具面板应滚动，不能把按钮压扁并裁切文字")
@@ -684,43 +863,6 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self.page.get_by_role("button", name="恢复默认布局", exact=True).count(), 0)
         self.assertEqual(self._state()["calls"], [])
 
-    def test_document_uses_workbench_width_and_respects_explicit_inspector_visibility(self) -> None:
-        self._set_viewport({"width": 1440, "height": 900})
-        title = "浏览器档案：验证侧栏伸缩后的正文阅读与研究工具重排"
-        response = self.page.request.post(
-            f"{self.base_url}/__e2e__/documents",
-            data={"title": title, "content": "# 布局测试\n\n这是隔离测试中的档案正文，不调用模型。\n" * 4},
-        )
-        self.assertEqual(response.status, 200)
-        self.page.get_by_role("button", name="科研档案", exact=True).click()
-        self.page.get_by_title(title, exact=True).click()
-        self.page.locator(".document-page").wait_for()
-        self.page.locator(".run-inspector").wait_for(state="hidden")
-        self.page.get_by_role("button", name="显示运行检查器", exact=True).click()
-        self.page.locator(".run-inspector").wait_for(state="visible")
-        self._drag_sidebar("left", 180)
-        self._wait_for_width(".session-sidebar", 420)
-        self._drag_sidebar("right", -170)
-        self._wait_for_width(".run-inspector", 480)
-        self.assertGreaterEqual(self._pane_width(".conversation"), 480)
-        self.page.wait_for_function("""() => {
-            const main = document.querySelector('.document-main').getBoundingClientRect();
-            const rail = document.querySelector('.document-rail').getBoundingClientRect();
-            return rail.top >= main.bottom - 1 && Math.abs(rail.width - main.width) <= 2;
-        }""")
-        self._assert_no_horizontal_page_overflow()
-        self.page.get_by_role("button", name="隐藏会话侧栏", exact=True).click()
-        self.page.wait_for_function("""() => {
-            const main = document.querySelector('.document-main').getBoundingClientRect();
-            const rail = document.querySelector('.document-rail').getBoundingClientRect();
-            return rail.left >= main.right - 1;
-        }""")
-        self.page.get_by_role("button", name="隐藏运行检查器", exact=True).click()
-        self.page.get_by_role("tab").first.click()
-        self.page.locator(".composer").wait_for()
-        self.assertFalse(self.page.locator(".run-inspector").is_visible(),
-                         "切回聊天不能覆盖用户明确隐藏的右栏偏好")
-        self.assertEqual(self._state()["calls"], [])
 
     def test_hidden_inspector_leaves_failure_details_reachable(self) -> None:
         self._set_viewport({"width": 1440, "height": 900})
@@ -736,52 +878,6 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.locator(".run-inspector").wait_for(state="visible")
         self.assertEqual(len(self._state()["calls"]), 1)
 
-    def test_auto_hidden_inspector_finishes_an_active_drag_before_mouseup(self) -> None:
-        self._set_viewport({"width": 1440, "height": 900})
-        title = "运行结束时自动隐藏的档案拖动测试"
-        response = self.page.request.post(
-            f"{self.base_url}/__e2e__/documents",
-            data={"title": title, "content": "# 拖动测试\n\n仅使用隔离档案和确定性慢任务。"},
-        )
-        self.assertEqual(response.status, 200)
-        self.page.get_by_role("button", name="科研档案", exact=True).click()
-        self.page.get_by_title(title, exact=True).click()
-        self.page.locator(".document-page").wait_for()
-        self.page.locator(".run-inspector").wait_for(state="hidden")
-
-        # Do not choose a visibility preference: the document's default
-        # automatic rule must show the inspector only while the run is active.
-        self.page.get_by_role("tab").first.click()
-        self._send("__slow__")
-        self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=8_000)
-        self.page.get_by_role("tab", name=title, exact=True).click()
-        self.page.locator(".run-inspector").wait_for(state="visible")
-        handle = self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True)
-        handle.wait_for(state="visible")
-        box = handle.bounding_box()
-        self.assertIsNotNone(box)
-        original_styles = self.page.evaluate("""() => ({
-            userSelect: document.body.style.userSelect, cursor: document.body.style.cursor,
-        })""")
-        start_x = box["x"] + box["width"] / 2
-        start_y = box["y"] + min(box["height"] / 2, 60)
-        self.page.mouse.move(start_x, start_y)
-        self.page.mouse.down()
-        try:
-            self.page.mouse.move(start_x - 40, start_y, steps=4)
-            self.assertEqual(self.page.evaluate("document.body.style.userSelect"), "none")
-            self.assertEqual(self.page.evaluate("document.body.style.cursor"), "col-resize")
-            self._wait_for_run_status("completed")
-            self.page.locator(".run-inspector").wait_for(state="hidden")
-            # Hiding/unmounting a captured handle can lose pointerup. Cleanup
-            # must therefore happen while the mouse button is still held.
-            self.page.wait_for_function("""styles =>
-                document.body.style.userSelect === styles.userSelect
-                && document.body.style.cursor === styles.cursor
-            """, arg=original_styles, timeout=3_000)
-        finally:
-            self.page.mouse.up()
-        self.assertEqual(len(self._state()["calls"]), 1)
 
     def test_tall_research_composer_and_notice_leave_messages_and_send_reachable(self) -> None:
         self._set_viewport({"width": 1000, "height": 600})

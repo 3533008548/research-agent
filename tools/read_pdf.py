@@ -279,7 +279,7 @@ def _resolve_local_pdf(path_text: str, papers_dir: Path) -> Path:
     """Only accept PDFs already copied into the managed papers directory."""
     requested = Path(path_text).expanduser()
     base = papers_dir.resolve()
-    candidate = (requested.resolve() if requested.is_absolute() else (base / requested.name).resolve())
+    candidate = (requested.resolve() if requested.is_absolute() else (base / requested).resolve())
     try:
         candidate.relative_to(base)
     except ValueError as exc:
@@ -422,7 +422,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
                 quality["index_round_trip"] = index_check
                 if not index_check["accepted"]:
                     paper_store.delete_paper(paper_id)
-                    raise RuntimeError("向量库入库后自检失败，已回滚新索引")
+                    raise RuntimeError("向量库入库后自检失败，已回滚新索引。" + quality_failure_summary(index_check))
             else:
                 quality["index_round_trip"] = {"accepted": True, "skipped": True}
 

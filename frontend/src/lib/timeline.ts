@@ -19,6 +19,7 @@ export interface TimelineInputEvent {
   stage?: string;
   status?: string;
   tool?: string;
+  call_id?: string;
   /** Present on token events; ignored here, declared so token shapes type-check. */
   text?: string;
   at_ms?: number;
@@ -55,6 +56,7 @@ export interface Timeline {
 }
 
 const TERMINAL_STATUSES = new Set([
+  "passed", "advisory", "unresolved", "inconclusive", "revision_requested",
   "completed",
   "failed",
   "cancelled",
@@ -86,6 +88,7 @@ export function buildTimeline(
   const byStage = new Map<string, TimelineStage>();
   const order: string[] = [];
   const tools: TimelineToolCall[] = [];
+  const toolCalls = new Map<string, TimelineToolCall>();
   // Tracked separately from `startMs`: 0 is a legitimate measured offset, so it
   // cannot double as the "not measured yet" sentinel.
   const startsSeen = new Set<string>();
@@ -93,12 +96,22 @@ export function buildTimeline(
   for (const event of events) {
     if (event.type === "tool") {
       if (event.tool) {
-        tools.push({
+        const existing = event.call_id ? toolCalls.get(event.call_id) : undefined;
+        if (existing) {
+          if (event.status !== "running" || existing.status === "running") {
+            existing.status = event.status || existing.status;
+            existing.durationMs = finite(event.duration_ms) ?? existing.durationMs;
+          }
+          continue;
+        }
+        const call = {
           tool: event.tool,
           status: event.status || "completed",
           durationMs: finite(event.duration_ms),
           atMs: finite(event.at_ms),
-        });
+        };
+        tools.push(call);
+        if (event.call_id) toolCalls.set(event.call_id, call);
       }
       continue;
     }

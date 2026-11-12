@@ -62,8 +62,8 @@ export function workspaceLayoutMode(viewportWidth: number): WorkspaceLayoutMode 
   return viewportWidth <= 760 ? "stacked" : viewportWidth <= 1120 ? "compact" : "desktop";
 }
 
-export function rightSidebarVisible(preference: RightSidebarVisibility, docFocusMode: boolean): boolean {
-  return preference === "auto" ? !docFocusMode : preference === "shown";
+export function rightSidebarVisible(preference: RightSidebarVisibility): boolean {
+  return preference !== "hidden";
 }
 
 export interface ResolvedWorkspaceWidths {

@@ -42,95 +42,6 @@ class ProfileResponse(BaseModel):
     content: str = ""
 
 
-class ResearchDocumentResponse(BaseModel):
-    document_id: str
-    title: str
-    summary: str = ""
-    created_at: str
-    updated_at: str
-    revision: int
-
-
-class ResearchDocumentSectionResponse(BaseModel):
-    section_id: str
-    heading: str
-    content_length: int
-    content_hash: str
-    summary: str = ""
-
-
-class ResearchDocumentVersionResponse(BaseModel):
-    revision: int
-    updated_at: str
-    current: bool
-
-
-class ResearchLedgerEvidenceResponse(BaseModel):
-    paper_id: str = ""
-    title: str = ""
-    page: int | None = None
-    chunk_index: int | None = None
-    relation: str
-    note: str = ""
-
-
-class ResearchLedgerItemResponse(BaseModel):
-    item_id: str
-    section_id: str
-    heading: str
-    section_hash: str
-    section_current: bool
-    kind: str
-    status: str
-    statement: str
-    falsification: str = ""
-    evidence: list[ResearchLedgerEvidenceResponse] = Field(default_factory=list)
-    updated_at: str = ""
-
-
-class ResearchLedgerSummaryResponse(BaseModel):
-    items: int = 0
-    supported: int = 0
-    contested: int = 0
-    stale_links: int = 0
-
-
-class ResearchDocumentLedgerResponse(BaseModel):
-    document_id: str
-    title: str
-    document_revision: int
-    ledger_revision: int
-    updated_at: str = ""
-    items: list[ResearchLedgerItemResponse] = Field(default_factory=list)
-    summary: ResearchLedgerSummaryResponse = Field(default_factory=ResearchLedgerSummaryResponse)
-
-
-class ResearchDocumentRouteRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=5_000)
-
-
-class ResearchDocumentRouteResponse(BaseModel):
-    document_id: str
-    intent: Literal[
-        "new_paper_impact_review",
-        "safe_patch",
-        "paper_comparison",
-        "ledger",
-        "innovation_review",
-        "consult",
-    ]
-    label: str
-    message: str
-
-
-class ResearchDocumentDetailResponse(ResearchDocumentResponse):
-    content: str
-    download_url: str
-    sections: list[ResearchDocumentSectionResponse] = Field(default_factory=list)
-    versions: list[ResearchDocumentVersionResponse] = Field(default_factory=list)
-    ledger: ResearchDocumentLedgerResponse
-
-
 class PaperResponse(BaseModel):
     paper_id: str
     title: str
@@ -264,6 +175,7 @@ class ChatRunResponse(BaseModel):
     model: str = ""
     answer: str = ""
     duration_ms: float | None = None
+    elapsed_ms: float | None = None
     metrics: dict[str, int | float] = Field(default_factory=dict)
     error_type: str = ""
     error_details: dict[str, Any] = Field(default_factory=dict)
@@ -327,6 +239,7 @@ class RunResponse(BaseModel):
     model: str = ""
     answer: str = ""
     duration_ms: float | None = None
+    elapsed_ms: float | None = None
     metrics: dict[str, int | float] = Field(default_factory=dict)
     error_type: str = ""
     error_details: dict[str, Any] = Field(default_factory=dict)

@@ -6,6 +6,7 @@ import type {
   Run,
   RunEvent,
 } from "../types";
+import type { RunTiming } from "./runTiming";
 
 /**
  * Pure presentation helpers.
@@ -17,7 +18,7 @@ import type {
  */
 
 export type ResearchMode = "chat" | "research";
-export type DisplayMessage = Message & { id: string; streaming?: boolean };
+export type DisplayMessage = Message & { id: string; streaming?: boolean; timing?: RunTiming };
 
 const TOOL_LABELS: Record<string, string> = {
   search_papers: "检索论文",
@@ -25,14 +26,8 @@ const TOOL_LABELS: Record<string, string> = {
   describe_image: "理解图片",
   paper_card: "生成论文卡片",
   query_papers: "检索本地论文库",
-  list_research_document_sections: "查看档案章节",
-  read_research_document_section: "读取档案章节",
-  apply_research_document_patch: "安全更新档案",
-  compare_papers_to_research_document: "论文档案比对",
-  read_research_document_ledger: "查看证据与假设账本",
-  apply_research_document_ledger_patch: "更新证据与假设账本",
-  review_research_document_innovation: "科研档案创新性审查",
-  review_new_paper_impact_on_research_document: "新论文综合审查",
+  list_papers: "查看本地论文",
+  list_indexed_papers: "查看已入库论文",
 };
 
 export function toolLabel(name: string | undefined): string {
@@ -54,12 +49,29 @@ export function statusLabel(status: string | undefined): string {
     cancelled: "已取消",
     failed: "执行失败",
     partial_failed: "部分完成",
+    streaming: "正在输出",
+    recovering: "正在恢复",
+    skipped: "已跳过",
+    interrupted: "未收到结束记录",
+    passed: "核验通过",
+    advisory: "核验有提示",
+    revision_requested: "定向修正中",
+    unresolved: "仍有待确认问题",
+    inconclusive: "核验未得出结论",
   };
   return labels[status || ""] || status || "等待开始";
 }
 
 export function stageLabel(stage: string | undefined, fallback: string): string {
   const labels: Record<string, string> = {
+    model: "模型生成",
+    verify: "事实核验",
+    run: "本轮任务",
+    planner: "规划研究",
+    researchers: "收集证据",
+    synthesis: "综合证据",
+    critic: "检查证据与局限",
+    revision: "修订报告",
     steer_queued: "已收到运行中补充，等待下一节点使用",
     session_wait: "等待本会话上一轮任务完成",
     capacity_wait: "等待任务执行名额",

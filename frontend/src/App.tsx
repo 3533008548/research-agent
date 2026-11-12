@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
 
 import {
   updateWorkspaceSettings,
@@ -9,14 +9,13 @@ import {
 import { ChatPanel } from "./components/workspace/ChatPanel";
 import { RunInspector } from "./components/RunInspector";
 import { DailyPanel } from "./components/workspace/DailyPanel";
-import { DocumentPanel } from "./components/workspace/DocumentPanel";
 import { DailyRunPanel, ProfilePanel } from "./components/workspace/SimplePanels";
 import { RunsPanel } from "./components/workspace/RunsPanel";
 import { userFacingError } from "./lib/errors";
 import type { Notice, WorkbenchTab, WorkspacePanel } from "./lib/workspace";
 import { useConversation } from "./hooks/useConversation";
 import { useDailyWorkspace } from "./hooks/useDailyWorkspace";
-import { useDocuments } from "./hooks/useDocuments";
+import { useProfile } from "./hooks/useProfile";
 import { useRunCenter } from "./hooks/useRunCenter";
 import { useWorkspaceChrome } from "./hooks/useWorkspaceChrome";
 import { useWorkspaceLayout } from "./hooks/useWorkspaceLayout";
@@ -27,6 +26,12 @@ import {
   type WorkspaceSettings,
 } from "./types";
 
+
+import { LibraryPanel } from "./components/workspace/LibraryPanel";
+import { SettingsPanel } from "./components/workspace/SettingsPanel";
+import { useLibrary } from "./hooks/useLibrary";
+import { type LibraryDocument, fileSize } from "./lib/library";
+const PaperReader = lazy(() => import("./components/workspace/PaperReader").then(module => ({default: module.PaperReader})));
 
 const API_TOKEN_KEY = "research-agent.api-token";
 
@@ -44,7 +49,11 @@ export function App() {
   const [apiKeyDraft, setApiKeyDraft] = useState(() => sessionStorage.getItem(API_TOKEN_KEY) || "");
 
 
-
+  const library = useLibrary(apiKey);
+  const [selectedDocument, setSelectedDocument] = useState<LibraryDocument | null>(null);
+  const [settingsSection, setSettingsSection] = useState<"general"|"daily"|"profile">("general");
+  const [readerTools, setReaderTools] = useState<HTMLDivElement | null>(null);
+  const [showRunTools, setShowRunTools] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [notice, setNotice] = useState<Notice>(null);
   const [openWorkspacePanel, setOpenWorkspacePanel] = useState<WorkspacePanel | null>(null);
@@ -162,29 +171,12 @@ export function App() {
     setActiveWorkbenchTabId,
   });
 
-  const {
-    documents,
-    documentRequest,
-    profile,
-    setDocumentRequest,
-    setDocuments,
-    setProfile,
-    selectResearchDocument,
-    submitResearchDocumentRequest,
-    downloadDocument,
-    removeResearchDocument,
-    openProfile,
-  } = useDocuments({
+  const { profile, setProfile, openProfile } = useProfile({
     apiKey,
-    isSending,
     setNotice,
     setWorkbenchTabs,
     setActiveWorkbenchTabId,
-    closeWorkbenchTab,
-    setMode,
-    sendMessage,
   });
-
 
   const {
     toggleWorkspacePanel,
@@ -192,7 +184,6 @@ export function App() {
   } = useWorkspaceChrome({
     apiKey,
     setNotice,
-    setDocuments,
     setProfile,
     setPapers,
     setWorkspaceSettings,
@@ -207,23 +198,33 @@ export function App() {
   });
 
 
-
-
   const activeWorkbenchTab = workbenchTabs.find((tab) => tab.id === activeWorkbenchTabId) || workbenchTabs[0];
-  const selectedDocumentId = activeWorkbenchTab?.kind === "document"
-    ? activeWorkbenchTab.document.document_id
-    : null;
-  useEffect(() => {
-    const list = messageListRef.current;
-    if (list) {
-      list.scrollTop = list.scrollHeight;
-    }
-  }, [messages]);
-
   useEffect(() => {
     void loadWorkspace();
   }, [loadWorkspace]);
 
+  function openUtility(kind: "library"|"settings") {
+    const tab: WorkbenchTab = kind === "library" ? {id:"library",kind:"library",title:"论文库"} : {id:"settings",kind:"settings",title:"设置"};
+    setWorkbenchTabs(tabs => tabs.some(t => t.id === kind) ? tabs : [...tabs, tab]);
+    setActiveWorkbenchTabId(kind);
+    setShowRunTools(false);
+    if (kind === "library") { void library.load(); void toggleWorkspacePanel("papers"); }
+  }
+  function openPaper(document: LibraryDocument) {
+    const id = `paper:${document.id}`;
+    setWorkbenchTabs(tabs => tabs.some(t => t.id === id) ? tabs : [...tabs, {id, kind:"paper", title:document.name, documentId:document.id}]);
+    setActiveWorkbenchTabId(id);
+    setShowRunTools(false);
+  }
+  function readWithAssistant(document: LibraryDocument) {
+    const prompt = `请阅读论文“${document.name}”，使用 read_pdf 读取运行时论文目录下的 library/${document.id}.pdf，并建立可检索的论文索引。`;
+    setDraft(draft.trim() ? `${draft}\n\n${prompt}` : prompt);
+    setMode("chat");
+    setActiveWorkbenchTabId("chat");
+  }
+  useEffect(() => {
+    setSelectedDocument(current => current ? library.data.documents.find(d => d.id === current.id) || null : null);
+  }, [library.data.documents]);
   function closeWorkbenchTab(tabId: string) {
     if (tabId === "chat") {
       return;
@@ -263,15 +264,10 @@ export function App() {
     setApiKey(nextKey);
   }
 
-  const inspectingDaily = activeWorkbenchTab?.kind === "daily" || activeWorkbenchTab?.kind === "dailyRun";
+  const inspectingDaily = activeWorkbenchTab?.kind === "daily" || activeWorkbenchTab?.kind === "dailyRun" || (activeWorkbenchTab?.kind === "settings" && settingsSection === "daily");
   const inspectedRun = inspectingDaily ? dailyCurrentRun : currentRun;
   const inspectedEvents = inspectingDaily ? dailyRunEvents : runEvents;
-  const documentActive = activeWorkbenchTab?.kind === "document";
-  const runInProgress =
-    isSending || dailySending ||
-    ["running", "queued", "cancelling"].includes(currentRun?.status ?? "");
-  const docFocusMode = documentActive && !runInProgress;
-  const layout = useWorkspaceLayout({ docFocusMode });
+  const layout = useWorkspaceLayout();
   const activeSessionTitle = sessions.find((session) => session.thread_id === activeSessionId)?.title || "对话";
   const runNeedsAttention = inspectedRun && ["failed", "partial_failed"].includes(inspectedRun.status);
 
@@ -284,14 +280,14 @@ export function App() {
       >
         <SessionSidebar
           hidden={!layout.leftVisible}
+          onOpenLibrary={() => openUtility("library")}
+          onOpenSettings={() => openUtility("settings")}
           sessions={sessions}
           activeSessionId={activeSessionId}
           sessionRunStatuses={sessionRunStatuses}
           isSending={isSending}
           openWorkspacePanel={openWorkspacePanel}
           workspaceLoading={workspaceLoading}
-          documents={documents}
-          selectedDocumentId={selectedDocumentId}
           profile={profile}
           papers={papers}
           dailyRuns={dailyRuns}
@@ -304,8 +300,6 @@ export function App() {
           onStartSession={() => void startSession()}
           onRemoveActiveSession={() => void removeActiveSession()}
           onToggleWorkspacePanel={(panel) => void toggleWorkspacePanel(panel as WorkspacePanel)}
-          onSelectResearchDocument={(documentId) => void selectResearchDocument(documentId)}
-          onRemoveResearchDocument={(document) => void removeResearchDocument(document)}
           onOpenProfile={() => void openProfile()}
           onPreparePaperRelationReview={(paper) => preparePaperRelationReview(paper)}
           onSelectDailyRun={(runId) => void selectDailyRun(runId)}
@@ -321,7 +315,7 @@ export function App() {
           {layout.leftResizeProps && <SidebarResizeHandle {...layout.leftResizeProps} />}
         </SessionSidebar>
 
-        <section className={`conversation ${documentActive ? "conversation-doc" : activeWorkbenchTab?.kind === "chat" ? "conversation-chat" : ""}`} aria-label="研究工作台">
+        <section className={`conversation ${activeWorkbenchTab?.kind === "chat" ? "conversation-chat" : ""}`} aria-label="研究工作台">
           <div className="workbench-header">
             <button
               type="button"
@@ -340,14 +334,13 @@ export function App() {
                   role="tab"
                   aria-selected={tab.id === activeWorkbenchTab?.id}
                   onClick={() => setActiveWorkbenchTabId(tab.id)}
-                  title={tab.kind === "chat" ? activeSessionTitle : tab.title}
+                  title={tab.kind === "chat" ? activeSessionTitle : tab.kind === "paper" ? library.data.documents.find(d => d.id === tab.documentId)?.name || tab.title : tab.title}
                 >
-                  {tab.kind === "document" && <span aria-hidden="true">▣</span>}
                   {tab.kind === "profile" && <span aria-hidden="true">◉</span>}
                   {tab.kind === "daily" && <span aria-hidden="true">◌</span>}
                   {tab.kind === "dailyRun" && <span aria-hidden="true">▧</span>}
                   {tab.kind === "runs" && <span aria-hidden="true">◫</span>}
-                  <span>{tab.kind === "chat" ? activeSessionTitle : tab.title}</span>
+                  <span>{tab.kind === "chat" ? activeSessionTitle : tab.kind === "paper" ? library.data.documents.find(d => d.id === tab.documentId)?.name || tab.title : tab.title}</span>
                 </button>
                 {tab.kind !== "chat" && (
                   <button
@@ -389,19 +382,17 @@ export function App() {
               <button className="text-button" type="button" onClick={layout.showRight}>查看运行详情</button>
             </p>
           )}
-          {activeWorkbenchTab?.kind === "profile" ? (
+          {workbenchTabs.some(t => t.kind === "library") && <div className="workbench-preserved" hidden={activeWorkbenchTab?.kind !== "library"}><LibraryPanel apiKey={apiKey} {...library} onOpen={openPaper} onSelect={setSelectedDocument}/></div>}
+          {workbenchTabs.some(t => t.kind === "settings") && <div className="workbench-preserved" hidden={activeWorkbenchTab?.kind !== "settings"}><SettingsPanel apiKey={apiKey} apiKeyDraft={apiKeyDraft} onApiKeyDraftChange={setApiKeyDraft} onApplyApiKey={applyApiKey} keywords={keywords} keywordDraft={keywordDraft} onKeywordDraftChange={setKeywordDraft} onAddKeyword={e => void addDailyKeyword(e)} onRemoveKeyword={word => void removeDailyKeyword(word)} section={settingsSection} onSectionChange={setSettingsSection} onLoadDaily={() => {void loadKeywords();void loadDailyCenter();}}>
+            <DailyPanel digest={dailyDigest} loading={dailyLoading} action={dailyAction} searchDraft={dailySearchDraft} runs={dailyRuns} isSending={dailySending} onSearchDraftChange={setDailySearchDraft} onStartDailyAction={kind => void startDailyAction(kind)} onLoadDailyCenter={() => void loadDailyCenter()} onUpdatePaper={(paper,status) => void updateDailyPaper(paper,status)} onSelectRun={id => void selectDailyRun(id)}/>
+          </SettingsPanel></div>}
+          <Suspense fallback={<p>正在加载阅读器…</p>}>{workbenchTabs.filter(t => t.kind === "paper").map(tab => {
+            if (tab.kind !== "paper") return null;
+            const document = library.data.documents.find(d => d.id === tab.documentId);
+            return document && <PaperReader key={tab.id} apiKey={apiKey} document={document} active={activeWorkbenchTabId === tab.id} toolsHost={readerTools} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/>;
+          })}</Suspense>
+          {["library","settings","paper"].includes(activeWorkbenchTab?.kind || "") ? null : activeWorkbenchTab?.kind === "profile" ? (
             <ProfilePanel profile={activeWorkbenchTab.profile} />
-          ) : activeWorkbenchTab?.kind === "document" ? (
-            <DocumentPanel
-              document={activeWorkbenchTab.document}
-              activeSessionId={activeSessionId}
-              isSending={isSending}
-              documentRequest={documentRequest}
-              onDocumentRequestChange={setDocumentRequest}
-              onSubmitRequest={(event, doc) => void submitResearchDocumentRequest(event, doc)}
-              onDownload={(doc) => void downloadDocument(doc)}
-              onRemove={(doc) => void removeResearchDocument(doc)}
-            />
           ) : activeWorkbenchTab?.kind === "dailyRun" ? (
             <DailyRunPanel title={activeWorkbenchTab.title} detail={activeWorkbenchTab.detail} />
           ) : activeWorkbenchTab?.kind === "runs" ? (
@@ -473,7 +464,11 @@ export function App() {
           )}
         </section>
 
-          <RunInspector
+          {(activeWorkbenchTab?.kind === "library" || activeWorkbenchTab?.kind === "paper") && !showRunTools ? <aside id="run-inspector" className="run-inspector" hidden={!layout.rightVisible}>
+            {layout.rightResizeProps && <SidebarResizeHandle {...layout.rightResizeProps}/>}
+            <div className="context-toolbar"><strong>{activeWorkbenchTab.kind === "paper" ? "阅读辅助" : "文件详情"}</strong><button className="text-button" onClick={() => setShowRunTools(true)}>运行</button></div>
+            <div className="run-inspector-content">{activeWorkbenchTab.kind === "paper" ? <div ref={setReaderTools}/> : selectedDocument ? <div className="file-details"><h2>{selectedDocument.name}</h2><dl><dt>文件大小</dt><dd>{fileSize(selectedDocument.size_bytes)}</dd><dt>页数</dt><dd>{selectedDocument.pages} 页</dd><dt>文件夹</dt><dd>{library.data.folders.find(f => f.id === selectedDocument.folder_id)?.name || "未分类"}</dd><dt>阅读进度</dt><dd>{selectedDocument.progress.page ? `第 ${selectedDocument.progress.page} 页` : "尚未阅读"}</dd></dl><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => openPaper(selectedDocument)}>继续阅读 →</button><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => readWithAssistant(selectedDocument)}>交给助手阅读</button>{papers.filter(p => p.title === selectedDocument.name || p.title === selectedDocument.name.replace(/\.pdf$/i," ").trim()).map(p => <button className="button button-secondary" key={p.paper_id} onClick={() => preparePaperRelationReview(p)}>关系审查</button>)}</div> : <p className="panel-hint">勾选论文查看详情；点击名称打开独立阅读页。</p>}</div>
+          </aside> : <RunInspector
             hidden={!layout.rightVisible}
             run={inspectedRun}
             events={inspectedEvents}
@@ -483,7 +478,8 @@ export function App() {
             cancelling={inspectingDaily ? dailyCancelling : isCancelling}
           >
             {layout.rightResizeProps && <SidebarResizeHandle {...layout.rightResizeProps} />}
-          </RunInspector>
+            {showRunTools && <button className="button button-secondary" onClick={() => setShowRunTools(false)}>返回阅读 / 文件详情</button>}
+          </RunInspector>}
       </div>
     </main>
   );

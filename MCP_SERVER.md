@@ -21,7 +21,7 @@
 
 ### 为什么不暴露写工具
 
-`read_pdf` 会写入向量库，`save_paper_relation` / `apply_research_document_patch`
+`read_pdf` 会写入向量库，`save_paper_relation`
 会修改用户数据。MCP Server 是一个**对外的公开面**：它执行的写操作没有配额、
 没有审计、也没有质量门控。这些能力留在应用内部。
 

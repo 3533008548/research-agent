@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from api.auth import require_api_key
 from api.observability import render_prometheus_metrics
@@ -24,14 +26,7 @@ from api.schemas import (
     PaperRelationResponse,
     PaperResponse,
     ProfileResponse,
-    ResearchDocumentDetailResponse,
     ResearchControlRequest,
-    ResearchDocumentLedgerResponse,
-    ResearchDocumentRouteRequest,
-    ResearchDocumentRouteResponse,
-    ResearchDocumentResponse,
-    ResearchDocumentSectionResponse,
-    ResearchDocumentVersionResponse,
     RunCreateRequest,
     RunResponse,
     RunStartResponse,
@@ -45,12 +40,24 @@ from api.schemas import (
     WorkspaceSettingsUpdateRequest,
     WorkspaceUploadResponse,
 )
-from research_document_routing import route_research_document_request
 from run_contract import bounded_timing_metrics, latest_error_details
 from workspace_uploads import UploadValidationError
 
 
 router = APIRouter(prefix="/api/v1")
+
+
+def _run_elapsed_ms(run: dict, completed_at: str | None = None) -> float | None:
+    """Wall time including queueing, computed on the server for naive legacy dates."""
+    try:
+        start = datetime.fromisoformat(run["created_at"])
+        if run["status"] in {"queued", "running", "cancelling"}:
+            end = datetime.now(start.tzinfo)
+        else:
+            end = datetime.fromisoformat(completed_at or run["updated_at"])
+        return max(0.0, round((end - start).total_seconds() * 1000, 1))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _session_payload(session: dict) -> dict:
@@ -88,6 +95,7 @@ def _run_response(
         "model": model,
         "answer": answer,
         "duration_ms": duration_ms,
+        "elapsed_ms": _run_elapsed_ms(run, completed_at),
         "metrics": metrics or {},
         "error_type": error_type,
         "error_details": latest_error_details(events) if run.get("status") in {"failed", "partial_failed"} else {},
@@ -153,7 +161,8 @@ def get_research_project(project_id: str, request: Request):
     project = manager.projects.get(project_id) if manager and hasattr(manager, "projects") else None
     if not project:
         raise HTTPException(status_code=404, detail="research project not found")
-    return {**project, "jobs": manager.projects.jobs(project_id), "reports": manager.projects.reports(project_id)}
+    return {**project, "jobs": manager.projects.jobs(project_id), "reports": manager.projects.reports(project_id),
+            "activity": manager.projects.activity(project_id)}
 
 
 @router.get("/research-projects/{project_id}/reports/{report_id}", dependencies=[Depends(require_api_key)])
@@ -269,7 +278,10 @@ def _timeline_events(
     allow-list: whatever else a durable event carries stays server-side.
     """
     if not run_id.startswith("daily-"):
-        return events
+        return [{**event, "type": event.get("event_type", "status"),
+                 **{key: event.get("metrics", {})[key] for key in ("at_ms", "duration_ms", "verification_round") if key in event.get("metrics", {})},
+                 **{key: event.get("metadata", {})[key] for key in ("tool", "call_id") if key in event.get("metadata", {})}}
+                for event in events]
     scheduler = getattr(request.app.state, "workspace_scheduler", None)
     if scheduler is None:
         return []
@@ -340,13 +352,6 @@ def _workspace_scheduler(request: Request):
     return scheduler
 
 
-def _research_documents(request: Request):
-    store = getattr(request.app.state, "research_document_store", None)
-    if store is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="research document service unavailable")
-    return store
-
-
 def _paper_relations(request: Request):
     store = getattr(request.app.state, "paper_relation_store", None)
     if store is None:
@@ -361,17 +366,6 @@ def _workspace_uploads(request: Request):
     return uploads
 
 
-def _document_payload(document: dict) -> dict:
-    return {
-        "document_id": document["document_id"],
-        "title": document["title"],
-        "summary": document.get("summary", ""),
-        "created_at": document["created_at"],
-        "updated_at": document["updated_at"],
-        "revision": document["revision"],
-    }
-
-
 def _workspace_settings_payload(request: Request) -> dict:
     paths = _workspace_paths(request)
     cfg = request.app.state.agent.cfg
@@ -384,16 +378,6 @@ def _workspace_settings_payload(request: Request) -> dict:
         "daily_search_enabled": stored.get("daily_search_enabled") if isinstance(stored.get("daily_search_enabled"), bool) else cfg.daily_search_enabled,
         "restart_required": True,
     }
-
-
-@router.get(
-    "/workspace/research-documents",
-    response_model=list[ResearchDocumentResponse],
-    dependencies=[Depends(require_api_key)],
-)
-def list_research_documents(request: Request) -> list[dict]:
-    """List document metadata without injecting document bodies into chat state."""
-    return [_document_payload(document) for document in _research_documents(request).list(limit=50)]
 
 
 @router.post(
@@ -417,76 +401,6 @@ async def upload_workspace_file(
 
 
 @router.get(
-    "/workspace/research-documents/{document_id}",
-    response_model=ResearchDocumentDetailResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def get_research_document(document_id: str, request: Request) -> dict:
-    document = _research_documents(request).read(document_id)
-    if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
-    return {
-        **_document_payload(document),
-        "content": document.get("content", ""),
-        "sections": document.get("sections", []),
-        "versions": _research_documents(request).list_versions(document_id, limit=10),
-        "ledger": document.get("ledger", {}),
-        "download_url": f"/api/v1/workspace/research-documents/{document_id}/download",
-    }
-
-
-@router.get(
-    "/workspace/research-documents/{document_id}/sections",
-    response_model=list[ResearchDocumentSectionResponse],
-    dependencies=[Depends(require_api_key)],
-)
-def list_research_document_sections(document_id: str, request: Request) -> list[dict]:
-    """Expose section metadata for UI navigation without sending document bodies."""
-    document = _research_documents(request).list_sections(document_id)
-    if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
-    return list(document.get("sections") or [])
-
-
-@router.get(
-    "/workspace/research-documents/{document_id}/versions",
-    response_model=list[ResearchDocumentVersionResponse],
-    dependencies=[Depends(require_api_key)],
-)
-def list_research_document_versions(document_id: str, request: Request) -> list[dict]:
-    """Show restorable versions; mutations remain agent-confirmed operations."""
-    if _research_documents(request).read(document_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
-    return _research_documents(request).list_versions(document_id, limit=20)
-
-
-@router.get(
-    "/workspace/research-documents/{document_id}/ledger",
-    response_model=ResearchDocumentLedgerResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def get_research_document_ledger(document_id: str, request: Request) -> dict:
-    """Read the evidence/hypothesis ledger; writes require explicit agent confirmation."""
-    ledger = _research_documents(request).read_ledger(document_id)
-    if ledger is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
-    return ledger
-
-
-@router.post(
-    "/workspace/research-documents/{document_id}/route",
-    response_model=ResearchDocumentRouteResponse,
-    dependencies=[Depends(require_api_key)],
-)
-def route_research_document(document_id: str, payload: ResearchDocumentRouteRequest, request: Request) -> dict:
-    """Classify one document-scoped request into a non-authoritative workflow hint."""
-    document = _research_documents(request).read(document_id)
-    if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
-    return route_research_document_request(document, payload.message)
-
-
-@router.get(
     "/workspace/profile",
     response_model=ProfileResponse,
     dependencies=[Depends(require_api_key)],
@@ -497,35 +411,6 @@ def get_workspace_profile(request: Request) -> dict:
     if profile is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="profile service unavailable")
     return {"content": str(profile.read() or "")}
-
-
-@router.get(
-    "/workspace/research-documents/{document_id}/download",
-    dependencies=[Depends(require_api_key)],
-)
-def download_research_document(document_id: str, request: Request) -> FileResponse:
-    document = _research_documents(request).read(document_id)
-    if document is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
-    path = _workspace_paths(request).safe_child(
-        _workspace_paths(request).research_documents_dir / document_id,
-        str(document.get("docx_file") or "document.docx"),
-    )
-    if not path.is_file():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="document download not found")
-    return FileResponse(path, filename=f"{document['title']}.docx")
-
-
-@router.delete(
-    "/workspace/research-documents/{document_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_api_key)],
-)
-def delete_research_document(document_id: str, request: Request) -> Response:
-    """Delete a research dossier together with its Markdown, docx, ledger, and history."""
-    if not _research_documents(request).delete(document_id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research document not found")
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get(
@@ -883,6 +768,9 @@ def get_run(run_id: str, request: Request) -> dict:
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
     events = []
+    if run.get("research") and hasattr(manager, "projects"):
+        run["research"] = {**run["research"], "jobs": manager.projects.jobs(run_id),
+                           "activity": manager.projects.activity(run_id)}
     if run_id.startswith(("chat-", "research-")):
         events = request.app.state.agent.sessions.get_run_events(run_id, run["thread_id"])
     return _run_payload(request, run, _timeline_events(request, run_id, run, events))

@@ -167,26 +167,5 @@ class TestPaperLookup(unittest.TestCase):
         self.assertEqual(len(available), 3)
 
 
-class TestResearchDocumentPaperResolution(unittest.TestCase):
-    def test_near_duplicate_titles_no_longer_fail_the_whole_request(self):
-        from tools.research_documents import _resolve_papers
-
-        store = _Store([
-            {"paper_id": "paper-1", "title": "Deep RL for TSN: A Survey"},
-            {"paper_id": "paper-2", "title": "Deep RL for TSN: A Survey (Extended)"},
-        ])
-        resolved = _resolve_papers(store, ["Deep RL for TSN: A Survey"])
-        self.assertIsInstance(resolved, list)
-        self.assertEqual([item["paper_id"] for item in resolved], ["paper-1"])
-
-    def test_unknown_paper_reports_indexed_candidates(self):
-        from tools.research_documents import _resolve_papers
-
-        store = _Store([{"paper_id": "paper-1", "title": "Deep RL for TSN: A Survey"}])
-        result = _resolve_papers(store, ["Quantum Error Correction"])
-        self.assertIsInstance(result, str)
-        self.assertIn("paper-1", result)
-
-
 if __name__ == "__main__":
     unittest.main()

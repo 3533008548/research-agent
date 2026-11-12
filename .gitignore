@@ -13,6 +13,14 @@ evals/reports/*.json
 !.env.example
 frontend/node_modules/
 frontend/dist/
+frontend/public/pdfjs/
+desktop/node_modules/
+desktop/release/
+build/
+build-desktop.log
+.visual_check/desktop-runtime*/
+.visual_check/desktop-profile*/
+*.spec
 # 旧版分散路径（保留忽略以支持显式迁移）
 chroma_data/
 checkpoint.db

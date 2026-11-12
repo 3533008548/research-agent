@@ -47,7 +47,7 @@ function persistPreferences(preferences: WorkspaceLayoutPreferences) {
 }
 
 /** UI-only preferences: hiding a pane never changes a session, run or SSE stream. */
-export function useWorkspaceLayout({ docFocusMode }: { docFocusMode: boolean }) {
+export function useWorkspaceLayout() {
   const workspaceRef = useRef<HTMLDivElement>(null);
   const [preferences, setPreferences] = useState(readPreferences);
   const preferencesRef = useRef(preferences);
@@ -106,7 +106,7 @@ export function useWorkspaceLayout({ docFocusMode }: { docFocusMode: boolean }) 
   }, [finishDrag]);
 
   const leftVisible = preferences.leftVisible;
-  const rightVisible = rightSidebarVisible(preferences.rightVisibility, docFocusMode);
+  const rightVisible = rightSidebarVisible(preferences.rightVisibility);
   const widths = useMemo(() => resolveWorkspaceWidths({
     workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible,
   }), [workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible]);
@@ -116,8 +116,8 @@ export function useWorkspaceLayout({ docFocusMode }: { docFocusMode: boolean }) 
   useLayoutEffect(() => {
     const drag = dragRef.current;
     if (drag && !(drag.side === "left" ? leftResizable : rightResizable)) {
-      // Document focus can hide a pane while its run finishes. A removed
-      // handle need not deliver lostpointercapture back through React.
+      // A hidden or unmounted handle may not deliver lostpointercapture
+      // back through React. End the drag when it is no longer resizable.
       finishDrag();
     }
   }, [leftResizable, rightResizable, draggingSide, finishDrag]);

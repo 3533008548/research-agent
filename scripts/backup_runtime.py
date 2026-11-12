@@ -72,8 +72,10 @@ def main() -> int:
                 shutil.copy2(source, target)
         if paths.papers_dir.exists():
             shutil.copytree(paths.papers_dir, staging / "primary/papers")
-        if paths.research_documents_dir.exists():
-            shutil.copytree(paths.research_documents_dir, staging / "primary/research_documents")
+        # Keep user files from the retired dossier feature in backups.
+        legacy_documents = paths.primary_dir / "research_documents"
+        if legacy_documents.exists():
+            shutil.copytree(legacy_documents, staging / "primary/research_documents")
         # Preserve artifacts from the retired reproduction feature in backups.
         legacy_projects = paths.primary_dir / "experiment_projects"
         if legacy_projects.exists():

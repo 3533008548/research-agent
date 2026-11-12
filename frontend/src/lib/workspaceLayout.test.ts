@@ -21,13 +21,10 @@ it("falls back safely for damaged, obsolete and invalid layout preferences", () 
   })), { version: 1, leftWidth: 350, rightWidth: 440, leftVisible: false, rightVisibility: "hidden" });
 });
 
-it("preserves explicit visibility choices across document focus transitions", () => {
-  assert.equal(rightSidebarVisible("auto", false), true);
-  assert.equal(rightSidebarVisible("auto", true), false);
-  for (const focused of [false, true]) {
-    assert.equal(rightSidebarVisible("shown", focused), true);
-    assert.equal(rightSidebarVisible("hidden", focused), false);
-  }
+it("shows the inspector by default and preserves explicit visibility choices", () => {
+  assert.equal(rightSidebarVisible("auto"), true);
+  assert.equal(rightSidebarVisible("shown"), true);
+  assert.equal(rightSidebarVisible("hidden"), false);
 });
 
 it("keeps breakpoint boundaries consistent for pointer resizing", () => {

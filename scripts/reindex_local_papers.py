@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                 quality["index_round_trip"] = index_check
                 if not index_check["accepted"]:
                     store.delete_paper(paper_id)
-                    raise RuntimeError("向量库入库后自检失败，已回滚新索引")
+                    raise RuntimeError("向量库入库后自检失败，已回滚新索引。" + quality_failure_summary(index_check))
                 write_document_map(paths, paper_id=paper_id, document_map=document_map)
                 # Replacing by exact title left duplicates behind whenever a
                 # readable file name differed by so much as a colon.

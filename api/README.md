@@ -100,13 +100,6 @@ Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TL
 | `GET` | `/api/v1/sessions/{session_id}/messages` | 恢复该会话的用户可见对话 |
 | `GET` | `/api/v1/sessions/{session_id}/usage` | 读取该会话持久化的输入、输出与合计 Token 统计 |
 | `GET` | `/api/v1/sessions/{session_id}/runs` | 列出该会话最近的聊天与深度研究任务 |
-| `GET` | `/api/v1/workspace/research-documents` | 列出研究档案元数据 |
-| `GET` | `/api/v1/workspace/research-documents/{id}` | 按需读取一份研究档案的 Markdown、四章节目录与版本摘要 |
-| `GET` | `/api/v1/workspace/research-documents/{id}/sections` | 读取四个固定章节的元数据与校验哈希，不含正文 |
-| `GET` | `/api/v1/workspace/research-documents/{id}/versions` | 列出当前版本和可恢复的历史快照 |
-| `GET` | `/api/v1/workspace/research-documents/{id}/ledger` | 读取独立的证据与假设账本及章节关联新鲜度 |
-| `POST` | `/api/v1/workspace/research-documents/{id}/route` | 将当前档案的自然语言请求路由为流程提示，不执行写入 |
-| `GET` | `/api/v1/workspace/research-documents/{id}/download` | 下载该档案的 Word 文档 |
 | `GET` | `/api/v1/workspace/profile` | 读取独立于会话历史的用户画像 |
 | `GET` | `/api/v1/workspace/papers` | 列出本地已索引论文与片段数 |
 | `GET` | `/api/v1/workspace/paper-relations` | 查看用户确认的论文关系；可用 `paper_id` 过滤 |
@@ -129,30 +122,6 @@ Compose 默认将 7860 端口绑定到 `127.0.0.1`。公开访问时，请在 TL
 
 `POST /api/v1/sessions/{session_id}/chat-runs` 保留为兼容别名，客户端应逐步迁移到
 统一的 `/api/v1/runs` 接口。
-
-## 科研档案的安全修改
-
-研究档案是 Markdown 源文件，并同步导出 Word。新档案固定采用四个章节：研究背景与研究现状、
-研究内容与创新、研究方案与可行性、研究展望与计划。HTTP 接口只提供只读查看；写入由 Agent 的
-受限工具完成：它先读取目标章节，携带 `revision` 与章节 `content_hash` 提交局部补丁。版本或哈希
-不匹配时，存储层拒绝写入而不会尝试整篇覆盖。每次成功写入前，旧正文会作为完整历史快照保存；
-恢复也会创建新修订，不会抹掉之后的历史。
-
-“论文 × 科研档案”比对同样仅由 Agent 工具执行，会扫描全部四个章节和所选本地论文的全部切块，
-返回带页码/章节定位的词汇重合候选。它不是自动写入流程，词汇未命中也不能证明不存在概念关系。
-
-每份档案还可带有 `research_ledger.json`。它是正文之外的研究判断索引：每项关联一个固定章节，
-记录研究问题、假设、创新候选或决策，以及可定位论文证据、认识状态和可证伪条件。账本写入通过
-Agent 工具完成，需携带账本修订号和关联章节哈希；`supported` 状态缺少论文定位会被拒绝。正文发生
-变化后，旧条目不会被静默删除，而会显示为待复核。创新性审查也由 Agent 工具完成，按研究问题、
-核心假设、方法机制、适用条件、评价计划五维汇集全量词汇扫描和已有混合检索候选；它只产出创新候选
-及区分实验建议，不替代系统性文献综述，也不自动改写档案或账本。
-
-档案页的自然语言请求会先经过 `POST /workspace/research-documents/{id}/route` 的轻量规则路由：
-`new_paper_impact_review`、`safe_patch`、`paper_comparison`、`ledger`、`innovation_review` 或 `consult`。其中
-“新导入论文 + 修改档案”是明确的产品级复合意图：Agent 必须先唯一定位论文，再调用一次只读综合审查工具，产出重叠/借鉴、可行性影响、创新性候选和逐章节拟修改项；用户确认前不得写入。它只返回包含
-`document_id`、原请求和流程提示的消息，不读取全文、不创建任务也不修改任何数据；随后普通对话任务仍由
-Agent 的工具约束、版本号和章节哈希校验执行。规则与用户原话冲突或无法判断时，Agent 应以用户原话为准并澄清。
 
 ## 论文关系增强检索
 

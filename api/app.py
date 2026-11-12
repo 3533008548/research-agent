@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import mimetypes
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -14,9 +15,10 @@ from api.routes import router
 from api.run_manager import ChatRunManager
 from badcase_store import BadcaseStore
 from paper_relations import PaperRelationStore
-from research_documents import ResearchDocumentStore
 from scheduler import Scheduler
 from workspace_uploads import WorkspaceUploadStore
+from library_store import LibraryStore
+from api.library_routes import router as library_router
 
 
 def _default_badcase_store(agent) -> BadcaseStore:
@@ -60,8 +62,8 @@ def create_app(
     cfg = getattr(agent, "cfg", None)
     paths = getattr(cfg, "runtime_paths", None)
     app.state.workspace_paths = paths
+    app.state.library_store = LibraryStore(paths) if paths else None
     app.state.workspace_uploads = WorkspaceUploadStore(paths) if paths else None
-    app.state.research_document_store = ResearchDocumentStore(paths) if paths else None
     app.state.paper_relation_store = PaperRelationStore(paths) if paths else None
     app.state.workspace_scheduler = (
         getattr(daily_run_manager, "scheduler", None)
@@ -69,6 +71,7 @@ def create_app(
         else (Scheduler(cfg.daily_db, request_timeout_seconds=cfg.daily_request_timeout_seconds) if cfg else None)
     )
     app.include_router(router)
+    app.include_router(library_router)
     return app
 
 
@@ -80,6 +83,9 @@ def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str 
     the directory, while local React development normally uses Vite's proxy.
     """
     dist = Path(dist_dir)
+    # Windows registry MIME mappings can label ES-module workers text/plain.
+    mimetypes.add_type('text/javascript', '.mjs')
+    mimetypes.add_type('application/wasm', '.wasm')
     index = dist / "index.html"
     if not index.is_file():
         return False
@@ -87,6 +93,8 @@ def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str 
     suffix = mount_path.strip("/")
     normalized_path = f"/{suffix}" if suffix else ""
     assets = dist / "assets"
+    if (dist / "pdfjs").is_dir():
+        app.mount(f"{normalized_path}/pdfjs", StaticFiles(directory=dist / "pdfjs"), name="pdf-assets")
     if assets.is_dir():
         app.mount(
             f"{normalized_path}/assets" or "/assets",

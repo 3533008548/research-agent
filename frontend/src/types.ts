@@ -51,6 +51,14 @@ export interface RunErrorDetails {
 }
 
 export interface RunEvent {
+  verification_round?: number;
+  id?: string | number;
+  call_id?: string;
+  agent?: string;
+  job_id?: string;
+  version?: number;
+  attempt?: number;
+  created_at?: string;
   type: "status" | "token" | "tool" | "done" | "error";
   status?: string;
   stage?: string;
@@ -86,6 +94,8 @@ export interface Run {
   model: string;
   answer: string;
   duration_ms: number | null;
+  /** Server-measured wall time since submission, including queueing. */
+  elapsed_ms?: number | null;
   metrics: Record<string, number>;
   error_type: string;
   error_details?: RunErrorDetails;
@@ -103,6 +113,8 @@ export interface Run {
 }
 
 export interface ResearchProject {
+  activity?: RunEvent[];
+  created_at?: string;
   project_id: string;
   origin_session_id: string;
   question: string;
@@ -124,84 +136,6 @@ export interface ResearchProject {
   evidence: Array<{ id: string; stable_id: string; source: string; excerpt: string }>;
   budget: { max_calls: number; calls: number; max_tokens: number; tokens: number };
   jobs?: Array<{ job_id: string; role: string; state: string; version: number; attempts?: number; result?: { error?: string }; payload: { question?: string; gap?: string } }>;
-}
-
-export interface ResearchDocument {
-  document_id: string;
-  title: string;
-  summary: string;
-  created_at: string;
-  updated_at: string;
-  revision: number;
-}
-
-export interface ResearchDocumentSection {
-  section_id: "background" | "content_innovation" | "approach_feasibility" | "outlook_plan";
-  heading: string;
-  content_length: number;
-  content_hash: string;
-  summary: string;
-}
-
-export interface ResearchDocumentVersion {
-  revision: number;
-  updated_at: string;
-  current: boolean;
-}
-
-export interface ResearchLedgerEvidence {
-  paper_id: string;
-  title: string;
-  page: number | null;
-  chunk_index: number | null;
-  relation: "supports" | "contradicts" | "conditions" | "inspiration";
-  note: string;
-}
-
-export interface ResearchLedgerItem {
-  item_id: string;
-  section_id: ResearchDocumentSection["section_id"];
-  heading: string;
-  section_hash: string;
-  section_current: boolean;
-  kind: "research_question" | "hypothesis" | "innovation_candidate" | "decision";
-  status: "open" | "hypothesis" | "supported" | "contested" | "rejected" | "decision";
-  statement: string;
-  falsification: string;
-  evidence: ResearchLedgerEvidence[];
-  updated_at: string;
-}
-
-export interface ResearchLedgerSummary {
-  items: number;
-  supported: number;
-  contested: number;
-  stale_links: number;
-}
-
-export interface ResearchDocumentLedger {
-  document_id: string;
-  title: string;
-  document_revision: number;
-  ledger_revision: number;
-  updated_at: string;
-  items: ResearchLedgerItem[];
-  summary: ResearchLedgerSummary;
-}
-
-export interface ResearchDocumentRoute {
-  document_id: string;
-  intent: "new_paper_impact_review" | "safe_patch" | "paper_comparison" | "ledger" | "innovation_review" | "consult";
-  label: string;
-  message: string;
-}
-
-export interface ResearchDocumentDetail extends ResearchDocument {
-  content: string;
-  download_url: string;
-  sections: ResearchDocumentSection[];
-  versions: ResearchDocumentVersion[];
-  ledger: ResearchDocumentLedger;
 }
 
 export interface Paper {

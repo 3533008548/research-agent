@@ -66,6 +66,20 @@ def _pdf_test_sample() -> Path | None:
 class TestFastAPIService(unittest.TestCase):
     """API 外观层复用既有会话存储，不调用真实模型。"""
 
+    def test_run_elapsed_time_includes_queueing_and_handles_server_timezones(self):
+        from datetime import datetime, timedelta, timezone
+        from api.routes import _run_elapsed_ms
+
+        for zone in (None, timezone.utc, timezone(timedelta(hours=8))):
+            start = datetime.now(zone) - timedelta(seconds=65)
+            run = {"created_at": start.isoformat(), "status": "queued"}
+            self.assertGreaterEqual(_run_elapsed_ms(run), 65000)
+            self.assertLess(_run_elapsed_ms(run), 67000)
+            run.update(status="failed", updated_at=(start + timedelta(seconds=12)).isoformat())
+            self.assertEqual(_run_elapsed_ms(run), 12000)
+            self.assertEqual(_run_elapsed_ms(run, (start + timedelta(seconds=10)).isoformat()), 10000)
+        self.assertIsNone(_run_elapsed_ms({"created_at": "invalid", "status": "running"}))
+
     class _FakeAgent:
         model = "fake-model"
 
@@ -88,7 +102,7 @@ class TestFastAPIService(unittest.TestCase):
 
         def step(
             self, message, *, session_id, run_id, cancel_event, on_token,
-            steer_provider=None, on_steer=None,
+            steer_provider=None, on_steer=None, on_progress=None,
         ):
             if cancel_event.is_set():
                 answer, outcome, status = "已取消", "cancelled", "cancelled"
@@ -351,7 +365,7 @@ class TestFastAPIService(unittest.TestCase):
             self.assertIn("console.log", client.get("/assets/app.js").text)
             self.assertFalse(mount_react_frontend(FastAPI(), dist / "missing"))
 
-    def test_workspace_routes_keep_documents_keywords_and_settings_outside_chat_state(self):
+    def test_workspace_routes_keep_profile_keywords_and_settings_outside_chat_state(self):
         from fastapi.testclient import TestClient
         from api.app import create_app
         from runtime_paths import RuntimePaths
@@ -373,41 +387,22 @@ class TestFastAPIService(unittest.TestCase):
         app = create_app(agent=self.agent)
         try:
             client = TestClient(app)
-            document = app.state.research_document_store.save("研究方案", "# 研究方案\n\n方案正文")
-
-            listed = client.get("/api/v1/workspace/research-documents")
-            self.assertEqual(listed.status_code, 200)
-            self.assertEqual(listed.json()[0]["document_id"], document["document_id"])
             profile = client.get("/api/v1/workspace/profile")
             self.assertEqual(profile.status_code, 200)
             self.assertIn("语言：中文", profile.json()["content"])
-            detail = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}")
-            self.assertEqual(detail.status_code, 200)
-            self.assertIn("方案正文", detail.json()["content"])
-            self.assertEqual(len(detail.json()["sections"]), 4)
-            self.assertEqual(detail.json()["versions"][0]["revision"], 1)
-            self.assertEqual(detail.json()["ledger"]["ledger_revision"], 0)
-            sections = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/sections")
-            self.assertEqual(sections.status_code, 200)
-            self.assertEqual(sections.json()[0]["section_id"], "background")
-            versions = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/versions")
-            self.assertEqual(versions.status_code, 200)
-            self.assertTrue(versions.json()[0]["current"])
-            ledger = client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/ledger")
-            self.assertEqual(ledger.status_code, 200)
-            self.assertEqual(ledger.json()["summary"]["items"], 0)
-            routed = client.post(
-                f"/api/v1/workspace/research-documents/{document['document_id']}/route",
-                json={"message": "请补充研究方案中的可行性分析"},
-            )
-            self.assertEqual(routed.status_code, 200)
-            self.assertEqual(routed.json()["intent"], "safe_patch")
-            self.assertIn(document["document_id"], routed.json()["message"])
-            self.assertEqual(
-                client.get(f"/api/v1/workspace/research-documents/{document['document_id']}/download").status_code,
-                200,
-            )
-
+            # Retired API endpoints must stay unavailable even with old user files.
+            legacy_file = paths.primary_dir / "research_documents" / "old-document" / "document.md"
+            legacy_file.parent.mkdir(parents=True)
+            legacy_file.write_text("historical user draft", encoding="utf-8")
+            self.assertFalse(hasattr(app.state, "research_document_store"))
+            self.assertFalse(any("research-documents" in path for path in app.openapi()["paths"]))
+            for suffix in ("", "/old-document", "/old-document/sections", "/old-document/versions",
+                           "/old-document/ledger", "/old-document/download"):
+                self.assertEqual(client.get("/api/v1/workspace/research-documents" + suffix).status_code, 404)
+            self.assertEqual(client.post("/api/v1/workspace/research-documents/old-document/route",
+                                         json={"message": "修改"}).status_code, 404)
+            self.assertEqual(client.delete("/api/v1/workspace/research-documents/old-document").status_code, 404)
+            self.assertEqual(legacy_file.read_text(encoding="utf-8"), "historical user draft")
             papers = client.get("/api/v1/workspace/papers")
             self.assertEqual(papers.status_code, 200)
             self.assertEqual(papers.json()[0]["title"], "本地论文")
@@ -534,49 +529,6 @@ class TestFastAPIService(unittest.TestCase):
         finally:
             app.state.workspace_scheduler.close()
 
-    def test_delete_research_document_removes_dossier_and_files(self):
-        from fastapi.testclient import TestClient
-        from api.app import create_app
-        from runtime_paths import RuntimePaths
-
-        paths = RuntimePaths.from_root(Path(self.tmp) / "delete-runtime")
-        self.agent.cfg = SimpleNamespace(
-            runtime_paths=paths,
-            daily_db=str(paths.daily_db),
-            daily_request_timeout_seconds=8,
-            model="workspace-model",
-            rag_enabled=True,
-            pdf_max_pages=15,
-            daily_search_enabled=False,
-        )
-        app = create_app(agent=self.agent)
-        client = TestClient(app)
-        document = app.state.research_document_store.save("待删除档案", "# 待删除档案\n\n正文")
-
-        directory = paths.research_documents_dir / document["document_id"]
-        self.assertTrue(directory.is_dir())
-        listed_before = client.get("/api/v1/workspace/research-documents").json()
-        self.assertTrue(any(item["document_id"] == document["document_id"] for item in listed_before))
-
-        deleted = client.delete(f"/api/v1/workspace/research-documents/{document['document_id']}")
-        self.assertEqual(deleted.status_code, 204)
-        self.assertFalse(directory.is_dir())
-        self.assertEqual(
-            client.get(f"/api/v1/workspace/research-documents/{document['document_id']}").status_code,
-            404,
-        )
-        listed_after = client.get("/api/v1/workspace/research-documents").json()
-        self.assertFalse(any(item["document_id"] == document["document_id"] for item in listed_after))
-
-        # Deleting an unknown or already-removed dossier is a clean 404.
-        self.assertEqual(
-            client.delete(f"/api/v1/workspace/research-documents/{document['document_id']}").status_code,
-            404,
-        )
-        self.assertEqual(
-            client.delete("/api/v1/workspace/research-documents/not-a-doc-id").status_code,
-            404,
-        )
 
     def test_badcase_feedback_keeps_only_a_safe_run_snapshot_and_follows_session_delete(self):
         from fastapi.testclient import TestClient
@@ -898,14 +850,6 @@ class TestRetrievalAdmissionPolicy(unittest.TestCase):
         self.assertFalse(should_answer_without_tools(
             "这篇论文的原文实验数据和作者是谁？"
         ))
-
-    def test_explicit_research_document_request_uses_the_archive_path(self):
-        from research_agent import should_force_research_document_save
-
-        self.assertTrue(should_force_research_document_save("把这份方案保存成科研档案"))
-        self.assertTrue(should_force_research_document_save("请导出当前研究计划"))
-        self.assertFalse(should_force_research_document_save("把偏好保存到用户画像"))
-        self.assertFalse(should_force_research_document_save("不要保存这份研究方案"))
 
 
 class TestPdfReaderLayout(unittest.TestCase):
@@ -1569,7 +1513,7 @@ class TestVerifyNode(unittest.TestCase):
             {"role": "assistant", "content": "旧任务完成"},
             {"role": "user", "content": "继续"},
             {"role": "assistant", "content": None, "reasoning_content": "需要读取新章节", "tool_calls": [{
-                "id": "current-call", "function": {"name": "list_research_document_sections", "arguments": "{}"},
+                "id": "current-call", "function": {"name": "list_indexed_papers", "arguments": "{}"},
             }]},
             {"role": "tool", "tool_call_id": "current-call", "content": "当前章节"},
         ]
@@ -1750,7 +1694,7 @@ class TestVerifyNode(unittest.TestCase):
         finally:
             app.checkpointer.conn.close()
 
-    def test_forced_research_document_save_calls_the_archive_tool_once(self):
+    def test_forced_paper_list_calls_the_tool_once(self):
         from graph_builder import build_graph
         from llm_client import LLMClient
 
@@ -1758,27 +1702,27 @@ class TestVerifyNode(unittest.TestCase):
             self._FakeResponse({
                 "content": None,
                 "tool_calls": [{
-                    "id": "archive-1", "type": "function",
+                    "id": "list-1", "type": "function",
                     "function": {
-                        "name": "save_research_document",
-                        "arguments": '{"title":"TSN 方案","content":"# TSN 方案"}',
+                        "name": "list_indexed_papers",
+                        "arguments": "{}",
                     },
                 }],
             }),
-            self._FakeResponse({"content": "已创建科研档案：TSN 方案。"}),
+            self._FakeResponse({"content": "已列出本地论文。"}),
         ]
         with patch("llm_client.requests.post", side_effect=responses) as post, \
-             patch("graph_builder.execute_tool", return_value="✅ 已创建研究档案") as execute:
+             patch("graph_builder.execute_tool", return_value="已索引论文：TSN 论文") as execute:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
-                allowed_tool_names={"save_research_document"},
-                force_tool_name="save_research_document",
+                allowed_tool_names={"list_indexed_papers"},
+                force_tool_name="list_indexed_papers",
                 llm_client=LLMClient("test-key", "https://example.test/chat"),
             )
             try:
                 result = app.invoke(
-                    {"messages": [{"role": "user", "content": "把方案保存成科研档案"}], "metadata": {}},
-                    config={"configurable": {"thread_id": "archive-save"}},
+                    {"messages": [{"role": "user", "content": "列出本地已索引论文"}], "metadata": {}},
+                    config={"configurable": {"thread_id": "forced-list"}},
                 )
             finally:
                 app.checkpointer.conn.close()
@@ -1786,11 +1730,11 @@ class TestVerifyNode(unittest.TestCase):
         first_payload, second_payload = (call.kwargs["json"] for call in post.call_args_list)
         self.assertEqual(
             first_payload["tool_choice"],
-            {"type": "function", "function": {"name": "save_research_document"}},
+            {"type": "function", "function": {"name": "list_indexed_papers"}},
         )
         self.assertEqual(second_payload["tool_choice"], "auto")
         execute.assert_called_once()
-        self.assertEqual(result["messages"][-1]["content"], "已创建科研档案：TSN 方案。")
+        self.assertEqual(result["messages"][-1]["content"], "已列出本地论文。")
 
     def test_verify_clears_retry_metadata_after_success(self):
         """修正后的回复通过验证后，不应把旧反馈带入下一轮对话。"""
@@ -1882,6 +1826,7 @@ class TestVerifyNode(unittest.TestCase):
             }),
             self._FakeResponse({"content": "这是一段超过一百字符的工具结果总结。" * 8}),
             requests.exceptions.ReadTimeout("verify timeout"),
+            requests.exceptions.ReadTimeout("verify retry timeout"),
         ]
         usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
         guard = CircuitBreaker(failure_threshold=1, recovery_seconds=60)
@@ -1907,7 +1852,7 @@ class TestVerifyNode(unittest.TestCase):
             call for call in post.call_args_list
             if call.kwargs["json"].get("temperature") == 0.1
         ]
-        self.assertEqual(len(verify_calls), 1)
+        self.assertEqual(len(verify_calls), 2)
         connect_timeout, read_timeout = verify_calls[0].kwargs["timeout"]
         self.assertEqual(connect_timeout, 3.05)
         self.assertGreater(read_timeout, 3.5)
@@ -1919,6 +1864,42 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(verify_started["purpose"], "verify")
         self.assertEqual(verify_started["priority"], "verify")
         self.assertFalse(verify_started["counts_toward_circuit"])
+        failure = next(event for event in events if event["type"] == "verify_request_failed")
+        self.assertEqual(failure["error_details"]["deadline_ms"], 4000)
+        self.assertEqual(failure["error_details"]["attempts"], 2)
+        self.assertEqual(failure["error_details"]["retries_used"], 1)
+        self.assertGreater(failure["duration_ms"], 0)
+
+    def test_verify_default_budget_allows_recovery_without_marking_run_failed(self):
+        import requests
+        from graph_builder import build_graph
+        from llm_client import LLMClient
+        from resilience import CircuitBreaker
+        events = []
+        guard = CircuitBreaker(failure_threshold=1, recovery_seconds=60)
+        responses = [
+            self._FakeResponse({"content": None, "tool_calls": [{"id": "tool-1", "type": "function",
+                "function": {"name": "list_papers", "arguments": "{}"}}]}),
+            self._FakeResponse({"content": "这是一段超过一百字符的工具结果总结。" * 8}),
+            requests.exceptions.ConnectionError("transient"),
+            self._FakeResponse({"content": "OK"}),
+        ]
+        with patch("llm_client.requests.post", side_effect=responses) as post:
+            app = build_graph(api_key="test-key", checkpoint_db=":memory:", verify_guard=guard,
+                llm_client=LLMClient("test-key", "https://example.test/chat"), event_callback=events.append)
+            try:
+                app.invoke({"messages": [{"role": "user", "content": "列出本地论文并总结"}], "metadata": {}},
+                           config={"configurable": {"thread_id": "verify-recovery"}})
+            finally:
+                app.checkpointer.conn.close()
+        calls = [call for call in post.call_args_list if call.kwargs["json"].get("temperature") == 0.1]
+        self.assertEqual(len(calls), 2)
+        self.assertGreater(calls[0].kwargs["timeout"][1], 100)
+        self.assertLessEqual(calls[0].kwargs["timeout"][1], 120)
+        self.assertLess(calls[1].kwargs["timeout"][1], calls[0].kwargs["timeout"][1])
+        self.assertTrue(any(event["type"] == "verify_request_finished" for event in events))
+        self.assertFalse(any(event["type"] == "verify_request_failed" for event in events))
+        self.assertTrue(guard.allow_request())
 
     def test_stream_retries_same_model_before_first_token(self):
         """流式连接在尚未输出 token 时可以安全重放一次同模型请求。"""
@@ -2549,7 +2530,7 @@ class TestPaperArtifacts(unittest.TestCase):
 
             @classmethod
             def get_paper_chunks(cls, _paper_id):
-                return [{"element_id": chunk["id"]} for chunk in cls.indexed["chunks"]]
+                return [{"element_id": chunk["id"], "text": chunk["text"]} for chunk in cls.indexed["chunks"]]
 
             @staticmethod
             def delete_paper(paper_id):
@@ -2730,281 +2711,6 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(client.calls[0][0]["model"], "test-model")
         self.assertEqual(client.calls[0][1]["policy"].priority.name, "SUMMARY")
         self.assertFalse(client.calls[0][1]["policy"].counts_toward_circuit)
-
-
-class TestResearchDocumentRouting(unittest.TestCase):
-    def test_explicit_document_phrases_select_a_non_authoritative_workflow_hint(self):
-        from research_document_routing import route_research_document_request
-
-        document = {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"}
-        cases = {
-            "新导入了一篇论文，请修改一下科研档案": "new_paper_impact_review",
-            "我新引入了一篇论文，更新研究档案": "new_paper_impact_review",
-            "请补充研究方案中的可行性分析": "safe_patch",
-            "请将以上所有修改全部写入": "full_patch",
-            "将新导入论文与这份方案比对，看看研究内容是否重叠": "paper_comparison",
-            "梳理这份方案的证据与假设，并列出可证伪条件": "ledger",
-            "请做一次创新性审查，看看是否有新颖性": "innovation_review",
-            "这份方案最大的风险是什么": "consult",
-        }
-        for request, expected in cases.items():
-            routed = route_research_document_request(document, request)
-            self.assertEqual(routed["intent"], expected)
-            self.assertIn(document["document_id"], routed["message"])
-            self.assertIn(request, routed["message"])
-
-    def test_new_paper_route_exposes_only_read_only_assessment_tools(self):
-        from research_document_routing import allowed_tools_for_routed_request
-
-        envelope = (
-            "【科研档案路由】\n"
-            "document_id=research-doc-abcdef123456\n"
-            "route=new_paper_impact_review\n\n"
-            "用户请求：新导入了一篇论文，请修改科研档案"
-        )
-        self.assertEqual(
-            allowed_tools_for_routed_request(envelope),
-            frozenset({
-                "list_indexed_papers",
-                "review_new_paper_impact_on_research_document",
-            }),
-        )
-        self.assertIsNone(allowed_tools_for_routed_request("没有路由标记的普通对话"))
-
-    def test_safe_patch_route_exposes_only_document_patch_tools(self):
-        from research_document_routing import allowed_tools_for_routed_request
-
-        envelope = (
-            "【科研档案路由】\n"
-            "document_id=research-doc-abcdef123456\n"
-            "route=safe_patch\n\n"
-            "用户请求：将以上所有修改全部写入"
-        )
-        self.assertEqual(
-            allowed_tools_for_routed_request(envelope),
-            frozenset({
-                "list_research_document_sections",
-                "read_research_document_section",
-                "apply_research_document_patch",
-            }),
-        )
-
-    def test_full_patch_route_exposes_the_two_step_commit_tools(self):
-        from research_document_routing import allowed_tools_for_routed_request
-
-        envelope = (
-            "【科研档案路由】\n"
-            "document_id=research-doc-abcdef123456\n"
-            "route=full_patch\n\n"
-            "用户请求：请将以上所有修改全部写入"
-        )
-        self.assertEqual(
-            allowed_tools_for_routed_request(envelope),
-            frozenset({
-                "prepare_research_document_patch_context",
-                "apply_research_document_patch",
-            }),
-        )
-
-
-class TestResearchDocuments(unittest.TestCase):
-    """Research plans are durable artifacts, not hidden conversation memory."""
-
-    def test_full_patch_context_reads_four_sections_without_partial_output(self):
-        import re
-        from tools import execute_tool
-
-        with tempfile.TemporaryDirectory() as tmp:
-            runtime = Path(tmp) / "runtime"
-            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
-                saved = execute_tool("save_research_document", {
-                    "title": "TSN 方案",
-                    "content": (
-                        "## 研究背景与研究现状\n背景。\n\n"
-                        "## 研究内容与创新\n创新。\n\n"
-                        "## 研究方案与可行性\n方案。\n\n"
-                        "## 研究展望与计划\n计划。"
-                    ),
-                })
-                document_id = re.search(r"`(research-doc-[a-f0-9]{12})`", saved).group(1)
-                context = execute_tool("prepare_research_document_patch_context", {
-                    "document_id": document_id,
-                })
-
-        self.assertIn("完整补丁上下文", context)
-        self.assertIn("研究背景与研究现状", context)
-        self.assertIn("研究内容与创新", context)
-        self.assertIn("研究方案与可行性", context)
-        self.assertIn("研究展望与计划", context)
-        self.assertEqual(context.count("哈希：`"), 4)
-
-    def test_analysis_units_ignore_standalone_bibliography_for_content_matching(self):
-        from tools.research_documents import _analysis_units
-
-        units = _analysis_units(
-            "验证 GCL 容量约束与训练成本。\n\n"
-            "1. Smith A. TSN scheduling. 2024.\n2. Lee B. DRL routing. 2025."
-        )
-        self.assertEqual(units, ["验证 GCL 容量约束与训练成本。"])
-
-    def test_store_uses_fixed_sections_and_checked_patches_with_history(self):
-        from docx import Document
-        from research_documents import ResearchDocumentStore
-        from runtime_paths import RuntimePaths
-
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = RuntimePaths.from_root(Path(tmp) / "runtime")
-            store = ResearchDocumentStore(paths)
-            created = store.save(
-                "TSN 扩散调度验证方案",
-                "# TSN 扩散调度验证方案\n\n## 假设\n- 在突发流量下减少截止期违例。\n\n## 计划\n1. 在 20、50、100 flows 上与 PPO 对比。",
-            )
-
-            self.assertEqual(created["revision"], 1)
-            self.assertTrue(Path(created["markdown_path"]).is_file())
-            self.assertTrue(Path(created["docx_path"]).is_file())
-            self.assertEqual(Document(created["docx_path"]).core_properties.title, "TSN 扩散调度验证方案")
-            self.assertEqual(store.search("PPO")[0]["document_id"], created["document_id"])
-            loaded = store.read(created["document_id"])
-            self.assertEqual(
-                [section["heading"] for section in loaded["sections"]],
-                ["研究背景与研究现状", "研究内容与创新", "研究方案与可行性", "研究展望与计划"],
-            )
-            target = store.read_section(created["document_id"], "outlook_plan")
-            updated = store.apply_patch(
-                created["document_id"],
-                base_revision=target["revision"],
-                operations=[{
-                    "op": "append_to_section",
-                    "section_id": "outlook_plan",
-                    "expected_hash": target["content_hash"],
-                    "content": "增加分布偏移和消融实验。",
-                }],
-            )
-            loaded = store.read(created["document_id"])
-            self.assertEqual(updated["revision"], 2)
-            self.assertIn("分布偏移", loaded["content"])
-            self.assertIn("突发流量", loaded["content"])
-            self.assertEqual(store.list_versions(created["document_id"])[1]["revision"], 1)
-            background = store.read_section(created["document_id"], "background")
-            ledger = store.apply_ledger_patch(
-                created["document_id"],
-                base_revision=0,
-                operations=[{
-                    "op": "upsert_item",
-                    "section_id": "background",
-                    "expected_section_hash": background["content_hash"],
-                    "kind": "hypothesis",
-                    "status": "hypothesis",
-                    "statement": "突发流量下该方案可能减少截止期违例。",
-                    "falsification": "若在相同负载下未优于基线，则否定该假设。",
-                    "evidence": [],
-                }],
-            )
-            self.assertEqual(ledger["ledger_revision"], 1)
-            self.assertEqual(store.read_ledger(created["document_id"])["summary"]["stale_links"], 0)
-            with self.assertRaisesRegex(ValueError, "至少需要一条"):
-                store.apply_ledger_patch(
-                    created["document_id"], base_revision=1,
-                    operations=[{
-                        "op": "upsert_item", "section_id": "background",
-                        "expected_section_hash": background["content_hash"], "kind": "hypothesis",
-                        "status": "supported", "statement": "不应无证据支持", "evidence": [],
-                    }],
-                )
-            with self.assertRaisesRegex(ValueError, "重新读取"):
-                store.apply_patch(
-                    created["document_id"], base_revision=1,
-                    operations=[{
-                        "op": "replace_section", "section_id": "outlook_plan",
-                        "expected_hash": target["content_hash"], "content": "不应写入",
-                    }],
-                )
-            restored = store.restore_version(created["document_id"], base_revision=2, revision=1)
-            self.assertEqual(restored["revision"], 3)
-            self.assertNotIn("分布偏移", store.read(created["document_id"])["content"])
-            with self.assertRaisesRegex(ValueError, "整篇覆盖"):
-                store.save("TSN 扩散调度验证方案", "不应覆盖", document_id=created["document_id"])
-            self.assertTrue(str(Path(loaded["markdown_path"])).startswith(str(paths.research_documents_dir)))
-
-    def test_tool_handlers_keep_research_documents_outside_profile_and_memory(self):
-        import re
-        from tools import execute_tool
-
-        with tempfile.TemporaryDirectory() as tmp:
-            runtime = Path(tmp) / "runtime"
-            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
-                saved = execute_tool("save_research_document", {
-                    "title": "临时实验方案",
-                    "content": "## 目标\n验证 bursty traffic 下的时延和截止期违例。",
-                })
-                document_id = re.search(r"`(research-doc-[a-f0-9]{12})`", saved).group(1)
-                searched = execute_tool("search_research_documents", {"query": "bursty"})
-                loaded = execute_tool("read_research_document", {"document_id": document_id})
-
-            self.assertIn(document_id, searched)
-            self.assertIn("截止期违例", loaded)
-            self.assertTrue((runtime / "primary" / "research_documents" / document_id / "document.docx").is_file())
-            self.assertFalse((runtime / "primary" / "profile.md").exists())
-
-    def test_document_tool_patch_and_global_paper_comparison_are_safe_and_read_only(self):
-        import re
-        from tools import execute_tool
-
-        class _Store:
-            def list_papers(self):
-                return [{"paper_id": "paper-tsn", "title": "TSN Scheduling", "chunks": 2}]
-
-            def get_paper_chunks(self, paper_id):
-                return [
-                    {"paper_id": paper_id, "chunk_index": 0, "page": 3, "section": "Method", "text": "TSN scheduling handles burst traffic and deadline violations."},
-                    {"paper_id": paper_id, "chunk_index": 1, "page": 4, "section": "Experiment", "text": "PPO baseline measures end-to-end delay."},
-                ]
-
-        with tempfile.TemporaryDirectory() as tmp:
-            runtime = Path(tmp) / "runtime"
-            with patch.dict(os.environ, {"APP_DATA_DIR": str(runtime)}, clear=False):
-                saved = execute_tool("save_research_document", {
-                    "title": "TSN 方案",
-                    "content": "## 研究背景与研究现状\nTSN burst traffic\n\n## 研究方案与可行性\nPPO baseline",
-                })
-                document_id = re.search(r"`(research-doc-[a-f0-9]{12})`", saved).group(1)
-                section = execute_tool("read_research_document_section", {
-                    "document_id": document_id, "section_id": "background",
-                })
-                revision = int(re.search(r"第 (\d+) 版", section).group(1))
-                content_hash = re.search(r"哈希：`([^`]+)`", section).group(1)
-                patched = execute_tool("apply_research_document_patch", {
-                    "document_id": document_id,
-                    "base_revision": revision,
-                    "operations": [{
-                        "op": "append_to_section", "section_id": "background",
-                        "expected_hash": content_hash, "content": "补充研究问题。",
-                    }],
-                })
-                before_compare = (runtime / "primary" / "research_documents" / document_id / "document.md").read_text(encoding="utf-8")
-                compared = execute_tool("compare_papers_to_research_document", {
-                    "document_id": document_id, "paper_ids_or_titles": ["paper-tsn"],
-                }, paper_store=_Store())
-                innovation = execute_tool("review_research_document_innovation", {
-                    "document_id": document_id, "paper_ids_or_titles": ["paper-tsn"],
-                }, paper_store=_Store())
-                impact = execute_tool("review_new_paper_impact_on_research_document", {
-                    "document_id": document_id, "paper_id_or_title": "paper-tsn",
-                }, paper_store=_Store())
-                after_compare = (runtime / "primary" / "research_documents" / document_id / "document.md").read_text(encoding="utf-8")
-
-            self.assertIn("安全更新", patched)
-            self.assertIn("4 个固定章节", compared)
-            self.assertIn("第 3 页", compared)
-            self.assertIn("五个审查维度", innovation)
-            self.assertIn("研究问题", innovation)
-            self.assertIn("综合影响审查", impact)
-            self.assertIn("研究内容重叠与可借鉴", impact)
-            self.assertIn("研究方案与可行性影响", impact)
-            self.assertIn("创新性候选（五维）", impact)
-            self.assertIn("不会修改档案、账本或版本", impact)
-            self.assertEqual(before_compare, after_compare)
 
 
 class TestPaperRecordNormalization(unittest.TestCase):
@@ -4529,6 +4235,7 @@ class TestToolRuntime(unittest.TestCase):
 
         self.assertIn("not available", result)
         dispatcher.assert_not_called()
+        self.assertRegex(events[0].pop("call_id"), r"^[a-f0-9]{32}$")
         self.assertEqual(events, [{
             "type": "tool_failed", "tool": "search_papers",
             "error_type": "ToolAccessDenied",
@@ -4773,7 +4480,7 @@ class TestRuntimePaths(unittest.TestCase):
                 self.assertTrue(paths.state_file.exists())
                 self.assertTrue(paths.database_dir.is_dir())
                 self.assertTrue(paths.papers_dir.is_dir())
-                self.assertTrue(paths.research_documents_dir.is_dir())
+                self.assertFalse((paths.primary_dir / "research_documents").exists())
                 self.assertTrue(paths.chroma_dir.is_dir())
                 self.assertTrue(paths.images_dir.is_dir())
                 self.assertEqual(paths.safe_child(paths.papers_dir, "../escape.pdf").parent, paths.papers_dir)
@@ -4871,8 +4578,8 @@ class TestRuntimePaths(unittest.TestCase):
             paths.profile_path.write_text("# 用户画像\n", encoding="utf-8")
             paths.paper_relations_file.write_text('{"version": 1, "relations": []}\n', encoding="utf-8")
             (paths.papers_dir / "paper.pdf").write_bytes(b"%PDF-test")
-            (paths.research_documents_dir / "research-doc-backup").mkdir()
-            (paths.research_documents_dir / "research-doc-backup" / "document.md").write_text(
+            ((paths.primary_dir / "research_documents") / "research-doc-backup").mkdir(parents=True)
+            ((paths.primary_dir / "research_documents") / "research-doc-backup" / "document.md").write_text(
                 "# 备份验证\n", encoding="utf-8",
             )
             output = root / "backups"
@@ -5343,7 +5050,7 @@ class TestAgentToolBudget(unittest.TestCase):
     """The agent budget is expressed in tool rounds, never in graph steps.
 
     Recursion steps and tool rounds differ by roughly a factor of two, and that
-    mismatch is what made "读论文更新档案" hit the ceiling so often.
+    mismatch can cause multi-step paper retrieval to hit the ceiling too soon.
     """
 
     def test_graph_steps_are_derived_from_rounds(self):
@@ -5359,23 +5066,11 @@ class TestAgentToolBudget(unittest.TestCase):
         from research_agent import (
             MAX_AGENT_GRAPH_STEPS,
             MAX_AGENT_TOOL_ROUNDS,
-            RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS,
-            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
-            RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS,
-            RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS,
             graph_steps_for_tool_rounds,
         )
 
         self.assertEqual(
             MAX_AGENT_GRAPH_STEPS, graph_steps_for_tool_rounds(MAX_AGENT_TOOL_ROUNDS)
-        )
-        self.assertEqual(
-            RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS,
-            graph_steps_for_tool_rounds(RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS),
-        )
-        self.assertEqual(
-            RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS,
-            graph_steps_for_tool_rounds(RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS),
         )
 
     def test_chat_budget_is_a_loop_guard_not_a_cost_cap(self):
@@ -5386,12 +5081,9 @@ class TestAgentToolBudget(unittest.TestCase):
         """
         from research_agent import (
             MAX_AGENT_TOOL_ROUNDS,
-            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
         )
 
         self.assertGreaterEqual(MAX_AGENT_TOOL_ROUNDS, 20)
-        # Ideal path is read context -> read dossier -> apply patch.
-        self.assertGreaterEqual(RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS, 6)
 
     def test_rounds_are_counted_per_turn_not_per_call(self):
         from graph_builder import tool_rounds_in
@@ -5519,7 +5211,6 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 return {"messages": [{"role": "assistant", "content": "完成"}]}
 
         cases = (
-            ("把这份方案保存成科研档案", {"save_research_document"}),
             ("超时发生时系统应如何处理？", set()),
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -5543,128 +5234,6 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 agent.memory.close()
                 agent.sessions.close()
 
-    def test_new_paper_route_denies_document_write_tools_on_first_pass(self):
-        from config import Config
-        from research_agent import MAX_AGENT_TOOL_ROUNDS, ResearchAgent
-        from research_document_routing import route_research_document_request
-
-        class _FakeApp:
-            def invoke(self, _state, config):
-                return {"messages": [{"role": "assistant", "content": "请确认拟修改项。"}]}
-
-        envelope = route_research_document_request(
-            {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"},
-            "新导入了一篇论文，请修改一下科研档案",
-        )["message"]
-        with tempfile.TemporaryDirectory() as tmp:
-            agent = ResearchAgent(Config(
-                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
-            ))
-            try:
-                with patch("research_agent.build_graph", autospec=True, return_value=_FakeApp()) as build:
-                    self.assertEqual(agent.step(envelope), "请确认拟修改项。")
-                captured = build.call_args.kwargs
-                self.assertEqual(
-                    captured["allowed_tool_names"],
-                    {"list_indexed_papers", "review_new_paper_impact_on_research_document"},
-                )
-                self.assertEqual(captured["tool_round_budget"], MAX_AGENT_TOOL_ROUNDS)
-            finally:
-                agent.memory.close()
-                agent.sessions.close()
-
-    def test_safe_patch_route_uses_document_only_tools_and_extra_bounded_budget(self):
-        from config import Config
-        from research_agent import (
-            RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS,
-            RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS,
-            ResearchAgent,
-        )
-        from research_document_routing import route_research_document_request
-
-        class _FakeApp:
-            config = None
-
-            def invoke(self, _state, config):
-                self.config = config
-                return {"messages": [{"role": "assistant", "content": "已写入。"}]}
-
-        envelope = route_research_document_request(
-            {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"},
-            "请补充研究方案中的可行性分析",
-        )["message"]
-        with tempfile.TemporaryDirectory() as tmp:
-            agent = ResearchAgent(Config(
-                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
-            ))
-            app = _FakeApp()
-            try:
-                with patch("research_agent.build_graph", autospec=True, return_value=app) as build:
-                    self.assertEqual(agent.step(envelope), "已写入。")
-                captured = build.call_args.kwargs
-                self.assertEqual(
-                    captured["allowed_tool_names"],
-                    {
-                        "list_research_document_sections",
-                        "read_research_document_section",
-                        "apply_research_document_patch",
-                    },
-                )
-                self.assertEqual(captured["tool_round_budget"], RESEARCH_DOCUMENT_PATCH_TOOL_ROUNDS)
-                self.assertEqual(app.config["recursion_limit"], RESEARCH_DOCUMENT_PATCH_GRAPH_STEPS)
-            finally:
-                agent.memory.close()
-                agent.sessions.close()
-
-    def test_full_patch_route_is_bounded_without_verification(self):
-        from config import Config
-        from research_agent import (
-            RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS,
-            RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
-            ResearchAgent,
-        )
-        from research_document_routing import route_research_document_request
-
-        class _FakeApp:
-            config = None
-
-            def invoke(self, _state, config):
-                self.config = config
-                return {"messages": [{"role": "tool", "content": "✅ 已安全更新研究档案"}]}
-
-        envelope = route_research_document_request(
-            {"document_id": "research-doc-abcdef123456", "title": "TSN 方案"},
-            "请将以上所有修改全部写入",
-        )["message"]
-        with tempfile.TemporaryDirectory() as tmp:
-            agent = ResearchAgent(Config(
-                deepseek_key="test-key", rag_enabled=False, data_dir=tmp,
-            ))
-            app = _FakeApp()
-            try:
-                with patch("research_agent.build_graph", autospec=True, return_value=app) as build:
-                    self.assertEqual(agent.step(envelope), "✅ 已安全更新研究档案")
-                captured = build.call_args.kwargs
-                self.assertEqual(
-                    captured["allowed_tool_names"],
-                    {
-                        "prepare_research_document_patch_context",
-                        "apply_research_document_patch",
-                    },
-                )
-                self.assertEqual(captured["tool_round_budget"], RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS)
-                self.assertFalse(captured["enable_verify"])
-                # Two rounds could not even fit the ideal path (read context ->
-                # read dossier -> apply patch), so any retry tripped the limit.
-                self.assertEqual(
-                    captured["max_tool_rounds"],
-                    RESEARCH_DOCUMENT_FULL_PATCH_TOOL_ROUNDS,
-                )
-                self.assertGreaterEqual(captured["max_tool_rounds"], 6)
-                self.assertEqual(app.config["recursion_limit"], RESEARCH_DOCUMENT_FULL_PATCH_GRAPH_STEPS)
-            finally:
-                agent.memory.close()
-                agent.sessions.close()
 
     def test_session_order_is_stable_for_fast_consecutive_creates(self):
         from session_store import SessionStore

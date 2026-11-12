@@ -27,8 +27,10 @@ def public_sse_event(event: dict[str, Any]) -> dict[str, Any]:
             "tool": _bounded_text(event.get("tool"), 80),
             "status": _bounded_text(event.get("status") or "running", 40),
         }
-        if isinstance(event.get("duration_ms"), (int, float)) and not isinstance(event["duration_ms"], bool):
-            payload["duration_ms"] = round(float(event["duration_ms"]), 1)
+        payload.update(bounded_timing_metrics(event))
+        for key, limit in (("call_id", 120), ("agent", 80), ("error_type", 120)):
+            if event.get(key):
+                payload[key] = _bounded_text(event[key], limit)
         return payload
     if event_type == "done":
         payload = {
@@ -55,6 +57,10 @@ def public_sse_event(event: dict[str, Any]) -> dict[str, Any]:
     }
     if event.get("stage"):
         payload["stage"] = _bounded_text(event["stage"], 80)
+    if event.get("verification_round") in (1, 2):
+        payload["verification_round"] = event["verification_round"]
+    if event.get("error_type"):
+        payload["error_type"] = _bounded_text(event["error_type"], 120)
     if event.get("run_id"):
         payload["run_id"] = _bounded_text(event["run_id"], 120)
     # Status events also carry the two bounded timing numbers so a live

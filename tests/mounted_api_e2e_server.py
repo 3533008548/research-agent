@@ -85,6 +85,58 @@ class _E2EAgent:
         self.calls.append({"message": message, "session_id": session_id})
         history = self._histories.setdefault(session_id, [])
         history.append({"role": "user", "content": message})
+        if message == "__verify_repair_limit__":
+            from research_agent import ResearchAgent
+            from run_contract import graph_activity_event
+            events = [
+                {"type": "verify_request_started", "verification_round": 1},
+                {"type": "verify_revision_requested", "verification_round": 1},
+                {"type": "verify_request_started", "verification_round": 2},
+                {"type": "verify_request_finished", "verification_round": 2, "duration_ms": 100},
+                {"type": "verify_unresolved", "verification_round": 2},
+            ]
+            for event in events:
+                ResearchAgent._persist_chat_event(self, session_id, _kwargs["run_id"], event, 100)
+                _kwargs["on_progress"](graph_activity_event(event))
+            answer = "一次修正后的回复，仍有问题待确认。"
+            history.append({"role": "assistant", "content": answer})
+            self._traces[session_id] = {"outcome": "success"}
+            return answer
+        if message == "__verify_timeout__":
+            from research_agent import ResearchAgent
+            from run_contract import graph_activity_event
+            failure = {"type": "verify_request_failed", "error_type": "LLMRequestTimeoutError", "duration_ms": 45010,
+                "error_details": {"code": "LLM_RESPONSE_TIMEOUT", "phase": "response_headers", "elapsed_ms": 45010,
+                    "deadline_ms": 45000, "attempts": 1, "retries_used": 0, "response_body": "PRIVATE_DIAGNOSTIC"}}
+            for event in ({"type": "verify_request_started"}, {"type": "verify_status"}, failure):
+                ResearchAgent._persist_chat_event(self, session_id, _kwargs["run_id"], event, 45010)
+                _kwargs["on_progress"](graph_activity_event(event))
+            answer = "已保留的正常回复"
+            history.append({"role": "assistant", "content": answer})
+            self._traces[session_id] = {"outcome": "success"}
+            return answer
+        if message == "__tools__":
+            from research_agent import ResearchAgent
+            from run_contract import graph_activity_event
+            from tool_runtime import ToolExecutionContext, ToolRuntime
+            def emit(kind, **details):
+                event = {"type": kind, **details}
+                ResearchAgent._persist_chat_event(self, session_id, _kwargs["run_id"], event, 0)
+                if _kwargs.get("on_progress"):
+                    _kwargs["on_progress"](graph_activity_event(event))
+            def execute(name, args, **kwargs):
+                cancel_event.wait(timeout=1.8)
+                return "❌ E2E_PRIVATE_TOOL_RESULT" if name == "read_pdf" else "E2E_PRIVATE_TOOL_RESULT"
+            runtime = ToolRuntime(ToolExecutionContext(), event_callback=emit, executor=execute)
+            runtime.execute("query_papers", {"query": "E2E_PRIVATE_TOOL_ARGUMENT"})
+            runtime.execute("read_pdf", {"url_or_path": "E2E_PRIVATE_TOOL_ARGUMENT"})
+            # A finished tool/model stage must not mark the whole run as completed.
+            _kwargs["on_progress"]({"type": "status", "stage": "model", "status": "completed"})
+            cancel_event.wait(timeout=1.8)
+            self._traces[session_id] = {"outcome": "success"}
+            answer = "工具状态测试完成"
+            history.append({"role": "assistant", "content": answer})
+            return answer
         if message == "__error__":
             raise RuntimeError("浏览器 E2E 受控失败")
         if message == "__http401__":
@@ -101,6 +153,20 @@ class _E2EAgent:
                 "api_key": "E2E_PRIVATE_KEY_DO_NOT_RENDER",
             }
             raise error
+        if message == "__scroll__":
+            answer = "历史段落，用于验证向上阅读。\n\n" * 60
+            on_token(answer)
+            for index in range(60):
+                if cancel_event.wait(timeout=0.15):
+                    self._traces[session_id] = {"outcome": "cancelled"}
+                    return answer
+                part = f"流式新增第 {index + 1} 段。\n\n"
+                answer += part
+                on_token(part)
+            self._traces[session_id] = {"outcome": "success"}
+            history.append({"role": "assistant", "content": answer})
+            return answer
+
         if message == "__slow__":
             on_token("旧会话片段")
             cancel_event.wait(timeout=4)
@@ -149,11 +215,6 @@ def create_e2e_app(data_dir: str, redis_url: str = ""):
     app = create_app(agent=agent, title="科研助手 API 浏览器 E2E", chat_run_manager=manager, research_run_manager=research_manager)
     app.state.e2e_uses_redis = bool(redis_url)
 
-    @app.post("/__e2e__/documents", include_in_schema=False)
-    def e2e_create_document(payload: dict) -> dict:
-        # This fixture-only route seeds the same isolated store read by the
-        # production document API; no model or user runtime is involved.
-        return app.state.research_document_store.save(payload["title"], payload["content"])
 
     @app.get("/__e2e__/state", include_in_schema=False)
     def e2e_state() -> dict:
@@ -165,6 +226,26 @@ def create_e2e_app(data_dir: str, redis_url: str = ""):
                     "status": run["status"], "answer": run.get("answer", ""),
                 })
         return {"calls": list(agent.calls), "runs": runs, "uses_redis": app.state.e2e_uses_redis}
+
+    @app.post("/__e2e__/research-activity", include_in_schema=False)
+    def e2e_research_activity(payload: dict) -> dict:
+        store = research_manager.projects
+        project = store.list()[0]
+        project_id = project["project_id"]
+        if payload["phase"] == "start":
+            lead = store.claim(store.jobs(project_id)[0]["job_id"])
+            store.complete(lead, {"action": "research", "tasks": [
+                {"gap": "条件", "question": "任务一", "expected": "全文条件", "difference": "首次"},
+                {"gap": "反例", "question": "任务二", "expected": "原文反例", "difference": "首次"}]})
+            for queued in store.jobs(project_id):
+                if queued["role"].startswith("researcher"):
+                    job = store.claim(queued["job_id"])
+                    store.record_activity(job, {"type": "tool_started", "tool": "query_papers", "call_id": job["job_id"]})
+        else:
+            for job in store.jobs(project_id):
+                if job["role"].startswith("researcher"):
+                    store.record_activity(job, {"type": "tool_finished", "tool": "query_papers", "call_id": job["job_id"], "duration_ms": 1200})
+        return {"project_id": project_id}
 
     dist = ROOT / "frontend" / "dist"
     if not mount_react_frontend(app, dist):

@@ -11,22 +11,6 @@ from tools.paper_relations import (
     handle_list_relation_candidates,
     handle_save_paper_relation,
 )
-from tools.research_documents import (
-    handle_apply_research_document_patch,
-    handle_apply_research_document_ledger_patch,
-    handle_compare_papers_to_research_document,
-    handle_list_research_document_sections,
-    handle_list_research_document_versions,
-    handle_prepare_research_document_patch_context,
-    handle_read_research_document,
-    handle_read_research_document_ledger,
-    handle_read_research_document_section,
-    handle_review_new_paper_impact_on_research_document,
-    handle_review_research_document_innovation,
-    handle_restore_research_document_version,
-    handle_save_research_document,
-    handle_search_research_documents,
-)
 from tools.describe import handle_describe_image
 from tools.profile_tool import handle_read_profile, handle_update_profile
 from cancellation import raise_if_cancelled
@@ -41,20 +25,6 @@ _TOOL_HANDLERS = {
     "list_relation_candidates": handle_list_relation_candidates,
     "save_paper_relation": handle_save_paper_relation,
     "delete_paper_relation": handle_delete_paper_relation,
-    "save_research_document": handle_save_research_document,
-    "search_research_documents": handle_search_research_documents,
-    "read_research_document": handle_read_research_document,
-    "list_research_document_sections": handle_list_research_document_sections,
-    "read_research_document_section": handle_read_research_document_section,
-    "prepare_research_document_patch_context": handle_prepare_research_document_patch_context,
-    "apply_research_document_patch": handle_apply_research_document_patch,
-    "read_research_document_ledger": handle_read_research_document_ledger,
-    "apply_research_document_ledger_patch": handle_apply_research_document_ledger_patch,
-    "list_research_document_versions": handle_list_research_document_versions,
-    "restore_research_document_version": handle_restore_research_document_version,
-    "compare_papers_to_research_document": handle_compare_papers_to_research_document,
-    "review_research_document_innovation": handle_review_research_document_innovation,
-    "review_new_paper_impact_on_research_document": handle_review_new_paper_impact_on_research_document,
     "describe_image": handle_describe_image,
     "query_papers": handle_query_papers,
     "list_papers": handle_list_papers,

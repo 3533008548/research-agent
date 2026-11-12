@@ -16,6 +16,7 @@ import {
 } from "../api";
 import { userFacingError } from "../lib/errors";
 import { appendRunEvent, displayMessages, type ResearchMode } from "../lib/labels";
+import { stopTiming, timingFromRun } from "../lib/runTiming";
 import { useSessionConversationState } from "./useSessionConversationState";
 import type { Notice } from "../lib/workspace";
 import type {
@@ -28,6 +29,16 @@ const ACTIVE_SESSION_KEY = "research-agent.active-session";
 const isPendingRun = (run: Run | null | undefined) => Boolean(
   run && !run.research && ["queued", "running", "cancelling"].includes(run.status),
 );
+
+function restoredMessages(history: Parameters<typeof displayMessages>[0], run?: Run) {
+  const messages = displayMessages(history);
+  const last = messages.at(-1);
+  // History has no run IDs. Only annotate a reply that actually matches this run.
+  if (run && last?.role === "assistant" && run.answer && last.content === run.answer) {
+    last.timing = timingFromRun(run);
+  }
+  return messages;
+}
 
 /**
  * Session navigation only changes the visible conversation. Each run keeps
@@ -66,7 +77,7 @@ export function useConversation({
     const target = getSession(project.origin_session_id).currentRun;
     if (target?.run_id !== project.project_id || target.updated_at >= project.updated_at) return;
     bindSession(project.origin_session_id).setCurrentRun(current => current?.run_id === project.project_id
-      ? { ...current, status, answer: project.report, research: project, updated_at: project.updated_at } : current);
+      ? { ...current, status, answer: project.report, research: { ...current.research, ...project }, updated_at: project.updated_at } : current);
   }, [getSession, bindSession]);
 
   useEffect(() => () => {
@@ -80,10 +91,11 @@ export function useConversation({
     const controller = new AbortController();
     streams.current.set(run.run_id, controller);
     const { setMessages, setCurrentRun, setRunEvents, setIsSending, setSessionUsage } = bindSession(sessionId);
-    const complete = (answer?: string) => setMessages((current) => {
+    const complete = (answer?: string, detail?: Run, finished = true) => setMessages((current) => {
       const last = current.at(-1);
-      return last?.role === "assistant" && last.streaming
-        ? [...current.slice(0, -1), { ...last, content: answer ?? last.content, streaming: false }]
+      return last?.role === "assistant" && (last.streaming || last.timing)
+        ? [...current.slice(0, -1), { ...last, content: answer ?? last.content, streaming: false,
+          timing: (detail && timingFromRun(detail)) || (finished ? stopTiming(last.timing) : last.timing) }]
         : current;
     });
     setCurrentRun(run);
@@ -99,7 +111,7 @@ export function useConversation({
               : current;
           });
         }
-        if (event.type === "status" || event.type === "done") {
+        if (event.type === "done" || (event.type === "status" && (!event.stage || event.stage === "run"))) {
           const completed = event.type === "done" && event.status === "completed";
           setCurrentRun((current) => current && {
             ...current, status: event.status || current.status,
@@ -119,12 +131,13 @@ export function useConversation({
       if (controller.signal.aborted) return;
       const detail = await getRun(apiKey, run.run_id);
       setCurrentRun(detail);
-      complete(detail.answer || undefined);
+      setRunEvents(detail.events);
+      complete(detail.answer || undefined, detail);
       if (isPendingRun(detail)) bindSession(sessionId).setLoaded(false);
       // History and run status are separate snapshots. On reconnect, reload
       // the final transcript so a completion during loading is not duplicated.
       if (restoring && !isPendingRun(detail)) {
-        setMessages(displayMessages(await getSessionMessages(apiKey, sessionId)));
+        setMessages(restoredMessages(await getSessionMessages(apiKey, sessionId), detail));
       }
       const [refreshedSessions, usage] = await Promise.all([
         listSessions(apiKey), getSessionUsage(apiKey, sessionId),
@@ -139,7 +152,7 @@ export function useConversation({
       // A broken event connection does not prove the server task failed.
       // Reloading this session reconnects to its persisted run.
       bindSession(sessionId).setLoaded(false);
-      complete();
+      complete(undefined, undefined, false);
       if (activeSessionRef.current === sessionId) {
         setNotice({ kind: "error", text: userFacingError(error) });
       }
@@ -162,24 +175,46 @@ export function useConversation({
         getSessionMessages(apiKey, sessionId), getSessionUsage(apiKey, sessionId),
       ]);
       const runs = await listSessionRuns(apiKey, sessionId);
-      const run = runs.find((item) => ["chat", "research"].includes(item.kind));
+      const latest = runs.find((item) => ["chat", "research"].includes(item.kind));
+      const run = latest ? await getRun(apiKey, latest.run_id) : undefined;
       const pending = run && !run.research && isPendingRun(run);
-      const restored = displayMessages(history);
+      const restored = restoredMessages(history, run);
       if (pending) {
-        restored.push({ id: `assistant-${run.run_id}`, role: "assistant", content: "", streaming: true });
+        restored.push({ id: `assistant-${run.run_id}`, role: "assistant", content: "", streaming: true, timing: timingFromRun(run) });
       } else if (run?.answer && restored.at(-1)?.role === "user") {
-        restored.push({ id: `assistant-${run.run_id}`, role: "assistant", content: run.answer });
+        restored.push({ id: `assistant-${run.run_id}`, role: "assistant", content: run.answer, timing: timingFromRun(run) });
       }
       target.setMessages(restored);
       target.setSessionUsage(usage);
       target.setCurrentRun(run || null);
-      target.setRunEvents([]);
+      // Active streams replay from their start; use persisted history for finished runs.
+      target.setRunEvents(pending ? [] : run?.events || []);
       target.setLoaded(true);
       if (pending) void observeRun(sessionId, run, `/api/v1/runs/${encodeURIComponent(run.run_id)}/events`, true);
     } finally {
       target.setLoading(false);
     }
   }, [apiKey, bindSession, getSession, observeRun]);
+
+  const researchRunId = currentRun?.research ? currentRun.run_id : "";
+  useEffect(() => {
+    if (!researchRunId) return;
+    let disposed = false;
+    let timer: number;
+    const target = bindSession(activeSessionId);
+    const refresh = async () => {
+      try {
+        const detail = await getRun(apiKey, researchRunId);
+        if (!disposed) {
+          target.setCurrentRun(current => current?.run_id === researchRunId && current.updated_at <= detail.updated_at ? detail : current);
+          target.setRunEvents(detail.events);
+        }
+      } catch { /* The workbench reports connection errors; keep the last known activity. */ }
+      if (!disposed) timer = window.setTimeout(() => void refresh(), 2000);
+    };
+    void refresh();
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [apiKey, activeSessionId, researchRunId, bindSession]);
 
   async function uploadAttachment(file: File) {
     if (isUploading || isSending) {
@@ -336,10 +371,12 @@ export function useConversation({
     setCurrentRun(null);
     setNotice(null);
     setRunEvents([]);
+    const submittedAt = Date.now();
     setMessages((current) => [
       ...current,
       { id: `user-${Date.now()}`, role: "user", content: shownContent },
-      { id: `assistant-${Date.now()}`, role: "assistant", content: "", streaming: true },
+      { id: `assistant-${submittedAt}`, role: "assistant", content: "", streaming: true,
+        timing: { elapsedMs: 0, sampledAt: submittedAt, running: true } },
     ]);
 
     try {
@@ -373,6 +410,7 @@ export function useConversation({
         setMessages(current => {
           const last = current.at(-1);
           return last?.streaming ? [...current.slice(0, -1), { ...last, streaming: false,
+            timing: undefined,
             content: "多 Agent 研究已启动。可在对话区查看判断、证据和阶段报告，或暂停、调整目标。选择输入框中的“对话”可继续聊天。" }] : current;
         });
       } else {
@@ -383,7 +421,7 @@ export function useConversation({
       setMessages((current) => {
         const last = current.at(-1);
         return last?.role === "assistant" && last.streaming
-          ? [...current.slice(0, -1), { ...last, content: `⚠️ ${message}`, streaming: false }]
+          ? [...current.slice(0, -1), { ...last, content: `⚠️ ${message}`, streaming: false, timing: stopTiming(last.timing) }]
           : current;
       });
       if (activeSessionRef.current === activeSessionId) setNotice({ kind: "error", text: message });

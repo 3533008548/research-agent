@@ -62,9 +62,44 @@ export function failedRunEvent(event: RunEvent): boolean {
   return event.type === "error" || event.status === "failed" || event.status === "partial_failed";
 }
 
+export function runEventStatusLabel(event: RunEvent): string {
+  if (event.status === "waiting" && ["model", "verify"].includes(event.stage || "")) return "等待模型服务";
+  if (event.stage === "verify" && failedRunEvent(event)) {
+    return event.error_type === "LLMRequestTimeoutError" || /TIMEOUT|DEADLINE_EXCEEDED/.test(event.error_details?.code || "")
+      ? "核验超时" : "核验未完成";
+  }
+  return "";
+}
+
+export function verificationIncomplete(events: RunEvent[]): boolean {
+  const latest = [...events].reverse().find(event => event.stage === "verify");
+  return !!latest && ["failed", "skipped", "cancelled", "unresolved", "inconclusive"].includes(latest.status || "");
+}
+
+export function verificationNotice(events: RunEvent[]): string {
+  const latest = [...events].reverse().find(event => event.stage === "verify");
+  if (latest?.status === "unresolved") return "仍有待确认的事实问题；已达到一次自动修正上限。";
+  if (latest?.status === "inconclusive") return "核验未返回可用结论，本轮回复仍需核对。";
+  if (latest?.status === "advisory") return "核验有非阻断提示，已保留回答。";
+  return verificationIncomplete(events) ? "事实核验未完成，本轮回复未经完整核验。" : "";
+}
+
 /** A terminal transport event can describe failure; its type is not success. */
 export function runEventDescription(event: RunEvent, fallback = event.stage || "任务状态更新"): string {
+  if (event.stage === "verify" && failedRunEvent(event)) {
+    return `${runEventStatusLabel(event)}，已保留回复；这不表示发现了事实错误。`;
+  }
   if (event.summary) return event.summary;
+  if (event.stage === "verify") {
+    const descriptions: Record<string, string> = {
+      passed: "本次核验未发现问题", advisory: "有非阻断提示，保留回答，不触发自动重写",
+      revision_requested: "发现影响核心结论的事实问题，开始一次定向修正",
+      unresolved: "仍有待确认问题，已达到一次自动修正上限",
+      inconclusive: "核验未返回可用结论，保留回复，不自动重写",
+      completed: "核验模型已返回结果",
+    };
+    if (descriptions[event.status || ""]) return descriptions[event.status!];
+  }
   if (failedRunEvent(event)) return event.error_type ? `运行未完成：${event.error_type}` : "运行未完成，可查看错误诊断";
   if (event.status === "cancelled") return "任务已取消";
   if (event.type === "done" && event.status === "completed") return "已生成最终结果";
