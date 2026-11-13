@@ -91,6 +91,12 @@ def prepare_model_context(
     active_start = len(original) - 1
     while active_start > 0 and original[active_start].get('role') == 'tool':
         active_start -= 1
+    # Steering notes or a draft can follow the current tool group. They must
+    # not reclassify evidence just fetched for this user request as old history.
+    latest_call = max((i for i in range(latest_user, len(original))
+                       if original[i].get('role') == 'assistant' and original[i].get('tool_calls')),
+                      default=active_start)
+    active_start = min(active_start, latest_call)
     tail_start = _tail_start(
         original,
         min_start=head_end,

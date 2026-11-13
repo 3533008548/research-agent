@@ -116,6 +116,11 @@ class TestToolResults(unittest.TestCase):
         self.assertEqual(view.messages[-1]['content'], current)
         self.assertIn('FINAL_WITNESS', view.messages[-1]['content'])
         self.assertEqual(messages, before)
+        for following in ({'role': 'system', 'content': '用户补充：仔细核对符号'},
+                          {'role': 'assistant', 'content': '等待核验的答复'}):
+            steered = prepare_model_context(messages + [following], context_limit=131072)
+            self.assertEqual(steered.messages[-2]['content'], current)
+            self.assertIn('FINAL_WITNESS', steered.messages[-2]['content'])
 
     def test_legacy_truncated_message_never_claims_full_original_is_preserved(self):
         from context_engine import _slim_old_message
