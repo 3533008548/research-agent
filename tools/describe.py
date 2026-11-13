@@ -16,6 +16,7 @@ def handle_describe_image(
     args: dict,
     *,
     memory_store=None,
+    paper_store=None,
     llm_client=None,
     vision_model: str = DEFAULT_VISION_MODEL,
     cancel_event=None,
@@ -27,11 +28,20 @@ def handle_describe_image(
     client for admission control, but failures do not contribute to the chat
     circuit breaker.
     """
-    image_path = str(args.get("image_path", "") or "").strip()
-    if not image_path:
-        return "❌ 请提供图片路径。"
-
     paths = get_runtime_paths()
+    image_path = str(args.get("image_path", "") or "").strip().strip('"\'')
+    source_note = ""
+    if args.get('paper_id_or_title'):
+        if image_path:
+            return '❌ 请使用图片路径或论文与图号中的一种定位方式。'
+        try:
+            from paper_images import resolve_paper_image
+            resolved, source_note = resolve_paper_image(args, paper_store, paths)
+            image_path = str(resolved)
+        except (ValueError, OSError, TypeError) as exc:
+            return f'❌ 图片定位失败：{exc}'
+    if not image_path:
+        return "❌ 请提供图片路径，或 paper_id_or_title 与 figure/page；可用 list_paper_images 查询图片目录。"
     requested = Path(image_path).expanduser()
     p = None
     allowed_dirs = (paths.images_dir, paths.papers_dir)
@@ -52,7 +62,10 @@ def handle_describe_image(
                 break
 
     if p is None or not p.is_file():
-        return f"❌ 图片不存在: {image_path}"
+        return f"❌ 图片不存在: {image_path}。请用 list_paper_images 查询当前论文目录，或直接传 paper_id_or_title 与 figure/page，不要猜路径。"
+    if not source_note:
+        from paper_images import asset_source_note
+        source_note = asset_source_note(p)
     if p.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
         return "❌ 仅支持 PNG、JPG 或 JPEG 图片。"
     if p.stat().st_size > MAX_IMAGE_BYTES:
@@ -63,13 +76,15 @@ def handle_describe_image(
     task = str(args.get("task") or "describe")
     if task not in {"describe", "transcribe_algorithm"}:
         return "❌ task 仅支持 describe 或 transcribe_algorithm。"
-    cache_key = str(p) if task == "describe" else str(p) + "#algorithm-transcription-v1"
+    import hashlib
+    scope_key = hashlib.sha256(source_note.encode()).hexdigest()[:12] if source_note else ''
+    cache_key = (str(p) if task == "describe" else str(p) + "#algorithm-transcription-v1") + scope_key
 
     # ── 描述缓存命中 ──
     if memory_store:
         cached = memory_store.get_image_description(cache_key)
         if cached:
-            return f"🖼️ 图片描述 ({p.name}) [缓存]:\n{cached}"
+            return f"🖼️ 图片描述 ({p.name}) [缓存]:\n" + (source_note + '\n' if source_note else '') + cached
 
     # ── 附带图注（sidecar）──
     caption_text = ""
@@ -105,6 +120,8 @@ def handle_describe_image(
         prompt += f"\n论文中的图注是: 「{caption_text[:200]}」\n请结合图注理解图片，描述各子图的内容和它们的关系。"
     else:
         prompt += "如果是网络架构图，描述每层结构和数据流；如果是流程图，描述每个步骤；如果是实验数据图，描述数据和结论。用中文回答。"
+    if source_note:
+        prompt += '\n来源定位：' + source_note
 
     try:
         resp = llm_client.post(
@@ -140,4 +157,4 @@ def handle_describe_image(
         except Exception:
             pass
 
-    return f"🖼️ 图片描述 ({p.name}):\n{desc}"
+    return f"🖼️ 图片描述 ({p.name}):\n" + (source_note + '\n' if source_note else '') + desc

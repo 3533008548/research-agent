@@ -98,14 +98,25 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     algorithm_evidence = query_algorithm_evidence(query, scope, get_runtime_paths(), section=section)
     if algorithm_evidence is not None:
         return algorithm_evidence
+    from paper_images import figure_numbers
+    image_prefix = ""
+    numbers = figure_numbers(query)
+    if scope and numbers:
+        from tools.paper_images import handle_list_paper_images
+        for paper_id in scope[:2]:
+            for number in sorted(numbers, key=int)[:2]:
+                image_prefix += handle_list_paper_images(
+                    {"paper_id_or_title": paper_id, "figure": number, "limit": 2},
+                    paper_store=paper_store,
+                ) + "\n\n"
     results, pending = paper_store.query_with_timeout(
         query, top_k=top_k, paper_ids=scope, section=section,
     )
     if pending and results is None:
-        return f"⏳ {pending}"
+        return image_prefix + f"⏳ {pending}"
     if not results:
         prefix = f"⏳ {pending}\n\n" if pending else ""
-        return prefix + "📭 未找到相关内容。请先阅读并索引论文（read_pdf 会自动索引）。"
+        return image_prefix + prefix + "📭 未找到相关正文片段。"
     retrieval_mode = results[0].get("retrieval", "semantic")
     prefix = f"⏳ {pending}\n\n" if pending else ""
     heading = {
@@ -167,7 +178,7 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     summary = _relation_summary(results)
     if summary:
         lines.append(f"\n{summary}")
-    return "\n".join(lines)
+    return image_prefix + "\n".join(lines)
 
 
 def _relation_summary(results: list[dict]) -> str:

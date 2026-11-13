@@ -57,14 +57,35 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "describe_image",
-                "description": "用 DeepSeek 视觉模型描述论文图片；核对算法伪代码时用 transcribe_algorithm 逐行转写原页裁图。",
+                "description": "查看论文原图。可提供 image_path，或直接提供 paper_id_or_title 与 figure/page，自动从原 PDF 生成图片，不必让用户截图或提供路径。算法核对用 transcribe_algorithm。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "image_path": {"type": "string", "description": "图片路径"},
+                        "paper_id_or_title": {"type": "string", "description": "论文标题或 paper_id；与 figure 或 page 合用，和 image_path 二选一"},
+                        "figure": {"type": "string", "description": "图号，例如 4、Fig. 4 或图四；自动定位原页，包括矢量图"},
+                        "page": {"type": "integer", "minimum": 1, "maximum": 100, "description": "从 1 开始的 PDF 页码；可与图号合用消除歧义"},
                         "task": {"type": "string", "enum": ["describe", "transcribe_algorithm"], "description": "默认 describe；算法原文核对用 transcribe_algorithm，保留行号、缩进和符号"},
                     },
-                    "required": ["image_path"],
+                    "anyOf": [{"required": ["image_path"]}, {"required": ["paper_id_or_title", "figure"]}, {"required": ["paper_id_or_title", "page"]}],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_paper_images",
+                "description": "查找论文图片的图号、页码和实际保存路径。兼容旧索引，缺失图片会从原 PDF 恢复；矢量图提供包含该图的整页原图。历史读取结果被截断时用此工具重新查找。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paper_id_or_title": {"type": "string", "description": "已索引论文标题或 paper_id"},
+                        "figure": {"type": "string", "description": "可选图号，例如 4、Fig. 4 或图四"},
+                        "page": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "offset": {"type": "integer", "minimum": 0, "description": "目录分页起点，默认 0"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "最多返回条数，默认 10"},
+                    },
+                    "required": ["paper_id_or_title"],
                 },
             },
         },

@@ -15,6 +15,8 @@ fs.writeFileSync(path.join(profile, 'runtime', 'primary', 'settings.json'), JSON
 const source = path.resolve(process.argv[2] || path.join(profile, 'source paper.pdf'));
 const algorithmNumber = process.argv[3] || '4';
 assert.match(algorithmNumber, /^\d+$/);
+const figureNumber = process.argv[4];
+if (figureNumber) assert.match(figureNumber, /^\d+$/);
 if (!process.argv[2]) {
   execFileSync('python', ['-c', [
     'import pymupdf,sys',
@@ -105,7 +107,8 @@ const model = http.createServer((req, res) => {
     console.log(`${name}: passed`);
     return result;
   }
-  await runTool('read_pdf', { url_or_path: '"' + source + '"', max_pages: 100 });
+  const firstRead = await runTool('read_pdf', { url_or_path: '"' + source + '"', max_pages: 100 });
+  assert.match(firstRead, /list_paper_images/);
   const library = await api('/library');
   assert.equal(library.documents.length, 1);
   const document = library.documents[0];
@@ -119,9 +122,20 @@ const model = http.createServer((req, res) => {
   const answer = await runTool('query_papers', { query: 'Algorithm ' + algorithmNumber, paper_id_or_title: papers[0].paper_id, top_k: 1 });
   assert.match(answer, new RegExp('Algorithm ' + algorithmNumber + '\\b', 'i'));
   assert.match(answer, /Return/i);
+  if (figureNumber) {
+    const images = await runTool('list_paper_images', { paper_id_or_title: papers[0].paper_id, figure: figureNumber });
+    const imagePath = images.match(/图片路径：([^\r\n]+)/)?.[1];
+    assert.ok(imagePath && fs.existsSync(imagePath), images);
+    assert.match(images, /整页原图/);
+    fs.unlinkSync(imagePath);
+    const vision = await runTool('describe_image', { paper_id_or_title: papers[0].paper_id, figure: figureNumber });
+    assert.match(vision, new RegExp('Figure ' + figureNumber + '\\b'));
+    assert.ok(fs.existsSync(imagePath), 'Deleted image was not regenerated');
+  }
   console.log(JSON.stringify({ profile, pages: document.pages, indexedPapers: papers.length, chunks: papers[0].chunks,
     checks: ['quoted absolute path import', 'bundled OCR without system installation', 'library listing',
-      'managed-path reindex', 'duplicate replacement', 'algorithm retrieval'] }));
+      'managed-path reindex', 'duplicate replacement', 'algorithm retrieval',
+      ...(figureNumber ? ['figure directory', 'vision by figure', 'image cache recovery'] : [])] }));
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (desktop) await desktop.close().catch(() => {});
   model.close();

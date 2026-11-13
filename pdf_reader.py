@@ -81,7 +81,7 @@ class PaperReader:
     """增强型 PDF 阅读器，先保留页面元素关系，再渲染为兼容的 Markdown 文本。"""
 
     _TABLE_CAPTION = re.compile(r"(?:table|tab\\.?|表)\\s*\\d+", re.IGNORECASE)
-    _FIGURE_CAPTION = re.compile(r"(?:figure|fig\\.?|图)\\s*\\d+", re.IGNORECASE)
+    _FIGURE_CAPTION = re.compile(r"(?:figure|fig\.?|图)\s*\d+", re.IGNORECASE)
 
     def __init__(self, max_pages: int = 15, max_chars: int | None = None):
         if pymupdf is None:
@@ -337,38 +337,13 @@ class PaperReader:
     def _extract_figure_elements(
         self, page, page_number: int, text_blocks: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        images = []
-        try:
-            for info in page.get_image_info():
-                bbox = info.get("bbox")
-                if not bbox:
-                    continue
-                x0, y0, x1, y1 = (float(value) for value in bbox)
-                if (x1 - x0) * (y1 - y0) >= 5_000:
-                    images.append([x0, y0, x1, y1])
-        except Exception:
-            return []
-        groups: list[list[list[float]]] = []
-        for bbox in sorted(images, key=lambda item: (item[1], item[0])):
-            if groups and bbox[1] - max(item[3] for item in groups[-1]) < 20:
-                groups[-1].append(bbox)
-            else:
-                groups.append([bbox])
+        from paper_images import figure_regions
 
-        elements = []
-        for index, group in enumerate(groups, start=1):
-            bbox = [min(item[0] for item in group), min(item[1] for item in group), max(item[2] for item in group), max(item[3] for item in group)]
-            caption_block = self._find_caption(text_blocks, bbox, self._FIGURE_CAPTION, prefer_below=True)
-            caption = caption_block["text"] if caption_block else ""
-            label = self._caption_label(caption, self._FIGURE_CAPTION, f"Figure {index}")
-            elements.append({
-                "id": f"p{page_number:03d}-f{index:02d}",
-                "kind": "figure", "page": page_number, "order": 20_000 + index,
-                "section": "未标注", "label": label, "caption": caption,
-                "caption_element_id": "", "asset_path": "", "bbox": bbox,
-                "related_ids": [],
-            })
-        return elements
+        return [{**figure, "id": f"p{page_number:03d}-f{index:02d}",
+                 "kind": "figure", "page": page_number, "order": 20_000 + index,
+                 "section": "未标注", "caption_element_id": "", "asset_path": "",
+                 "related_ids": []}
+                for index, figure in enumerate(figure_regions(page), 1)]
 
     @staticmethod
     def _block_represented(block: dict, element: dict) -> bool:
@@ -434,8 +409,9 @@ class PaperReader:
         for element in elements:
             if element.get("kind") == "text":
                 continue
-            bbox = element.get("bbox") or [0, 0, 0, 0]
-            caption = PaperReader._find_caption(
+            bbox = element.get("caption_bbox") or element.get("bbox") or [0, 0, 0, 0]
+            caption = next((text for text in text_elements if element.get("caption") and element["caption"] in text["text"]), None)
+            caption = caption or PaperReader._find_caption(
                 [{"text": text["text"], "bbox": text["bbox"], "id": text["id"]} for text in text_elements],
                 bbox,
                 PaperReader._TABLE_CAPTION if element.get("kind") == "table" else PaperReader._FIGURE_CAPTION,
@@ -480,147 +456,13 @@ def extract_images(
     max_pages: int = 15,
     output_dir: str | Path | None = None,
 ) -> list[str]:
-    """
-    图注感知图片提取：
-      1. 找图注文字（Figure N: / Fig. N:）作为锚点
-      2. 同图注下方的图片合并为一个 figure 分组
-      3. 渲染合并区域的外接矩形为一张 PNG（保留子图关系）
-      4. 无图注时按位置相邻（gap < 20px）分组回退
-      5. 过滤面积 < 5000 px² 的小图（图标/logo）
-    """
-    try:
-        import pymupdf
-    except ImportError:
-        print("      ⚠ PyMuPDF 未安装，跳过图片提取。pip install PyMuPDF", file=sys.stderr)
-        return []
-
-    from pathlib import Path
-    import re as _re
-
+    """Export discoverable, page-grounded images including vector figures."""
+    from paper_images import extract_pdf_images
     if output_dir is None:
         from runtime_paths import get_runtime_paths
         output_dir = get_runtime_paths().images_dir
-    img_dir = Path(output_dir)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(pdf_path).stem[:30]
-
-    caption_pat = _re.compile(r'(?:Figure|Fig\.?|图)\s*(\d+)')
-
-    # ── 缓存：已有该论文图片则跳过 ──
-    existing = list(img_dir.glob(f"{stem}_*.png")) if img_dir.exists() else []
-    if existing:
-        print(f"      🖼 缓存命中: {len(existing)} 张图片", file=sys.stderr)
-        return [str(f) for f in existing]
-
-    saved = []
-    captions_map = {}  # label → caption text（用于描述时附带）
-    doc = pymupdf.open(pdf_path)
-    total_pages = min(len(doc), max_pages)
-
-    for page_num in range(total_pages):
-        page = doc[page_num]
-
-        # ── 1. 找图注（文字块 + y 坐标 + 完整文本）──
-        captions = []  # [(num, y_mid, text)]
-        try:
-            for block in page.get_text("dict")["blocks"]:
-                if block.get("type") != 0:
-                    continue
-                for line in block.get("lines", []):
-                    text = "".join(span.get("text", "") for span in line.get("spans", []))
-                    m = caption_pat.search(text)
-                    if m and len(text) < 120:  # 图注通常较短
-                        captions.append((int(m.group(1)), line.get("bbox", (0, 0, 0, 0))[3], text.strip()))
-        except Exception:
-            pass
-        captions.sort(key=lambda c: c[1])
-
-        # ── 2. 找图片 bbox ──
-        imgs = []
-        try:
-            for info in page.get_image_info():
-                bbox = info.get("bbox")
-                if not bbox:
-                    continue
-                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                if w * h < 5000:  # 过滤小图
-                    continue
-                imgs.append((bbox[0], bbox[1], bbox[2], bbox[3]))
-        except Exception:
-            pass
-
-        if not imgs:
-            continue
-
-        # ── 3. 分组：有图注 → 归入下方最近的图注 ──
-        groups = []  # [(label, [bboxes])]
-        if captions:
-            for (x0, y0, x1, y1) in imgs:
-                nearest = None
-                for num, cap_y, cap_text in captions:
-                    if cap_y >= y1:  # 图注在图片下方
-                        nearest = (num, cap_y, cap_text)
-                        break
-                if nearest:
-                    label = f"Figure{nearest[0]}"
-                    captions_map.setdefault(label, nearest[2])
-                else:
-                    label = f"p{page_num+1}_fig"
-                found = None
-                for g in groups:
-                    if g[0] == label:
-                        found = g; break
-                if found:
-                    found[1].append((x0, y0, x1, y1))
-                else:
-                    groups.append((label, [(x0, y0, x1, y1)]))
-        else:
-            # ── 无图注 → 位置相邻分组回退 ──
-            sorted_imgs = sorted(imgs, key=lambda b: (b[1], b[0]))
-            cur_group = [sorted_imgs[0]] if sorted_imgs else []
-            for i in range(1, len(sorted_imgs)):
-                prev = cur_group[-1]
-                cur = sorted_imgs[i]
-                gap_y = cur[1] - prev[3]
-                gap_x = cur[0] - prev[2]
-                if gap_y < 20 and gap_x < 20:
-                    cur_group.append(cur)
-                else:
-                    groups.append((f"p{page_num+1}_fig{len(groups)+1}", cur_group))
-                    cur_group = [cur]
-            if cur_group:
-                groups.append((f"p{page_num+1}_fig{len(groups)+1}", cur_group))
-
-        # ── 4. 渲染每个分组的外接矩形 ──
-        for label, bboxes in groups:
-            try:
-                min_x = min(b[0] for b in bboxes)
-                min_y = min(b[1] for b in bboxes)
-                max_x = max(b[2] for b in bboxes)
-                max_y = max(b[3] for b in bboxes)
-                # 稍微扩展一点，避免边缘裁剪
-                clip = pymupdf.Rect(min_x - 5, min_y - 5, max_x + 5, max_y + 5)
-                pix = page.get_pixmap(clip=clip, dpi=150)
-                fname = img_dir / f"{stem}_{label}.png"
-                pix.save(str(fname))
-                saved.append(str(fname))
-            except Exception:
-                pass
-
-    doc.close()
-
-    # ── 保存图注 sidecar（供 describe_image 附带）──
-    if captions_map:
-        try:
-            cap_file = img_dir / f"{stem}_captions.json"
-            import json as _json
-            cap_file.write_text(_json.dumps(captions_map, ensure_ascii=False, indent=1), encoding="utf-8")
-        except Exception:
-            pass
-
-    if saved:
-        print(f"      🖼 提取 {len(saved)} 张图到 {img_dir}/", file=sys.stderr)
-    return saved
+    manifest = extract_pdf_images(Path(pdf_path), Path(output_dir), max_pages)
+    return [entry["asset_path"] for entry in manifest["images"]]
 
 
 # ═══════════════════════════════════════════════════════════════

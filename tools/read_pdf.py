@@ -440,12 +440,19 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
 
     quality["attempts"] = 2 if parser_label == "备用文本解析" else 1
     quality["parser"] = parser_label
-    result = reader.render_document(parsed_document)
+    image_header = (
+        f"🖼️ 图片入口：论文「{title}」。可用 list_paper_images 查询图号、页码和保存路径；"
+        "也可直接 describe_image(paper_id_or_title=论文标题或ID, figure=图号)。"
+        "矢量图会返回包含该图的整页原图。图片目录可随时重新查询，不依赖本次全文是否完整显示。\n"
+    )
+    if images:
+        image_header += f"已导出 {len(images)} 张图片（前 8 项）：\n" + "\n".join(f"  - {item}" for item in images[:8]) + "\n"
+    else:
+        image_header += "本次未导出图片；可按论文和 page 查看原页，不代表原 PDF 没有图。\n"
+    result = image_header + "\n" + reader.render_document(parsed_document)
     warnings = [item["message"] for item in quality.get("issues", []) if item.get("severity") == "warning"]
     if warnings:
         result += "\n\n⚠️ 解析质量提示：" + "；".join(warnings)
-    if images:
-        result += "\n\n🖼️ **提取的图片**:\n" + "\n".join(f"  - {item}" for item in images)
 
     if paper_store:
         try:
@@ -480,13 +487,12 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
                 f"已自动合并 {quality['repairs']['merged_orphan_text_chunks']} 个碎片块"
                 if quality.get("status") == "repaired" else "质量检查通过"
             )
-            result += (
-                "\n\n---\n"
+            result = (
                 f"📌 已按{title_source}命名为：**{title}**。论文 ID：`{paper_id}`。{quality_note}；解析策略：{parser_label}。\n"
                 f"页面元素映射：`{document_map_path}`。\n"
                 "如需完整的可追溯精读，请明确要求“生成论文证据卡”；"
-                "系统会把结论保存为带页码、图表和来源块锚点的本地 Markdown 文件。"
-            )
+                "系统会把结论保存为带页码、图表和来源块锚点的本地 Markdown 文件。\n\n"
+            ) + result
         except Exception as exc:
             try:
                 paper_store.delete_paper(paper_id)

@@ -32,8 +32,13 @@ with pymupdf.open() as pdf:
   with pymupdf.open(stream=cp.get_svg_image(text_as_path=True).encode(),filetype='svg') as svg:
    with pymupdf.open(stream=svg.convert_to_pdf(),filetype='pdf') as outlined:
     p.show_pdf_page(pymupdf.Rect(45,60,305,510),outlined,0)
- pdf.save(papers/'vector-algorithm.pdf')
  assert 'finalWitness' not in p.get_text()
+ p=pdf.new_page(width=600,height=800)
+ p.draw_rect(pymupdf.Rect(50,80,400,260))
+ p.insert_text((70,140),'VECTOR FIGURE WITNESS')
+ p.insert_text((50,285),'Fig. 4. A vector forwarding diagram.')
+ assert not p.get_image_info()
+ pdf.save(papers/'vector-algorithm.pdf')
 db=root/'derived/chroma';db.mkdir(parents=True)
 c=chromadb.PersistentClient(path=str(db),settings=Settings(anonymized_telemetry=False))
 collection=c.get_or_create_collection('papers',metadata={'hnsw:space':'cosine'})
@@ -42,7 +47,7 @@ artifacts=root/'derived/paper_artifacts/fixture-paper';artifacts.mkdir(parents=T
 (artifacts/'document_map.json').write_text(json.dumps({'paper_id':'fixture-paper','title':'Routing Fixture','source_file':'vector-algorithm.pdf','extraction_version':2,'processed_pages':1,'total_pages':1,'pages':[],'chunks':[]}))
 `, profile], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
 let desktop;
-let recovered = '', transcribed = false;
+let recovered = '', transcribed = false, imageVerified = false, imagesListed = false;
 const requests = [];
 const model = http.createServer((request, response) => {
   let body = '';
@@ -52,17 +57,27 @@ const model = http.createServer((request, response) => {
       const payload = JSON.parse(body); requests.push(payload);
       if (!payload.stream) {
         const content = payload.messages.at(-1).content;
+        let answer = '核验通过。';
         if (Array.isArray(content) && content.some(part => part.type === 'image_url')) {
-          assert.match(content[0].text, /逐行转写/);
-          transcribed = true;
+          if (/逐行转写/.test(content[0].text)) {
+            transcribed = true;
+            answer = '1 Function Route(graph)\n25 Return finalWitness';
+          } else {
+            assert.match(content[0].text, /Figure 4/);
+            assert.match(content[0].text, /p\.2/);
+            assert.match(content[0].text, /整页原图/);
+            assert.match(content[0].text, /勿混入相邻图表/);
+            imageVerified = true;
+            answer = '图 4 的矢量原图已找到并读取。';
+          }
         }
         response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({ choices: [{ message: { content: transcribed ? '1 Function Route(graph)\n25 Return finalWitness' : '核验通过。' } }] }));
+        response.end(JSON.stringify({ choices: [{ message: { content: answer } }] }));
         return;
       }
       const toolResults = payload.messages.filter(message => message.role === 'tool');
       if (requests.length <= 4) fs.writeFileSync(path.join(profile, 'model-input-' + requests.length + '.json'), JSON.stringify(payload.messages));
-      assert.ok(requests.length <= 8, 'Unexpected repeated tool loop');
+      assert.ok(requests.length <= 10, 'Unexpected repeated tool loop');
       const evidence = toolResults.find(message => String(message.content).includes('算法原页取证'));
       let call;
       if (!evidence) {
@@ -74,8 +89,21 @@ const model = http.createServer((request, response) => {
         const crop = recovered.match(/原页区域[^\n]*?：([^\r\n]+)/)?.[1];
         assert.ok(crop && fs.existsSync(crop), recovered);
         call = { name: 'describe_image', arguments: JSON.stringify({ image_path: crop, task: 'transcribe_algorithm' }) };
+      } else if (!imagesListed) {
+        const listing = toolResults.find(message => String(message.content).includes('图片目录 —'));
+        if (!listing) {
+          call = { name: 'list_paper_images', arguments: JSON.stringify({ paper_id_or_title: 'fixture-paper', figure: '图四' }) };
+        } else {
+          assert.match(listing.content, /已检查 2\/2 页/);
+          const imagePath = String(listing.content).match(/图片路径：([^\r\n]+)/)?.[1];
+          assert.ok(imagePath && fs.existsSync(imagePath), listing.content);
+          imagesListed = true;
+          // Prove vision resolves by paper and figure after path/context loss.
+          fs.unlinkSync(imagePath);
+          call = { name: 'describe_image', arguments: JSON.stringify({ paper_id_or_title: 'fixture-paper', figure: '4' }) };
+        }
       }
-      const delta = call ? { reasoning_content: 'Read and verify source evidence.', tool_calls: [{ index: 0, id: 'pdf-check-' + requests.length, type: 'function', function: call }] } : { content: '算法原页已完整读取并核对：finalWitness。' };
+      const delta = call ? { reasoning_content: 'Read and verify source evidence.', tool_calls: [{ index: 0, id: 'pdf-check-' + requests.length, type: 'function', function: call }] } : { content: '算法和图 4 原页已完整读取并核对：finalWitness。' };
       response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
       response.end('data: ' + JSON.stringify({ choices: [{ delta, finish_reason: null }] }) + '\n\ndata: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: call ? 'tool_calls' : 'stop' }] }) + '\n\ndata: [DONE]\n\n');
     } catch (error) { response.writeHead(500); response.end(String(error)); }
@@ -94,15 +122,15 @@ const model = http.createServer((request, response) => {
   await page.evaluate(() => window.desktop.configure({ deepseekKey: 'desktop-pdf-fake-key-not-a-credential' }));
   await page.waitForURL('**/startup.html');
   await page.getByRole('textbox', { name: '消息', exact: true }).waitFor({ timeout: 120000 });
-  await page.getByRole('textbox', { name: '消息', exact: true }).fill('解释 Routing Fixture 的算法一，核对最后一行。');
+  await page.getByRole('textbox', { name: '消息', exact: true }).fill('解释 Routing Fixture 的算法一和图四，核对最后一行并直接看原图。');
   await page.getByRole('button', { name: /发送|submit/i }).click();
-  await page.locator('.message-assistant').filter({ hasText: '算法原页已完整读取并核对：finalWitness。' }).waitFor({ timeout: 120000 });
-  assert.ok(recovered.includes('finalWitness') && transcribed);
+  await page.locator('.message-assistant').filter({ hasText: '算法和图 4 原页已完整读取并核对：finalWitness。' }).waitFor({ timeout: 120000 });
+  assert.ok(recovered.includes('finalWitness') && transcribed && imagesListed && imageVerified);
   const original = JSON.parse(fs.readFileSync(path.join(profile, 'runtime/derived/paper_artifacts/fixture-paper/document_map.json'), 'utf8'));
   assert.equal(original.extraction_version, 2);
   assert.deepEqual(original.chunks, []);
   assert.ok(fs.readdirSync(path.join(profile, 'runtime/derived/paper_artifacts/fixture-paper')).some(name => name.startsWith('algorithms-v')));
-  console.log('Desktop PDF passed: stale index, punctuationless caption, vector pseudocode, bundled OCR, complete tail, source crop, dedicated transcription and unchanged original index.');
+  console.log('Desktop PDF passed: stale index, vector pseudocode, bundled OCR, transcription, vector figure directory, deleted-image recovery, vision by paper/figure, and unchanged original index.');
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (desktop) await desktop.close().catch(() => {});
   model.close();

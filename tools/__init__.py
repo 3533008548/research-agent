@@ -11,6 +11,7 @@ from tools.paper_relations import (
     handle_save_paper_relation,
 )
 from tools.describe import handle_describe_image
+from tools.paper_images import handle_list_paper_images
 from tools.profile_tool import handle_read_profile, handle_update_profile
 from cancellation import raise_if_cancelled
 from tool_catalog import TOOL_NAMES, get_tool_definition
@@ -24,6 +25,7 @@ _TOOL_HANDLERS = {
     "save_paper_relation": handle_save_paper_relation,
     "delete_paper_relation": handle_delete_paper_relation,
     "describe_image": handle_describe_image,
+    "list_paper_images": handle_list_paper_images,
     "query_papers": handle_query_papers,
     "list_papers": handle_list_papers,
     "list_indexed_papers": handle_list_indexed,

@@ -454,5 +454,159 @@ class TestPdfIntegrity(unittest.TestCase):
         self.assertFalse(list(destination.glob('*.part')))
 
 
+class TestPdfImages(unittest.TestCase):
+    def setUp(self):
+        from runtime_paths import RuntimePaths
+        from types import SimpleNamespace
+        import json
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.paths = RuntimePaths.from_root(self.tmp.name)
+        self.paths.papers_dir.mkdir(parents=True)
+        self.paths.images_dir.mkdir(parents=True)
+        self.source = self.paths.papers_dir / 'figure-fixture.pdf'
+        with pymupdf.open() as pdf:
+            for number in (4, 40):
+                p = pdf.new_page(width=600, height=800)
+                p.insert_text((50, 50), 'Figure Fixture Paper')
+                p.insert_text((50, 80), 'Evidence of vector routing diagrams with labeled paths and independent source provenance.')
+                p.draw_rect(pymupdf.Rect(50, 120, 300, 260))
+                p.insert_text((70, 160), 'VECTOR WITNESS ' + str(number))
+                p.insert_text((50, 285), f'Fig. {number}. The forwarding diagram.')
+                p.insert_text((50, 400), 'Fig. 9 shows a prose reference, not a caption.')
+            pdf.save(self.source)
+        folder = self.paths.paper_artifacts_dir / 'fixture'
+        folder.mkdir(parents=True)
+        self.map_path = folder / 'document_map.json'
+        self.map_path.write_text(json.dumps({'paper_id': 'fixture', 'title': 'Figure Fixture Paper',
+            'source_file': self.source.name, 'processed_pages': 1, 'total_pages': 1, 'pages': [], 'chunks': []}), encoding='utf-8')
+        self.old_map = self.map_path.read_bytes()
+        self.store = SimpleNamespace(list_papers=lambda: [{'paper_id': 'fixture', 'title': 'Figure Fixture Paper'}],
+                                     query_with_timeout=lambda *a, **k: ([], None))
+        env = patch.dict(os.environ, {'APP_DATA_DIR': self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_vector_figures_have_real_page_assets_and_exact_numbers(self):
+        from paper_images import extract_pdf_images, figure_numbers
+        with pymupdf.open(self.source) as pdf:
+            self.assertFalse(pdf[0].get_image_info())
+        catalog = extract_pdf_images(self.source, self.paths.images_dir)
+        self.assertEqual([(e['number'], e['page']) for e in catalog['images']], [('4', 1), ('40', 2)])
+        for e in catalog['images']:
+            self.assertTrue(Path(e['asset_path']).is_file())
+            self.assertEqual(e['asset_kind'], 'page')
+        for query, expected in [('图四', {'4'}), ('Figure 40', {'40'}), ('Fig. 4.', {'4'}), ('图四十', {'40'}), ('Fig. 4.1', set())]:
+            self.assertEqual(figure_numbers(query), expected)
+
+    def test_image_cache_respects_source_content_and_requested_pages(self):
+        from pdf_reader import extract_images
+        (self.paths.images_dir / 'figure-fixture_p14_Figure4.png').write_bytes(b'stale')
+        one = extract_images(str(self.source), 1, self.paths.images_dir)
+        two = extract_images(str(self.source), 2, self.paths.images_dir)
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(two), 2)
+        self.assertEqual(extract_images(str(self.source), 1, self.paths.images_dir), one)
+        with pymupdf.open(self.source) as pdf:
+            pdf.set_metadata({'title': 'changed source content'})
+            pdf.saveIncr()
+        changed = extract_images(str(self.source), 1, self.paths.images_dir)
+        self.assertNotEqual(one, changed)
+        self.assertTrue(Path(changed[0]).is_file())
+
+    def test_old_map_recovers_beyond_index_and_regenerates_deleted_images(self):
+        from paper_images import resolve_paper_image
+        args = {'paper_id_or_title': 'fixture', 'figure': '图四十'}
+        target, note = resolve_paper_image(args, self.store, self.paths)
+        self.assertIn('p.2', note)
+        self.assertIn('Figure 40', note)
+        self.assertIn('整页', note)
+        target.unlink()
+        self.assertEqual(resolve_paper_image(args, self.store, self.paths)[0], target)
+        self.assertTrue(target.is_file())
+        self.assertEqual(self.map_path.read_bytes(), self.old_map)
+
+    def test_lookup_is_registered_and_returns_complete_paginated_paths(self):
+        from tool_runtime import ToolRuntime, ToolExecutionContext
+        runtime = ToolRuntime(ToolExecutionContext())
+        result = runtime.execute('list_paper_images', {'paper_id_or_title': 'fixture', 'limit': 1}, paper_store=self.store)
+        self.assertIn('offset=1', result)
+        self.assertIn('Figure 4', result)
+        self.assertNotIn('Figure 40', result)
+        path = result.split('图片路径：')[1].splitlines()[0]
+        self.assertTrue(Path(path).is_file())
+        result = runtime.execute('list_paper_images', {'paper_id_or_title': 'fixture', 'offset': 1}, paper_store=self.store)
+        self.assertIn('Figure 40', result)
+
+    def test_explicit_figure_query_includes_image_even_when_text_index_is_empty(self):
+        from tools.search import handle_query_papers
+        result = handle_query_papers({'query': '解释图四', 'paper_id_or_title': 'fixture'}, paper_store=self.store)
+        self.assertIn('Figure 4', result)
+        self.assertIn('图片路径', result)
+        self.assertNotIn('Figure 40', result)
+
+    def test_unknown_figure_does_not_substitute_and_page_fallback_is_available(self):
+        from paper_images import resolve_paper_image
+        with self.assertRaisesRegex(ValueError, '未定位'):
+            resolve_paper_image({'paper_id_or_title': 'fixture', 'figure': '9'}, self.store, self.paths)
+        path, note = resolve_paper_image({'paper_id_or_title': 'fixture', 'page': 2}, self.store, self.paths)
+        self.assertTrue(path.is_file())
+        self.assertIn('p.2', note)
+        with self.assertRaisesRegex(ValueError, '页码超出'):
+            resolve_paper_image({'paper_id_or_title': 'fixture', 'page': 3}, self.store, self.paths)
+
+    def test_source_outside_library_is_rejected(self):
+        import json
+        from paper_images import paper_image_catalog
+        mapping = json.loads(self.old_map)
+        mapping['source_file'] = '../../outside.pdf'
+        self.map_path.write_text(json.dumps(mapping))
+        with self.assertRaisesRegex(ValueError, '原 PDF 不在'):
+            paper_image_catalog('fixture', self.store, self.paths)
+
+    def test_describe_by_number_and_listed_path_both_preserve_target_figure(self):
+        from tools.describe import handle_describe_image
+        from paper_images import resolve_paper_image
+        client = MagicMock()
+        client.post.return_value.json.return_value = {'choices': [{'message': {'content': 'verified vector image'}}]}
+        target, _ = resolve_paper_image({'paper_id_or_title': 'fixture', 'figure': '4'}, self.store, self.paths)
+        for args in ({'paper_id_or_title': 'fixture', 'figure': '4'}, {'image_path': str(target)}):
+            result = handle_describe_image(args, paper_store=self.store, llm_client=client)
+            self.assertIn('verified vector image', result)
+            content = client.post.call_args.args[0]['messages'][0]['content']
+            self.assertIn('Figure 4', content[0]['text'])
+            self.assertIn('勿混入相邻图表', content[0]['text'])
+            self.assertTrue(content[1]['image_url']['url'].startswith('data:image/png;base64,'))
+
+    def test_read_pdf_image_directory_survives_actual_runtime_truncation(self):
+        from tool_runtime import ToolRuntime, ToolExecutionContext
+        from types import SimpleNamespace
+        store = SimpleNamespace(list_papers=lambda: [], index_document_map=lambda doc, **kw: doc['paper_id'])
+        with patch.object(PaperReader, 'render_document', return_value='Long original prose. ' * 2000):
+            result = ToolRuntime(ToolExecutionContext()).execute('read_pdf',
+                {'url_or_path': self.source.name, 'title': 'Figure Fixture Paper', 'max_pages': 2},
+                paper_store=store, memory_store=MagicMock())
+        self.assertIn('截断至 12000', result)
+        self.assertIn('论文 ID', result)
+        self.assertIn('list_paper_images', result)
+        self.assertIn('_p001_Figure4_', result)
+        self.assertIn('_p002_Figure40_', result)
+
+    def test_map_attaches_only_exact_figure_and_page_and_exposes_asset(self):
+        from paper_artifacts import attach_image_assets
+        parsed = PaperReader(max_pages=2).parse_document(self.source)
+        from pdf_reader import extract_images
+        assets = extract_images(str(self.source), 2, self.paths.images_dir)
+        attach_image_assets(parsed, list(reversed(assets)))
+        doc = build_document_map(parsed, paper_id='fixture', title='Fixture', source_file=self.source.name)
+        for page in doc['pages']:
+            figure = next(e for e in page['elements'] if e['kind'] == 'figure')
+            self.assertIn(f"_p{page['page']:03d}_", figure['asset_path'])
+            chunk = next(c for c in doc['chunks'] if figure['id'] in c['source_element_ids'])
+            context, _ = related_context(doc, chunk['id'])
+            self.assertIn(figure['asset_path'], context)
+            self.assertIn('整页', context)
+
+
 if __name__ == "__main__":
     unittest.main()

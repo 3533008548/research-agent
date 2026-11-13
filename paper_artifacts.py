@@ -491,11 +491,18 @@ def attach_image_assets(document_map: dict[str, Any], image_paths: list[str]) ->
     for page_record in document_map.get("pages") or []:
         page = page_record.get("page")
         figures = [item for item in page_record.get("elements") or [] if item.get("kind") == "figure"]
-        page_matches = [path for path in candidates if f"p{page}_" in path.name.casefold()]
+        page_matches = [path for path in candidates if re.search(rf"(?:^|_)p0*{page}_", path.name, re.I)]
         for index, figure in enumerate(figures):
-            label_key = re.sub(r"[^a-z0-9]", "", str(figure.get("label") or "").casefold())
-            match = next((path for path in candidates if label_key and label_key in re.sub(r"[^a-z0-9]", "", path.stem.casefold())), None)
-            match = match or (page_matches[index] if index < len(page_matches) else None)
+            from paper_images import figure_numbers
+            numbers = figure_numbers(str(figure.get("label") or ""))
+            match = next((path for path in page_matches if numbers and numbers == figure_numbers(path.stem)), None)
+            if match is None and numbers:
+                legacy = [path for path in candidates if not re.search(r"(?:^|_)p\d+_", path.name, re.I)
+                          and numbers == figure_numbers(path.stem)]
+                if len(legacy) == 1:
+                    match = legacy[0]
+            if not numbers:
+                match = next((path for path in page_matches if re.search(rf"_image{index + 1}_", path.stem)), None)
             if match:
                 figure["asset_path"] = str(match)
 
@@ -564,7 +571,10 @@ def related_context(
         text = str(element.get("text") or element.get("caption") or "").strip()
         if not text:
             continue
+        asset = str(element.get("asset_path") or "")
         entry = f"[{label} · p.{element.get('page')}] {text}"
+        if asset:
+            entry = f"[{label} · p.{element.get('page')}] 图片路径（describe_image）：{asset}\n" + entry
         if used + len(entry) > max_chars:
             break
         rows.append(entry)
@@ -582,6 +592,9 @@ def related_context(
         and page_end > page_start
     ) else f"p.{page_start}"
     locator = f"{page_locator} · {target_label}"
+    if (primary or {}).get("kind") == "figure" and primary.get("asset_path"):
+        kind = "整页原图，需按图号查看" if primary.get("asset_kind") == "page" else "图片区域"
+        rows.insert(0, f"{kind}（describe_image）：{primary['asset_path']}")
     if (primary or {}).get("extraction_method") == "ocr":
         locator += " · OCR 转写，符号需核对原页"
         if primary.get("asset_path"):

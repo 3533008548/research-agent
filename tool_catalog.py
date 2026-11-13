@@ -41,6 +41,7 @@ _PRESENTATION = {
     "save_paper_relation": ("论文关系确认保存", 3_000),
     "delete_paper_relation": ("论文关系删除", 1_500),
     "describe_image": ("图像分析", 2_000),
+    "list_paper_images": ("论文图片目录", 8_000),
     "query_papers": ("论文检索", 5_000),
     "list_papers": ("本地论文列表", 3_000),
     "list_indexed_papers": ("索引论文列表", 3_000),
