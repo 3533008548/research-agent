@@ -15,6 +15,7 @@ import { RunActivity } from "./RunActivity";
  */
 export function RunInspector({
   hidden = false,
+  embedded = false,
   children,
   run,
   events,
@@ -24,6 +25,7 @@ export function RunInspector({
   cancelling,
 }: {
   hidden?: boolean;
+  embedded?: boolean;
   children?: ReactNode;
   run: Run | null;
   events: RunEvent[];
@@ -32,8 +34,9 @@ export function RunInspector({
   onOpenRunCenter: () => void;
   cancelling: boolean;
 }) {
+  const Container = embedded ? "section" : "aside";
   return (
-    <aside id="run-inspector" className="run-inspector" aria-label="运行检查器" hidden={hidden}>
+    <Container id={embedded ? undefined : "run-inspector"} className={embedded ? "inspector-embedded" : "run-inspector"} aria-label="运行检查器" hidden={hidden}>
       <div className="run-inspector-content">
       <div className="panel-heading">
         <div>
@@ -101,6 +104,6 @@ export function RunInspector({
       )}
       </div>
       {children}
-    </aside>
+    </Container>
   );
 }

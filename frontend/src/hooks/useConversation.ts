@@ -248,6 +248,7 @@ export function useConversation({
 
   async function selectSession(sessionId: string) {
     if (sessionId === activeSessionRef.current && getSession(sessionId).loaded) {
+      setActiveWorkbenchTabId("chat");
       return;
     }
     try {

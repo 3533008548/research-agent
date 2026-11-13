@@ -196,10 +196,16 @@ export function useWorkspaceLayout() {
     finishDrag();
     updatePreferences({ ...preferencesRef.current, rightVisibility: rightVisible ? "hidden" : "shown" });
   };
-  const showRight = () => {
+  const showRight = useCallback(() => {
     finishDrag();
     updatePreferences({ ...preferencesRef.current, rightVisibility: "shown" });
-  };
+  }, [finishDrag, updatePreferences]);
+  const setChatDocked = useCallback((docked: boolean) => {
+    finishDrag();
+    const current = preferencesRef.current;
+    updatePreferences({ ...current, chatPlacement: docked ? "right" : "center",
+      ...(docked ? { rightVisibility: "shown", rightWidth: Math.max(current.rightWidth, 480) } : {}) });
+  }, [finishDrag, updatePreferences]);
 
   const workspaceStyle = {
     "--left-width": `${widths.leftWidth}px`,
@@ -208,6 +214,7 @@ export function useWorkspaceLayout() {
   return {
     workspaceRef, workspaceStyle, layoutMode: widths.mode,
     leftVisible, rightVisible, leftWidth: widths.leftWidth, rightWidth: widths.rightWidth,
+    chatDocked: preferences.chatPlacement === "right", setChatDocked,
     toggleLeft, toggleRight, showRight,
     leftResizeProps: resizeProps("left"), rightResizeProps: resizeProps("right"),
   };

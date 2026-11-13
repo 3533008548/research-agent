@@ -1,6 +1,7 @@
 export type SidebarSide = "left" | "right";
 export type WorkspaceLayoutMode = "desktop" | "compact" | "stacked";
 export type RightSidebarVisibility = "auto" | "shown" | "hidden";
+export type ChatPlacement = "center" | "right";
 
 export interface WorkspaceLayoutPreferences {
   version: 1;
@@ -8,6 +9,7 @@ export interface WorkspaceLayoutPreferences {
   rightWidth: number;
   leftVisible: boolean;
   rightVisibility: RightSidebarVisibility;
+  chatPlacement: ChatPlacement;
 }
 
 export const WORKSPACE_LAYOUT_KEY = "research-agent.workspace-layout.v1";
@@ -15,7 +17,7 @@ export const CENTER_MIN_WIDTH = 480;
 export const COMPACT_CENTER_MIN_WIDTH = 320;
 export const SIDEBAR_LIMITS = {
   left: { min: 190, max: 420, initial: 240 },
-  right: { min: 245, max: 480, initial: 310 },
+  right: { min: 245, max: 800, initial: 310 },
 } as const;
 
 export function defaultLayoutPreferences(): WorkspaceLayoutPreferences {
@@ -25,6 +27,7 @@ export function defaultLayoutPreferences(): WorkspaceLayoutPreferences {
     rightWidth: SIDEBAR_LIMITS.right.initial,
     leftVisible: true,
     rightVisibility: "auto",
+    chatPlacement: "center",
   };
 }
 
@@ -52,6 +55,7 @@ export function parseLayoutPreferences(raw: string | null): WorkspaceLayoutPrefe
       rightVisibility: ["auto", "shown", "hidden"].includes(String(stored.rightVisibility))
         ? stored.rightVisibility as RightSidebarVisibility
         : defaults.rightVisibility,
+      chatPlacement: stored.chatPlacement === "right" ? "right" : "center",
     };
   } catch {
     return defaults;

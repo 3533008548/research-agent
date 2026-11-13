@@ -815,6 +815,204 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertTrue(send.is_visible())
         self.assertLessEqual(send.bounding_box()["y"] + send.bounding_box()["height"], 600)
 
+    def _drag_chat_tab(self, to_right: bool, cancel: bool = False) -> None:
+        source = self.page.locator(".conversation .draggable-chat-tab" if to_right else ".right-workspace .draggable-chat-tab")
+        box = source.bounding_box()
+        self.page.mouse.move(box["x"] + 20, box["y"] + box["height"] / 2)
+        self.page.mouse.down()
+        self.page.mouse.move(box["x"] + 35, box["y"] + box["height"] / 2, steps=5)
+        zone = self.page.locator(".chat-drop-right" if to_right else ".chat-drop-center")
+        zone.wait_for(state="visible")
+        if cancel:
+            self.page.keyboard.press("Escape")
+        else:
+            target = zone.bounding_box()
+            self.page.mouse.move(target["x"] + target["width"] / 2, target["y"] + 45, steps=8)
+        self.page.mouse.up()
+        zone.wait_for(state="hidden")
+
+    def test_chat_tab_docks_beside_paper_and_returns_without_losing_state(self) -> None:
+        self._set_viewport({"width": 1700, "height": 1000})
+        import fitz
+        with fitz.open() as document:
+            document.new_page().insert_text((50, 80), "Read and discuss a paper side by side")
+            uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                "file": {"name": "docking-paper.pdf", "mimeType": "application/pdf", "buffer": document.tobytes()},
+            })
+        self.assertEqual(uploaded.status, 201)
+        self.page.get_by_label("消息", exact=True).fill("保留这份草稿")
+        self.page.evaluate("window.originalComposer = document.querySelector('.composer')")
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="docking-paper.pdf", exact=True).click()
+        self.page.locator(".textLayer span").first.wait_for()
+        self.page.evaluate("window.originalReader = document.querySelector('.pdf-sheet canvas')")
+        self._drag_chat_tab(True, cancel=True)
+        self.assertEqual(self.page.locator(".conversation .draggable-chat-tab").count(), 1)
+        self._drag_chat_tab(True)
+        rail = self.page.locator(".right-workspace")
+        rail.get_by_label("消息", exact=True).wait_for()
+        self.assertEqual(rail.get_by_label("消息", exact=True).input_value(), "保留这份草稿")
+        self.assertTrue(self.page.evaluate("window.originalComposer === document.querySelector('.composer')"))
+        self.assertTrue(self.page.evaluate("window.originalReader === document.querySelector('.pdf-sheet canvas')"))
+        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+        self._wait_for_width(".session-sidebar", 240)
+        self._wait_for_width(".run-inspector", 480)
+        self._send("边读论文边讨论")
+        rail.locator(".message-assistant").filter(has_text="来自 FastAPI：边读论文边讨论").wait_for()
+        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+        self.page.locator(".run-status-button").click()
+        rail.get_by_role("heading", name="本轮任务", exact=True).wait_for()
+        rail.locator(".draggable-chat-tab button").click()
+        rail.get_by_label("消息", exact=True).fill("第二份草稿")
+        self.page.get_by_role("button", name="隐藏右侧栏", exact=True).click()
+        self.page.get_by_role("button", name="显示右侧栏", exact=True).click()
+        self.assertEqual(rail.get_by_label("消息", exact=True).input_value(), "第二份草稿")
+        self._new_session()
+        self.page.wait_for_function("document.querySelector('.composer textarea').value === ''")
+        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+        self.page.locator(".session-item").filter(has_text="浏览器 E2E 会话").click()
+        self.page.wait_for_function("document.querySelector('.composer textarea').value === '第二份草稿'")
+        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+        self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True).press("End")
+        self._wait_for_width(".run-inspector", 800)
+        self.assertGreaterEqual(self._pane_width(".conversation"), 480)
+        self._set_viewport({"width": 1000, "height": 900})
+        self._assert_no_horizontal_page_overflow()
+        self.assertTrue(rail.get_by_role("button", name="发送", exact=True).is_visible())
+        self._set_viewport({"width": 390, "height": 844})
+        self._assert_no_horizontal_page_overflow()
+        self.assertTrue(rail.get_by_label("消息", exact=True).is_visible())
+        self._set_viewport({"width": 1700, "height": 1000})
+        self._wait_for_width(".run-inspector", 800)
+        self._drag_chat_tab(False)
+        self.page.locator(".conversation .composer").wait_for()
+        self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "第二份草稿")
+        self.assertTrue(self.page.evaluate("window.originalComposer === document.querySelector('.composer')"))
+        self.assertEqual(self.page.locator(".composer").count(), 1)
+        self.page.get_by_role("tab", name="docking-paper.pdf", exact=True).click()
+        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+
+    def test_docked_chat_restores_placement_width_and_hidden_state_after_reload(self) -> None:
+        self._set_viewport({"width": 1700, "height": 900})
+        self._send("刷新后保留右侧对话")
+        self.page.locator(".message-assistant").filter(has_text="来自 FastAPI：刷新后保留右侧对话").wait_for()
+        self._drag_chat_tab(True)
+        self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True).press("End")
+        self._wait_for_width(".run-inspector", 800)
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.locator(".right-workspace .message-assistant").filter(has_text="来自 FastAPI：刷新后保留右侧对话").wait_for()
+        self._wait_for_width(".run-inspector", 800)
+        self.assertEqual(self.page.locator(".conversation .draggable-chat-tab").count(), 0)
+        self.page.get_by_role("button", name="隐藏右侧栏", exact=True).click()
+        self.page.reload(wait_until="domcontentloaded")
+        self.assertFalse(self.page.locator(".right-workspace").is_visible())
+        self.page.locator(".session-item.active").click()
+        self.page.locator(".right-workspace .composer").wait_for()
+        self._wait_for_width(".run-inspector", 800)
+        self._drag_chat_tab(False)
+        self.page.wait_for_function("document.activeElement === document.querySelector('.conversation .draggable-chat-tab button')")
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.locator(".conversation .composer").wait_for()
+        self.assertEqual(self.page.locator(".right-workspace .draggable-chat-tab").count(), 0)
+
+    def test_reading_tools_open_from_paper_while_chat_is_docked(self) -> None:
+        self._set_viewport({"width": 1440, "height": 900})
+        import fitz
+        with fitz.open() as document:
+            document.new_page().insert_text((50, 80), "Every claim needs evidence.")
+            uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                "file": {"name": "reading-tools.pdf", "mimeType": "application/pdf", "buffer": document.tobytes()},
+            })
+        self.assertEqual(uploaded.status, 201)
+        self.page.get_by_label("消息", exact=True).fill("保留对话草稿")
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="reading-tools.pdf", exact=True).click()
+        self.page.locator(".textLayer span").first.wait_for()
+        self._drag_chat_tab(True)
+        self.page.get_by_role("button", name="随手记", exact=True).click()
+        note = self.page.get_by_role("textbox", name="笔记正文", exact=True)
+        note.fill("笔记与聊天分别保留")
+        self.page.get_by_role("button", name="保存笔记", exact=True).click()
+        self.page.locator(".note-save-status").filter(has_text="已保存").wait_for()
+        self.page.locator(".right-workspace .draggable-chat-tab button").click()
+        self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "保留对话草稿")
+        self.page.route("**/api/v1/library/documents/*/translate", lambda route: route.fulfill(json={"text": "每个判断都需要证据。"}))
+        self.page.locator(".textLayer").evaluate("""el => {
+            const range = document.createRange();
+            range.selectNodeContents(el.querySelector('span'));
+            const selection = window.getSelection();
+            selection.removeAllRanges(); selection.addRange(range);
+            el.dispatchEvent(new KeyboardEvent('keyup', {key: 'Shift', bubbles: true}));
+        }""")
+        self.page.get_by_role("button", name="隐藏右侧栏", exact=True).click()
+        self.page.get_by_role("button", name="翻译选段", exact=True).click()
+        self.page.locator(".right-workspace .translation-text").filter(has_text="每个判断都需要证据。").wait_for()
+        self.page.locator(".session-item.active").click()
+        self.page.locator(".right-workspace .composer").wait_for()
+        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+        self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "保留对话草稿")
+        self.assertEqual(self._state()["calls"], [])
+
+    def test_docking_during_session_load_keeps_the_current_content_tab(self) -> None:
+        self._set_viewport({"width": 1440, "height": 900})
+        self.page.locator(".session-item.active").wait_for()
+        created = self.page.request.post(f"{self.base_url}/api/v1/sessions", data={"title": "延迟读取的会话"})
+        session_id = created.json()["thread_id"]
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="设置", exact=True).click()
+        pending = []
+        self.page.route(f"**/sessions/{session_id}/messages", lambda route: pending.append((route, route.fetch())))
+        self.page.locator(".session-item").filter(has_text="延迟读取的会话").click()
+        deadline = time.monotonic() + 5
+        while not pending and time.monotonic() < deadline:
+            self.page.wait_for_timeout(20)
+        self.assertTrue(pending)
+        self._drag_chat_tab(True)
+        self.assertTrue(self.page.locator(".settings-page").is_visible())
+        route, response = pending.pop()
+        route.fulfill(response=response)
+        self.page.wait_for_function("!document.querySelector('.composer textarea').disabled")
+        self.assertTrue(self.page.locator(".settings-page").is_visible(), "晚到的会话响应不能切换中央页面")
+        self.assertTrue(self.page.locator(".right-workspace .composer").is_visible())
+
+    def test_docking_keeps_history_scroll_position(self) -> None:
+        self._set_viewport({"width": 1700, "height": 900})
+        self.page.route("**/api/v1/sessions/*/messages", lambda route: route.fulfill(json=[
+            {"role": "user", "content": "阅读历史消息"},
+            {"role": "assistant", "content": "历史段落，保留阅读位置。\n\n" * 100},
+        ]))
+        self.page.reload(wait_until="domcontentloaded")
+        listing = self.page.locator(".message-list")
+        self.page.wait_for_function("document.querySelector('.message-list').scrollTop > 600")
+        listing.hover()
+        self.page.mouse.wheel(0, -600)
+        self.page.wait_for_timeout(250)
+        top = listing.evaluate("el => el.scrollTop")
+        self._drag_chat_tab(True)
+        self.page.wait_for_timeout(250)
+        self.assertAlmostEqual(listing.evaluate("el => el.scrollTop"), top, delta=3)
+        self._drag_chat_tab(False)
+        self.page.wait_for_timeout(250)
+        self.assertAlmostEqual(listing.evaluate("el => el.scrollTop"), top, delta=3)
+
+    def test_chat_docks_into_hidden_right_rail_and_empty_workbench(self) -> None:
+        self._set_viewport({"width": 1440, "height": 900})
+        self.page.get_by_role("button", name="隐藏运行检查器", exact=True).click()
+        self._send("__slow__")
+        self.page.locator(".message-assistant").filter(has_text="旧会话片段").wait_for()
+        self._drag_chat_tab(True)
+        self.page.locator(".right-workspace .message-assistant").filter(has_text="慢请求完成").wait_for()
+        self.assertTrue(self.page.locator(".dock-empty-workbench").is_visible())
+        self._wait_for_width(".session-sidebar", 240)
+        self._wait_for_width(".run-inspector", 480)
+        self.assertEqual(len(self._state()["calls"]), 1)
+        tab = self.page.locator(".right-workspace .draggable-chat-tab button")
+        tab.press("Alt+Shift+ArrowLeft")
+        self.page.locator(".conversation .composer").wait_for()
+        self.page.locator(".conversation .draggable-chat-tab button").press("Alt+Shift+ArrowRight")
+        self.page.locator(".right-workspace .composer").wait_for()
+
     def test_sidebars_resize_show_hide_and_restore_saved_preferences(self) -> None:
         self._set_viewport({"width": 1440, "height": 900})
         response = self.page.request.post(
@@ -840,7 +1038,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(title_element.inner_text(), title)
 
         self._drag_sidebar("right", -250)
-        self._wait_for_width(".run-inspector", 480)
+        self._wait_for_width(".run-inspector", 540)
         self.assertGreaterEqual(self._pane_width(".conversation"), 480)
         self.page.get_by_role("button", name="隐藏会话侧栏", exact=True).click()
         self.page.locator(".session-sidebar").wait_for(state="hidden")
@@ -857,7 +1055,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self._wait_for_width(".session-sidebar", 420)
         self.assertFalse(self.page.locator(".run-inspector").is_visible())
         self.page.get_by_role("button", name="显示运行检查器", exact=True).click()
-        self._wait_for_width(".run-inspector", 480)
+        self._wait_for_width(".run-inspector", 540)
         self._set_viewport({"width": 1121, "height": 900})
         self.page.wait_for_function("""() => {
             const width = selector => document.querySelector(selector).getBoundingClientRect().width;
@@ -870,7 +1068,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertFalse(self.page.get_by_role("separator", name="调整会话侧栏宽度", exact=True).is_visible())
         self._set_viewport({"width": 1440, "height": 900})
         self._wait_for_width(".session-sidebar", 420)
-        self._wait_for_width(".run-inspector", 480)
+        self._wait_for_width(".run-inspector", 540)
 
         # Keyboard resizing uses the same bounds and persists just like drag.
         handle = self.page.get_by_role("separator", name="调整会话侧栏宽度", exact=True)

@@ -1,4 +1,58 @@
 /* Quiet desktop surfaces. Existing grid sizing and accessible resize handles remain. */
+.workspace { position: relative; }
+.chat-host, .chat-surface, .right-workspace, .right-tools-host, .context-panel, .inspector-embedded {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.chat-host, .chat-surface, .right-tools-host, .context-panel, .inspector-embedded { flex: 1 1 0; }
+.chat-host[hidden], .right-tools-host[hidden] { display: none; }
+.right-workspace-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.35rem;
+  overflow-x: auto;
+  margin-bottom: 0.7rem;
+  padding-bottom: 0.45rem;
+  border-bottom: 1px solid #373f4b;
+  scrollbar-width: thin;
+}
+.right-workspace-tabs .workbench-tab:first-child { flex: 1 1 auto; min-width: 0; }
+.right-workspace-tabs .workbench-tab:first-child button { width: 100%; }
+.draggable-chat-tab[draggable="true"], .draggable-chat-tab[draggable="true"] > button { cursor: grab; }
+.draggable-chat-tab[draggable="true"]:active { cursor: grabbing; }
+.right-workspace.has-docked-chat { padding: 0.8rem 0.75rem 0.75rem; }
+.has-docked-chat .message-list { padding: 0 0.35rem; }
+.has-docked-chat .composer { width: 100%; }
+.has-docked-chat .composer-actions { margin-left: auto; }
+.has-docked-chat .attachment-chip { max-width: 100%; }
+.context-panel > .run-inspector-content, .inspector-embedded > .run-inspector-content { flex: 1 1 0; }
+.dock-empty-workbench { flex: 1; }
+.chat-drop-zone {
+  position: absolute;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  border: 2px dashed #739dd2;
+  border-radius: 8px;
+  color: #e3efff;
+  background: rgba(39, 65, 100, 0.88);
+  box-shadow: inset 0 0 0 5px rgba(118, 164, 225, 0.08);
+}
+.chat-drop-right { top: 6px; bottom: 6px; right: 0; }
+.chat-drop-center { top: 6px; height: 112px; }
+.chat-drop-zone.is-over { border-style: solid; border-color: #b4d4ff; background: rgba(48, 83, 129, 0.96); }
+.chat-drop-zone > div { display: grid; gap: 0.6rem; padding: 1rem; text-align: center; pointer-events: none; }
+.chat-drop-zone strong { font-size: 0.95rem; }
+.chat-drop-zone span { font-size: 0.78rem; color: #b8cce6; }
+.chat-drop-zone .dock-preview-icon { font-size: 1.8rem; }
+@media (max-width: 760px) {
+  .chat-host, .chat-surface { flex-basis: auto; }
+  .right-workspace.has-docked-chat .chat-host:not([hidden]) { height: 75dvh; flex: 0 0 auto; }
+  .right-workspace.has-docked-chat .message-list { overflow-y: auto; }
+  .right-workspace.has-docked-chat .composer { max-height: 45dvh; }
+}
 :root {
   color: #e2e5eb;
   background: #1b1f25;

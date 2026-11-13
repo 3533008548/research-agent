@@ -57,6 +57,17 @@ const model = http.createServer((request, response) => {
   await page.getByRole('button', { name: 'desktop-client.pdf', exact: true }).click();
   await page.locator('.textLayer span').first().waitFor();
   assert.ok(await page.locator('.pdf-sheet canvas').evaluate(el => el.width > 100));
+  const chatTab = await page.locator('.conversation .draggable-chat-tab').boundingBox();
+  await page.mouse.move(chatTab.x + 20, chatTab.y + chatTab.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(chatTab.x + 40, chatTab.y + chatTab.height / 2, { steps: 5 });
+  await page.locator('.chat-drop-right').waitFor();
+  const dropZone = await page.locator('.chat-drop-right').boundingBox();
+  await page.mouse.move(dropZone.x + dropZone.width / 2, dropZone.y + 80, { steps: 8 });
+  await page.mouse.up();
+  await page.locator('.right-workspace .composer').waitFor();
+  assert.ok(await page.locator('.paper-reader').isVisible());
+  await page.getByRole('textbox', { name: '消息', exact: true }).fill('停靠期间的对话草稿');
   await page.getByRole('spinbutton', { name: '缩放比例', exact: true }).fill('150');
   await page.getByRole('button', { name: '随手记', exact: true }).click();
   await page.getByRole('textbox', { name: '笔记正文', exact: true }).fill('安装版笔记：原文和解释分开保存。');
@@ -76,12 +87,16 @@ const model = http.createServer((request, response) => {
   assert.equal(await page.evaluate(() => localStorage.getItem('desktop-restart-check')), 'retained');
   assert.equal((await page.evaluate(() => window.desktop.info())).configured, true);
   assert.equal(fs.readFileSync(path.join(profile, 'credentials.bin')).includes(Buffer.from(testKey)), false);
+  await page.locator('.right-workspace .composer').waitFor();
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('research-agent.workspace-layout.v1')).chatPlacement), 'right');
   await page.getByRole('button', { name: '论文库', exact: true }).click();
   await page.getByRole('button', { name: 'desktop-client.pdf', exact: true }).click();
   await page.locator('.textLayer span').first().waitFor();
   assert.equal(await page.getByRole('spinbutton', { name: '页码', exact: true }).inputValue(), '2');
   assert.equal(await page.getByRole('spinbutton', { name: '缩放比例', exact: true }).inputValue(), '150');
+  await page.getByRole('tab', { name: '辅助 / 运行', exact: true }).click();
   await page.getByText('安装版笔记：原文和解释分开保存。', { exact: true }).waitFor();
+  await page.locator('.right-workspace .draggable-chat-tab button').click();
   await page.getByRole('button', { name: '上一页', exact: true }).click();
   await page.locator('.textLayer span').filter({ hasText: 'Each annotation' }).waitFor();
   await page.locator('.textLayer').evaluate(el => {
@@ -94,10 +109,15 @@ const model = http.createServer((request, response) => {
   assert.equal(requests.at(-1).messages.at(-1).content, 'Each annotation links a passage to its page.');
   const preview = await desktop.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG().toString('base64'));
   if (preview) fs.writeFileSync(path.join(root, '.visual_check/desktop-client.png'), Buffer.from(preview, 'base64'));
-  await page.getByRole('tab').first().click();
+  await page.locator('.right-workspace .draggable-chat-tab button').click();
   await page.getByRole('textbox', { name: '消息', exact: true }).fill('你好，测试本地客户端对话。');
   await page.getByRole('button', { name: /发送|submit/i }).click();
   await page.locator('.message-assistant').filter({ hasText: '桌面端对话已连通。' }).waitFor();
+  assert.ok(await page.locator('.paper-reader').isVisible());
+  const dockedPreview = await desktop.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG().toString('base64'));
+  if (dockedPreview) fs.writeFileSync(path.join(root, '.visual_check/desktop-chat-docked.png'), Buffer.from(dockedPreview, 'base64'));
+  await page.locator('.right-workspace .draggable-chat-tab button').press('Alt+Shift+ArrowLeft');
+  await page.locator('.conversation .message-assistant').filter({ hasText: '桌面端对话已连通。' }).waitFor();
   assert.ok(requests.some(request => request.stream));
   const saved = await page.evaluate(async id => (await fetch(`/api/v1/library/documents/${id}/notes`)).json(), upload.id);
   assert.ok(saved.some(note => note.content.startsWith('安装版笔记')));
@@ -107,7 +127,7 @@ const model = http.createServer((request, response) => {
   assert.deepEqual(errors, []);
   await desktop.close(); desktop = null;
   await assert.rejects(fetch(initialOrigin + '/api/v1/desktop/status', { signal: AbortSignal.timeout(2000) }));
-  console.log('Desktop passed: isolated install runtime, auth, real PDF, notes, encrypted setup, same-origin restart, translation, queued chat, tray close and backend shutdown.');
+  console.log('Desktop passed: isolated runtime, auth, real PDF, notes, encrypted setup, same-origin restart, docked chat persistence, translation, queued chat, tab return, tray close and backend shutdown.');
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (desktop) await desktop.close().catch(() => {});
   model.close();

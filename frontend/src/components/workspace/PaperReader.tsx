@@ -30,6 +30,7 @@ type Props = {
   document: LibraryDocument;
   active: boolean;
   toolsHost: HTMLElement | null;
+  onShowTools: () => void;
   onProgress: (id: string, progress: LibraryDocument["progress"]) => void;
 };
 export function PaperReader({
@@ -37,6 +38,7 @@ export function PaperReader({
   document: doc,
   active,
   toolsHost,
+  onShowTools,
   onProgress,
 }: Props) {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null),
@@ -154,6 +156,7 @@ export function PaperReader({
     }
   }
   async function newNote(value: NoteAnchor | null = null, content = "") {
+    onShowTools();
     if (!(await flush())) return;
     setEditor(
       { id: crypto.randomUUID(), content, anchor: value, revision: 0 },
@@ -415,6 +418,7 @@ export function PaperReader({
   }
   async function translate() {
     if (!anchor) return;
+    onShowTools();
     const selected = anchor;
     translateAbort.current?.abort();
     const abort = new AbortController();

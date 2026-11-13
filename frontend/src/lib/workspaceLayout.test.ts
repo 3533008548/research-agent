@@ -15,10 +15,20 @@ it("falls back safely for damaged, obsolete and invalid layout preferences", () 
   assert.deepEqual(parseLayoutPreferences(JSON.stringify({
     version: 1, leftWidth: -200, rightWidth: 999999,
     leftVisible: "false", rightVisibility: "sometimes",
-  })), { ...defaultLayoutPreferences(), leftWidth: 190, rightWidth: 480 });
+  })), { ...defaultLayoutPreferences(), leftWidth: 190, rightWidth: 800 });
   assert.deepEqual(parseLayoutPreferences(JSON.stringify({
     version: 1, leftWidth: 350, rightWidth: 440, leftVisible: false, rightVisibility: "hidden",
-  })), { version: 1, leftWidth: 350, rightWidth: 440, leftVisible: false, rightVisibility: "hidden" });
+  })), { ...defaultLayoutPreferences(), leftWidth: 350, rightWidth: 440, leftVisible: false, rightVisibility: "hidden" });
+});
+
+it("restores chat placement without changing visibility or older layout preferences", () => {
+  const old = { version: 1, leftWidth: 280, rightWidth: 600, leftVisible: false, rightVisibility: "hidden" };
+  assert.deepEqual(parseLayoutPreferences(JSON.stringify(old)), { ...old, chatPlacement: "center" });
+  const docked = { ...old, chatPlacement: "right" };
+  assert.deepEqual(parseLayoutPreferences(JSON.stringify(docked)), docked);
+  for (const chatPlacement of [null, "left", true, {}, 1]) {
+    assert.deepEqual(parseLayoutPreferences(JSON.stringify({ ...old, chatPlacement })), { ...old, chatPlacement: "center" });
+  }
 });
 
 it("shows the inspector by default and preserves explicit visibility choices", () => {
@@ -38,7 +48,7 @@ it("keeps the center usable for every visibility combination and requested width
   for (const workspaceWidth of [761, 800, 914, 915, 1000, 1120, 1121, 1280, 1440, 1700]) {
     for (const leftVisible of [false, true]) {
       for (const rightVisible of [false, true]) {
-        for (const [leftWidth, rightWidth] of [[190, 245], [240, 310], [420, 480]]) {
+        for (const [leftWidth, rightWidth] of [[190, 245], [240, 310], [420, 480], [420, 800]]) {
           const resolved = resolveWorkspaceWidths({
             workspaceWidth, viewportWidth: workspaceWidth,
             preferences: { ...defaultLayoutPreferences(), leftWidth, rightWidth }, leftVisible, rightVisible,
@@ -47,7 +57,7 @@ it("keeps the center usable for every visibility combination and requested width
           if (leftVisible) assert.ok(resolved.leftWidth >= 190);
           if (rightVisible) assert.ok(resolved.rightWidth >= 245);
           assert.equal(resolved.leftWidth + resolved.centerWidth + resolved.rightWidth, workspaceWidth);
-          assert.ok(resolved.leftWidth <= 420 && resolved.rightWidth <= 480);
+          assert.ok(resolved.leftWidth <= 420 && resolved.rightWidth <= 800);
           assert.ok(resolved.leftWidth >= resolved.leftBounds.min && resolved.leftWidth <= resolved.leftBounds.max);
           assert.ok(resolved.rightWidth >= resolved.rightBounds.min && resolved.rightWidth <= resolved.rightBounds.max);
           if (!leftVisible) assert.equal(resolved.leftWidth, 0);
@@ -94,4 +104,20 @@ it("a manual change uses actual pixels even after viewport compression", () => {
   assert.equal(resolve(initial.leftWidth - 10, 480).leftWidth, initial.leftWidth - 10);
   const compressedRight = resolve(240, 480);
   assert.equal(resolve(240, compressedRight.rightWidth - 10).rightWidth, compressedRight.rightWidth - 10);
+});
+
+
+it("allows a wide chat rail while preserving the left rail and reading area", () => {
+  const preferences = { ...defaultLayoutPreferences(), rightWidth: 800 };
+  const resolve = (workspaceWidth: number) => resolveWorkspaceWidths({
+    workspaceWidth, viewportWidth: workspaceWidth, preferences, leftVisible: true, rightVisible: true,
+  });
+  assert.equal(resolve(1700).rightWidth, 800);
+  assert.equal(resolve(1440).rightWidth, 720);
+  assert.equal(resolve(1000).rightWidth, 280);
+  for (const width of [1000, 1440, 1700]) {
+    assert.equal(resolve(width).leftWidth, 240);
+    assert.ok(resolve(width).centerWidth >= 480);
+  }
+  assert.equal(parseLayoutPreferences(JSON.stringify(preferences)).rightWidth, 800);
 });
