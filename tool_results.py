@@ -150,6 +150,14 @@ def page_view(record, text, *, offset=0, limit=4000, budget=10000):
     # Reserve space for the complete reference and continuation instructions.
     header_meta = {key: record[key] for key in ('result_id', 'tool', 'total_chars', 'source')}
     overhead = len(json.dumps(header_meta, ensure_ascii=False)) + len(RESULT_GUIDANCE) + 250
+    if budget <= overhead:
+        # Tiny third-party limits may fit a reference but no useful body. Keep
+        # the ID intact, and let the bounded read tool choose the next window.
+        compact = {**header_meta, 'source': {}, 'view': 'reference', 'has_more': True, 'next_offset': offset}
+        pointer = HEADER + json.dumps(compact, ensure_ascii=False, separators=(',', ':')) + '\nread_tool_result'
+        if len(pointer) <= budget:
+            return pointer
+        return '已保存；请用 list_tool_results 查询。' if budget >= 35 else '已保存'
     take = max(1, min(limit, budget - overhead))
     end = min(total, offset + take)
     # Prefer a nearby complete line; offsets always use the original Python text.

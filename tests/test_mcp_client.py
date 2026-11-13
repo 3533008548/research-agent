@@ -150,8 +150,13 @@ class RuntimeInheritanceTests(unittest.TestCase):
         )])
         runtime = ToolRuntime(ToolExecutionContext(run_kind="research"))
         result = runtime.execute("mcp__demo__lookup", {})
-        self.assertLess(len(result), 5000)
-        self.assertIn("截断", result)
+        from tool_results import result_header
+        self.assertLessEqual(len(result), 200)
+        meta = result_header(result)
+        self.assertEqual(meta['total_chars'], 5000)
+        self.assertTrue(meta['has_more'])
+        recovered = runtime.execute('read_tool_result', {'result_id': meta['result_id'], 'limit': 8000})
+        self.assertTrue(recovered.endswith('x' * 5000))
 
     def test_external_tool_is_denied_when_outside_the_allow_list(self):
         register_external_tools([_external_definition()])
