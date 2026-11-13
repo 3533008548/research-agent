@@ -268,6 +268,7 @@ def build_graph(
     # graph tests while the runtime owns all cross-cutting policy.
     tool_runtime = ToolRuntime(
         runtime_context, event_callback=emit, executor=execute_tool,
+        result_db=checkpoint_db if checkpoint_db != ':memory:' else None,
     )
 
     def watch_stream_cancellation(response):
@@ -345,6 +346,9 @@ def build_graph(
         # 对话上下文不会替代核心约束提示词。
         profile_text = profile_manager.summary() if profile_manager else ""
         prompt = system_prompt or SYSTEM_PROMPT
+        if tool_schemas:
+            from tool_results import RESULT_GUIDANCE
+            prompt += '\n\n工具结果读取规则：' + RESULT_GUIDANCE
         if profile_text:
             prompt = f"[用户画像] {profile_text}\n\n{prompt}"
         if prepared_context.archive_context:

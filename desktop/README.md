@@ -79,6 +79,8 @@ npm test
 
 `node --test desktop/tests/*.test.cjs` 验证更新状态、重复点击、失败重试和安装时机。`node scripts/check_desktop_update.cjs` 使用隔离客户端与本地更新服务器验证实际下载、校验、设置界面和安装前后台退出；截获安装器启动，不覆盖机器上的真实安装。
 
+`node scripts/check_desktop_tool_results.cjs` 使用真实长 PDF 验证保存完整工具结果、有限预览、应用重启后的目录搜索与末尾续读，以及会话隔离。它不调用付费模型，使用隔离数据目录；`--dev` 验证开发入口。原始工具结果随 `checkpoint.db` 备份和会话删除。
+
 ## 当前边界
 
 - 本次提供 Windows x64 安装包及应用内更新，尚未制作 macOS/Linux 发行包。

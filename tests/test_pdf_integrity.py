@@ -586,7 +586,9 @@ class TestPdfImages(unittest.TestCase):
             result = ToolRuntime(ToolExecutionContext()).execute('read_pdf',
                 {'url_or_path': self.source.name, 'title': 'Figure Fixture Paper', 'max_pages': 2},
                 paper_store=store, memory_store=MagicMock())
-        self.assertIn('截断至 12000', result)
+        from tool_results import result_header
+        self.assertTrue(result_header(result)['has_more'])
+        self.assertLessEqual(len(result), 12000)
         self.assertIn('论文 ID', result)
         self.assertIn('list_paper_images', result)
         self.assertIn('_p001_Figure4_', result)

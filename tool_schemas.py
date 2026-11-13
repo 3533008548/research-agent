@@ -7,6 +7,39 @@ def _raw_tool_schemas() -> list[dict]:
     """Return the static schemas used to construct the public tool catalog."""
     return [
         {
+            "type": "function", "function": {
+                "name": "list_tool_results",
+                "description": "查找当前会话已保存的完整工具返回。上下文压缩、丢失结果 ID 或重启后用此目录恢复入口；query 会搜索工具原文。只访问当前允许使用的工具结果。",
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string", "description": "可选：原文关键词或工具名"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10}
+                }}
+            }
+        },
+        {
+            "type": "function", "function": {
+                "name": "read_tool_result",
+                "description": "按 result_id 续读保存的工具原文。offset 是原文字符位置，范围左闭右开；按 next_offset 继续。工具结果完整不等于源 PDF/OCR 完整。",
+                "parameters": {"type": "object", "properties": {
+                    "result_id": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 8000}
+                }, "required": ["result_id"]}
+            }
+        },
+        {
+            "type": "function", "function": {
+                "name": "search_tool_result",
+                "description": "在指定结果的完整保存原文中搜索字面关键词，返回精确字符位置及附近片段。核对遗漏的算法末行、图号或结论时使用；未命中不能证明源 PDF 中不存在。",
+                "parameters": {"type": "object", "properties": {
+                    "result_id": {"type": "string"}, "query": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5}
+                }, "required": ["result_id", "query"]}
+            }
+        },
+        {
             "type": "function",
             "function": {
                 "name": "search_papers",

@@ -11,12 +11,15 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from cancellation import RequestCancelledError, raise_if_cancelled
 from tool_catalog import get_tool_definition
 from tools import execute_tool
+from tool_results import (HEADER, RESULT_TOOLS, ToolResultStore, handle_result_tool,
+                          page_view, source_reference)
 
 
 class ToolDeadlineExceeded(RuntimeError):
@@ -34,6 +37,8 @@ class ToolExecutionContext:
     allowed_tool_names: frozenset[str] | None = None
     cancel_event: threading.Event | None = None
     deadline_monotonic: float | None = None
+    result_db: str = ""
+    result_session_id: str = ""
 
 
 ToolExecutor = Callable[..., str]
@@ -48,10 +53,20 @@ class ToolRuntime:
         *,
         event_callback: Callable[..., None] | None = None,
         executor: ToolExecutor = execute_tool,
+        result_db: str | None = None,
     ) -> None:
         self.context = context
         self._event_callback = event_callback
         self._executor = executor
+        self._result_db = context.result_db or result_db
+        self._result_session = context.result_session_id or context.session_id or 'anonymous-' + uuid.uuid4().hex
+        self._result_store = None
+
+    def result_store(self):
+        if self._result_store is None:
+            from runtime_paths import get_runtime_paths
+            self._result_store = ToolResultStore(self._result_db or get_runtime_paths().checkpoint_db)
+        return self._result_store
 
     def _emit(self, event_type: str, **details: Any) -> None:
         if self._event_callback is None:
@@ -72,14 +87,7 @@ class ToolRuntime:
 
     def _is_allowed(self, name: str) -> bool:
         allowed = self.context.allowed_tool_names
-        return allowed is None or name in allowed
-
-    @staticmethod
-    def _truncate_result(result: object, limit: int) -> str:
-        text = result if isinstance(result, str) else str(result)
-        if len(text) <= limit:
-            return text
-        return text[:limit] + f"\n\n...（截断至 {limit} 字符）"
+        return allowed is None or name in allowed or (name in RESULT_TOOLS and bool(allowed - RESULT_TOOLS))
 
     def execute(
         self,
@@ -115,6 +123,18 @@ class ToolRuntime:
         started_at = time.perf_counter()
         self._emit("tool_started", tool=name, call_id=call_id)
         try:
+            if name in RESULT_TOOLS:
+                try:
+                    text = handle_result_tool(name, args, store=self.result_store(),
+                                              session_id=self._result_session,
+                                              allowed_tools=self.context.allowed_tool_names,
+                                              scope=self.context.research_scope)
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    text = f"❌ 工具结果读取失败：{exc}" if isinstance(exc, ValueError) else '❌ 工具结果存储不可读，无法确认完整内容。'
+                self._ensure_active('after_result_read')
+                self._emit('tool_failed' if text.startswith('❌') else 'tool_finished', tool=name, call_id=call_id,
+                           duration_ms=round((time.perf_counter() - started_at) * 1000, 1))
+                return text
             result = self._executor(
                 name,
                 args,
@@ -147,12 +167,23 @@ class ToolRuntime:
             )
             raise
 
-        text = self._truncate_result(result, definition.result_limit)
+        raw = result if isinstance(result, str) else str(result)
+        try:
+            record = self.result_store().save(
+                session_id=self._result_session, run_id=self.context.run_id,
+                tool=name, scope=self.context.research_scope, source=source_reference(args), content=raw,
+            )
+            text = raw if len(raw) <= 800 and not raw.startswith(HEADER) else page_view(record, raw, limit=definition.result_limit, budget=definition.result_limit)
+        except (OSError, sqlite3.Error):
+            # The action already happened. Never retry a write tool just to recover its output.
+            self._emit('tool_failed', tool=name, call_id=call_id, error_type='ToolResultStorageError')
+            return ('❌ 工具已执行，但完整结果保存失败，无法续读；不要自动重复有副作用的操作。'
+                    '以下仅为未归档预览，不能据此宣称已完整读取：\n' + raw[:max(0, definition.result_limit - 110)])
         self._emit(
-            "tool_failed" if text.lstrip().startswith("❌") else "tool_finished",
+            "tool_failed" if raw.lstrip().startswith("❌") else "tool_finished",
             tool=name,
             call_id=call_id,
-            **({"error_type": "ToolResultError"} if text.lstrip().startswith("❌") else {}),
+            **({"error_type": "ToolResultError"} if raw.lstrip().startswith("❌") else {}),
             duration_ms=round((time.perf_counter() - started_at) * 1_000, 1),
             rag_keyword_fallback=name == "query_papers" and "关键词候选" in text,
         )

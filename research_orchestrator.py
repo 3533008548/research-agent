@@ -716,6 +716,8 @@ class ResearchOrchestrator:
                 run_kind="research",
                 run_id=run_id,
                 session_id=worker_id,
+                result_db=getattr(self.sessions, 'db_path', ''),
+                result_session_id=self.sessions.tool_result_owner(run_id) if hasattr(self.sessions, 'tool_result_owner') else '',
                 research_scope=spec.role,
                 allowed_tool_names=frozenset(spec.allowed_tools),
                 cancel_event=cancel_event,
@@ -1005,6 +1007,7 @@ class ResearchOrchestrator:
 
     @staticmethod
     def _evidence_from_messages(messages: list[dict], role: str, *, unlimited: bool = False) -> list[dict[str, Any]]:
+        from tool_results import RESULT_TOOLS, result_header
         tool_names: dict[str, str] = {}
         tool_sources: dict[str, str] = {}
         cards: list[dict[str, Any]] = []
@@ -1032,16 +1035,41 @@ class ResearchOrchestrator:
             if unlimited and content.startswith("Tool is not available in this "):
                 continue
             tool = tool_names.get(str(message.get("tool_call_id", "")), "tool")
+            saved = result_header(content)
+            if tool in RESULT_TOOLS and saved is None:
+                continue  # A result directory or lookup failure is not source evidence.
+            saved_reference = {}
+            if saved:
+                tool = saved['tool']
+                saved_reference = {key: saved[key] for key in ('result_id', 'offset', 'end', 'total_chars', 'view', 'has_more') if key in saved}
+                if saved.get('view') == 'page':
+                    content = content.split('正文（字符范围为左闭右开）：\n', 1)[-1]
+                elif saved.get('view') == 'search':
+                    hits = json.loads(content.rsplit('\n', 1)[-1])
+                    content = '\n\n'.join(hit['text'] for hit in hits)
+                    saved_reference['matches'] = [{'offset': hit['offset'], 'end': hit['end']} for hit in hits]
+                else:
+                    continue
+                if not content or content.startswith(('❌', '📭')):
+                    continue
+
+            def retain(new_cards):
+                for card in new_cards:
+                    if saved_reference:
+                        card.setdefault('source_anchor', {})['tool_result'] = dict(saved_reference)
+                        card['uncertainty'] = card.get('uncertainty', '') + ' 仅基于当前工具结果可见范围，可按结果 ID 续读原文。'
+                    cards.append(card)
+
             if unlimited and tool == "read_pdf":
-                raw = str(message.get("content") or "").split("\n\n🖼️ **提取的图片**", 1)[0].split("\n\n---\n", 1)[0]
+                raw = content.split("\n\n🖼️ **提取的图片**", 1)[0].split("\n\n---\n", 1)[0]
                 pages = re.split(r"━━━ 第 (\d+) 页 ━━━", raw)
                 if len(pages) > 1:
                     source = tool_sources.get(str(message.get("tool_call_id", ""))) or ResearchOrchestrator._source_label(content, tool)
                     for index in range(1, len(pages), 2):
-                        cards.append({"id": "", "researcher": role, "source_type": tool,
+                        retain([{"id": "", "researcher": role, "source_type": tool,
                             "source": source, "excerpt": pages[index + 1].strip(),
                             "source_anchor": {"kind": "page", "page": int(pages[index])},
-                            "uncertainty": "PDF 解析文本；需核对版式、表格与适用条件。"})
+                            "uncertainty": "PDF 解析文本；需核对版式、表格与适用条件。"}])
                     continue
             structured_cards = split_tool_evidence(
                 content, researcher=role, source_type=tool, unlimited=unlimited,
@@ -1050,7 +1078,7 @@ class ResearchOrchestrator:
                 if content.startswith("⏳"):
                     for card in structured_cards:
                         card["uncertainty"] += " 本次为降级关键词检索，尚未完成语义检索。"
-                cards.extend(structured_cards)
+                retain(structured_cards)
                 continue
             if content.startswith("⏳"):
                 continue  # A pure waiting message is not source evidence.
@@ -1065,7 +1093,7 @@ class ResearchOrchestrator:
             quality = ResearchOrchestrator._search_evidence_quality(content, tool)
             if quality:
                 card["relevance"] = quality
-            cards.append(card)
+            retain([card])
         return cards if unlimited else cards[:6]
 
     @staticmethod

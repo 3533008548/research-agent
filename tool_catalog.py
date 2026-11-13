@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from tool_schemas import _raw_tool_schemas
+from tool_results import RESULT_TOOLS
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,9 @@ class ToolDefinition:
 
 
 _PRESENTATION = {
+    "list_tool_results": ("工具结果目录", 12_000),
+    "read_tool_result": ("工具结果续读", 10_000),
+    "search_tool_result": ("工具结果搜索", 8_000),
     "search_papers": ("论文搜索", 3_000),
     "read_pdf": ("论文阅读", 12_000),
     "generate_paper_card": ("论文证据卡", 3_000),
@@ -120,5 +124,5 @@ def get_tool_schemas(allowed_tool_names: set[str] | frozenset[str] | None = None
     return [
         deepcopy(definition.schema)
         for definition in (*TOOL_CATALOG, *external)
-        if allowed is None or definition.name in allowed
+        if allowed is None or definition.name in allowed or (definition.name in RESULT_TOOLS and bool(allowed - RESULT_TOOLS))
     ]

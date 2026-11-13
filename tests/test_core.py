@@ -4209,7 +4209,7 @@ class TestToolCatalog(unittest.TestCase):
         )
         self.assertEqual(
             [schema["function"]["name"] for schema in get_tool_schemas({"read_pdf"})],
-            ["read_pdf"],
+            ["list_tool_results", "read_tool_result", "search_tool_result", "read_pdf"],
         )
 
 
@@ -4258,8 +4258,10 @@ class TestToolRuntime(unittest.TestCase):
             executor=dispatcher,
         )
         result = runtime.execute("search_papers", {"query": "TSN"})
-        self.assertIn("截断至 3000 字符", result)
-        self.assertLessEqual(len(result), 3_100)
+        from tool_results import result_header
+        self.assertTrue(result_header(result)['has_more'])
+        self.assertEqual(result_header(result)['total_chars'], 3200)
+        self.assertLessEqual(len(result), 3_000)
         self.assertEqual([event["type"] for event in events], [
             "tool_started", "tool_finished",
         ])

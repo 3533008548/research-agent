@@ -850,6 +850,14 @@ class SessionStore:
         return self.get_research_run(run_id)
 
     @_synchronized
+    def tool_result_owner(self, run_id: str) -> str:
+        """Keep worker artifacts with the originating session across restarts."""
+        row = self._conn.execute('''SELECT thread_id FROM research_runs WHERE run_id=?
+            UNION SELECT origin_session_id AS thread_id FROM research_projects WHERE project_id=?''',
+            (run_id, run_id)).fetchone()
+        return str(row['thread_id']) if row else ''
+
+    @_synchronized
     def delete(self, thread_id: str) -> bool:
         """硬删除一个会话及全部 LangGraph checkpoint 关联行。"""
         if not self.get(thread_id):
@@ -865,6 +873,12 @@ class SessionStore:
             and self._table_has_column(row["name"], "thread_id")
         ]
         with self._conn:
+            if any(row['name'] == 'tool_results' for row in rows):
+                self._conn.execute('''DELETE FROM tool_results WHERE session_id=? OR run_id IN (
+                    SELECT run_id FROM chat_runs WHERE thread_id=? UNION
+                    SELECT run_id FROM research_runs WHERE thread_id=? UNION
+                    SELECT project_id FROM research_projects WHERE origin_session_id=?)''',
+                    (thread_id, thread_id, thread_id, thread_id))
             for table in checkpoint_tables:
                 # table 名来自 sqlite_master 且已由 PRAGMA 验证；方括号避免关键字冲突。
                 self._conn.execute(f"DELETE FROM [{table}] WHERE thread_id=?", (thread_id,))

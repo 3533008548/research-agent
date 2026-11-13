@@ -15,6 +15,7 @@ from tools.paper_images import handle_list_paper_images
 from tools.profile_tool import handle_read_profile, handle_update_profile
 from cancellation import raise_if_cancelled
 from tool_catalog import TOOL_NAMES, get_tool_definition
+from tool_results import RESULT_TOOLS
 
 
 _TOOL_HANDLERS = {
@@ -33,6 +34,9 @@ _TOOL_HANDLERS = {
     "update_profile": handle_update_profile,
     "read_profile": handle_read_profile,
 }
+
+# Result retrieval must pass the runtime's session and capability boundary.
+_TOOL_HANDLERS.update({name: lambda *_a, **_k: '❌ 请通过当前会话的 ToolRuntime 读取已保存结果。' for name in RESULT_TOOLS})
 
 _EXECUTABLE_TOOL_NAMES = frozenset({*_TOOL_HANDLERS, "memory_search"})
 if TOOL_NAMES != _EXECUTABLE_TOOL_NAMES:
