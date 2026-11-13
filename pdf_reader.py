@@ -164,9 +164,11 @@ class PaperReader:
                               "missing_native_blocks": missing_native})
 
         self._link_table_continuations(pages)
+        from pdf_ocr import EXTRACTION_VERSION
+
         return {
             "version": 1,
-            "extraction_version": 2,
+            "extraction_version": EXTRACTION_VERSION,
             "source_file": source.name,
             "metadata_title": str(metadata.get("title") or "").strip(),
             "total_pages": total_pages,

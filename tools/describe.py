@@ -60,10 +60,14 @@ def handle_describe_image(
     if llm_client is None:
         return "❌ DeepSeek 视觉模型未启用，请先配置 DEEPSEEK_API_KEY。"
     vision_model = vision_model or DEFAULT_VISION_MODEL
+    task = str(args.get("task") or "describe")
+    if task not in {"describe", "transcribe_algorithm"}:
+        return "❌ task 仅支持 describe 或 transcribe_algorithm。"
+    cache_key = str(p) if task == "describe" else str(p) + "#algorithm-transcription-v1"
 
     # ── 描述缓存命中 ──
     if memory_store:
-        cached = memory_store.get_image_description(str(p))
+        cached = memory_store.get_image_description(cache_key)
         if cached:
             return f"🖼️ 图片描述 ({p.name}) [缓存]:\n{cached}"
 
@@ -89,7 +93,15 @@ def handle_describe_image(
         return f"❌ 读取图片失败: {e}"
 
     prompt = "请详细描述这张图的内容。"
-    if caption_text:
+    if task == "transcribe_algorithm":
+        prompt = (
+            "请逐行转写图片中的算法伪代码，而不是概述算法。保留全部行号、缩进、函数签名、"
+            "变量名、上下标、集合操作、比较符号和循环边界，直到最后一行及辅助函数。"
+            "特别核对 <= 与 <、!= 与 =、入队对象和下标。不能从算法常识推断或补写缺失行。"
+            "无法辨认的位置用[无法辨认]标记；有歧义时列出原行号及可能字符。"
+            "先输出保留原文的代码块，再用中文列出无法核验的符号。"
+        )
+    elif caption_text:
         prompt += f"\n论文中的图注是: 「{caption_text[:200]}」\n请结合图注理解图片，描述各子图的内容和它们的关系。"
     else:
         prompt += "如果是网络架构图，描述每层结构和数据流；如果是流程图，描述每个步骤；如果是实验数据图，描述数据和结论。用中文回答。"
@@ -124,7 +136,7 @@ def handle_describe_image(
     # ── 存入缓存 ──
     if memory_store:
         try:
-            memory_store.save_image_description(str(p), desc)
+            memory_store.save_image_description(cache_key, desc)
         except Exception:
             pass
 

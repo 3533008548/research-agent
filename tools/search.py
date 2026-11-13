@@ -93,6 +93,11 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
             return f"❌ {scope_error}"
     else:
         scope = None
+    from paper_algorithms import query_algorithm_evidence
+
+    algorithm_evidence = query_algorithm_evidence(query, scope, get_runtime_paths(), section=section)
+    if algorithm_evidence is not None:
+        return algorithm_evidence
     results, pending = paper_store.query_with_timeout(
         query, top_k=top_k, paper_ids=scope, section=section,
     )

@@ -13,6 +13,8 @@ from pathlib import Path
 import pymupdf
 
 ALGORITHM_CAPTION = re.compile(r"^(?:Algorithm|算法)\s*\d+\b(?=\s*[:.：]|\s*$)", re.I)
+ALGORITHM_LABEL = re.compile(r"^(?:Algorithm|算法)\s*(\d+)\b(?!\.\d)", re.I)
+EXTRACTION_VERSION = 3
 _CODE_WORD = re.compile(r"\b(?:function|input|output|return|for|while|if|end)\b", re.I)
 
 
@@ -78,7 +80,8 @@ def attach_visual_assets(document: dict, pdf_path, output_dir) -> list[str]:
             for element in page.get("elements", []):
                 if element.get("kind") not in {"algorithm", "ocr_text"}:
                     continue
-                path = output / f"{digest}_{element['id']}.png"
+                region_key = hashlib.sha256(repr(element["bbox"]).encode()).hexdigest()[:10]
+                path = output / f"{digest}_v{EXTRACTION_VERSION}_{region_key}_{element['id']}.png"
                 if not path.exists():
                     rect = pymupdf.Rect(element["bbox"])
                     dpi = min(180, max(36, int(72 * (12_000_000 / max(rect.get_area(), 1)) ** 0.5)))
@@ -91,16 +94,28 @@ def attach_visual_assets(document: dict, pdf_path, output_dir) -> list[str]:
 def extract_visual_text(page, blocks: list[dict]) -> tuple[list[dict], list[dict]]:
     """Return dedicated algorithm elements plus explicit extraction diagnostics."""
     elements, diagnostics = [], []
-    captions = [b for b in blocks if ALGORITHM_CAPTION.match(b["text"])]
+    # IEEE and algorithm2e commonly omit punctuation after the number. A
+    # matching label is only a candidate: nearby panel rules distinguish such
+    # captions from prose like "Algorithm 4 provides the optimized path".
+    # Work at line level: MuPDF can merge a short caption with a tall block
+    # from the other column, giving it a page-wide bounding box.
+    native_lines = [line
+        for block in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"]
+        for line in block.get("lines", [])
+    ]
+    captions = [{"text": "".join(span["text"] for span in line.get("spans", [])),
+                 "bbox": list(line["bbox"])} for line in native_lines
+                if ALGORITHM_LABEL.match("".join(span["text"] for span in line.get("spans", [])))]
     rules = []
+    drawings = page.get_drawings() if captions else []
     if captions:
-        for drawing in page.get_drawings():
+        for drawing in drawings:
             rect = drawing["rect"]
             if rect.width > 80 and rect.height < 3:
                 rules.append(rect)
     for caption in captions:
         x0, y0, x1, y1 = caption["bbox"]
-        label = ALGORITHM_CAPTION.match(caption["text"]).group()
+        label = ALGORITHM_LABEL.match(caption["text"]).group()
         aligned = sorted(
             [r for r in rules if r.x0 <= x0 + 12 and r.x1 >= x1 - 12],
             key=lambda r: r.y0,
@@ -113,6 +128,8 @@ def extract_visual_text(page, blocks: list[dict]) -> tuple[list[dict], list[dict
         bottom = next((r for r in below if r.y0 > y1 + 12), None)
         top = next((r for r in reversed(aligned) if y0 - 16 <= r.y0 <= y0), None)
         if bottom is None or (top is None and separator is None):
+            if not ALGORITHM_CAPTION.match(caption["text"]):
+                continue
             # Unboxed pseudocode: do not silently accept a title with no body.
             nearby = " ".join(b["text"] for b in blocks if b is not caption
                                and abs(b["bbox"][0] - x0) < 40
@@ -125,7 +142,22 @@ def extract_visual_text(page, blocks: list[dict]) -> tuple[list[dict], list[dict
         bbox = [float(edge.x0), float(y1 + 1), float(edge.x1), float(bottom.y0)]
         body = page.get_text("text", clip=pymupdf.Rect(bbox), sort=True).strip()
         method = "native"
-        if len(body) < 60 or len(_CODE_WORD.findall(body)) < 2:
+        region = pymupdf.Rect(bbox)
+        # A native Input/Output header does not prove that the remaining lines
+        # are native. Detect image content and outlined glyphs outside native
+        # spans, otherwise a mixed panel can pass the simple text-length gate.
+        spans = [pymupdf.Rect(span["bbox"]) + (-1, -1, 1, 1)
+                 for line in native_lines for span in line.get("spans", [])]
+        outlined = sum(
+            "f" in drawing["type"] and len(drawing["items"]) >= 6
+            and 1 <= drawing["rect"].width <= 120 and 2 <= drawing["rect"].height <= 24
+            and region.contains(drawing["rect"])
+            and not any(rect.contains(drawing["rect"]) for rect in spans)
+            for drawing in drawings
+        )
+        raster = any((region & pymupdf.Rect(info["bbox"])).get_area() > 1024
+                     for info in page.get_image_info())
+        if len(body) < 60 or len(_CODE_WORD.findall(body)) < 2 or outlined >= 8 or raster:
             method = "ocr"
             try:
                 body = ocr_region(page, bbox)

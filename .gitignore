@@ -20,6 +20,8 @@ build/
 build-desktop.log
 .visual_check/desktop-runtime*/
 .visual_check/desktop-profile*/
+.visual_check/desktop-pdf-*/
+.visual_check/pdf-algorithm/
 *.spec
 # 旧版分散路径（保留忽略以支持显式迁移）
 chroma_data/

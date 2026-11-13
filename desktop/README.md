@@ -5,7 +5,7 @@
 
 ## 使用
 
-1. 运行 `release/Research-Assistant-Setup-0.2.4.exe` 安装，启动“Research Assistant”。
+1. 运行 `release/Research-Assistant-Setup-0.2.5.exe` 安装，启动“Research Assistant”。
 2. 在工作台左下角的“设置 → 通用”填写模型 API Key。密钥通过 Electron safeStorage 使用 Windows 系统加密，保存后自动重启后台。没有密钥也能整理、阅读 PDF 和写笔记。
 3. “论文库”在工作台内打开。支持多文件导入、文件夹、重命名、移动、搜索、回收站和恢复。点击论文名称打开独立阅读标签。
 4. 阅读器支持 25%～400% 缩放、Ctrl＋滚轮、适应宽度、整页显示、手形拖动、空格临时拖动、查找文字、划选翻译和页码批注。笔记自动保存，失败时保留本机草稿；版本冲突可另存为新笔记。
@@ -20,6 +20,8 @@
 0.2.1 起，桌面端也支持在对话中提供本机 PDF 绝对路径（含带引号路径和 `file:///` URI），后台先复制到论文库再读取，原文件保持不变。网页服务仍需先上传。`list_papers` 包含论文库导入的文件，并返回可直接使用的相对路径。
 
 安装包内置 Tesseract 英文、简体中文 OCR 语言数据，解析图片/矢量算法区域无需另装 Tesseract。默认识别英文；源码运行可用 `PDF_OCR_LANGUAGE=eng+chi_sim` 处理中文扫描件。构建时按固定版本和 SHA-256 校验下载，随包附带 Apache-2.0 许可。源码运行先执行 `python scripts/fetch_ocr_data.py`；OCR 转写保留页码和原图，公式符号仍需核对。
+
+0.2.5 起，指定论文询问算法编号或伪代码时，会从原 PDF 获取完整算法区域，兼容仅含标题的旧索引，不按检索条数截掉算法末尾。自动附上原页裁图供逐行转写；OCR 或区域识别失败时提供整页备用图，并明确报告尚未恢复的内容。
 
 ## 数据与恢复
 
@@ -71,7 +73,9 @@ npm test
 
 安装 Python 版 Playwright 后，`node scripts/check_desktop_app.cjs` 会启动 `win-unpacked` 的真实客户端，在隔离用户目录中验证首启、PDF、笔记、系统凭据加密、重启恢复、划词翻译、对话队列、托盘关闭和后台退出。测试使用本地模拟模型，并从被测客户端的 PATH 移除 Python/Node；不会调用付费模型或修改用户数据。加 `--dev` 可验证开发入口。
 
-`node scripts/check_desktop_ingestion.cjs [PDF路径]` 专门验证打包后的入库链路：外部绝对路径导入、内置 OCR、真实 Chroma 写入、重复索引替换和算法检索。默认生成含图片算法的测试 PDF；指定真实论文时应包含 Algorithm 4。测试使用独立数据目录、本地模拟模型，并故意设置不存在的系统 OCR 目录，确保客户端确实使用随包资源。
+`node scripts/check_desktop_ingestion.cjs [PDF路径] [算法编号]` 专门验证打包后的入库链路：外部绝对路径导入、内置 OCR、真实 Chroma 写入、重复索引替换和算法检索。默认生成含图片算法的测试 PDF，算法编号默认 4。测试使用独立数据目录、本地模拟模型，并故意设置不存在的系统 OCR 目录，确保客户端确实使用随包资源。
+
+`node scripts/check_desktop_pdf.cjs` 验证仅有标题的旧索引能自动恢复无冒号标题的矢量算法，返回最后一行并将原页裁图交给专用转写任务；原索引和论文 ID 保持不变。使用真实本地 OCR 和模拟视觉模型，`--dev` 验证开发入口。
 
 `node --test desktop/tests/*.test.cjs` 验证更新状态、重复点击、失败重试和安装时机。`node scripts/check_desktop_update.cjs` 使用隔离客户端与本地更新服务器验证实际下载、校验、设置界面和安装前后台退出；截获安装器启动，不覆盖机器上的真实安装。
 

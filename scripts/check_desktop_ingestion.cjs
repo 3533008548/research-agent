@@ -13,6 +13,8 @@ const profile = path.join(root, '.visual_check', 'desktop-profile-ingestion-' + 
 fs.mkdirSync(path.join(profile, 'runtime', 'primary'), { recursive: true });
 fs.writeFileSync(path.join(profile, 'runtime', 'primary', 'settings.json'), JSON.stringify({ rag_enabled: true, daily_search_enabled: false }));
 const source = path.resolve(process.argv[2] || path.join(profile, 'source paper.pdf'));
+const algorithmNumber = process.argv[3] || '4';
+assert.match(algorithmNumber, /^\d+$/);
 if (!process.argv[2]) {
   execFileSync('python', ['-c', [
     'import pymupdf,sys',
@@ -114,8 +116,8 @@ const model = http.createServer((req, res) => {
   const papers = await api('/workspace/papers');
   assert.equal(papers.length, 1);
   assert.ok(papers[0].chunks > 0);
-  const answer = await runTool('query_papers', { query: 'Algorithm 4', paper_id_or_title: papers[0].paper_id, top_k: 3 });
-  assert.match(answer, /Algorithm 4/i);
+  const answer = await runTool('query_papers', { query: 'Algorithm ' + algorithmNumber, paper_id_or_title: papers[0].paper_id, top_k: 1 });
+  assert.match(answer, new RegExp('Algorithm ' + algorithmNumber + '\\b', 'i'));
   assert.match(answer, /Return/i);
   console.log(JSON.stringify({ profile, pages: document.pages, indexedPapers: papers.length, chunks: papers[0].chunks,
     checks: ['quoted absolute path import', 'bundled OCR without system installation', 'library listing',

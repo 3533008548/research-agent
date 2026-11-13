@@ -57,11 +57,12 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "describe_image",
-                "description": "用 DeepSeek 视觉模型描述论文图片（架构图/流程图/实验图）。",
+                "description": "用 DeepSeek 视觉模型描述论文图片；核对算法伪代码时用 transcribe_algorithm 逐行转写原页裁图。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "image_path": {"type": "string", "description": "图片路径"},
+                        "task": {"type": "string", "enum": ["describe", "transcribe_algorithm"], "description": "默认 describe；算法原文核对用 transcribe_algorithm，保留行号、缩进和符号"},
                     },
                     "required": ["image_path"],
                 },
@@ -135,13 +136,14 @@ def _raw_tool_schemas() -> list[dict]:
                     "在已索引论文中语义检索方法细节/公式/实验数据。支持按章节过滤。"
                     "当用户已指定论文时（如“论文A的…”“比较A和B”），用 paper_id_or_title 限定范围，"
                     "此时不会跨论文扩展，结果只来自指定论文；"
+                    "指定算法编号（Algorithm 1/算法一）时自动从原 PDF 读取完整算法框并提供原页裁图，兼容旧索引；"
                     "开放式方法/主题提问（未指定论文）不要传该参数，以便借助论文关系召回相关论文。"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "查询内容"},
-                        "top_k": {"type": "integer", "description": "返回段落数"},
+                        "top_k": {"type": "integer", "description": "普通检索返回段落数；明确算法编号时返回完整算法区域"},
                         "section": {"type": "string", "description": "限定章节（如 Method/Experiments），可选"},
                         "paper_id_or_title": {
                             "description": (

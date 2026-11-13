@@ -136,6 +136,15 @@ def assess_document_map(
     lost_native = [page["page"] for page in pages if page.get("missing_native_blocks", 0)]
     if lost_native:
         issue("error", "native_text_loss", "原 PDF 文本层有内容未进入页面元素，拒绝不完整入库。", pages=lost_native)
+    lost_algorithms = [page["page"] for page in pages if any(
+        item.get("code") == "algorithm_extracted" and not any(
+            element.get("kind") == "algorithm" and element.get("label") == item.get("label")
+            and element.get("bbox") == item.get("bbox") and str(element.get("text") or "").strip()
+            for element in page.get("elements", [])
+        ) for item in page.get("extraction_diagnostics", [])
+    )]
+    if lost_algorithms:
+        issue("error", "algorithm_region_loss", "已定位的算法框缺少对应正文元素，拒绝不完整入库。", pages=lost_algorithms)
     ocr_pages = [page["page"] for page in pages if any(
         item.get("status") == "ocr" for item in page.get("extraction_diagnostics", [])
     )]

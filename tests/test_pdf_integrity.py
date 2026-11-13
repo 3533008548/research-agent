@@ -94,18 +94,24 @@ class TestPdfIntegrity(unittest.TestCase):
             self.assertIn("预期 2 块", result["issues"][0]["message"])
         self.assertFalse(verify_index_round_trip({"chunks": [doc["chunks"][0]] * 2}, complete[:1])["accepted"])
 
-    def make_panel(self, *, raster=False, tall=False):
+    def make_panel(self, *, raster=False, vector=False, tall=False,
+                   caption="Algorithm 4: Least Bandwidth Consumption"):
         with pymupdf.open() as doc:
             page = doc.new_page(width=600, height=800)
-            page.insert_text((50, 50), "Algorithm 4: Least Bandwidth Consumption")
+            page.insert_text((50, 50), caption)
             for y in (36, 54, 260):
                 page.draw_line((45, y), (305, y))
             code = "1 Function LBC(paths, r):\n2 for edge in paths do\n3   add edge to edgeList\n4 end\n5 Return paths with smallest averBand"
-            if raster:
+            if raster or vector:
                 with pymupdf.open() as image_doc:
                     p = image_doc.new_page(width=260, height=180)
                     p.insert_text((8, 20), code, fontsize=10)
-                    page.insert_image(pymupdf.Rect(45, 60, 305, 240), stream=p.get_pixmap(matrix=pymupdf.Matrix(3, 3)).tobytes("png"))
+                    if vector:
+                        with pymupdf.open(stream=p.get_svg_image(text_as_path=True).encode(), filetype="svg") as svg:
+                            with pymupdf.open(stream=svg.convert_to_pdf(), filetype="pdf") as outlined:
+                                page.show_pdf_page(pymupdf.Rect(45, 60, 305, 240), outlined, 0)
+                    else:
+                        page.insert_image(pymupdf.Rect(45, 60, 305, 240), stream=p.get_pixmap(matrix=pymupdf.Matrix(3, 3)).tobytes("png"))
             else:
                 page.insert_text((50, 80), code, fontsize=10)
             if tall:
@@ -124,6 +130,193 @@ class TestPdfIntegrity(unittest.TestCase):
         content = "\n".join(c["text"] for c in m["chunks"])
         self.assertIn("Long body evidence line 44", content)
         self.assertTrue(any(c["kind"] == "algorithm" and "Return" in c["text"] for c in m["chunks"]))
+
+    def test_vector_algorithm_without_caption_punctuation_is_not_silently_lost(self):
+        self.make_panel(vector=True, tall=True, caption="Algorithm 4 Routing Algorithm")
+        with pymupdf.open(self.path) as pdf:
+            self.assertNotIn("averBand", pdf[0].get_text())
+            self.assertFalse(pdf[0].get_image_info())
+        body = "1 Function Route(paths):\n2 for edge in paths do\n3 Return paths with smallest averBand"
+        with patch("pdf_ocr.ocr_region", return_value=body) as ocr:
+            m, q = self.parse_map()
+        self.assertTrue(q["accepted"], q)
+        self.assertTrue(any(c["kind"] == "algorithm" and "averBand" in c["text"] for c in m["chunks"]))
+        ocr.assert_called_once()
+
+    def test_punctuationless_vector_panel_fails_closed_when_ocr_fails(self):
+        self.make_panel(vector=True, tall=True, caption="Algorithm 4 Routing Algorithm")
+        for tables in (True, False):
+            with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
+                d = PaperReader(max_pages=1).parse_document(self.path, extract_tables=tables)
+            _, q = prepare_document_map(build_document_map(d, paper_id="p", title="Paper", source_file=self.path.name), requested_pages=1)
+            self.assertFalse(q["accepted"], q)
+            self.assertIn("unresolved_visual_text", {i["code"] for i in q["issues"]})
+
+    def test_native_punctuationless_panel_preserves_algorithm_identity(self):
+        self.make_panel(caption="Algorithm 4 Routing Algorithm")
+        with patch("pdf_ocr.ocr_region", side_effect=AssertionError("native body must not use OCR")):
+            m, q = self.parse_map()
+        self.assertTrue(q["accepted"], q)
+        self.assertTrue(any(c["kind"] == "algorithm" and "averBand" in c["text"] for c in m["chunks"]))
+
+    def test_mixed_native_header_and_vector_body_still_requires_ocr(self):
+        self.make_panel(vector=True, caption="Algorithm 4 Routing Algorithm")
+        with pymupdf.open(self.path) as pdf:
+            pdf[0].insert_text((50, 220), "Input graph and candidate paths.\nOutput the best feasible path, then return to the caller.", fontsize=8)
+            pdf.saveIncr()
+        with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")) as ocr:
+            _, q = self.parse_map()
+        ocr.assert_called_once()
+        self.assertFalse(q["accepted"])
+
+    def test_quality_gate_detects_algorithm_element_lost_after_extraction(self):
+        self.make_panel()
+        d = PaperReader().parse_document(self.path)
+        d['pages'][0]['elements'] = [e for e in d['pages'][0]['elements'] if e['kind'] != 'algorithm']
+        _, q = prepare_document_map(build_document_map(d, paper_id="p", title="Paper", source_file=self.path.name), requested_pages=1)
+        self.assertIn("algorithm_region_loss", {i["code"] for i in q["issues"]})
+
+    def test_prose_algorithm_mention_in_other_column_does_not_trigger_ocr(self):
+        with pymupdf.open() as pdf:
+            page = pdf.new_page()
+            page.insert_text((50, 50), "Algorithm 4 provides the optimized path.\nThis is explanatory prose rather than an algorithm caption.")
+            for y in (36, 54, 260):
+                page.draw_line((350, y), (550, y))
+            pdf.save(self.path)
+        with patch("pdf_ocr.ocr_region", side_effect=AssertionError("prose must not be OCRed")) as ocr:
+            d = PaperReader().parse_document(self.path)
+        ocr.assert_not_called()
+        self.assertFalse(d['pages'][0]['extraction_diagnostics'])
+
+    def test_algorithm_transcription_does_not_reuse_generic_image_description(self):
+        from tools.describe import handle_describe_image
+        from runtime_paths import RuntimePaths
+        paths = RuntimePaths.from_root(Path(self.tmp.name) / 'runtime')
+        paths.ensure_initialized()
+        image = paths.images_dir / 'algorithm.png'
+        image.write_bytes(b'fixture')
+        memory = MagicMock()
+        memory.get_image_description.side_effect = lambda key: 'generic description' if key == str(image) else None
+        client = MagicMock()
+        client.post.return_value.json.return_value = {'choices': [{'message': {'content': '1 Function Route\n2 return path'}}]}
+        with patch('tools.describe.get_runtime_paths', return_value=paths):
+            result = handle_describe_image({'image_path': str(image), 'task': 'transcribe_algorithm'},
+                                           memory_store=memory, llm_client=client)
+        self.assertIn('return path', result)
+        prompt = client.post.call_args.args[0]['messages'][0]['content'][0]['text']
+        self.assertIn('逐行转写', prompt)
+        self.assertIn('[无法辨认]', prompt)
+        self.assertNotEqual(memory.save_image_description.call_args.args[0], str(image))
+
+    def scoped_algorithm_store(self, *, source_file="algorithm.pdf"):
+        import shutil
+        from paper_artifacts import write_document_map
+        from runtime_paths import RuntimePaths
+        paths = RuntimePaths.from_root(Path(self.tmp.name) / "runtime")
+        paths.ensure_initialized()
+        shutil.copyfile(self.path, paths.papers_dir / "algorithm.pdf")
+        # Mimic an old index whose map and embedding contain no pseudocode.
+        write_document_map(paths, paper_id="p", document_map={
+            "paper_id": "p", "title": "Routing Paper", "extraction_version": 2,
+            "source_file": source_file, "total_pages": 1, "processed_pages": 1,
+            "pages": [], "chunks": [],
+        })
+        store = MagicMock()
+        store.list_papers.return_value = [{"paper_id": "p", "title": "Routing Paper"}]
+        store.query_with_timeout.side_effect = AssertionError("Numbered algorithms must bypass top-k retrieval")
+        return paths, store
+
+    def test_old_index_recovers_full_algorithm_and_reuses_versioned_source_cache(self):
+        from tools.search import handle_query_papers
+        self.make_panel(vector=True, tall=True, caption="Algorithm 4 Routing Algorithm")
+        paths, store = self.scoped_algorithm_store()
+        body = "1 Function Route(paths):\n" + "\n".join(f"{i} for edge in path do keep candidate" for i in range(2, 90)) + "\n90 Return finalWitness"
+        original_map = next(paths.paper_artifacts_dir.glob('*/document_map.json')).read_bytes()
+        with patch("tools.search.get_runtime_paths", return_value=paths), \
+             patch("pdf_ocr.ocr_region", return_value=body) as ocr:
+            result = handle_query_papers({"query": "解释算法四", "paper_id_or_title": "p", "top_k": 1}, paper_store=store)
+            again = handle_query_papers({"query": "Algorithm 4", "paper_id_or_title": "p"}, paper_store=store)
+        self.assertIn(body, result)
+        self.assertIn("OCR", result)
+        self.assertIn("p.1", result)
+        self.assertIn("describe_image", result)
+        self.assertEqual(result, again)
+        ocr.assert_called_once()
+        store.index_document_map.assert_not_called()
+        store.delete_paper.assert_not_called()
+        self.assertEqual(next(paths.paper_artifacts_dir.glob('*/document_map.json')).read_bytes(), original_map)
+        self.assertEqual(len(list(paths.images_dir.glob('*.png'))), 1)
+
+    def test_algorithm_read_failure_is_explicit_and_retried_after_recovery(self):
+        from paper_algorithms import query_algorithm_evidence
+        self.make_panel(vector=True, tall=True, caption="Algorithm 4 Routing Algorithm")
+        paths, _ = self.scoped_algorithm_store()
+        with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
+            failed = query_algorithm_evidence("Algorithm 4", ["p"], paths)
+        self.assertIn("OCR unavailable", failed)
+        self.assertIn("尚未恢复", failed)
+        self.assertIn("原页备用图", failed)
+        self.assertTrue(list(paths.images_dir.glob('*algorithm-page.png')))
+        self.assertFalse(list(paths.paper_artifacts_dir.glob('*/algorithms-*.json')))
+        with patch("pdf_ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return repairedWitness"):
+            recovered = query_algorithm_evidence("Algorithm 4", ["p"], paths)
+        self.assertIn("repairedWitness", recovered)
+
+    def test_algorithm_lookup_does_not_escape_paper_scope_or_source_directory(self):
+        from paper_algorithms import query_algorithm_evidence
+        self.make_panel()
+        paths, _ = self.scoped_algorithm_store(source_file=str(self.path))
+        with patch("paper_algorithms._read_regions", side_effect=AssertionError("must not open outside managed PDFs")):
+            result = query_algorithm_evidence("Algorithm 4", ["p"], paths)
+        self.assertIn("不可读", result)
+        self.assertIsNone(query_algorithm_evidence("Algorithm 4", None, paths))
+        self.assertIsNone(query_algorithm_evidence("routing approaches", ["p"], paths))
+        self.assertIn("缺少原 PDF 路径", query_algorithm_evidence("Algorithm 4", ["other-paper"], paths))
+
+    def test_algorithm_read_checks_source_pages_beyond_old_index_coverage(self):
+        from paper_algorithms import query_algorithm_evidence
+        self.make_panel(caption="Algorithm 4 Routing Algorithm")
+        with pymupdf.open(self.path) as pdf:
+            pdf.new_page(pno=0).insert_text((40, 50), "Introductory text before the algorithm page.")
+            pdf.save(Path(self.tmp.name) / "two-pages.pdf")
+        self.path = Path(self.tmp.name) / "two-pages.pdf"
+        paths, _ = self.scoped_algorithm_store()
+        result = query_algorithm_evidence("Algorithm 4", ["p"], paths)
+        self.assertIn("p.2", result)
+        self.assertIn("averBand", result)
+
+    def test_scoped_pseudocode_request_without_number_recovers_algorithms(self):
+        from paper_algorithms import query_algorithm_evidence
+        self.make_panel(caption="Algorithm 4 Routing Algorithm")
+        paths, _ = self.scoped_algorithm_store()
+        for query in ('解释这篇论文的伪代码', 'show the pseudocode'):
+            result = query_algorithm_evidence(query, ["p"], paths)
+            self.assertIn('Algorithm 4', result)
+            self.assertIn('averBand', result)
+
+    def test_numbered_algorithm_lookup_does_not_substitute_another_number(self):
+        from paper_algorithms import query_algorithm_evidence
+        self.make_panel(caption="Algorithm 40 Routing Algorithm")
+        paths, _ = self.scoped_algorithm_store()
+        result = query_algorithm_evidence("Algorithm 4", ["p"], paths)
+        self.assertNotIn('averBand', result)
+        self.assertIn('尚未恢复算法 4', result)
+
+    def test_algorithm_source_cache_invalidates_when_pdf_changes(self):
+        from paper_algorithms import query_algorithm_evidence
+        self.make_panel(vector=True, caption="Algorithm 4 Routing Algorithm")
+        paths, _ = self.scoped_algorithm_store()
+        source = paths.papers_dir / "algorithm.pdf"
+        with patch("pdf_ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return oldWitness"):
+            self.assertIn("oldWitness", query_algorithm_evidence("Algorithm 4", ["p"], paths))
+        with pymupdf.open(source) as pdf:
+            pdf.set_metadata({"title": "Changed source"})
+            pdf.saveIncr()
+        with patch("pdf_ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return newWitness") as ocr:
+            result = query_algorithm_evidence("Algorithm 4", ["p"], paths)
+        self.assertIn("newWitness", result)
+        self.assertNotIn("oldWitness", result)
+        ocr.assert_called_once()
 
     def test_explicit_algorithm_locator_bypasses_semantic_distractors(self):
         from paper_store import PaperStore
