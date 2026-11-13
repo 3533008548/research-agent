@@ -15,6 +15,7 @@ class TestRemovedResearchDocuments(unittest.TestCase):
         self.assertNotIn("research_document", SYSTEM_PROMPT)
         self.assertNotIn("研究档案", SYSTEM_PROMPT)
         for name in (
+            "list_relation_candidates",
             "save_research_document", "search_research_documents", "read_research_document",
             "list_research_document_sections", "read_research_document_section",
             "prepare_research_document_patch_context", "apply_research_document_patch",
@@ -24,4 +25,5 @@ class TestRemovedResearchDocuments(unittest.TestCase):
             "review_new_paper_impact_on_research_document",
         ):
             with self.subTest(name=name):
+                self.assertNotIn(name, names)
                 self.assertIn("未知工具", execute_tool(name, {}))

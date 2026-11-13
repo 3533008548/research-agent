@@ -272,8 +272,6 @@ class PaperStore:
         # A lightweight, user-confirmed relation store.  It is deliberately
         # optional so the vector store stays usable in isolation and in tests.
         self.relation_store = relation_store
-        # Injected at agent startup; None means relation review stays disabled.
-        self.relation_reviewer = None
         # Lexical retrieval used to re-read and re-tokenize the whole corpus on
         # every request (~160 ms of the ~840 ms hybrid query).  A postings index
         # is built once and reused until the corpus changes.  Declared on the
@@ -386,34 +384,7 @@ class PaperStore:
             stats["retrieval_chunks"] = len(chunks)
             stats["text_characters"] = sum(len(c["text"]) for c in chunks
                 if c.get("kind", "text") in {"text", "algorithm", "ocr_text"})
-        self._queue_relation_review(resolved_id, resolved_title, document_map)
         return resolved_id
-
-    def _queue_relation_review(
-        self, paper_id: str, title: str, document_map: dict[str, Any],
-    ) -> None:
-        """Ask the reviewer to examine only this newly indexed paper.
-
-        Queued after indexing so a failed index never leaves a job behind, and
-        deliberately fire-and-forget: review must not slow down or fail import.
-        """
-        reviewer = getattr(self, "relation_reviewer", None)
-        if reviewer is None or not paper_id:
-            return
-        try:
-            from paper_relation_review import paper_fingerprint
-
-            fingerprint = paper_fingerprint(
-                title=title,
-                chunk_count=len(list(document_map.get("chunks") or [])),
-                source_file=str(document_map.get("source_file") or ""),
-            )
-            reviewer.enqueue(paper_id, fingerprint)
-        except Exception as exc:  # noqa: BLE001 - review is best-effort
-            log.warning(
-                "论文关系审查未入队 (exc_type=%s, exc=%s)",
-                type(exc).__name__, exc,
-            )
 
     def _index_chunks(
         self,
@@ -949,16 +920,6 @@ class PaperStore:
             except Exception as exc:
                 log.warning(
                     "已删除论文，但未能清理关系边 (exc_type=%s, exc=%s)",
-                    type(exc).__name__, exc,
-                )
-        reviewer = getattr(self, "relation_reviewer", None)
-        if reviewer is not None:
-            try:
-                reviewer.store.cancel(paper_id)
-                reviewer.store.drop_paper(paper_id)
-            except Exception as exc:  # noqa: BLE001 - deletion must not fail on derived state
-                log.warning(
-                    "已删除论文，但未能清理关系审查状态 (exc_type=%s, exc=%s)",
                     type(exc).__name__, exc,
                 )
         return len(ids_to_delete)

@@ -646,7 +646,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertIn("浏览器 E2E 会话", self.page.locator(".session-item.active").inner_text())
         self.assertEqual(self.page.locator("textarea").first.input_value(), "A 保留的草稿")
 
-    def test_paper_library_keeps_relation_review_without_reproduction(self) -> None:
+    def test_paper_library_keeps_reading_without_relation_review(self) -> None:
         self.page.locator(".session-item.active").wait_for()
         self.page.route("**/api/v1/workspace/papers", lambda route: route.fulfill(json=[{
             "paper_id": "paper-library-test", "title": "已有论文", "chunks": 3,
@@ -662,10 +662,33 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
         self.page.get_by_role("button", name="论文库", exact=True).click()
         self.page.get_by_role("checkbox", name="选择 已有论文.pdf", exact=True).check()
-        self.page.get_by_role("button", name="关系审查", exact=True).first.wait_for()
+        self.page.get_by_role("button", name="交给助手阅读", exact=True).wait_for()
         self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
-        self.page.get_by_role("button", name="关系审查", exact=True).first.click()
-        self.assertIn("【论文关系审查】", self.page.locator("textarea").first.input_value())
+        self.assertEqual(self.page.get_by_role("button", name="关系审查", exact=True).count(), 0)
+
+    def test_reader_chunk_failure_keeps_workbench_and_recovers_after_reload(self) -> None:
+        import fitz
+        with fitz.open() as document:
+            document.new_page().insert_text((50, 80), "Reader recovery fixture")
+            uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                'file': {'name': 'recovery.pdf', 'mimeType': 'application/pdf', 'buffer': document.tobytes()},
+            })
+        self.assertEqual(uploaded.status, 201)
+        pattern = "**/assets/PaperReader-*.js"
+        self.page.route(pattern, lambda route: route.abort("failed"))
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="recovery.pdf", exact=True).click()
+        self.page.get_by_role("heading", name="论文预览未能打开", exact=True).wait_for()
+        self.assertEqual(self.page.locator(".session-sidebar").count(), 1)
+        self.page.get_by_role("button", name="设置", exact=True).click()
+        self.page.get_by_role("button", name="保存通用设置", exact=True).wait_for()
+        self.page.get_by_role("tab", name="recovery.pdf", exact=True).click()
+        self.page.unroute(pattern)
+        self.page.get_by_role("button", name="重新加载界面", exact=True).click()
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="recovery.pdf", exact=True).click()
+        self.page.locator(".textLayer span").first.wait_for()
+        self.assertGreater(self.page.locator(".pdf-sheet canvas").evaluate("el => el.width"), 100)
 
     def test_workspace_layout_keeps_sessions_and_tools_in_the_left_rail(self) -> None:
         # Use the fixture's real session API so navigation remains usable;

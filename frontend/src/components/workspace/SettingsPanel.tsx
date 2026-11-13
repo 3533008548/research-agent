@@ -7,6 +7,7 @@ import {
 import type { DailyKeyword, UserProfile, WorkspaceSettings } from "../../types";
 import { ProfilePanel } from "./SimplePanels";
 import { userFacingError } from "../../lib/errors";
+import { DesktopUpdatePanel } from "./DesktopUpdatePanel";
 
 export function SettingsPanel({
   apiKey,
@@ -173,6 +174,7 @@ export function SettingsPanel({
           )}
           {desktopInfo ? (
             <>
+              <DesktopUpdatePanel />
               <h2>客户端连接</h2>
               <p className="panel-hint">
                 {desktopInfo.configured

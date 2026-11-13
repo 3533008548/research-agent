@@ -121,8 +121,18 @@ def assess_document_map(
         item.get("status") == "failed" for item in page.get("extraction_diagnostics", [])
     )]
     if unresolved:
+        details = []
+        for page in pages:
+            for item in page.get("extraction_diagnostics", []):
+                if item.get("status") != "failed":
+                    continue
+                reason = item.get("detail") or {
+                    "algorithm_region_unresolved": "算法区域边界未能定位",
+                    "algorithm_body_missing": "算法正文提取不完整",
+                }.get(item.get("code"), "视觉文字提取失败")
+                details.append(f"第 {page['page']} 页 {item.get('label', '页面')}：{reason}")
         issue("error", "unresolved_visual_text",
-              "算法正文或扫描内容未恢复；请检查 OCR 语言包或核对原页，不能视为完整入库。", pages=unresolved)
+              "算法正文或扫描内容未恢复；" + "；".join(details[:6]), pages=unresolved)
     lost_native = [page["page"] for page in pages if page.get("missing_native_blocks", 0)]
     if lost_native:
         issue("error", "native_text_loss", "原 PDF 文本层有内容未进入页面元素，拒绝不完整入库。", pages=lost_native)
@@ -293,7 +303,9 @@ def quality_failure_summary(report: dict[str, Any]) -> str:
     errors = [item for item in list(report.get("issues") or []) if item.get("severity") == "error"]
     if not errors:
         return "质量检查未通过。"
-    return "；".join(str(item.get("message") or "质量检查失败") for item in errors[:2])
+    return "；".join(str(item.get("message") or "质量检查失败")
+                     + (f"（涉及页码：{','.join(map(str, item['pages']))}）" if item.get("pages") else "")
+                     for item in errors[:2])
 
 
 def _merge_orphan_text_fragments(document_map: dict[str, Any], *, max_chunk_chars: int) -> int:

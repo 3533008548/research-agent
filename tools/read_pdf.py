@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import os
 import re
 import socket
 import sys
@@ -22,7 +23,7 @@ from paper_artifacts import (
 )
 from paper_quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
 from pdf_reader import PaperReader, extract_images
-from runtime_paths import get_runtime_paths
+from runtime_paths import RuntimePaths, get_runtime_paths
 
 
 MAX_PDF_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -276,16 +277,46 @@ def _download_pdf(url: str, destination: Path) -> int:
 
 
 def _resolve_local_pdf(path_text: str, papers_dir: Path) -> Path:
-    """Only accept PDFs already copied into the managed papers directory."""
+    """Resolve managed files; the desktop may import an explicit local PDF."""
+    path_text = path_text.strip().strip('"\'')
+    if path_text.lower().startswith("file:"):
+        parsed = urllib.parse.urlparse(path_text)
+        if parsed.netloc not in {"", "localhost"}:
+            raise ValueError("请使用本机 PDF 路径或通过论文库导入文件")
+        path_text = urllib.parse.unquote(parsed.path)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", path_text):
+            path_text = path_text[1:]
     requested = Path(path_text).expanduser()
     base = papers_dir.resolve()
     candidate = (requested.resolve() if requested.is_absolute() else (base / requested).resolve())
     try:
         candidate.relative_to(base)
     except ValueError as exc:
-        raise ValueError("本地 PDF 必须先上传或放入运行时 papers 目录") from exc
+        if os.getenv("RESEARCH_DESKTOP_MODE") != "1" or not requested.is_absolute():
+            raise ValueError(f"本地 PDF 必须先通过论文库导入。当前论文目录：{base}") from exc
+        if candidate.suffix.lower() != ".pdf" or not candidate.is_file():
+            raise ValueError(f"未找到可读取的 PDF 文件：{candidate}") from exc
+        from library_store import LibraryStore
+
+        library = LibraryStore(RuntimePaths.from_root(base.parent.parent))
+        with candidate.open("rb") as source:
+            document = library.import_file(candidate.name, source)
+        if document["trashed"]:
+            raise ValueError("该论文在回收站中，请先在论文库恢复")
+        return library.file(document["id"])
+    # Display names differ from the content-addressed filenames in the library.
+    if not candidate.is_file() and requested.parent == Path("."):
+        from library_store import LibraryStore
+
+        library = LibraryStore(RuntimePaths.from_root(base.parent.parent))
+        matches = [item for item in library.list()["documents"]
+                   if not item["trashed"] and item["name"].casefold() == requested.name.casefold()]
+        if len(matches) == 1:
+            return library.file(matches[0]["id"])
+        if len(matches) > 1:
+            raise ValueError("论文库存在同名 PDF，请从论文库选择具体文件后交给助手阅读")
     if candidate.suffix.lower() != ".pdf" or not candidate.is_file():
-        raise ValueError("未找到可读取的 PDF 文件")
+        raise ValueError(f"未找到可读取的 PDF 文件：{candidate}。可调用 list_papers 获取可读取路径")
     return candidate
 
 
@@ -334,9 +365,18 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
     else:
         try:
             pdf_path = _resolve_local_pdf(raw_input, pdf_dir)
-        except ValueError as exc:
+        except (ValueError, OSError, KeyError) as exc:
             return f"❌ {exc}"
 
+    source_file = pdf_path.relative_to(pdf_dir.resolve()).as_posix()
+    fallback_stem = pdf_path.stem
+    if pdf_path.parent.name == "library":
+        from library_store import LibraryStore
+
+        try:
+            fallback_stem = Path(LibraryStore(paths).get(pdf_path.stem)["name"]).stem
+        except KeyError:
+            pass
     paper_id = f"paper_{uuid.uuid4().hex[:12]}"
     selected: tuple[PaperReader, dict, dict, dict, str, str, str] | None = None
     failed_attempts: list[str] = []
@@ -351,13 +391,13 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
                 if table_aware else reader.parse_document(str(pdf_path), extract_tables=False)
             )
             title, title_source = resolve_paper_title(
-                requested_title, parsed_document, pdf_path.stem,
+                requested_title, parsed_document, fallback_stem,
             )
             document_map, quality = _quality_checked_document_map(
                 parsed_document,
                 paper_id=paper_id,
                 title=title,
-                source_file=pdf_path.name,
+                source_file=source_file,
                 max_pages=max_pages,
             )
         except ImportError as exc:
@@ -373,10 +413,10 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
 
     if selected is None:
         detail = "；".join(failed_attempts[:2]) or "未获得可用解析结果"
-        return f"❌ PDF 未索引：切块质量检查失败，已使用备用解析策略重试。{detail}"
+        return f"❌ PDF 未索引：解析/入库前质量检查未通过，尚未写入向量库。已尝试备用解析策略。{detail}"
 
     reader, parsed_document, document_map, quality, parser_label, title, title_source = selected
-    existing_ids = _existing_paper_ids(paper_store, paths, title, pdf_path.name) if paper_store else []
+    existing_ids = _existing_paper_ids(paper_store, paths, title, source_file) if paper_store else []
     images: list[str] = []
     try:
         from pdf_ocr import attach_visual_assets
@@ -392,7 +432,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
                 parsed_document,
                 paper_id=paper_id,
                 title=title,
-                source_file=pdf_path.name,
+                source_file=source_file,
                 max_pages=max_pages,
             )
     except Exception as exc:

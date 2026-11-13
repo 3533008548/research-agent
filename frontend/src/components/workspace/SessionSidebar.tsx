@@ -54,7 +54,6 @@ export function SessionSidebar({
   onRemoveActiveSession: () => void;
   onToggleWorkspacePanel: (panel: string) => void;
   onOpenProfile: () => void;
-  onPreparePaperRelationReview: (paper: Paper) => void;
   onSelectDailyRun: (runId: string) => void;
   onOpenDailyCenter: () => void;
   onAddDailyKeyword: (event: FormEvent<HTMLFormElement>) => void;

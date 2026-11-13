@@ -71,9 +71,14 @@ def _find_source_pdf(paths, paper_id: str, title: str) -> tuple[Path | None, str
     document_map = load_document_map(paths, paper_id)
     source_file = str((document_map or {}).get("source_file") or "").strip()
     if source_file:
-        candidate = paths.papers_dir / source_file
-        if candidate.is_file():
+        candidate = (paths.papers_dir / source_file).resolve()
+        if candidate.is_relative_to(paths.papers_dir.resolve()) and candidate.is_file():
             return candidate, "document_map"
+        # Older desktop imports saved only the basename of a library snapshot.
+        if Path(source_file).name == source_file:
+            snapshot = paths.papers_dir / "library" / source_file
+            if snapshot.is_file() and not snapshot.is_symlink():
+                return snapshot, "file_name(library_legacy)"
     wanted = title_match_key(title)
     if wanted:
         best: tuple[float, str, Path] | None = None
@@ -150,7 +155,7 @@ def handle_generate_paper_card(
     if pdf_match_kind.startswith("file_name"):
         # The recorded name went stale after a rename; repair it so later
         # lookups do not have to fall back again.
-        update_document_map_source_file(paths, paper_id, source_pdf.name)
+        update_document_map_source_file(paths, paper_id, source_pdf.relative_to(paths.papers_dir).as_posix())
 
     max_pages = _bounded_int(args.get("max_pages"), 100, 1, 100)
     try:

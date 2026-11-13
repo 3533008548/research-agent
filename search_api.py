@@ -400,18 +400,23 @@ def list_downloaded_records() -> list[dict[str, Any]]:
 
 
 def list_downloaded_papers() -> str:
-    """List locally downloaded PDFs without accessing network services."""
+    """Expose the same imported documents and paths that the reader can open."""
     from runtime_paths import get_runtime_paths
+    from library_store import LibraryStore
 
-    pdf_dir = get_runtime_paths().papers_dir
-    pdfs = list(pdf_dir.glob("*.pdf")) if pdf_dir.exists() else []
-    if not pdfs:
-        return "📭 尚未下载任何论文。"
-    total_size = sum(item.stat().st_size for item in pdfs)
-    lines = [f"📂 本地已下载论文（共 {len(pdfs)} 篇，{total_size / 1024 / 1024:.1f} MB）\n"]
-    for index, item in enumerate(pdfs, 1):
-        modified = datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"  {index}. {item.name}  ({item.stat().st_size / 1024:.0f} KB, {modified})")
+    paths = get_runtime_paths()
+    library = LibraryStore(paths)
+    errors = library.discover()
+    documents = [item for item in library.list()["documents"] if not item["trashed"]]
+    lines = [f"📂 本地论文（共 {len(documents)} 篇；文件已导入不代表已建立索引）",
+             f"当前论文目录：{paths.papers_dir}"]
+    for index, item in enumerate(documents, 1):
+        lines.append(f"  {index}. {item['name']} ({item['size_bytes'] / 1024:.0f} KB)\n"
+                     f"     read_pdf 路径：library/{item['id']}.pdf")
+    if not documents:
+        lines.append("📭 尚未导入任何论文。请先通过论文库导入 PDF。")
+    for error in errors[:5]:
+        lines.append(f"⚠️ {error['name']}：{error['error']}")
     return "\n".join(lines)
 
 

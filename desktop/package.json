@@ -1,6 +1,6 @@
 {
   "name": "research-assistant-desktop",
-  "version": "0.2.0",
+  "version": "0.2.3",
   "private": true,
   "description": "科研助手桌面客户端",
   "author": "Research Assistant",
@@ -8,7 +8,8 @@
   "scripts": {
     "start": "electron .",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder --win nsis",
+    "dist": "electron-builder --win nsis --publish never",
+    "test": "node --test tests/*.test.cjs",
     "postinstall": "install-electron"
   },
   "build": {
@@ -20,6 +21,7 @@
     "files": [
       "main.cjs",
       "preload.cjs",
+      "updater.cjs",
       "startup.html",
       "package.json",
       "icon.png",
@@ -49,10 +51,20 @@
       "packElevateHelper": false,
       "allowElevation": false
     },
-    "electronDist": "node_modules/electron/dist"
+    "electronDist": "node_modules/electron/dist",
+    "artifactName": "Research-Assistant-Setup-${version}.${ext}",
+    "publish": {
+      "provider": "github",
+      "owner": "3533008548",
+      "repo": "research-agent",
+      "releaseType": "release"
+    }
   },
   "devDependencies": {
     "electron": "^45.3.1",
     "electron-builder": "^26.18.0"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.12"
   }
 }

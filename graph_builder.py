@@ -48,8 +48,21 @@ from verification import MAX_VERIFY_PASSES, classify_review, verification_prompt
 #  State
 # ═══════════════════════════════════════════════════════════════
 
+def merge_messages(previous: list[dict], incoming: list[dict]) -> list[dict]:
+    """Replace a reviewed draft while retaining tool evidence and earlier turns."""
+    merged = list(previous)
+    for raw in incoming:
+        message = dict(raw)
+        if message.pop("_replace_answer", False):
+            start = max((i for i, m in enumerate(merged) if m.get("role") == "user"), default=-1)
+            merged = [m for i, m in enumerate(merged) if i <= start or
+                      m.get("role") != "assistant" or m.get("tool_calls")]
+        merged.append(message)
+    return merged
+
+
 class AgentState(TypedDict):
-    messages: Annotated[list[dict], lambda a, b: a + b]
+    messages: Annotated[list[dict], merge_messages]
     metadata: dict
 
 
@@ -77,6 +90,10 @@ def sanitize_model_messages(
             continue
         message = dict(raw_message)
         role = message.get("role")
+        # Older versions appended private review notes to public answers. Keep
+        # the answer, but do not feed these generated notes into the next task.
+        if role == "assistant" and isinstance(message.get("content"), str):
+            message["content"] = message["content"].split("\n\n核验提示（不触发自动重写）：\n", 1)[0]
 
         if role == "assistant":
             reasoning = message.get("reasoning_content")
@@ -690,6 +707,8 @@ def build_graph(
                 )
             if stream_failed:
                 metadata["stream_incomplete"] = True
+            if verify_fb and not assistant_msg.get("tool_calls"):
+                assistant_msg["_replace_answer"] = True
             return {"messages": [assistant_msg], "metadata": metadata}
 
         # 非流式模式
@@ -717,6 +736,8 @@ def build_graph(
                 {"id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
                 for tc in msg["tool_calls"]
             ]
+        elif verify_fb:
+            assistant_msg["_replace_answer"] = True
         emit(
             "llm_request_finished",
             duration_ms=round((time.perf_counter() - request_started) * 1000, 1),
@@ -838,7 +859,8 @@ def build_graph(
         content = last_msg.get("content", "")
         if not content:
             return _complete_verification()
-        recent = list(messages[-8:])
+        turn_start = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
+        recent = list(messages[turn_start + 1:])[-8:]
         has_tools = any(m.get("role") == "tool" for m in recent)
 
         # ── 第1层：跳过门控 ──
@@ -975,7 +997,7 @@ def build_graph(
         if decision.result == "passed" and len(content) > 24000:
             emit("verify_inconclusive", verification_round=verify_round)
             update = _complete_verification()
-            update["messages"] = [{"role": "assistant", "content": content + "\n\n⚠️ 超长回复仅核验了标明的摘录，未覆盖全文；摘录中未发现问题不代表全文通过。"}]
+            update["messages"] = [{"role": "assistant", "_replace_answer": True, "content": content + "\n\n⚠️ 本次只核对了部分内容，其余内容仍需核对。"}]
             return update
         if decision.result == "passed":
             emit("verify_passed", verification_round=verify_round)
@@ -1004,27 +1026,29 @@ def build_graph(
         if decision.result == "inconclusive":
             emit("verify_inconclusive", verification_round=verify_round)
             update = _complete_verification()
-            update["messages"] = [{"role": "assistant", "content": content + "\n\n⚠️ 自动核验未返回可用结论，本轮回复仍需核对。"}]
+            update["messages"] = [{"role": "assistant", "_replace_answer": True, "content": content + "\n\n⚠️ 自动核验未返回可用结论，本轮回复仍需核对。"}]
             return update
 
         if decision.result == "advisory":
             emit("verify_advisory", verification_round=verify_round)
             update = _complete_verification()
-            note = "\n\n核验提示（不触发自动重写）：\n" + "\n".join(decision.advisory)
-            update["messages"] = [{"role": "assistant", "content": content + note}]
+            # Advisory review is an internal quality signal, not a new user request.
             return update
 
         if verify_round >= MAX_VERIFY_PASSES:
             emit("verify_unresolved", verification_round=verify_round)
             update = _complete_verification()
-            warning = "⚠️ 已完成一次自动修正，仍有待确认的事实问题；不再自动重写。核验器的意见需要结合原文判断：\n" + "\n".join(decision.blocking) + "\n\n---\n"
-            update["messages"] = [{"role": "assistant", "content": warning + content}]
+            warning = "\n\n⚠️ 本次回答仍有事实争议，相关结论需要对照原文确认，暂不宜直接采用。"
+            update["messages"] = [{"role": "assistant", "_replace_answer": True, "content": content + warning}]
             return update
 
         blocking = "\n".join(decision.blocking)
         feedback = (f"[系统验证] 仅针对以下实质性事实问题做一次定向修正：\n{blocking}\n\n"
                     "核验意见是待检查的判断，不应盲从；对照原文或计算确认后再修正，证据不足则明确保留不确定性。"
-                    "保留与这些问题无关的正确内容，不因措辞偏好扩展研究范围。")
+                    "保留与这些问题无关的正确内容，不因措辞偏好扩展研究范围。"
+                    "这是内部质量检查，不是用户的新消息。完成必要的原文核对后，输出面向用户当前请求的完整最终答复，替换整份初稿；"
+                    "将修正融入正文，保留本轮操作结果和有效内容，不要只输出勘误或修正说明。"
+                    "不要对核验器说话，不要叙述采纳意见的过程，也不要回应上一轮核验提示。")
         emit("verify_revision_requested", verification_round=verify_round)
         return {"metadata": {**metadata,
             "verify_feedback": feedback,

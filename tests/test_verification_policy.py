@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import patch
 
-from graph_builder import build_graph
+from graph_builder import build_graph, merge_messages, sanitize_model_messages
 from llm_client import LLMClient
 from verification import classify_review, verification_prompt
 
@@ -78,7 +78,9 @@ class TestVerificationPolicy(unittest.TestCase):
             result = app.invoke(state, config={"configurable": {"thread_id": "bounded"}})
         self.assertEqual(post.call_count, 3)  # Two reviews, one repair; no third review.
         self.assertEqual(result["metadata"], {"session_id": "retained-session"})
-        self.assertIn("不再自动重写", result["messages"][-1]["content"])
+        self.assertIn("仍有事实争议", result["messages"][-1]["content"])
+        self.assertNotIn("[严重]", result["messages"][-1]["content"])
+        self.assertEqual(sum(m.get("role") == "assistant" for m in result["messages"]), 1)
         self.assertEqual([e["verification_round"] for e in events if e["type"] == "verify_request_started"], [1, 2])
         self.assertEqual(events[-1]["type"], "verify_unresolved")
         retry_prompt = post.call_args_list[-1].kwargs["json"]["messages"][0]["content"]
@@ -92,7 +94,7 @@ class TestVerificationPolicy(unittest.TestCase):
             result = app.get_graph().nodes["verify"].data.invoke(self.state())
         self.assertEqual(post.call_count, 1)
         self.assertFalse(result.get("metadata", {}).get("verify_feedback"))
-        self.assertIn("不触发自动重写", result["messages"][-1]["content"])
+        self.assertNotIn("messages", result)
         self.assertEqual(events[-1]["type"], "verify_advisory")
 
     def test_truncated_ok_is_inconclusive(self):
@@ -110,7 +112,7 @@ class TestVerificationPolicy(unittest.TestCase):
         state["messages"][-1]["content"] = "超长回答" * 7000
         with patch("llm_client.requests.post", return_value=Response("OK")):
             result = app.get_graph().nodes["verify"].data.invoke(state)
-        self.assertIn("未覆盖全文", result["messages"][-1]["content"])
+        self.assertIn("只核对了部分内容", result["messages"][-1]["content"])
         self.assertEqual(events[-1]["type"], "verify_inconclusive")
 
     def test_repaired_stream_is_not_appended_to_visible_draft(self):
@@ -132,3 +134,56 @@ class TestVerificationPolicy(unittest.TestCase):
             result = app.invoke(self.state(), config={"configurable": {"thread_id": "stream-repair"}})
         self.assertEqual("".join(streamed), draft)
         self.assertEqual(result["messages"][-1]["content"], repaired)
+        self.assertEqual([m["content"] for m in result["messages"] if m["role"] == "assistant"], [repaired])
+
+    def test_previous_turn_tools_do_not_trigger_review_of_new_task(self):
+        events = []
+        app = self.app(events)
+        state = self.state()
+        state["messages"] += [{"role": "user", "content": "只说明安装方法"},
+                              {"role": "assistant", "content": "安装说明。" * 40}]
+        with patch("llm_client.requests.post") as post:
+            app.get_graph().nodes["verify"].data.invoke(state)
+        post.assert_not_called()
+
+    def test_replacement_preserves_other_turns_and_tool_pairs(self):
+        previous = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old answer"},
+                    {"role": "user", "content": "import"}, {"role": "assistant", "content": "draft"},
+                    {"role": "assistant", "content": "checking", "tool_calls": [{"id": "t"}]},
+                    {"role": "tool", "tool_call_id": "t", "content": "evidence"}]
+        merged = merge_messages(previous, [{"role": "assistant", "content": "full final", "_replace_answer": True}])
+        self.assertEqual(merged[:3], previous[:3])
+        self.assertEqual(merged[3:5], previous[4:])
+        self.assertEqual(merged[-1], {"role": "assistant", "content": "full final"})
+        self.assertEqual(previous[3]["content"], "draft")
+
+    def test_legacy_review_notes_are_not_in_model_context(self):
+        previous = [{"role": "assistant", "content": "Original answer\n\n核验提示（不触发自动重写）：\n[轻微] old feedback"}]
+        self.assertEqual(sanitize_model_messages(previous)[0]["content"], "Original answer")
+        self.assertIn("old feedback", previous[0]["content"])
+
+    def test_repair_prompt_requires_full_answer_to_current_user(self):
+        app = self.app([])
+        with patch("llm_client.requests.post", return_value=Response("[严重] x=3 与 x=2 冲突。[需修正]")):
+            result = app.get_graph().nodes["verify"].data.invoke(self.state())
+        feedback = result["metadata"]["verify_feedback"]
+        self.assertIn("完整最终答复", feedback)
+        self.assertIn("不要只输出勘误", feedback)
+
+    def test_checkpoint_and_next_turn_keep_only_complete_repaired_answer(self):
+        app = self.app([])
+        draft = "初稿声称 x=3。" * 30
+        final = "入库成功。以下为完整摘要，原文给出的 x=2。" * 15
+        config = {"configurable": {"thread_id": "two-turns"}}
+        with patch("llm_client.requests.post", side_effect=[Response(draft),
+                   Response("[严重] x=3 与 x=2 矛盾。[需修正]"), Response(final), Response("OK"),
+                   Response("已完成本轮操作。")]) as post:
+            app.invoke(self.state(), config=config)
+            saved = app.get_state(config).values["messages"]
+            self.assertEqual([m["content"] for m in saved if m["role"] == "assistant"], [final])
+            app.invoke({"messages": [{"role": "user", "content": "接下来只整理文件"}], "metadata": {}}, config=config)
+        payload = str(post.call_args.kwargs["json"]["messages"])
+        self.assertNotIn(draft, payload)
+        self.assertNotIn("[严重]", payload)
+        self.assertIn(final, payload)
+        self.assertEqual(post.call_count, 5)

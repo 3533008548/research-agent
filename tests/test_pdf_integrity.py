@@ -215,7 +215,8 @@ class TestPdfIntegrity(unittest.TestCase):
 
     def test_local_tesseract_recovers_raster_algorithm(self):
         try:
-            tessdata = pymupdf.get_tessdata()
+            from pdf_ocr import resolve_ocr_tessdata
+            tessdata = resolve_ocr_tessdata('eng')
         except RuntimeError:
             self.skipTest("Tesseract language data not installed")
         if not (Path(tessdata) / "eng.traineddata").is_file():
@@ -224,6 +225,40 @@ class TestPdfIntegrity(unittest.TestCase):
         m, q = self.parse_map()
         self.assertTrue(q["accepted"], q)
         self.assertTrue(any(c["kind"] == "algorithm" and "Return" in c["text"] for c in m["chunks"]))
+
+    def test_packaged_ocr_uses_bundled_language_data_without_system_install(self):
+        import sys
+        from pdf_ocr import resolve_ocr_tessdata
+        bundled = Path(self.tmp.name) / 'bundle' / 'tessdata'
+        bundled.mkdir(parents=True)
+        for language in ('eng', 'chi_sim'):
+            (bundled / f'{language}.traineddata').write_bytes(b'fixture')
+        with patch.object(sys, '_MEIPASS', str(bundled.parent), create=True), \
+             patch.dict(os.environ, {'TESSDATA_PREFIX': str(Path(self.tmp.name) / 'missing')}), \
+             patch('pymupdf.get_tessdata', side_effect=RuntimeError('not installed')):
+            self.assertEqual(resolve_ocr_tessdata('eng+chi_sim'), str(bundled))
+
+    def test_missing_ocr_data_identifies_page_region_and_reason(self):
+        from pdf_ocr import OCRLanguageDataError
+        from paper_quality import quality_failure_summary
+        self.make_panel(raster=True)
+        with patch('pdf_ocr.resolve_ocr_tessdata', side_effect=OCRLanguageDataError('缺少 OCR 语言数据（eng）')):
+            _, quality = self.parse_map()
+        self.assertFalse(quality['accepted'])
+        summary = quality_failure_summary(quality)
+        for detail in ('第 1 页', 'Algorithm 4', '缺少 OCR 语言数据'):
+            self.assertIn(detail, summary)
+
+    def test_build_refuses_corrupt_ocr_resource_and_keeps_it_out_of_bundle(self):
+        import io
+        from scripts import fetch_ocr_data
+        destination = Path(self.tmp.name) / 'download'
+        with patch.dict(fetch_ocr_data.FILES, {'eng.traineddata': '0' * 64}, clear=True), \
+             patch('urllib.request.urlopen', side_effect=lambda *a, **k: io.BytesIO(b'corrupt download')):
+            with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+                fetch_ocr_data.ensure_ocr_data(destination)
+        self.assertFalse((destination / 'eng.traineddata').exists())
+        self.assertFalse(list(destination.glob('*.part')))
 
 
 if __name__ == "__main__":

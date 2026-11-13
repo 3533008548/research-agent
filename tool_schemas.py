@@ -30,7 +30,7 @@ def _raw_tool_schemas() -> list[dict]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "url_or_path": {"type": "string", "description": "PDF URL 或路径"},
+                        "url_or_path": {"type": "string", "description": "PDF URL，或 list_papers 返回的相对路径（含 library/ 子目录）。桌面客户端也支持用户提供的本机 PDF 绝对路径，会先自动导入论文库；网页服务需先上传。不要猜测数据目录。"},
                         "title": {"type": "string", "description": "可选的论文正式标题；优先使用已检索到或用户提供的书目信息"},
                         "max_pages": {"type": "integer", "description": "最大页数"},
                     },
@@ -76,24 +76,6 @@ def _raw_tool_schemas() -> list[dict]:
                     "type": "object",
                     "properties": {
                         "paper_id_or_title": {"type": "string", "description": "可选：已索引论文的精确标题或 paper_id"},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_relation_candidates",
-                "description": (
-                    "查看论文入库时自动审查产生的、尚未确认的论文关系候选。"
-                    "候选只是待确认线索，不会参与检索；确认需走 save_paper_relation 并获得用户明确同意。"
-                    "用户问「有哪些待确认关系」「自动发现了什么关系」时使用。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "paper_id_or_title": {"type": "string", "description": "可选：只看某一篇论文的候选"},
-                        "status": {"type": "string", "enum": ["pending", "accepted", "rejected"], "description": "候选状态，默认 pending"},
                     },
                 },
             },

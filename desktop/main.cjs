@@ -22,6 +22,7 @@ if (process.env.RESEARCH_ASSISTANT_USER_DATA)
   );
 let win,
   tray,
+  updates,
   backend,
   origin,
   token,
@@ -323,6 +324,50 @@ else {
           version: app.getVersion(),
         };
       });
+      ipcMain.on("desktop:renderer-error", (event, message) => {
+        try {
+          validSender(event);
+          if (typeof message !== "string") return;
+          fs.appendFile(path.join(app.getPath("userData"), "renderer.log"),
+            `${new Date().toISOString()} ${message.slice(0, 4000)}\n`, () => {});
+        } catch {}
+      });
+      const { autoUpdater } = require("electron-updater");
+      let updateStoppedBackend = false;
+      updates = require("./updater.cjs").createUpdater({
+        updater: autoUpdater,
+        version: app.getVersion(),
+        supported: app.isPackaged && process.platform === "win32",
+        notify: (state) => {
+          if (win && !win.isDestroyed()) win.webContents.send("desktop:update-status", state);
+        },
+        prepareInstall: async () => {
+          if (restarting || quitting) throw Error("后台正在重启，请稍后安装更新。");
+          if (backend) {
+            const response = await fetch(origin + "/api/v1/desktop/status", {
+              headers: { "X-API-Key": token }, signal: AbortSignal.timeout(3000),
+            });
+            if (!response.ok) throw Error("无法确认后台任务状态，请稍后重试。");
+            const status = await response.json();
+            if (status.queued > 0) throw Error(`当前还有 ${status.queued} 项任务，请待完成或取消后安装更新。`);
+          }
+          restarting = true;
+          updateStoppedBackend = true;
+          await stopBackend();
+        },
+        recoverInstall: () => {
+          if (updateStoppedBackend && !quitting) {
+            updateStoppedBackend = false;
+            void startBackend().finally(() => { restarting = false; });
+          }
+        },
+      });
+      for (const [name, action] of Object.entries({
+        status: () => updates.snapshot(), check: () => updates.check(),
+        download: () => updates.download(), install: () => updates.install(),
+      })) {
+        ipcMain.handle(`desktop:update-${name}`, async (event) => { validSender(event); return action(); });
+      }
       ipcMain.handle("desktop:configure", async (event, value) => {
         validSender(event);
         if (!safeStorage.isEncryptionAvailable())
@@ -389,6 +434,8 @@ else {
             .catch(() => {});
       });
       await startBackend();
+      if (app.isPackaged && !process.env.RESEARCH_ASSISTANT_USER_DATA)
+        setTimeout(() => { void updates.check(); }, 30000).unref();
     })
     .catch((error) => {
       dialog.showErrorBox("科研助手启动失败", error.message);

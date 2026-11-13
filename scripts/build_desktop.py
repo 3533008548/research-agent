@@ -12,10 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def build_backend():
+    sys.path.insert(0, str(ROOT))
+    from scripts.fetch_ocr_data import ensure_ocr_data
+
+    tessdata = ensure_ocr_data()
     command = [sys.executable, '-m', 'PyInstaller', '--noconfirm', '--onedir',
                '--name', 'research-backend', '--distpath', str(ROOT/'build/desktop-backend'),
                '--workpath', str(ROOT/'build/pyinstaller'), '--specpath', str(ROOT/'build'),
-               '--paths', str(ROOT)]
+               '--paths', str(ROOT), '--add-data', f'{tessdata}{os.pathsep}tessdata']
     for package in ('chromadb', 'langgraph', 'langchain_core', 'onnxruntime', 'tiktoken'):
         command += ['--collect-all', package]
     for package in ('uvicorn', 'tools', 'papers', 'mcp'):

@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
+import { ReaderErrorBoundary } from "./components/ReaderErrorBoundary";
 
 import {
   updateWorkspaceSettings,
@@ -180,7 +181,6 @@ export function App() {
 
   const {
     toggleWorkspacePanel,
-    preparePaperRelationReview,
   } = useWorkspaceChrome({
     apiKey,
     setNotice,
@@ -191,9 +191,6 @@ export function App() {
     openWorkspacePanel,
     setOpenWorkspacePanel,
     setWorkspaceLoading,
-    setDraft,
-    setWorkbenchTabs,
-    setActiveWorkbenchTabId,
     loadKeywords,
   });
 
@@ -217,7 +214,7 @@ export function App() {
     setShowRunTools(false);
   }
   function readWithAssistant(document: LibraryDocument) {
-    const prompt = `请阅读论文“${document.name}”，使用 read_pdf 读取运行时论文目录下的 library/${document.id}.pdf，并建立可检索的论文索引。`;
+    const prompt = `请阅读论文“${document.name}”，调用 read_pdf，url_or_path 使用 ${JSON.stringify(`library/${document.id}.pdf`)}，max_pages 使用 ${Math.min(document.pages, 100)}，并建立可检索的论文索引。`;
     setDraft(draft.trim() ? `${draft}\n\n${prompt}` : prompt);
     setMode("chat");
     setActiveWorkbenchTabId("chat");
@@ -301,7 +298,6 @@ export function App() {
           onRemoveActiveSession={() => void removeActiveSession()}
           onToggleWorkspacePanel={(panel) => void toggleWorkspacePanel(panel as WorkspacePanel)}
           onOpenProfile={() => void openProfile()}
-          onPreparePaperRelationReview={(paper) => preparePaperRelationReview(paper)}
           onSelectDailyRun={(runId) => void selectDailyRun(runId)}
           onOpenDailyCenter={() => void openDailyCenter()}
           onAddDailyKeyword={(event) => void addDailyKeyword(event)}
@@ -389,7 +385,7 @@ export function App() {
           <Suspense fallback={<p>正在加载阅读器…</p>}>{workbenchTabs.filter(t => t.kind === "paper").map(tab => {
             if (tab.kind !== "paper") return null;
             const document = library.data.documents.find(d => d.id === tab.documentId);
-            return document && <PaperReader key={tab.id} apiKey={apiKey} document={document} active={activeWorkbenchTabId === tab.id} toolsHost={readerTools} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/>;
+            return document && <div key={tab.id} className="reader-boundary-host" hidden={activeWorkbenchTabId !== tab.id}><ReaderErrorBoundary><PaperReader apiKey={apiKey} document={document} active={activeWorkbenchTabId === tab.id} toolsHost={readerTools} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/></ReaderErrorBoundary></div>;
           })}</Suspense>
           {["library","settings","paper"].includes(activeWorkbenchTab?.kind || "") ? null : activeWorkbenchTab?.kind === "profile" ? (
             <ProfilePanel profile={activeWorkbenchTab.profile} />
@@ -467,7 +463,7 @@ export function App() {
           {(activeWorkbenchTab?.kind === "library" || activeWorkbenchTab?.kind === "paper") && !showRunTools ? <aside id="run-inspector" className="run-inspector" hidden={!layout.rightVisible}>
             {layout.rightResizeProps && <SidebarResizeHandle {...layout.rightResizeProps}/>}
             <div className="context-toolbar"><strong>{activeWorkbenchTab.kind === "paper" ? "阅读辅助" : "文件详情"}</strong><button className="text-button" onClick={() => setShowRunTools(true)}>运行</button></div>
-            <div className="run-inspector-content">{activeWorkbenchTab.kind === "paper" ? <div ref={setReaderTools}/> : selectedDocument ? <div className="file-details"><h2>{selectedDocument.name}</h2><dl><dt>文件大小</dt><dd>{fileSize(selectedDocument.size_bytes)}</dd><dt>页数</dt><dd>{selectedDocument.pages} 页</dd><dt>文件夹</dt><dd>{library.data.folders.find(f => f.id === selectedDocument.folder_id)?.name || "未分类"}</dd><dt>阅读进度</dt><dd>{selectedDocument.progress.page ? `第 ${selectedDocument.progress.page} 页` : "尚未阅读"}</dd></dl><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => openPaper(selectedDocument)}>继续阅读 →</button><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => readWithAssistant(selectedDocument)}>交给助手阅读</button>{papers.filter(p => p.title === selectedDocument.name || p.title === selectedDocument.name.replace(/\.pdf$/i," ").trim()).map(p => <button className="button button-secondary" key={p.paper_id} onClick={() => preparePaperRelationReview(p)}>关系审查</button>)}</div> : <p className="panel-hint">勾选论文查看详情；点击名称打开独立阅读页。</p>}</div>
+            <div className="run-inspector-content">{activeWorkbenchTab.kind === "paper" ? <div ref={setReaderTools}/> : selectedDocument ? <div className="file-details"><h2>{selectedDocument.name}</h2><dl><dt>文件大小</dt><dd>{fileSize(selectedDocument.size_bytes)}</dd><dt>页数</dt><dd>{selectedDocument.pages} 页</dd><dt>文件夹</dt><dd>{library.data.folders.find(f => f.id === selectedDocument.folder_id)?.name || "未分类"}</dd><dt>阅读进度</dt><dd>{selectedDocument.progress.page ? `第 ${selectedDocument.progress.page} 页` : "尚未阅读"}</dd></dl><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => openPaper(selectedDocument)}>继续阅读 →</button><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => readWithAssistant(selectedDocument)}>交给助手阅读</button></div> : <p className="panel-hint">勾选论文查看详情；点击名称打开独立阅读页。</p>}</div>
           </aside> : <RunInspector
             hidden={!layout.rightVisible}
             run={inspectedRun}

@@ -361,6 +361,7 @@ class TestFastAPIService(unittest.TestCase):
             self.assertTrue(mount_react_frontend(app, dist))
             client = TestClient(app)
             self.assertIn("React client", client.get("/").text)
+            self.assertEqual(client.get("/").headers["cache-control"], "no-store")
             self.assertIn("React client", client.get("/sessions/example").text)
             self.assertIn("console.log", client.get("/assets/app.js").text)
             self.assertFalse(mount_react_frontend(FastAPI(), dist / "missing"))
@@ -5305,7 +5306,8 @@ class TestAuditRegressionFixes(unittest.TestCase):
             private_pdf.write_bytes(b"%PDF-private")
             with patch.dict(os.environ, {"APP_DATA_DIR": str(paths.root)}, clear=False):
                 result = handle_read_pdf({"url_or_path": str(private_pdf)})
-            self.assertIn("必须先上传", result)
+            self.assertIn("必须先通过论文库导入", result)
+            self.assertIn("当前论文目录", result)
 
     def test_pdf_tool_rejects_loopback_before_network_request(self):
         from tools.read_pdf import handle_read_pdf

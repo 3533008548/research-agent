@@ -1,10 +1,11 @@
 import io
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import fitz
 from fastapi import FastAPI
@@ -83,6 +84,65 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(_resolve_local_pdf(f"library/{doc['id']}.pdf", self.paths.papers_dir), self.store.file(doc['id']))
         with self.assertRaises(ValueError):
             _resolve_local_pdf('../outside.pdf', self.paths.papers_dir)
+
+    def test_desktop_imports_an_explicit_external_path_and_file_uri(self):
+        from tools.read_pdf import _resolve_local_pdf
+        outside = Path(self.temp.name) / '中文 paper.pdf'
+        data = pdf_bytes()
+        outside.write_bytes(data)
+        with patch.dict(os.environ, {'RESEARCH_DESKTOP_MODE': '0'}):
+            with self.assertRaisesRegex(ValueError, '当前论文目录'):
+                _resolve_local_pdf(str(outside), self.paths.papers_dir)
+        with patch.dict(os.environ, {'RESEARCH_DESKTOP_MODE': '1'}):
+            result = _resolve_local_pdf(f'"{outside}"', self.paths.papers_dir)
+            self.assertTrue(result.is_relative_to(self.store.files))
+            self.assertEqual(result.read_bytes(), data)
+            self.assertEqual(_resolve_local_pdf(outside.as_uri(), self.paths.papers_dir), result)
+        self.assertEqual(outside.read_bytes(), data)
+        self.assertEqual(len(self.store.list()['documents']), 1)
+
+    def test_imported_display_names_are_readable_and_listed_with_real_paths(self):
+        from tools.read_pdf import _resolve_local_pdf
+        from search_api import list_downloaded_papers
+        doc = self.store.import_file('中文论文.pdf', io.BytesIO(pdf_bytes()))
+        self.assertEqual(_resolve_local_pdf(doc['name'], self.paths.papers_dir), self.store.file(doc['id']))
+        with patch.dict(os.environ, {'APP_DATA_DIR': str(self.paths.root)}):
+            listing = list_downloaded_papers()
+            self.assertIn(doc['name'], listing)
+            self.assertIn(f"library/{doc['id']}.pdf", listing)
+            self.store.update(doc['id'], {'trashed': True})
+            self.assertNotIn(doc['id'], list_downloaded_papers())
+
+    def test_same_named_documents_require_an_unambiguous_path(self):
+        from tools.read_pdf import _resolve_local_pdf
+        for content in ('First version', 'Second version'):
+            self.store.import_file('same.pdf', io.BytesIO(pdf_bytes(content)))
+        with self.assertRaisesRegex(ValueError, '同名'):
+            _resolve_local_pdf('same.pdf', self.paths.papers_dir)
+
+    def test_ingestion_preserves_library_source_path_and_card_lookup(self):
+        from tools.read_pdf import handle_read_pdf
+        from tools.paper_card import _find_source_pdf
+        from paper_artifacts import load_document_map
+        document = self.store.import_file('Research paper.pdf', io.BytesIO(pdf_bytes(
+            'Research question and evidence are linked to the source.\n'
+            'Methods and limitations remain available for later verification.')))
+        source_file = f"library/{document['id']}.pdf"
+        store = Mock()
+        store.list_papers.return_value = []
+        def index(document_map, *, paper_id, **kwargs):
+            store.get_paper_chunks.return_value = [
+                {'element_id': c['id'], 'text': c['text']} for c in document_map['chunks']]
+            return paper_id
+        store.index_document_map.side_effect = index
+        with patch.dict(os.environ, {'APP_DATA_DIR': str(self.paths.root)}):
+            result = handle_read_pdf({'url_or_path': source_file}, paper_store=store, memory_store=Mock())
+        self.assertNotIn('❌', result)
+        paper_id = store.index_document_map.call_args.kwargs['paper_id']
+        saved = load_document_map(self.paths, paper_id)
+        self.assertEqual(saved['source_file'], source_file)
+        self.assertEqual(_find_source_pdf(self.paths, paper_id, 'Research paper')[0], self.store.file(document['id']))
+        self.assertTrue(saved['quality']['index_round_trip']['accepted'])
 
     def test_authenticated_content_ranges_and_note_validation(self):
         app = FastAPI()

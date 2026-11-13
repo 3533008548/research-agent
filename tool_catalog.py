@@ -38,7 +38,6 @@ _PRESENTATION = {
     "read_pdf": ("论文阅读", 12_000),
     "generate_paper_card": ("论文证据卡", 3_000),
     "list_paper_relations": ("论文关系查看", 6_000),
-    "list_relation_candidates": ("论文关系候选", 6_000),
     "save_paper_relation": ("论文关系确认保存", 3_000),
     "delete_paper_relation": ("论文关系删除", 1_500),
     "describe_image": ("图像分析", 2_000),

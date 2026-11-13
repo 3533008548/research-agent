@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+from pathlib import Path
 
 import pymupdf
 
@@ -14,15 +16,46 @@ ALGORITHM_CAPTION = re.compile(r"^(?:Algorithm|算法)\s*\d+\b(?=\s*[:.：]|\s*$
 _CODE_WORD = re.compile(r"\b(?:function|input|output|return|for|while|if|end)\b", re.I)
 
 
+class OCRLanguageDataError(RuntimeError):
+    """The OCR engine exists but the requested language resources do not."""
+
+
+def resolve_ocr_tessdata(language: str) -> str:
+    languages = language.split("+")
+    if not languages or any(not re.fullmatch(r"[A-Za-z0-9_]+", name) for name in languages):
+        raise OCRLanguageDataError("PDF_OCR_LANGUAGE 必须是语言代码，例如 eng 或 eng+chi_sim")
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    candidates = [os.getenv("TESSDATA_PREFIX"), root / "tessdata",
+                  Path(__file__).resolve().parent / "build" / "ocr" / "tessdata"]
+    try:
+        candidates.append(pymupdf.get_tessdata())
+    except RuntimeError:
+        pass
+    for candidate in candidates:
+        if candidate and all((Path(candidate) / f"{name}.traineddata").is_file() for name in languages):
+            return str(candidate)
+    raise OCRLanguageDataError(
+        f"缺少 OCR 语言数据（{language}）。桌面端请安装包含 OCR 资源的新版客户端；"
+        "源码运行请执行 python scripts/fetch_ocr_data.py，或设置 TESSDATA_PREFIX。"
+    )
+
+
+def _ocr_failure(exc: Exception) -> dict:
+    return {"code": "ocr_language_data_missing" if isinstance(exc, OCRLanguageDataError) else "ocr_failed",
+            "status": "failed", "detail": f"{type(exc).__name__}: {str(exc)[:300]}"}
+
+
 def ocr_region(page, bbox: list[float]) -> str:
     """Render explicitly: partial OCR in older MuPDF misses vector glyphs."""
+    language = os.getenv("PDF_OCR_LANGUAGE", "eng")
+    tessdata = resolve_ocr_tessdata(language)
     rect = pymupdf.Rect(bbox) & page.rect
     # Bound raster allocation even for oversized poster pages.
     dpi = min(300, max(36, int(72 * (12_000_000 / max(rect.get_area(), 1)) ** 0.5)))
     pix = page.get_pixmap(clip=rect, dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
     data = pix.pdfocr_tobytes(
-        language=os.getenv("PDF_OCR_LANGUAGE", "eng"),
-        tessdata=os.getenv("TESSDATA_PREFIX") or None,
+        language=language,
+        tessdata=tessdata,
     )
     with pymupdf.open(stream=data, filetype="pdf") as result:
         # sort=True can insert hundreds of padding spaces around ruled lines.
@@ -97,8 +130,7 @@ def extract_visual_text(page, blocks: list[dict]) -> tuple[list[dict], list[dict
             try:
                 body = ocr_region(page, bbox)
             except Exception as exc:
-                diagnostics.append({"code": "ocr_failed", "label": label, "bbox": bbox,
-                                    "status": "failed", "detail": type(exc).__name__})
+                diagnostics.append({**_ocr_failure(exc), "label": label, "bbox": bbox})
                 continue
         if len(body) < 60 or len(_CODE_WORD.findall(body)) < 2:
             diagnostics.append({"code": "algorithm_body_missing", "label": label,
@@ -123,6 +155,5 @@ def extract_visual_text(page, blocks: list[dict]) -> tuple[list[dict], list[dict
                                  "related_ids": []})
                 diagnostics.append({"code": "page_ocr", "status": "ocr", "bbox": bbox})
             except Exception as exc:
-                diagnostics.append({"code": "ocr_failed", "status": "failed", "bbox": bbox,
-                                    "detail": type(exc).__name__})
+                diagnostics.append({**_ocr_failure(exc), "bbox": bbox})
     return elements, diagnostics

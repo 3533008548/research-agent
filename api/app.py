@@ -118,6 +118,7 @@ def mount_react_frontend(app: FastAPI, dist_dir: str | Path, *, mount_path: str 
             raise HTTPException(status_code=404, detail="API route not found")
         # A client-side route should receive the SPA shell.  Static assets are
         # matched by the earlier mount and therefore never reach this handler.
-        return FileResponse(index)
+        # A cached shell can reference lazy chunks removed by a desktop update.
+        return FileResponse(index, headers={"Cache-Control": "no-store"})
 
     return True

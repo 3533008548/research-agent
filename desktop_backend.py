@@ -19,6 +19,7 @@ def main():
     args = parser.parse_args()
     os.environ['APP_DATA_DIR'] = str(Path(args.data_dir).resolve())
     os.environ['PYTHON_DOTENV_DISABLED'] = '1'
+    os.environ['RESEARCH_DESKTOP_MODE'] = '1'
     # Credentials arrive through an inherited environment, never CLI arguments.
     configured = bool(os.environ.get('DEEPSEEK_API_KEY', '').strip())
     os.environ.setdefault('DEEPSEEK_API_KEY', 'desktop-unconfigured')
