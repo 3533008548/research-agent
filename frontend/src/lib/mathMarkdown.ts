@@ -98,6 +98,48 @@ export function normalizeDisplayMath(content: string): string {
   return output.join("\n");
 }
 
+/** GFM splits table cells before remark-math parses them. Shield pipes only in
+ * complete math spans, then restore their exact TeX before KaTeX sees it.
+ * Escaping a pipe as \| is not equivalent: TeX renders that as a double bar. */
+export function prepareMathMarkdown(source: string) {
+  let content = normalizeDisplayMath(source);
+  let token = "\uE000MATH_PIPE\uE001";
+  while (content.includes(token)) token += "_";
+  const ranges: [number, number][] = [];
+  type MarkdownNode = { type: string; children?: MarkdownNode[]; position?: {
+    start: { offset?: number }; end: { offset?: number };
+  } };
+  function findMath(node: MarkdownNode) {
+    if (node.type === "math" || node.type === "inlineMath") {
+      const start = node.position?.start.offset, end = node.position?.end.offset;
+      if (start !== undefined && end !== undefined) {
+        const span = content.slice(start, end);
+        // A GFM cell cannot span lines. Do not pair currency in separate cells
+        // (e.g. "$5 | $10") and accidentally hide a real column separator.
+        if (node.type === "inlineMath" && (/\n/.test(span) || (/^\$\d/.test(span) && /\d/.test(content[end] || "")))) return;
+        ranges.push([start, end]);
+      }
+    } else node.children?.forEach(findMath);
+  }
+  if (content.includes("|")) findMath(mathParser.parse(content));
+  for (const [start, end] of ranges.reverse()) {
+    content = content.slice(0, start) + content.slice(start, end).replaceAll("|", token) + content.slice(end);
+  }
+  function restoreMathPipes() {
+    type HtmlNode = { type: string; value?: string; properties?: Record<string, unknown>; children?: HtmlNode[] };
+    return (tree: HtmlNode) => {
+      function visit(node: HtmlNode, math = false) {
+        const classes = node.properties?.className;
+        const inMath = math || (Array.isArray(classes) && classes.includes("language-math"));
+        if (inMath && node.type === "text" && node.value) node.value = node.value.replaceAll(token, "|");
+        node.children?.forEach(child => visit(child, inMath));
+      }
+      visit(tree);
+    };
+  }
+  return { content, restoreMathPipes };
+}
+
 /** Preserve failed expressions as readable text instead of a red error wall. */
 export function readableMathErrors() {
   type Node = { type: string; properties?: Record<string, unknown>; children?: Node[] };

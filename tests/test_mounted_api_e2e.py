@@ -247,7 +247,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
 
     def test_long_markdown_scrolls_locally_without_widening_chat(self):
         formula = " + ".join(f"x_{{{i}}}" for i in range(55))
-        content = ("布局边界测试\n\n" + "long_identifier_" * 70 + "\n\n行内公式：$" + formula + "$\n\n$$\n" + formula + "\n$$\n\n"
+        content = ("布局边界测试\n\n" + "long_identifier_" * 70 + "\n\n行内公式：$" + formula + "$\n\n$$\n" + formula + "\\tag{1}\n$$\n\n"
                    + "```text\n" + "very_long_code_" * 80 + "\n```\n\n"
                    + "| " + " | ".join(f"Column_{i}" for i in range(24)) + " |\n"
                    + "| " + " | ".join("---" for _ in range(24)) + " |\n"
@@ -259,6 +259,13 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         for width in (1440, 1000, 761, 390, 1440):
             self._set_viewport({"width": width, "height": 800})
             self._assert_panes_contain_content()
+            self.assertTrue(self.page.locator('.message-body .katex-display').evaluate("""el => {
+                el.scrollLeft = 0;
+                const body = el.querySelector('.katex-html');
+                const parts = Array.from(body.children).filter(n => !n.classList.contains('tag')).map(n => n.getBoundingClientRect());
+                return Math.min(...parts.map(r => r.left)) >= el.getBoundingClientRect().left - 1
+                    && body.querySelector('.tag').getBoundingClientRect().left >= Math.max(...parts.map(r => r.right));
+            }"""), "长公式的起点可见且编号不重叠")
             for selector in (".message-body pre", ".message-body table", ".message-body .katex-display"):
                 self.assertTrue(self.page.locator(selector).evaluate("""el => {
                     const rect = el.getBoundingClientRect();
@@ -271,6 +278,40 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             if width == 1000 and os.getenv("E2E_ARTIFACT_DIR"):
                 self.page.locator(".message-body .katex-display").scroll_into_view_if_needed()
                 self.page.screenshot(path=str(Path(os.environ["E2E_ARTIFACT_DIR"]) / "long-math-restored-window.png"))
+
+    def test_chat_table_keeps_formula_pipes_inside_their_cells(self):
+        content = r"""归一化方式对比：
+
+| 方式 | 含义 | 结果 |
+| --- | --- | --- |
+| 除以 2 | $\alpha,\beta\in[0,1]$，两项取平均 | 合并后仍落在区间内 |
+| 除以 $C_{|S|}^{2}$ | 对所有流对求平均 | 合并后仍落在区间内 |
+| 绝对值 \(|x-y|\) | 范数 $\|x\|$ | 条件概率 $P(A|B)$ |
+
+正文继续保留。"""
+        self.page.route("**/api/v1/sessions/*/messages", lambda route: route.fulfill(
+            json=[{"role": "assistant", "content": content}]))
+        self.page.reload(wait_until="domcontentloaded")
+        body = self.page.locator(".message-assistant .message-body")
+        body.locator(".katex").first.wait_for()
+        table = body.locator("table")
+        self.assertEqual(table.locator("tbody td").count(), 9)
+        self.assertEqual(table.locator(".katex").count(), 5)
+        self.assertEqual(table.locator("tbody tr").nth(1).locator("td").nth(1).inner_text(), "对所有流对求平均")
+        cardinality = table.locator("tbody tr").nth(1).locator("td").first
+        self.assertEqual(cardinality.locator("annotation").text_content(), "C_{|S|}^{2}")
+        self.assertEqual(body.locator(".math-fallback, .katex-error").count(), 0)
+        self.assertNotIn("MATH_PIPE", body.inner_text())
+        self.assertNotIn("$C_", body.inner_text())
+        for width in (1440, 390, 1440):
+            self._set_viewport({"width": width, "height": 900})
+            self._assert_panes_contain_content()
+        output = ROOT / "runtime" / "evaluations" / "translation-math"
+        output.mkdir(parents=True, exist_ok=True)
+        table.screenshot(path=str(output / "chat-table-formulas.png"))
+        self.page.reload(wait_until="domcontentloaded")
+        cardinality.locator(".katex").wait_for()
+        self.assertEqual(cardinality.locator("annotation").text_content(), "C_{|S|}^{2}")
 
     def test_long_research_questions_and_reports_stay_inside_the_conversation(self):
         question = ("请核查这个研究假设并比较适用条件和反例。" * 12

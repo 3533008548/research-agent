@@ -4,13 +4,15 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
+import remarkGfm from "remark-gfm";
 import rehypeKatex from "rehype-katex";
-import { normalizeDisplayMath, readableMathErrors } from "./mathMarkdown.ts";
+import { normalizeDisplayMath, prepareMathMarkdown, readableMathErrors } from "./mathMarkdown.ts";
 
 function render(content: string) {
+  const math = prepareMathMarkdown(content);
   return renderToStaticMarkup(createElement(ReactMarkdown, {
-    remarkPlugins: [remarkMath], rehypePlugins: [rehypeKatex, readableMathErrors],
-    children: normalizeDisplayMath(content),
+    remarkPlugins: [remarkGfm, remarkMath], rehypePlugins: [math.restoreMathPipes, rehypeKatex, readableMathErrors],
+    children: math.content,
   }));
 }
 
@@ -20,6 +22,54 @@ it("keeps paragraphs and headings after a multiline formula outside math", () =>
   assert.match(html, /<strong>正文<\/strong>/);
   assert.doesNotMatch(html, /math-fallback|katex-error/);
   assert.match(html, /katex-display/);
+});
+
+it("keeps set cardinality inside a single chat table cell without changing the TeX", () => {
+  const html = render(String.raw`| 归一化方式 | 解释 | 结果 |
+| --- | --- | --- |
+| 除以 2 | $\alpha,\beta\in[0,1]$，两项取平均 | 合并后仍落在区间内 |
+| 除以 $C_{|S|}^{2}$ | 对所有流对求平均 | 合并后仍落在区间内 |`);
+  assert.equal((html.match(/<td>/g) || []).length, 6);
+  assert.equal((html.match(/class="katex"/g) || []).length, 2);
+  assert.match(html, /<annotation encoding="application\/x-tex">C_\{\|S\|\}\^\{2\}<\/annotation>/);
+  assert.match(html, /<td>对所有流对求平均<\/td>/);
+  assert.doesNotMatch(html, /MATH_PIPE|math-fallback|katex-error|\$C_/);
+});
+
+it("preserves single bars, norms, matrix alignment and text bars inside table math", () => {
+  for (const tex of [String.raw`\left|x-y\right|`, String.raw`\|x\|`, String.raw`P(A|B)`,
+    String.raw`\begin{array}{|c|c|}a&b\\c&d\end{array}`, String.raw`\text{a|b}`]) {
+    for (const formula of [`$${tex}$`, `\\(${tex}\\)`]) {
+      const html = render(`| Formula | Note |\n| --- | --- |\n| ${formula} | preserved |`);
+      assert.equal((html.match(/class="katex"/g) || []).length, 1, formula);
+      assert.equal((html.match(/<td>/g) || []).length, 2, formula);
+      assert.ok(html.includes(`<annotation encoding="application/x-tex">${tex.replaceAll('&', '&amp;')}</annotation>`), formula);
+      assert.match(html, /<td>preserved<\/td>/);
+      assert.doesNotMatch(html, /MATH_PIPE|math-fallback|katex-error/);
+    }
+  }
+});
+
+it("does not shield table separators or code and never leaks markers on errors or streamed prefixes", () => {
+  const source = '| A | B |\n| --- | --- |\n| `x \\| y` | $C_{|S|}^2$ |';
+  const html = render(source);
+  assert.match(html, /<code>x \| y<\/code>/);
+  assert.match(html, /class="katex"/);
+  const marker = '\uE000MATH_PIPE\uE001';
+  assert.ok(render(`${marker} $|x|$`).includes(marker));
+  const invalid = render(String.raw`| Formula | Note |
+| --- | --- |
+| $\frac{|x|}$ | visible |`);
+  assert.match(invalid, /math-fallback/);
+  assert.match(invalid, /\\frac\{\|x\|\}/);
+  for (let i = 0; i <= source.length; i++) assert.doesNotMatch(render(source.slice(0, i)), /MATH_PIPE/);
+});
+
+it("does not join currency amounts or incomplete formulas across table cells and rows", () => {
+  const html = render('| A | B |\n| --- | --- |\n| $5 | $10 |\n| $20 | $30 |');
+  assert.equal((html.match(/<td>/g) || []).length, 4);
+  assert.match(html, /<td>\$5<\/td><td>\$10<\/td>/);
+  assert.doesNotMatch(html, /class="katex"|MATH_PIPE/);
 });
 
 it("preserves code, inline math and already normalized blocks", () => {

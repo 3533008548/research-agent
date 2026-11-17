@@ -414,6 +414,9 @@ a.daily-paper-title:hover { color: #95c8ff; text-decoration: underline; }
 
 /* Wide generated content scrolls at its own boundary, never at the pane. */
 :is(.message-body, .workspace-page-content, .research-workbench, .translation-text) :is(pre, .katex-display) { min-width: 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+/* Keep both ends reachable and reserve scrollable space for equation numbers. */
+:is(.message-body, .workspace-page-content, .research-workbench, .translation-text) .katex-display > .katex { width: max-content; min-width: 100%; }
+:is(.message-body, .workspace-page-content, .research-workbench, .translation-text) .katex-display > .katex > .katex-html > .tag { position: static; margin-left: 1.5em; }
 :is(.message-body, .workspace-page-content, .research-workbench, .translation-text) table { display: block; max-width: 100%; overflow-x: auto; }
 /* KaTeX's italic/subscript glyphs can extend beyond their advance width.
    Leave room for that overhang so short inline math does not get a scrollbar. */
