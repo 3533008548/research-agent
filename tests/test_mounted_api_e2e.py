@@ -626,8 +626,14 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
 
     def test_switch_before_create_run_response_does_not_cancel_it(self) -> None:
         pending = []
+        intercepted = False
 
         def delay_response(route):
+            nonlocal intercepted
+            if intercepted:
+                route.continue_()
+                return
+            intercepted = True
             response = route.fetch()
             pending.append((route, response))
 
@@ -641,7 +647,9 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.wait_for_function("document.querySelectorAll('.session-item').length === 2")
         route, response = pending.pop()
         route.fulfill(response=response)
-        self.page.unroute("**/api/v1/runs", delay_response)
+        # Keep interception enabled while the first SSE connection is opening.
+        # Disabling it here can strand in-flight Chromium requests; subsequent
+        # POSTs pass through without delay so only A's response is held.
         self._send("B 不受延迟影响")
         self.page.get_by_text("来自 FastAPI：B 不受延迟影响", exact=True).wait_for(timeout=8_000)
         self.assertEqual(self.page.get_by_text("慢请求完成", exact=True).count(), 0)
