@@ -39,6 +39,9 @@ const model = http.createServer((request, response) => {
     args: [...(development ? [path.join(root, 'desktop')] : []), '--headless'], env, timeout: 120000,
   });
   const page = await desktop.firstWindow();
+  // Windows display scaling can shrink a hidden window into the mobile layout.
+  // Exercise desktop docking at a fixed CSS viewport, independent of the host.
+  await page.setViewportSize({ width: 1440, height: 1000 });
   page.setDefaultTimeout(30000);
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
