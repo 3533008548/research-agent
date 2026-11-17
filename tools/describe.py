@@ -6,6 +6,8 @@ from pathlib import Path
 
 from llm_client import RequestPolicy, RequestPriority
 from runtime_paths import get_runtime_paths
+from cancellation import RequestCancelledError, raise_if_cancelled
+from tool_errors import ToolFailure, failure_from_exception
 
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -33,15 +35,15 @@ def handle_describe_image(
     source_note = ""
     if args.get('paper_id_or_title'):
         if image_path:
-            return '❌ 请使用图片路径或论文与图号中的一种定位方式。'
+            return ToolFailure(code='TOOL_INVALID_ARGUMENT', phase='validate', retryable=False)
         try:
             from paper_images import resolve_paper_image
             resolved, source_note = resolve_paper_image(args, paper_store, paths)
             image_path = str(resolved)
         except (ValueError, OSError, TypeError) as exc:
-            return f'❌ 图片定位失败：{exc}'
+            return ToolFailure(code='TOOL_SOURCE_RESOLUTION_FAILED', phase='resolve_source', retryable=False, legacy_reason=str(exc))
     if not image_path:
-        return "❌ 请提供图片路径，或 paper_id_or_title 与 figure/page；可用 list_paper_images 查询图片目录。"
+        return ToolFailure(code='TOOL_INVALID_ARGUMENT', phase='validate', retryable=False)
     requested = Path(image_path).expanduser()
     p = None
     allowed_dirs = (paths.images_dir, paths.papers_dir)
@@ -62,20 +64,20 @@ def handle_describe_image(
                 break
 
     if p is None or not p.is_file():
-        return f"❌ 图片不存在: {image_path}。请用 list_paper_images 查询当前论文目录，或直接传 paper_id_or_title 与 figure/page，不要猜路径。"
+        return ToolFailure(code='TOOL_SOURCE_NOT_FOUND', phase='resolve_source', retryable=False)
     if not source_note:
         from paper_images import asset_source_note
         source_note = asset_source_note(p)
     if p.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-        return "❌ 仅支持 PNG、JPG 或 JPEG 图片。"
+        return ToolFailure(code='TOOL_UNSUPPORTED_FORMAT', phase='validate', retryable=False)
     if p.stat().st_size > MAX_IMAGE_BYTES:
-        return "❌ 图片过大（上限 10MB），请先压缩后再分析。"
+        return ToolFailure(code='TOOL_INPUT_TOO_LARGE', phase='validate', retryable=False)
     if llm_client is None:
-        return "❌ DeepSeek 视觉模型未启用，请先配置 DEEPSEEK_API_KEY。"
+        return ToolFailure(code='TOOL_NOT_CONFIGURED', phase='validate', retryable=False)
     vision_model = vision_model or DEFAULT_VISION_MODEL
     task = str(args.get("task") or "describe")
     if task not in {"describe", "transcribe_algorithm"}:
-        return "❌ task 仅支持 describe 或 transcribe_algorithm。"
+        return ToolFailure(code='TOOL_INVALID_ARGUMENT', phase='validate', retryable=False)
     import hashlib
     scope_key = hashlib.sha256(source_note.encode()).hexdigest()[:12] if source_note else ''
     cache_key = (str(p) if task == "describe" else str(p) + "#algorithm-transcription-v1") + scope_key
@@ -104,8 +106,8 @@ def handle_describe_image(
         b64 = base64.b64encode(img_data).decode()
         ext = p.suffix.lstrip(".").lower()
         mime = f"image/{'jpeg' if ext in ('jpg','jpeg') else ext}"
-    except Exception as e:
-        return f"❌ 读取图片失败: {e}"
+    except OSError as exc:
+        return failure_from_exception(exc, code='TOOL_SOURCE_READ_FAILED', phase='read_source')
 
     prompt = "请详细描述这张图的内容。"
     if task == "transcribe_algorithm":
@@ -144,11 +146,22 @@ def handle_describe_image(
             cancel_event=cancel_event,
         )
         try:
-            desc = resp.json()["choices"][0]["message"]["content"]
+            choice = resp.json()["choices"][0]
+            desc = choice["message"]["content"]
+            if choice.get('finish_reason') in {'length', 'content_filter'}:
+                return ToolFailure(code='LLM_OUTPUT_TRUNCATED' if choice['finish_reason'] == 'length' else 'LLM_CONTENT_FILTERED',
+                                   phase='parse_response', evidence_status='partial' if desc else 'unavailable')
+            if not isinstance(desc, str) or not desc.strip():
+                return ToolFailure(code='TOOL_RESPONSE_INVALID', phase='parse_response')
+        except (ValueError, KeyError, IndexError, TypeError):
+            return ToolFailure(code='TOOL_RESPONSE_INVALID', phase='parse_response')
         finally:
             resp.close()
-    except Exception as e:
-        return f"❌ DeepSeek 视觉模型调用失败: {e}"
+    except RequestCancelledError:
+        raise
+    except Exception as exc:
+        raise_if_cancelled(cancel_event, '识图已取消')
+        return failure_from_exception(exc, phase='unknown', code='LLM_REQUEST_FAILED')
 
     # ── 存入缓存 ──
     if memory_store:

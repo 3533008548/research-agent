@@ -45,7 +45,14 @@ LLM_ERROR_CODES = frozenset({
     "LLM_CIRCUIT_OPEN", "LLM_STREAM_INTERRUPTED", "LLM_REQUEST_FAILED",
     "LLM_OUTPUT_TRUNCATED", "LLM_CONTENT_FILTERED", "LLM_STREAM_PROTOCOL_ERROR",
 })
-_ERROR_PHASES = frozenset({"queue", "connect", "response_headers", "stream_read", "retry", "unknown"})
+TOOL_ERROR_CODES = frozenset({
+    "TOOL_UNKNOWN", "TOOL_ACCESS_DENIED", "TOOL_SOURCE_SCOPE_DENIED", "TOOL_INVALID_ARGUMENT",
+    "TOOL_SOURCE_NOT_FOUND", "TOOL_SOURCE_RESOLUTION_FAILED", "TOOL_UNSUPPORTED_FORMAT", "TOOL_INPUT_TOO_LARGE",
+    "TOOL_NOT_CONFIGURED", "TOOL_SOURCE_READ_FAILED", "TOOL_RESPONSE_INVALID", "TOOL_RESULT_READ_FAILED",
+    "TOOL_RESULT_STORAGE_FAILED", "TOOL_EXECUTION_FAILED", "TOOL_REPORTED_FAILURE",
+})
+_ERROR_PHASES = frozenset({"queue", "connect", "response_headers", "stream_read", "retry", "unknown",
+                           "access", "validate", "resolve_source", "read_source", "parse_response", "execute", "result_storage"})
 _EXCEPTION_TYPES = frozenset({
     "LLMClientError", "LLMRequestTimeoutError", "LLMRequestFailedError",
     "LLMQueueFullError", "LLMCircuitOpenError", "HTTPError", "_RetryableHTTPError",
@@ -53,6 +60,7 @@ _EXCEPTION_TYPES = frozenset({
     "ChunkedEncodingError", "ReadTimeoutError", "ConnectTimeoutError",
     "ProtocolError", "TimeoutError", "ConnectionResetError", "SSLError",
     "RequestException", "JSONDecodeError", "RuntimeError", "OSError",
+    "ValueError", "TypeError", "KeyError", "IndexError", "PermissionError", "FileNotFoundError",
 })
 
 
@@ -61,10 +69,14 @@ def safe_error_details(source: object) -> dict[str, Any]:
     if not isinstance(source, dict):
         return {}
     safe: dict[str, Any] = {}
-    if isinstance(source.get("code"), str) and source["code"] in LLM_ERROR_CODES:
+    if isinstance(source.get("code"), str) and source["code"] in LLM_ERROR_CODES | TOOL_ERROR_CODES:
         safe["code"] = source["code"]
     if isinstance(source.get("phase"), str) and source["phase"] in _ERROR_PHASES:
         safe["phase"] = source["phase"]
+    if isinstance(source.get("retryable"), bool):
+        safe["retryable"] = source["retryable"]
+    if isinstance(source.get("evidence_status"), str) and source["evidence_status"] in {"unavailable", "partial", "unknown"}:
+        safe["evidence_status"] = source["evidence_status"]
     for key in ("exception_type", "cause_type"):
         if isinstance(source.get(key), str) and source[key] in _EXCEPTION_TYPES:
             safe[key] = source[key]
@@ -155,10 +167,12 @@ def graph_activity_event(event: dict[str, Any]) -> dict[str, Any] | None:
         status = {"tool_started": "running", "tool_finished": "completed", "tool_failed": "failed"}[kind]
         if event.get("error_type") == "RequestCancelledError":
             status = "cancelled"
+        details = safe_error_details(event.get("error_details"))
         return {"type": "tool", "status": status, **safe_metadata({
             "tool": event.get("tool"), "call_id": event.get("call_id"),
         }), **bounded_timing_metrics(event),
-            **({"error_type": str(event["error_type"])[:120]} if event.get("error_type") else {})}
+            **({"error_type": str(event["error_type"])[:120]} if event.get("error_type") else {}),
+            **({"error_details": details} if details else {})}
     stages = {
         "llm_request_started": ("model", "running"),
         "llm_response_headers": ("model", "running"),

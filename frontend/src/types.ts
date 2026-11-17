@@ -37,6 +37,8 @@ export interface RunStart {
 
 /** Bounded operational fields supplied by the backend; never response bodies. */
 export interface RunErrorDetails {
+  retryable?: boolean;
+  evidence_status?: "unavailable" | "partial" | "unknown";
   code?: string;
   phase?: string;
   exception_type?: string;

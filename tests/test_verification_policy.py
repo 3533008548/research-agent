@@ -146,6 +146,57 @@ class TestVerificationPolicy(unittest.TestCase):
             app.get_graph().nodes["verify"].data.invoke(state)
         post.assert_not_called()
 
+    def test_verifier_sees_earlier_image_failure_and_later_result_even_with_pdf_hits(self):
+        import json
+        from tool_errors import ToolFailure
+        from verification import verification_tool_inputs
+        app = self.app([])
+        messages = [{'role': 'user', 'content': '原文图中有哪些结构？'}]
+        def call(identifier, name, args, text):
+            messages.extend([{'role': 'assistant', 'tool_calls': [{'id': identifier, 'function': {
+                'name': name, 'arguments': json.dumps(args)}}]}, {'role': 'tool', 'tool_call_id': identifier, 'content': text}])
+        call('fail', 'describe_image', {'paper_id_or_title': 'paper', 'page': 3},
+             ToolFailure(code='LLM_RESPONSE_TIMEOUT', phase='response_headers', retryable=True))
+        for i in range(6):
+            call(f'q{i}', 'query_papers', {'query': str(i)}, f'📚 检索内容 {i}')
+        call('other', 'describe_image', {'paper_id_or_title': 'paper', 'page': 1}, '🖼️ 第 1 页，与缺失页面不同')
+        call('retry', 'describe_image', {'page': 3, 'paper_id_or_title': 'paper'}, '🖼️ 第 3 页有两个节点和一条边')
+        evidence, failures = verification_tool_inputs(messages)
+        self.assertEqual(failures[0].split(']')[0], evidence[-1].split(']')[0])
+        self.assertNotEqual(evidence[-2].split(']')[0], evidence[-1].split(']')[0])
+        messages.append({'role': 'assistant', 'content': '图中已经核实有两个节点。'})
+        with patch('llm_client.requests.post', return_value=Response('OK')) as post:
+            app.get_graph().nodes['verify'].data.invoke({'messages': messages, 'metadata': {}})
+        prompt = post.call_args.kwargs['json']['messages'][0]['content']
+        self.assertIn('<tool_failures>', prompt)
+        self.assertIn('LLM_RESPONSE_TIMEOUT', prompt)
+        self.assertIn('response_headers', prompt)
+        self.assertIn('"page": "3"', prompt.split('<tool_failures>')[1])
+        self.assertIn('第 3 页有两个节点和一条边', prompt)
+        self.assertIn('第 1 页，与缺失页面不同', prompt)
+        self.assertIn('never source evidence', prompt)
+
+    def test_only_failure_still_reaches_review_and_does_not_become_factual_evidence(self):
+        from tool_errors import ToolFailure
+        app = self.app([])
+        messages = [{'role': 'user', 'content': '你觉得图里的结构怎么样？'},
+                    {'role': 'tool', 'content': ToolFailure(code='TOOL_SOURCE_NOT_FOUND', phase='resolve_source', retryable=False)},
+                    {'role': 'assistant', 'content': '我已经看图核实过了。'}]
+        with patch('llm_client.requests.post', return_value=Response('OK')) as post:
+            app.get_graph().nodes['verify'].data.invoke({'messages': messages, 'metadata': {}})
+        prompt = post.call_args.kwargs['json']['messages'][0]['content']
+        self.assertNotIn('TOOL_SOURCE_NOT_FOUND', prompt.split('<tool_evidence>')[1].split('</tool_evidence>')[0])
+        self.assertIn('TOOL_SOURCE_NOT_FOUND', prompt.split('<tool_failures>')[1])
+
+    def test_failure_summary_is_bounded_and_discloses_omissions(self):
+        from verification import verification_tool_inputs
+        messages = [{'role': 'tool', 'content': '❌ 原始工具失败 ' + 'a' * 5000} for _ in range(20)]
+        evidence, failures = verification_tool_inputs(messages)
+        self.assertFalse(evidence)
+        self.assertEqual(len(failures), 9)
+        self.assertIn('12 条较早失败未展开', failures[0])
+        self.assertLess(len('\n'.join(failures)), 8000)
+
     def test_replacement_preserves_other_turns_and_tool_pairs(self):
         previous = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old answer"},
                     {"role": "user", "content": "import"}, {"role": "assistant", "content": "draft"},

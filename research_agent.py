@@ -988,9 +988,12 @@ class ResearchAgent:
             message = {
                 "tool_started": f"{label}已开始",
                 "tool_finished": f"{label}已完成",
-                "tool_failed": f"{label}失败，可重试",
+                "tool_failed": f"{label}失败",
             }[event_type]
             agent, stage, summary = "single_agent", "tool", message
+            if event_type == 'tool_failed' and event.get('error_details'):
+                from tool_errors import error_reason
+                summary += '：' + error_reason(safe_error_details(event['error_details']))
             if event.get("error_type") == "RequestCancelledError":
                 status, summary = "cancelled", f"{label}已取消"
         elif event_type in event_map:

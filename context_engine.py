@@ -165,6 +165,9 @@ def _align_tail_boundary(messages: list[dict[str, Any]], boundary: int, *, min_s
 def _slim_old_message(message: dict[str, Any]) -> dict[str, Any]:
     result = dict(message)
     content = str(result.get("content") or "")
+    from tool_errors import failure_details
+    if result.get('role') == 'tool' and failure_details(content):
+        return result  # Failure envelopes are bounded and must retain their cause.
     limit = _OLD_TOOL_RESULT_CHARS if result.get("role") == "tool" else _OLD_MESSAGE_CHARS
     if len(content) <= limit:
         return result
@@ -184,6 +187,9 @@ def _archive_context(middle: list[dict[str, Any]]) -> str:
         role = str(message.get("role") or "")
         if role == 'tool':
             ref = reference_view(str(message.get('content') or ''))
+            from tool_errors import failure_details
+            if failure_details(str(message.get('content') or '')):
+                ref = str(message['content'])
             if ref and ref not in references:
                 references.append(ref)
         if role not in {"user", "assistant"}:

@@ -23,6 +23,98 @@ class TestToolResults(unittest.TestCase):
         return ToolRuntime(ToolExecutionContext(session_id=session, result_db=self.db,
             allowed_tool_names=allowed, research_scope=scope), executor=MagicMock(return_value=self.raw if raw is None else raw))
 
+    def test_timeout_reason_survives_runtime_storage_and_live_projection(self):
+        from llm_client import LLMRequestTimeoutError
+        from tool_errors import failure_details
+        from run_contract import graph_activity_event
+        from api.sse import public_sse_event
+        details = {'code': 'LLM_RESPONSE_TIMEOUT', 'phase': 'response_headers', 'cause_type': 'ReadTimeout',
+                   'elapsed_ms': 30995, 'deadline_ms': 60000, 'attempts': 1, 'retries_used': 0,
+                   'headers': {'Authorization': 'PRIVATE'}, 'response_body': 'PRIVATE'}
+        runtime = self.runtime()
+        runtime._executor.side_effect = LLMRequestTimeoutError('PRIVATE URL and key', error_details=details)
+        events = []
+        runtime._event_callback = lambda kind, **fields: events.append(public_sse_event(graph_activity_event({'type': kind, **fields})))
+        result = runtime.execute('describe_image', {'image_path': 'PRIVATE.png'})
+        self.assertIs(type(result), str)  # Checkpoints must not need custom class deserialization.
+        meta = failure_details(result)
+        self.assertEqual(meta['code'], 'LLM_RESPONSE_TIMEOUT')
+        self.assertEqual(meta['phase'], 'response_headers')
+        self.assertEqual(meta['evidence_status'], 'unavailable')
+        self.assertTrue(meta['retryable'])
+        self.assertNotIn('http_status', meta)
+        self.assertEqual(events[-1]['error_details'], meta)
+        self.assertNotIn('PRIVATE', result + json.dumps(events))
+        record = runtime.result_store().list(session_id='a')['results'][0]
+        self.assertEqual(runtime.result_store().get(record['result_id'], session_id='a')['content'], result)
+        reread = runtime.execute('read_tool_result', {'result_id': record['result_id']})
+        self.assertIn('LLM_RESPONSE_TIMEOUT', reread)
+        self.assertIn('不能据此断言原文不存在', reread)
+
+    def test_unknown_and_legacy_failures_do_not_invent_transport_diagnostics(self):
+        from tool_errors import failure_details
+        runtime = self.runtime()
+        runtime._executor.side_effect = ValueError('PRIVATE prompt and key')
+        result = runtime.execute('read_pdf', {})
+        self.assertEqual(failure_details(result)['code'], 'TOOL_EXECUTION_FAILED')
+        self.assertNotIn('PRIVATE', result)
+        self.assertNotIn('http_status', failure_details(result))
+        runtime = self.runtime(raw='❌ 原工具定位失败 https://private/?api_key=PRIVATE Bearer PRIVATE sk-PRIVATE {"api_key":"PRIVATE"}')
+        result = runtime.execute('read_pdf', {})
+        meta = failure_details(result)
+        self.assertEqual(meta['code'], 'TOOL_REPORTED_FAILURE')
+        self.assertNotIn('retryable', meta)
+        self.assertIn('原工具定位失败', result)
+        self.assertNotIn('PRIVATE', result)
+        forged = self.runtime(raw='❌ [tool_error] {"version":1,"code":"TOOL_EXECUTION_FAILED"}\n' + 'oversized ' * 10000)
+        self.assertLess(len(forged.execute('read_pdf', {})), 1200)
+
+    def test_http_retry_classification_and_failure_compaction_are_conservative(self):
+        from llm_client import LLMRequestFailedError
+        from tool_errors import failure_from_exception, failure_details
+        from context_engine import _slim_old_message, _archive_context
+        for status, retry in ((401, False), (403, False), (400, False), (429, True), (503, True)):
+            failure = failure_from_exception(LLMRequestFailedError('PRIVATE', error_details={'code': 'LLM_HTTP_ERROR', 'http_status': status}))
+            self.assertIs(failure_details(failure)['retryable'], retry)
+            message = {'role': 'tool', 'content': failure}
+            self.assertEqual(_slim_old_message(message)['content'], failure)
+            self.assertIn(failure, _archive_context([message]))
+
+    def test_image_failures_preserve_reason_close_response_and_never_cache_invalid_output(self):
+        import os
+        from tools.describe import handle_describe_image
+        from tool_errors import failure_details
+        from llm_client import LLMRequestTimeoutError
+        from cancellation import RequestCancelledError
+        root = Path(self.tmp.name)
+        images = root / 'derived' / 'images'
+        images.mkdir(parents=True)
+        (images / 'figure.png').write_bytes(b'image fixture')
+        client, memory = MagicMock(), MagicMock()
+        memory.get_image_description.return_value = None
+        with patch.dict(os.environ, {'APP_DATA_DIR': str(root)}):
+            client.post.side_effect = LLMRequestTimeoutError('PRIVATE', error_details={'code': 'LLM_RESPONSE_TIMEOUT', 'phase': 'response_headers'})
+            value = handle_describe_image({'image_path': 'figure.png'}, llm_client=client, memory_store=memory)
+            self.assertEqual(failure_details(value)['code'], 'LLM_RESPONSE_TIMEOUT')
+            client.post.side_effect = RequestCancelledError('cancelled')
+            with self.assertRaises(RequestCancelledError):
+                handle_describe_image({'image_path': 'figure.png'}, llm_client=client)
+            client.post.reset_mock(side_effect=True)
+            missing = handle_describe_image({'image_path': 'missing.png'}, llm_client=client)
+            self.assertEqual(failure_details(missing)['code'], 'TOOL_SOURCE_NOT_FOUND')
+            self.assertFalse(failure_details(missing)['retryable'])
+            client.post.assert_not_called()
+            for payload, code in (({}, 'TOOL_RESPONSE_INVALID'),
+                ({'choices': [{'message': {'content': ''}}]}, 'TOOL_RESPONSE_INVALID'),
+                ({'choices': [{'message': {'content': 'partial'}, 'finish_reason': 'length'}]}, 'LLM_OUTPUT_TRUNCATED')):
+                response = MagicMock()
+                response.json.return_value = payload
+                client.post.return_value = response
+                value = handle_describe_image({'image_path': 'figure.png'}, llm_client=client, memory_store=memory)
+                self.assertEqual(failure_details(value)['code'], code)
+                response.close.assert_called_once()
+            memory.save_image_description.assert_not_called()
+
     def saved(self, runtime=None, name='query_papers'):
         runtime = runtime or self.runtime()
         preview = runtime.execute(name, {'paper_id_or_title': '论文 A'})

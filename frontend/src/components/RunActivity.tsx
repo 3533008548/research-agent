@@ -2,6 +2,7 @@ import { durationLabel, stageLabel, statusLabel, toolLabel } from "../lib/labels
 import { agentLabel, collectToolCalls } from "../lib/toolActivity";
 import { verificationNotice } from "../lib/runErrors";
 import type { Run, RunEvent } from "../types";
+import { RunErrorDetails } from "./RunErrorDetails";
 
 const toolErrors: Record<string, string> = {
   ToolResultError: "工具返回了失败结果",
@@ -41,6 +42,9 @@ export function RunActivity({ run, events }: { run: Run; events: RunEvent[] }) {
           {call.tool && <code className="tool-call-name">{call.tool}</code>}
           <p>{agentLabel(call.agent)}{call.version ? ` · 目标版本 ${call.version}` : ""}{durationLabel(call.duration_ms) ? ` · ${durationLabel(call.duration_ms)}` : ""}</p>
           {call.error_type && <p className="tool-call-error">{toolErrors[call.error_type] || `调用异常：${call.error_type}`}</p>}
+          {call.error_details && <details><summary>查看失败原因</summary>
+            <RunErrorDetails runId={run.run_id} errorType={call.error_type} details={call.error_details} />
+          </details>}
         </li>)}
       </ol>
     </section>

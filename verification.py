@@ -2,9 +2,54 @@
 from __future__ import annotations
 
 import re
+import json
+import hashlib
 from dataclasses import dataclass
 
 MAX_VERIFY_PASSES = 2  # Initial review, at most one repair, then a final review.
+
+
+def verification_tool_inputs(messages: list[dict]) -> tuple[list[str], list[str]]:
+    """Keep failed calls separately from evidence; preserve request identity.
+
+    A later non-error result is not automatically proof that missing evidence
+    was recovered. The reviewer must compare its source and actual contents.
+    """
+    from tool_errors import ToolFailure, failure_details
+    from tool_results import source_reference
+    calls, evidence, failures = {}, [], []
+    for message in messages:
+        for call in message.get('tool_calls') or []:
+            function = call.get('function') or {}
+            name = str(function.get('name') or 'unknown')
+            args = function.get('arguments') or '{}'
+            try:
+                args = json.loads(args) if isinstance(args, str) else args
+                canonical = json.dumps([name, args], sort_keys=True, ensure_ascii=False)
+                key = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+            except (ValueError, TypeError):
+                key = 'unknown'
+            source = source_reference(args) if isinstance(args, dict) else {}
+            calls[call.get('id')] = (name if re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', name) else 'unknown', key, source)
+        if message.get('role') != 'tool':
+            continue
+        text = str(message.get('content') or '')
+        name, key, source = calls.get(message.get('tool_call_id'), ('unknown', 'unknown', {}))
+        label = f'[tool={name} request={key} source={json.dumps(source, ensure_ascii=False)}]'
+        if text.lstrip().startswith('❌'):
+            if not failure_details(text):
+                text = str(ToolFailure(code='TOOL_REPORTED_FAILURE', evidence_status='unknown', legacy_reason=text))
+            failures.append(f'{label} status=failed\n{review_excerpt(text, 1200)}')
+        else:
+            evidence.append(f'{label} status=returned (内容与覆盖范围仍需核对)\n{text}')
+    omitted = len(failures) - 8
+    failure_views = failures[-8:]
+    if omitted > 0:
+        failure_views.insert(0, f'本轮另有 {omitted} 条较早失败未展开；未显示不等于没有失败。')
+    selected = evidence[-6:]
+    if len(evidence) > 6:
+        selected.insert(0, f'本轮另有 {len(evidence)-6} 条较早工具返回未展开，不代表不存在对应证据。')
+    return selected, failure_views
 
 
 def review_excerpt(text: str, limit: int) -> str:
@@ -14,7 +59,7 @@ def review_excerpt(text: str, limit: int) -> str:
     return text[:head] + "\n[审核输入摘录：中间内容由程序省略，不代表原文缺失]\n" + text[-(limit - head):]
 
 
-def verification_prompt(question: str, answer: str, evidence: list[str], previous: str = "") -> str:
+def verification_prompt(question: str, answer: str, evidence: list[str], previous: str = "", *, failures: list[str] | None = None) -> str:
     scope = "完整回答" if len(answer) <= 24000 else "回答摘录，未覆盖全文"
     retry = (
         "This is the final review after one repair. Check only whether the previously identified "
@@ -30,6 +75,14 @@ def verification_prompt(question: str, answer: str, evidence: list[str], previou
         "Quote the relevant answer and supplied evidence or show the counter-calculation. "
         "A source omitted from these excerpts is not evidence that the claim is false. "
         "Distinguish missing evidence from a demonstrated error.\n"
+        "The tool_failures section contains execution status, never source evidence. A timeout, missing file, "
+        "permission error or invalid response does not show that a paper lacks the requested content. "
+        "Use code, phase, retryable and evidence_status to distinguish temporary failure, invalid input and unknown cause. "
+        "Do not invent a cause, HTTP status or permission to retry. Do not demand repeated write/delete actions. "
+        "Matching request identifiers indicate the same tool and arguments, not successful verification. "
+        "A later returned result may fill a gap only if its actual contents cover the same source and claim. "
+        "If image analysis failed without supporting recovery, an answer claiming to have visually verified the image "
+        "is unsupported; a transparent limitation is not itself a factual error.\n"
         "Tool result headers describe visible character ranges. has_more=true or view=reference means "
         "the current view does not contain the whole stored tool result. A no-match search is only a literal "
         "search of that result. These do not establish absence in the original paper, or prove that all pages "
@@ -42,6 +95,7 @@ def verification_prompt(question: str, answer: str, evidence: list[str], previou
         + f"\n<user_question>\n{review_excerpt(question, 4000)}\n</user_question>"
         + "\n<tool_evidence>\n" + "\n\n".join(f"[T{i+1}] {review_excerpt(t, 6000)}" for i, t in enumerate(evidence))
         + "\n</tool_evidence>"
+        + "\n<tool_failures>\n" + '\n\n'.join(failures or []) + "\n</tool_failures>"
         + f"\n<response scope='{scope}' original_characters='{len(answer)}'>\n{review_excerpt(answer, 24000)}\n</response>"
         + "\nIssues (or OK):"
     )

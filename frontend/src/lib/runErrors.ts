@@ -7,6 +7,8 @@ const PHASES: Record<string, string> = {
   stream_read: "读取流式响应",
   retry: "重试模型请求",
   unknown: "未记录",
+  access: "检查工具权限", validate: "校验参数", resolve_source: "定位来源",
+  read_source: "读取来源", parse_response: "解析模型返回", execute: "执行工具", result_storage: "保存或读取工具结果",
 };
 
 const ERROR_CODES: Record<string, string> = {
@@ -21,6 +23,14 @@ const ERROR_CODES: Record<string, string> = {
   LLM_CIRCUIT_OPEN: "模型服务暂不可用",
   LLM_STREAM_INTERRUPTED: "模型流式响应中断",
   LLM_REQUEST_FAILED: "模型请求失败",
+  LLM_OUTPUT_TRUNCATED: "模型返回被截断", LLM_CONTENT_FILTERED: "模型未返回可用内容",
+  TOOL_UNKNOWN: "未知工具", TOOL_ACCESS_DENIED: "当前角色无权调用", TOOL_SOURCE_SCOPE_DENIED: "来源超出研究范围",
+  TOOL_INVALID_ARGUMENT: "参数不合法", TOOL_SOURCE_NOT_FOUND: "来源不存在或无法访问",
+  TOOL_SOURCE_RESOLUTION_FAILED: "图片定位失败", TOOL_UNSUPPORTED_FORMAT: "格式不受支持",
+  TOOL_INPUT_TOO_LARGE: "图片过大", TOOL_NOT_CONFIGURED: "模型未配置", TOOL_SOURCE_READ_FAILED: "来源读取失败",
+  TOOL_RESPONSE_INVALID: "模型响应为空或格式错误", TOOL_RESULT_READ_FAILED: "保存结果不可读",
+  TOOL_RESULT_STORAGE_FAILED: "完整结果保存失败", TOOL_EXECUTION_FAILED: "工具执行异常",
+  TOOL_REPORTED_FAILURE: "原工具未提供结构化原因",
 };
 
 function nonnegative(value: unknown): value is number {
@@ -41,6 +51,12 @@ export function errorDetailRows(details: RunErrorDetails | null | undefined): Ar
   const rows: Array<{ label: string; value: string }> = [];
   if (typeof details.code === "string" && Object.hasOwn(ERROR_CODES, details.code)) rows.push({ label: "错误代码", value: `${details.code}（${ERROR_CODES[details.code]}）` });
   if (typeof details.phase === "string" && Object.hasOwn(PHASES, details.phase)) rows.push({ label: "失败阶段", value: PHASES[details.phase] });
+  const evidence = { unavailable: "未取得可用证据", partial: "内容不完整", unknown: "尚不能确认" };
+  if (details.evidence_status && Object.hasOwn(evidence, details.evidence_status)) {
+    rows.push({ label: "证据状态", value: evidence[details.evidence_status] });
+    rows.push({ label: "重试建议", value: details.retryable === true ? "可重试，先确认无重复副作用"
+      : details.retryable === false ? "先修正参数、权限或配置" : "未知，需先核对原因" });
+  }
   if (exceptionName(details.exception_type)) rows.push({ label: "异常类型", value: details.exception_type });
   if (exceptionName(details.cause_type)) rows.push({ label: "底层原因", value: details.cause_type });
   if (Number.isInteger(details.http_status) && details.http_status! >= 100 && details.http_status! <= 599) {

@@ -28,6 +28,18 @@ test("does not render unknown payload keys or invalid diagnostic values", () => 
   assert.deepEqual(errorDetailRows({ code: "constructor", phase: "toString", request_id: "sk-private-token" }), []);
 });
 
+test("tool diagnostics distinguish transient errors, missing sources and unknown retryability", () => {
+  const timeout = errorDetailRows({ code: "LLM_RESPONSE_TIMEOUT", phase: "response_headers", retryable: true, evidence_status: "unavailable" });
+  assert.match(timeout.find(row => row.label === "重试建议")!.value, /可重试/);
+  assert.equal(timeout.find(row => row.label === "证据状态")!.value, "未取得可用证据");
+  const missing = errorDetailRows({ code: "TOOL_SOURCE_NOT_FOUND", phase: "resolve_source", retryable: false, evidence_status: "unavailable" });
+  assert.equal(missing.find(row => row.label === "失败阶段")!.value, "定位来源");
+  assert.match(missing.find(row => row.label === "重试建议")!.value, /先修正/);
+  const unknown = errorDetailRows({ code: "TOOL_REPORTED_FAILURE", evidence_status: "unknown" });
+  assert.match(unknown.find(row => row.label === "重试建议")!.value, /未知/);
+  assert.equal(unknown.some(row => row.label === "最后 HTTP 状态"), false);
+});
+
 test("failed terminal events retain failure presentation and prefer backend summaries", () => {
   assert.equal(failedRunEvent({ type: "done", status: "failed" }), true);
   assert.equal(failedRunEvent({ type: "done", status: "partial_failed" }), true);

@@ -57,7 +57,7 @@ class SafeErrorDetailsTests(unittest.TestCase):
         for source in (None, [], "not an object", 401):
             with self.subTest(source=source):
                 self.assertEqual(safe_error_details(source), {})
-        for field in ("code", "phase", "exception_type", "cause_type", "request_id"):
+        for field in ("code", "phase", "exception_type", "cause_type", "request_id", "evidence_status"):
             for invalid in ([], {}, True, 401):
                 with self.subTest(field=field, invalid=invalid):
                     self.assertEqual(safe_error_details({field: invalid}), {})
@@ -139,6 +139,19 @@ class DurableErrorDetailsTests(unittest.TestCase):
         events = self.store.get_run_events(self.run_id)
         self.assertEqual(events[0]["error_details"], HTTP_FAILURE)
         self.assertEqual(events[0]["metadata"], {"model": "fake-model"})
+
+    def test_tool_failure_reason_survives_restart_and_api_without_poisoning_completed_run(self):
+        details = {**HTTP_FAILURE, 'retryable': False, 'evidence_status': 'unavailable'}
+        self.store.add_run_event(self.session_id, self.run_id, 'chat', 'single_agent', 'tool', 'failed',
+            event_type='tool', error_type='ToolResultError', error_details={**details, 'body': PRIVATE_TEXT},
+            metadata={'tool': 'describe_image', 'call_id': 'vision-1'})
+        self.store.update_chat_run(self.run_id, status='completed', answer='已说明证据缺失')
+        self._reopen()
+        with self._client() as client:
+            payload = client.get(f'/api/v1/runs/{self.run_id}').json()
+        self.assertEqual(payload['events'][0]['error_details'], details)
+        self.assertFalse(payload.get('error_details'))
+        self.assertNotIn(PRIVATE_TEXT, json.dumps(payload))
 
     def test_restored_api_detail_keeps_latest_diagnostics_after_a_plain_terminal_event(self) -> None:
         self._record_failure()

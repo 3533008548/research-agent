@@ -152,6 +152,24 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         output.mkdir(parents=True, exist_ok=True)
         self.page.screenshot(path=str(output / "sidebar-tools.png"))
 
+    def test_tool_failure_cause_is_visible_live_and_after_reload(self):
+        self._set_viewport({"width": 1600, "height": 1000})
+        self._send('__vision_timeout__')
+        failure = self.page.locator('.tool-call-failed')
+        failure.wait_for()
+        failure.get_by_text('查看失败原因', exact=True).click()
+        self.assertIn('LLM_RESPONSE_TIMEOUT', failure.inner_text())
+        self.assertIn('未取得可用证据', failure.inner_text())
+        self.assertIn('31.00 秒', failure.inner_text())
+        self.assertIn('可重试，先确认无重复副作用', failure.inner_text())
+        self.assertNotIn('最后 HTTP 状态', failure.inner_text())
+        self.page.locator('.message-assistant').filter(has_text='工具状态测试完成').wait_for()
+        self.page.reload(wait_until='domcontentloaded')
+        failure.get_by_text('查看失败原因', exact=True).click()
+        self.assertIn('LLM_RESPONSE_TIMEOUT', failure.inner_text())
+        self.assertNotIn('E2E_PRIVATE', self.page.locator('.run-inspector').inner_text())
+        self.assertIn('等待模型响应超时', self.page.locator('.run-inspector').inner_text())
+
     def test_verify_timeout_remains_visible_after_success_and_reload(self):
         self._set_viewport({"width": 1440, "height": 1000})
         self._send("__verify_timeout__")

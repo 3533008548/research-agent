@@ -31,6 +31,9 @@ def public_sse_event(event: dict[str, Any]) -> dict[str, Any]:
         for key, limit in (("call_id", 120), ("agent", 80), ("error_type", 120)):
             if event.get(key):
                 payload[key] = _bounded_text(event[key], limit)
+        details = safe_error_details(event.get('error_details'))
+        if details:
+            payload['error_details'] = details
         return payload
     if event_type == "done":
         payload = {

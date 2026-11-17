@@ -41,7 +41,7 @@ from run_contract import safe_error_details
 from tool_catalog import get_tool_schemas
 from tool_runtime import ToolExecutionContext, ToolRuntime
 from tools import execute_tool
-from verification import MAX_VERIFY_PASSES, classify_review, verification_prompt
+from verification import MAX_VERIFY_PASSES, classify_review, verification_prompt, verification_tool_inputs
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -864,21 +864,22 @@ def build_graph(
         if not content:
             return _complete_verification()
         turn_start = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
-        recent = list(messages[turn_start + 1:])[-8:]
+        recent = list(messages[turn_start + 1:])
         has_tools = any(m.get("role") == "tool" for m in recent)
+        fact_texts, failures = verification_tool_inputs(recent)
 
         # ── 第1层：跳过门控 ──
         if not has_tools:
             return _complete_verification()
         # 短回复跳过（无事实可查）
-        if len(content) < 100:
+        if len(content) < 100 and not failures:
             return _complete_verification()
         # 主观问题跳过
         user_q = ""
         for m in reversed(messages):
             if m.get("role") == "user" and "[系统验证" not in m.get("content", ""):
                 user_q = m.get("content", ""); break
-        if _is_subjective_question(user_q):
+        if _is_subjective_question(user_q) and not failures:
             return _complete_verification()
 
         # verify 是辅助质量保障，不能在服务异常时拖住主对话。
@@ -900,22 +901,12 @@ def build_graph(
         if token_usage:
             token_usage["verify_status"] = f"🔄 第{retry_n+1}次修改..." if retry_n else "🔍 验证中..."
 
-        tool_texts = []
         has_read_pdf = False
         for m in recent:
             if m.get("role") == "tool":
                 t = m.get("content", "")
-                tool_texts.append(t)
                 if "📄" in t:
                     has_read_pdf = True
-
-        # ── verify 输入精简：低价值工具结果不送验证 ──
-        # 只保留 query_papers / read_pdf / search_papers 的结果（含事实内容）
-        def _is_fact_tool(text: str) -> bool:
-            return any(marker in text[:80] for marker in ["📚", "📄", "检索结果", "搜索结果", "PDF"])
-        fact_texts = [t for t in tool_texts if _is_fact_tool(t)]
-        if not fact_texts:
-            fact_texts = tool_texts[:1]  # 兜底：至少送一条
 
         library_context = ""
         if paper_store and has_read_pdf:
@@ -929,7 +920,7 @@ def build_graph(
 
         # Keep full ordinary answers and explicitly mark any bounded excerpts.
         prev_issues = state.get("metadata", {}).get("verify_issues", "")
-        verify_prompt = verification_prompt(user_q, content, fact_texts + ([library_context] if library_context else []), prev_issues)
+        verify_prompt = verification_prompt(user_q, content, fact_texts + ([library_context] if library_context else []), prev_issues, failures=failures)
 
         verify_policy = RequestPolicy(
             purpose="verify",

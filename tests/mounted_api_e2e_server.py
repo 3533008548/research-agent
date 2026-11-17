@@ -27,7 +27,7 @@ from api.app import create_app, mount_react_frontend
 from api.run_dispatcher import RunDispatcher
 from api.redis_runs import RedisChatRunBroker, RedisChatRunManager, RedisChatRunWorker, RedisResearchRunBroker, RedisResearchRunManager
 from config import Config
-from llm_client import LLMRequestFailedError
+from llm_client import LLMRequestFailedError, LLMRequestTimeoutError
 from session_store import SessionStore
 
 
@@ -115,7 +115,7 @@ class _E2EAgent:
             history.append({"role": "assistant", "content": answer})
             self._traces[session_id] = {"outcome": "success"}
             return answer
-        if message == "__tools__":
+        if message in {"__tools__", "__vision_timeout__"}:
             from research_agent import ResearchAgent
             from run_contract import graph_activity_event
             from tool_runtime import ToolExecutionContext, ToolRuntime
@@ -126,10 +126,15 @@ class _E2EAgent:
                     _kwargs["on_progress"](graph_activity_event(event))
             def execute(name, args, **kwargs):
                 cancel_event.wait(timeout=1.8)
+                if name == 'describe_image':
+                    raise LLMRequestTimeoutError('E2E_PRIVATE_TOOL_EXCEPTION', error_details={
+                        'code': 'LLM_RESPONSE_TIMEOUT', 'phase': 'response_headers', 'cause_type': 'ReadTimeout',
+                        'elapsed_ms': 30995, 'deadline_ms': 60000, 'attempts': 1, 'retries_used': 0,
+                        'response_body': 'E2E_PRIVATE_TOOL_RESPONSE'})
                 return "❌ E2E_PRIVATE_TOOL_RESULT" if name == "read_pdf" else "E2E_PRIVATE_TOOL_RESULT"
             runtime = ToolRuntime(ToolExecutionContext(), event_callback=emit, executor=execute)
             runtime.execute("query_papers", {"query": "E2E_PRIVATE_TOOL_ARGUMENT"})
-            runtime.execute("read_pdf", {"url_or_path": "E2E_PRIVATE_TOOL_ARGUMENT"})
+            runtime.execute('describe_image' if message == '__vision_timeout__' else 'read_pdf', {"url_or_path": "E2E_PRIVATE_TOOL_ARGUMENT"})
             # A finished tool/model stage must not mark the whole run as completed.
             _kwargs["on_progress"]({"type": "status", "stage": "model", "status": "completed"})
             cancel_event.wait(timeout=1.8)

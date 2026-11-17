@@ -20,6 +20,7 @@ from tool_catalog import get_tool_definition
 from tools import execute_tool
 from tool_results import (HEADER, RESULT_TOOLS, ToolResultStore, handle_result_tool,
                           page_view, source_reference)
+from tool_errors import ToolFailure, failure_details, failure_from_exception
 
 
 class ToolDeadlineExceeded(RuntimeError):
@@ -105,19 +106,21 @@ class ToolRuntime:
         name = str(name or "")[:80]
         call_id = uuid.uuid4().hex
         definition = get_tool_definition(name)
+        def rejected(code, error_type, phase='access'):
+            failure = ToolFailure(code=code, phase=phase, retryable=False)
+            self._emit('tool_failed', tool=name or 'unknown', call_id=call_id,
+                       error_type=error_type, error_details=failure.error_details)
+            return str(failure)
         if definition is None:
-            self._emit("tool_failed", tool=name or "unknown", call_id=call_id, error_type="UnknownTool")
-            return f"❌ 未知工具: {name or 'unknown'}"
+            return rejected('TOOL_UNKNOWN', 'UnknownTool')
         if not self._is_allowed(name):
-            self._emit("tool_failed", tool=name, call_id=call_id, error_type="ToolAccessDenied")
-            return f"Tool is not available in this {self.context.run_kind} role: {name}"
+            return rejected('TOOL_ACCESS_DENIED', 'ToolAccessDenied')
 
         if name == "read_pdf" and self.context.run_kind == "research":
             remote = str(args.get("url_or_path", "")).strip().lower().startswith(("https://", "http://"))
             scope = self.context.research_scope
             if (scope == "local" and remote) or (scope == "public" and not remote):
-                self._emit("tool_failed", tool=name, call_id=call_id, error_type="SourceScopeDenied")
-                return "❌ PDF 来源超出了用户指定的研究范围。"
+                return rejected('TOOL_SOURCE_SCOPE_DENIED', 'SourceScopeDenied')
 
         self._ensure_active("before_tool")
         started_at = time.perf_counter()
@@ -129,12 +132,13 @@ class ToolRuntime:
                                               session_id=self._result_session,
                                               allowed_tools=self.context.allowed_tool_names,
                                               scope=self.context.research_scope)
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    text = f"❌ 工具结果读取失败：{exc}" if isinstance(exc, ValueError) else '❌ 工具结果存储不可读，无法确认完整内容。'
+                except (ValueError, OSError, sqlite3.Error):
+                    text = ToolFailure(code='TOOL_RESULT_READ_FAILED', phase='result_storage', retryable=False)
                 self._ensure_active('after_result_read')
                 self._emit('tool_failed' if text.startswith('❌') else 'tool_finished', tool=name, call_id=call_id,
+                           **({'error_type': 'ToolResultError', 'error_details': failure_details(text)} if text.startswith('❌') else {}),
                            duration_ms=round((time.perf_counter() - started_at) * 1000, 1))
-                return text
+                return str(text)
             result = self._executor(
                 name,
                 args,
@@ -148,16 +152,7 @@ class ToolRuntime:
                 cancel_event=self.context.cancel_event,
             )
             self._ensure_active("after_tool")
-        except RequestCancelledError:
-            self._emit(
-                "tool_failed",
-                tool=name,
-                call_id=call_id,
-                duration_ms=round((time.perf_counter() - started_at) * 1_000, 1),
-                error_type="RequestCancelledError",
-            )
-            raise
-        except Exception as exc:
+        except (RequestCancelledError, ToolDeadlineExceeded) as exc:
             self._emit(
                 "tool_failed",
                 tool=name,
@@ -166,25 +161,37 @@ class ToolRuntime:
                 error_type=type(exc).__name__,
             )
             raise
+        except Exception as exc:
+            self._ensure_active('after_tool_error')
+            result = failure_from_exception(exc)
 
         raw = result if isinstance(result, str) else str(result)
+        diagnostics = getattr(result, 'error_details', {}) or failure_details(raw)
+        if diagnostics and not isinstance(raw, ToolFailure):
+            raw = ToolFailure(code=diagnostics.get('code', 'TOOL_REPORTED_FAILURE'),
+                              phase=diagnostics.get('phase', 'unknown'), retryable=diagnostics.get('retryable'),
+                              evidence_status=diagnostics.get('evidence_status', 'unknown'), details=diagnostics)
+            diagnostics = raw.error_details
+        if raw.lstrip().startswith('❌') and not diagnostics:
+            raw = ToolFailure(code='TOOL_REPORTED_FAILURE', evidence_status='unknown', legacy_reason=raw)
+            diagnostics = raw.error_details
         try:
             record = self.result_store().save(
                 session_id=self._result_session, run_id=self.context.run_id,
                 tool=name, scope=self.context.research_scope, source=source_reference(args), content=raw,
             )
-            text = raw if len(raw) <= 800 and not raw.startswith(HEADER) else page_view(record, raw, limit=definition.result_limit, budget=definition.result_limit)
+            text = raw if diagnostics or (len(raw) <= 800 and not raw.startswith(HEADER)) else page_view(record, raw, limit=definition.result_limit, budget=definition.result_limit)
         except (OSError, sqlite3.Error):
             # The action already happened. Never retry a write tool just to recover its output.
-            self._emit('tool_failed', tool=name, call_id=call_id, error_type='ToolResultStorageError')
-            return ('❌ 工具已执行，但完整结果保存失败，无法续读；不要自动重复有副作用的操作。'
-                    '以下仅为未归档预览，不能据此宣称已完整读取：\n' + raw[:max(0, definition.result_limit - 110)])
+            failure = ToolFailure(code='TOOL_RESULT_STORAGE_FAILED', phase='result_storage', evidence_status='unknown')
+            self._emit('tool_failed', tool=name, call_id=call_id, error_type='ToolResultStorageError', error_details=failure.error_details)
+            return str(failure)
         self._emit(
             "tool_failed" if raw.lstrip().startswith("❌") else "tool_finished",
             tool=name,
             call_id=call_id,
-            **({"error_type": "ToolResultError"} if raw.lstrip().startswith("❌") else {}),
+            **({"error_type": "ToolResultError", "error_details": diagnostics} if diagnostics else {}),
             duration_ms=round((time.perf_counter() - started_at) * 1_000, 1),
             rag_keyword_fallback=name == "query_papers" and "关键词候选" in text,
         )
-        return text
+        return str(text)

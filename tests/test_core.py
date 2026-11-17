@@ -4237,6 +4237,8 @@ class TestToolRuntime(unittest.TestCase):
         self.assertIn("not available", result)
         dispatcher.assert_not_called()
         self.assertRegex(events[0].pop("call_id"), r"^[a-f0-9]{32}$")
+        self.assertEqual(events[0].pop('error_details'), {'code': 'TOOL_ACCESS_DENIED', 'phase': 'access',
+                                                        'retryable': False, 'evidence_status': 'unavailable'})
         self.assertEqual(events, [{
             "type": "tool_failed", "tool": "search_papers",
             "error_type": "ToolAccessDenied",
