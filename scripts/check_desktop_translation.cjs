@@ -61,10 +61,8 @@ let desktop;
   assert.ok(await result.evaluate(el => el.scrollWidth <= el.clientWidth + 1));
   await page.getByRole('separator', { name: '调整运行检查器宽度', exact: true }).press('End');
   await page.waitForTimeout(200);
-  const bounds = await result.boundingBox();
-  const preview = await desktop.evaluate(async ({ BrowserWindow }, rect) =>
-    (await BrowserWindow.getAllWindows()[0].webContents.capturePage(rect)).toPNG().toString('base64'),
-    Object.fromEntries(Object.entries(bounds).map(([key, value]) => [key, Math.round(value)])));
+  const preview = await desktop.evaluate(async ({ BrowserWindow }) =>
+    (await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG().toString('base64'));
   if (preview) fs.writeFileSync(path.join(root, '.visual_check/desktop-translation-math.png'), Buffer.from(preview, 'base64'));
   await page.getByRole('button', { name: '译文加入笔记', exact: true }).click();
   assert.equal(await page.getByRole('textbox', { name: '笔记正文', exact: true }).inputValue(), translation);
