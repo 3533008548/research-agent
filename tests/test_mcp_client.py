@@ -26,6 +26,7 @@ from tool_catalog import (
     register_external_tools,
 )
 from tool_runtime import ToolExecutionContext, ToolRuntime
+from tool_errors import failure_details
 
 
 def _shutdown_loop(loop, thread) -> None:
@@ -217,9 +218,17 @@ class RuntimeInheritanceTests(unittest.TestCase):
             ToolExecutionContext(run_kind="research"),
             event_callback=lambda kind, **detail: events.append((kind, detail)),
         )
-        with self.assertRaises(RuntimeError):
-            runtime.execute("mcp__demo__lookup", {})
-        self.assertIn("tool_failed", [kind for kind, _ in events])
+        result = runtime.execute("mcp__demo__lookup", {})
+        details = failure_details(result)
+        self.assertEqual(details['code'], 'TOOL_EXECUTION_FAILED')
+        self.assertEqual(details['phase'], 'execute')
+        self.assertEqual(details['exception_type'], 'RuntimeError')
+        self.assertEqual(details['evidence_status'], 'unknown')
+        self.assertNotIn('external exploded', result)
+        failures = [detail for kind, detail in events if kind == 'tool_failed']
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]['error_details'], details)
+        self.assertNotIn('tool_finished', [kind for kind, _ in events])
 
 
 class NamingTests(unittest.TestCase):

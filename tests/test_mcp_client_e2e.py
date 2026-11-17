@@ -48,12 +48,22 @@ class McpClientEndToEndTests(unittest.TestCase):
         # first so the registry closes before its data directory is removed.
         cls.addClassCleanup(runtime.cleanup)
         cls.registry = ExternalToolRegistry([_spec(runtime.name)])
-        cls.addClassCleanup(cls.registry.stop)
+        cls.addClassCleanup(cls._stop_registry)
         cls.addClassCleanup(cls.registry.unpublish_from_catalog)
         # The server warms its vector store before serving, so the first
         # handshake is slow on a cold model cache.
         cls.registry.start(timeout_seconds=180.0)
         cls.registry.publish_to_catalog()
+
+    @classmethod
+    def _stop_registry(cls):
+        cls.registry.stop()
+        if cls.registry._thread.is_alive() or not cls.registry._loop.is_closed():
+            raise AssertionError("MCP shutdown must close its transports and event loop")
+        if cls.registry.errors():
+            raise AssertionError(f"MCP lifecycle errors: {cls.registry.errors()}")
+        # Shutdown is also safe when called again by application cleanup.
+        cls.registry.stop()
 
     def test_tools_are_discovered(self):
         names = {tool.remote_name for tool in self.registry.tools()}
@@ -109,6 +119,9 @@ class DegradationTests(unittest.TestCase):
             self.assertIn("❌", registry.call("mcp__broken__x", {}))
         finally:
             registry.stop()
+
+        self.assertFalse(registry._thread.is_alive())
+        self.assertTrue(registry._loop.is_closed())
 
     def test_disabled_server_is_never_launched(self):
         registry = ExternalToolRegistry([

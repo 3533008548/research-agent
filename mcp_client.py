@@ -152,6 +152,8 @@ class ExternalToolRegistry:
         self._lock = threading.RLock()
         self._started = False
         self._errors: dict[str, str] = {}
+        self._stop_requested = threading.Event()
+        self._shutdown_signal: asyncio.Event | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -195,34 +197,41 @@ class ExternalToolRegistry:
                 log.warning("MCP 外部服务 %s 不可用：%s", name, error)
 
     async def _serve(self, ready: threading.Event) -> None:
-        """Hold every server session open for the process lifetime."""
-        from contextlib import AsyncExitStack
-
+        """Keep each transport in its owning task until shutdown completes."""
+        self._shutdown_signal = asyncio.Event()
+        if self._stop_requested.is_set():
+            self._shutdown_signal.set()
         servers = [spec for spec in self.specs if spec.enabled]
         if not servers:
             ready.set()
-            await asyncio.Event().wait()
             return
-        # The stack owns the context managers for the lifetime of the session.
-        # Entering them with a bare ``__aenter__`` would let the underlying
-        # async generators be garbage-collected, and finalising one of them
-        # tears the server process down — which shows up as a bare
-        # "Connection closed" with no other symptom.
-        async with AsyncExitStack() as stack:
-            await self._open_sessions(servers, stack)
+        connected = [asyncio.Event() for _ in servers]
+        tasks = [asyncio.create_task(self._serve_server(spec, event))
+                 for spec, event in zip(servers, connected)]
+        try:
+            await asyncio.gather(*(event.wait() for event in connected))
             ready.set()
-            await asyncio.Event().wait()
+            await asyncio.gather(*tasks)
+        finally:
+            ready.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _open_sessions(
-        self, servers: list[McpServerSpec], stack: Any,
+    async def _serve_server(
+        self, spec: McpServerSpec, connected: asyncio.Event,
     ) -> None:
+        from contextlib import AsyncExitStack
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
         import os
 
-        async def _open(spec: McpServerSpec) -> None:
-            try:
+        try:
+            # MCP uses task-bound AnyIO cancel scopes: both entering and exiting
+            # the session/transport must happen in this same long-lived task.
+            async with AsyncExitStack() as stack:
                 env = {**os.environ, **spec.env} if spec.env else None
                 params = StdioServerParameters(
                     command=spec.command,
@@ -234,7 +243,7 @@ class ExternalToolRegistry:
                 # not be able to scribble on our own stdout, which carries the
                 # protocol stream of *our* server when we are embedded.
                 reader, writer = await stack.enter_async_context(
-                    stdio_client(params, errlog=open(os.devnull, "w")),
+                    stdio_client(params, errlog=stack.enter_context(open(os.devnull, "w"))),
                 )
                 session = await stack.enter_async_context(
                     ClientSession(reader, writer),
@@ -254,11 +263,13 @@ class ExternalToolRegistry:
                     "MCP 外部服务 %s 已连接，公开 %d 个工具",
                     spec.name, len(self._tools),
                 )
-            except Exception as exc:  # noqa: BLE001 - one bad server must not win
-                self._errors[spec.name] = f"{type(exc).__name__}: {exc}"
-                log.warning("MCP 外部服务 %s 连接失败：%s", spec.name, exc)
-
-        await asyncio.gather(*(_open(spec) for spec in servers))
+                connected.set()
+                await self._shutdown_signal.wait()
+        except Exception as exc:  # noqa: BLE001 - one bad server must not win
+            self._errors[spec.name] = f"{type(exc).__name__}: {exc}"
+            log.warning("MCP 外部服务 %s 连接失败：%s", spec.name, exc)
+        finally:
+            connected.set()
 
     def _register_tools(self, spec: McpServerSpec, remote_tools: list[Any]) -> None:
         for tool in remote_tools:
@@ -282,22 +293,23 @@ class ExternalToolRegistry:
 
     def stop(self) -> None:
         """Close every session and stop the background loop."""
+        self._stop_requested.set()
         with self._lock:
-            sessions = dict(self._sessions)
+            loop = self._loop
+            signal = self._shutdown_signal
+            thread = self._thread
+        if loop is not None and signal is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(signal.set)
+            except RuntimeError:  # The loop may have finished between checks.
+                pass
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=15)
+            if thread.is_alive():
+                log.warning("MCP 外部服务关闭尚未完成")
+        with self._lock:
             self._sessions.clear()
             self._tools.clear()
-            loop = self._loop
-        for session in sessions.values():
-            closer = getattr(session, "__aexit__", None)
-            if closer is None:
-                continue
-            try:
-                if loop is not None and not loop.is_closed():
-                    asyncio.run_coroutine_threadsafe(
-                        closer(None, None, None), loop,
-                    ).result(timeout=5)
-            except Exception:  # noqa: BLE001 - shutdown must not raise
-                pass
 
     # -- introspection -----------------------------------------------------
 

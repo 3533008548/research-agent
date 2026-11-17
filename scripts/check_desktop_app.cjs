@@ -79,6 +79,14 @@ const model = http.createServer((request, response) => {
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await page.getByRole('button', { name: '每日检索', exact: true }).click();
   await page.getByRole('button', { name: '用户画像', exact: true }).click();
+  assert.equal(await page.locator('.workspace').isVisible(), false);
+  assert.equal(await page.getByRole('tab').count(), 0);
+  assert.equal((await page.locator('.app-navigation').boundingBox()).width, 56);
+  await page.getByRole('button', { name: '工作台', exact: true }).click();
+  assert.equal(await page.getByRole('spinbutton', { name: '页码', exact: true }).inputValue(), '2');
+  await page.locator('.right-workspace .draggable-chat-tab button').click();
+  assert.equal(await page.getByRole('textbox', { name: '消息', exact: true }).inputValue(), '停靠期间的对话草稿');
+  await page.getByRole('button', { name: '设置', exact: true }).click();
   const testKey = 'desktop-acceptance-fake-key-not-a-credential';
   await page.evaluate(key => window.desktop.configure({ deepseekKey: key }), testKey);
   await page.waitForURL('**/startup.html');
@@ -127,7 +135,7 @@ const model = http.createServer((request, response) => {
   assert.deepEqual(errors, []);
   await desktop.close(); desktop = null;
   await assert.rejects(fetch(initialOrigin + '/api/v1/desktop/status', { signal: AbortSignal.timeout(2000) }));
-  console.log('Desktop passed: isolated runtime, auth, real PDF, notes, encrypted setup, same-origin restart, docked chat persistence, translation, queued chat, tab return, tray close and backend shutdown.');
+  console.log('Desktop passed: isolated runtime, auth, fixed navigation and separate pages, real PDF, notes, encrypted setup, same-origin restart, docked chat persistence, translation, queued chat, tab return, tray close and backend shutdown.');
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (desktop) await desktop.close().catch(() => {});
   model.close();

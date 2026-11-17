@@ -984,6 +984,14 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             self.page.mouse.move(target["x"] + target["width"] / 2, target["y"] + 45, steps=8)
         self.page.mouse.up()
         zone.wait_for(state="hidden")
+        if not cancel:
+            # Dropping schedules focus on the moved tab for the next frame.
+            # Wait for that before a subsequent separator keyboard operation.
+            target_tab = ".right-workspace" if to_right else ".conversation"
+            self.page.wait_for_function(
+                "selector => document.activeElement === document.querySelector(selector)",
+                arg=f"{target_tab} .draggable-chat-tab button",
+            )
 
     def test_chat_tab_docks_beside_paper_and_returns_without_losing_state(self) -> None:
         self._set_viewport({"width": 1700, "height": 1000})
