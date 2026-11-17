@@ -574,7 +574,13 @@
   line-height: 1.8;
 }
 .translation-text > :first-child { margin-top: 1rem; }
-.translation-text .katex-display { text-align: left; padding-block: 0.25rem; }
+.translation-text .katex-display { padding-block: 0.25rem; }
+/* Keep the formula's left edge reachable; its tag must occupy scrollable space. */
+.translation-text .katex-display > .katex { width: max-content; min-width: 100%; }
+.translation-text .katex-display > .katex > .katex-html > .tag {
+  position: static;
+  margin-left: 1.5em;
+}
 @container workbench (max-width:600px) {
   .library-table th:nth-child(5),
   .library-table td:nth-child(5) {

@@ -1006,6 +1006,11 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             if key == "Home":
                 self.assertTrue(equation.evaluate("el => el.scrollWidth > el.clientWidth"))
                 self.assertGreater(equation.evaluate("el => { el.scrollLeft = el.scrollWidth; return el.scrollLeft; }"), 0)
+                self.assertTrue(equation.evaluate("""el => {
+                    const body = el.querySelector('.katex-html');
+                    const right = Math.max(...Array.from(body.children).filter(n => !n.classList.contains('tag')).map(n => n.getBoundingClientRect().right));
+                    return body.querySelector('.tag').getBoundingClientRect().left >= right;
+                }"""), "窄侧栏中公式编号不应与公式重叠")
         output = ROOT / "runtime" / "evaluations" / "translation-math"
         output.mkdir(parents=True, exist_ok=True)
         self.page.screenshot(path=str(output / "sidebar-formulas.png"))

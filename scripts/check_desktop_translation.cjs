@@ -33,14 +33,17 @@ let desktop;
   const page = await desktop.firstWindow();
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.getByRole('button', { name: '论文库', exact: true }).waitFor({ timeout: 120000 });
-  const uploaded = await page.request.post(new URL('/api/v1/library/documents', page.url()).href, {
-    multipart: { file: { name: 'formula-translation.pdf', mimeType: 'application/pdf', buffer: pdf } },
-  });
-  assert.equal(uploaded.status(), 201);
+  const uploaded = await page.evaluate(async bytes => {
+    const data = new FormData();
+    data.append('file', new Blob([new Uint8Array(bytes)], { type: 'application/pdf' }), 'formula-translation.pdf');
+    return (await fetch('/api/v1/library/documents', { method: 'POST', body: data })).status;
+  }, Array.from(pdf));
+  assert.equal(uploaded, 201);
   await page.route('**/api/v1/library/documents/*/translate', route => route.fulfill({ json: { text: translation } }));
   await page.getByRole('button', { name: '论文库', exact: true }).click();
   await page.getByRole('button', { name: 'formula-translation.pdf', exact: true }).click();
   await page.locator('.textLayer span').first().waitFor();
+  await page.locator('.reader-selection').getByText('划选文字后可翻译或添加批注', { exact: true }).waitFor();
   await page.locator('.textLayer').evaluate(el => {
     const range = document.createRange(); range.selectNodeContents(el);
     const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
