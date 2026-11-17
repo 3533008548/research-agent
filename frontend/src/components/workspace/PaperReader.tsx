@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import {
   getDocument,
@@ -18,6 +18,7 @@ import {
 } from "../../lib/library";
 import { userFacingError } from "../../lib/errors";
 GlobalWorkerOptions.workerSrc = workerUrl;
+const MarkdownContent = lazy(() => import("../../MarkdownContent"));
 
 type Draft = {
   id: string;
@@ -681,11 +682,15 @@ export function PaperReader({
                     {translatedAnchor.quote}
                   </blockquote>
                 )}
-                <p className="translation-text">
+                <div className="translation-text">
                   {translating
                     ? "正在翻译…"
-                    : translation || "划选论文中的文字后点击翻译。"}
-                </p>
+                    : translationOk ? (
+                      <Suspense fallback={<p className="markdown-loading">{translation}</p>}>
+                        <MarkdownContent content={translation} />
+                      </Suspense>
+                    ) : translation || "划选论文中的文字后点击翻译。"}
+                </div>
                 {translating ? (
                   <button onClick={() => translateAbort.current?.abort()}>
                     取消翻译

@@ -953,6 +953,71 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "保留对话草稿")
         self.assertEqual(self._state()["calls"], [])
 
+    def test_translation_renders_latex_and_scrolls_wide_equations(self) -> None:
+        self._set_viewport({"width": 1440, "height": 1000})
+        import fitz
+        with fitz.open() as document:
+            document.new_page().insert_text((50, 80), "Definition 1. Delay duration difference model.")
+            uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                "file": {"name": "formula-translation.pdf", "mimeType": "application/pdf", "buffer": document.tobytes()},
+            })
+        self.assertEqual(uploaded.status, 201)
+        translation = r"""定义 1。设 \(S_A\) 从发言者到节点 \(v_i\) 的延迟区间为 \([d^A_{v_i},D^A_{v_i}]\)。中心点的接近度定义为：
+
+\[
+\alpha_{v_i}(S_A,S_B)=\frac{1}{1+\left|\frac{D^A_{v_i}+d^A_{v_i}}{2}-\frac{D^B_{v_i}+d^B_{v_i}}{2}\right|}.\tag{1}
+\]
+
+类似地，延迟区间长度的接近度定义为：
+
+\[
+\beta_{v_i}(S_A,S_B)=\frac{1}{1+|(D^A_{v_i}-d^A_{v_i})-(D^B_{v_i}-d^B_{v_i})|}.\tag{2}
+\]
+
+两者的值均介于 0 和 1 之间。"""
+        self.page.route("**/api/v1/library/documents/*/translate", lambda route: route.fulfill(json={"text": translation}))
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="formula-translation.pdf", exact=True).click()
+        self.page.locator(".textLayer span").first.wait_for()
+        self.page.locator(".textLayer").evaluate("""el => {
+            const range = document.createRange(); range.selectNodeContents(el);
+            const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+            el.dispatchEvent(new KeyboardEvent('keyup', {key: 'Shift', bubbles: true}));
+        }""")
+        self.page.get_by_role("button", name="翻译选段", exact=True).click()
+        self.page.locator(".translation-text .katex-display").first.wait_for()
+        self.page.evaluate("document.fonts.ready")
+        result = self.page.locator(".translation-text")
+        self.assertEqual(result.locator(".katex-display").count(), 2)
+        self.assertEqual(result.locator(".katex").count(), 5)
+        self.assertEqual(result.locator(".tag").count(), 2)
+        self.assertEqual(result.locator(".math-fallback, .katex-error").count(), 0)
+        self.assertTrue(self.page.evaluate("document.fonts.check('16px KaTeX_Main')"))
+        self.assertNotIn(r"\[", result.inner_text())
+        self.assertNotIn(r"\(", result.inner_text())
+        self.assertIn("两者的值均介于 0 和 1 之间。", result.inner_text())
+        separator = self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True)
+        for key in ("Home", "End"):
+            separator.press(key)
+            self.page.wait_for_timeout(150)
+            self.assertTrue(result.evaluate("el => el.scrollWidth <= el.clientWidth + 1"))
+            self._assert_no_horizontal_page_overflow()
+            equation = result.locator(".katex-display").last
+            if key == "Home":
+                self.assertTrue(equation.evaluate("el => el.scrollWidth > el.clientWidth"))
+                self.assertGreater(equation.evaluate("el => { el.scrollLeft = el.scrollWidth; return el.scrollLeft; }"), 0)
+        output = ROOT / "runtime" / "evaluations" / "translation-math"
+        output.mkdir(parents=True, exist_ok=True)
+        self.page.screenshot(path=str(output / "sidebar-formulas.png"))
+        result.screenshot(path=str(output / "translation-rendered.png"))
+        self.page.get_by_role("button", name="译文加入笔记", exact=True).click()
+        editor = self.page.get_by_role("textbox", name="笔记正文", exact=True)
+        self.assertEqual(editor.input_value(), translation)
+        self.page.get_by_role("button", name="保存笔记", exact=True).click()
+        self.page.locator(".note-save-status").filter(has_text="已保存").wait_for()
+        notes = self.page.request.get(f"{self.base_url}/api/v1/library/documents/{uploaded.json()['id']}/notes").json()
+        self.assertEqual(notes[0]['content'], translation)
+
     def test_docking_during_session_load_keeps_the_current_content_tab(self) -> None:
         self._set_viewport({"width": 1440, "height": 900})
         self.page.locator(".session-item.active").wait_for()

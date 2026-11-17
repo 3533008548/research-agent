@@ -568,10 +568,13 @@
   overflow: auto;
 }
 .translation-text {
-  white-space: pre-wrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: 0.86rem;
   line-height: 1.8;
 }
+.translation-text > :first-child { margin-top: 1rem; }
+.translation-text .katex-display { text-align: left; padding-block: 0.25rem; }
 @container workbench (max-width:600px) {
   .library-table th:nth-child(5),
   .library-table td:nth-child(5) {

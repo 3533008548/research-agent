@@ -413,11 +413,11 @@ a.daily-paper-title:hover { color: #95c8ff; text-decoration: underline; }
 .research-project-picker summary:focus-visible, .research-project-options button:focus-visible { outline: 2px solid #8bc4ff; outline-offset: -2px; }
 
 /* Wide generated content scrolls at its own boundary, never at the pane. */
-:is(.message-body, .workspace-page-content, .research-workbench) :is(pre, .katex-display) { min-width: 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
-:is(.message-body, .workspace-page-content, .research-workbench) table { display: block; max-width: 100%; overflow-x: auto; }
+:is(.message-body, .workspace-page-content, .research-workbench, .translation-text) :is(pre, .katex-display) { min-width: 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+:is(.message-body, .workspace-page-content, .research-workbench, .translation-text) table { display: block; max-width: 100%; overflow-x: auto; }
 /* KaTeX's italic/subscript glyphs can extend beyond their advance width.
    Leave room for that overhang so short inline math does not get a scrollbar. */
-:is(.message-body, .workspace-page-content, .research-workbench) :not(.katex-display) > .katex { display: inline-block; max-width: 100%; padding-inline: 0.12em; overflow-x: auto; overflow-y: hidden; vertical-align: middle; }
-:is(.message-body, .workspace-page-content, .research-workbench) :is(img, video) { max-width: 100%; height: auto; }
+:is(.message-body, .workspace-page-content, .research-workbench, .translation-text) :not(.katex-display) > .katex { display: inline-block; max-width: 100%; padding-inline: 0.12em; overflow-x: auto; overflow-y: hidden; vertical-align: middle; }
+:is(.message-body, .workspace-page-content, .research-workbench, .translation-text) :is(img, video) { max-width: 100%; height: auto; }
 .research-workbench pre { padding: 0.65rem; border: 1px solid #263b58; border-radius: 0.4rem; background: #0c1625; }
 .research-workbench th, .research-workbench td { padding: 0.3rem; border: 1px solid #31445e; }

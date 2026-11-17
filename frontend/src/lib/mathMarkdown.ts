@@ -1,5 +1,69 @@
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import remarkMath from "remark-math";
+
+const mathParser = unified().use(remarkParse).use(remarkMath);
+
+/** Recognize model-produced LaTeX delimiters before Markdown consumes the escapes.
+ * Markdown positions protect code, links and existing dollar math verbatim. */
+function normalizeLatexDelimiters(content: string): string {
+  if (!/\\[([]/.test(content)) return content;
+  type Node = { type: string; children?: Node[]; position?: {
+    start: { offset?: number }; end: { offset?: number };
+  } };
+  const protectedRanges: [number, number][] = [];
+  function visit(node: Node) {
+    if (["code", "inlineCode", "html", "link", "linkReference", "image", "imageReference", "definition", "math", "inlineMath"].includes(node.type)) {
+      const start = node.position?.start.offset, end = node.position?.end.offset;
+      if (start !== undefined && end !== undefined) protectedRanges.push([start, end]);
+    } else node.children?.forEach(visit);
+  }
+  visit(mathParser.parse(content));
+  const edits: { start: number; end: number; value: string }[] = [];
+  function convert(start: number, end: number) {
+    const tokens = content.slice(start, end).matchAll(/\\+[()[\]]/g);
+    let opener: { start: number; end: number; display: boolean } | undefined;
+    for (const token of tokens) {
+      if ((token[0].length - 1) % 2 === 0) continue; // Escaped backslash.
+      const symbol = token[0].slice(-1);
+      const at = start + token.index + token[0].length - 2;
+      if (symbol === "(" || symbol === "[") {
+        opener = { start: at, end: at + 2, display: symbol === "[" };
+      } else if (opener && symbol === (opener.display ? "]" : ")")) {
+        const body = content.slice(opener.end, at).trim();
+        if (body && (opener.display || !/\n\s*\n/.test(body))) {
+          let value = `$${body}$`;
+          if (opener.display) {
+            const before = content.slice(content.lastIndexOf("\n", opener.start - 1) + 1, opener.start);
+            // Retain blockquote/list indentation when creating a display block.
+            const container = before.match(/^([ \t]*(?:>[ \t]*)*)(?:(?:[-+*]|\d+[.)])([ \t]+))?/)!;
+            const prefix = container[1] + " ".repeat(container[0].length - container[1].length);
+            const lines = content.slice(opener.end, at).split("\n")
+              .map((line, i) => i && line.startsWith(prefix) ? line.slice(prefix.length) : line)
+              .join("\n").trim().split("\n");
+            const lead = before === container[0] ? "" : `\n${prefix}`;
+            const after = content.slice(at + 2, content.indexOf("\n", at + 2) < 0 ? end : content.indexOf("\n", at + 2));
+            value = `${lead}$$\n${prefix}${lines.join(`\n${prefix}`)}\n${prefix}$$${after.trim() ? `\n${prefix}` : ""}`;
+          }
+          edits.push({ start: opener.start, end: at + 2, value });
+        }
+        opener = undefined;
+      }
+    }
+  }
+  let start = 0;
+  for (const [from, to] of protectedRanges) {
+    convert(start, from);
+    start = to;
+  }
+  convert(start, content.length);
+  for (const edit of edits.reverse()) content = content.slice(0, edit.start) + edit.value + content.slice(edit.end);
+  return content;
+}
+
 /** Normalize line-start display formulas without touching fenced code. */
 export function normalizeDisplayMath(content: string): string {
+  content = normalizeLatexDelimiters(content);
   const lines = content.split(/\r?\n/);
   const output: string[] = [];
   let fence: string | undefined;
