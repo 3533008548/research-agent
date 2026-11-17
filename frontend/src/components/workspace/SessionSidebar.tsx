@@ -1,23 +1,9 @@
-import type { Dispatch, FormEvent, ReactNode, SetStateAction } from "react";
+import type { ReactNode } from "react";
 
 import { statusLabel } from "../../lib/labels";
-import type {
-  DailyKeyword,
-  Paper,
-  Run,
-  Session,
-  UserProfile,
-  WorkspaceSettings,
-} from "../../types";
+import type { Session } from "../../types";
 
-/**
- * The left rail: the conversation list, the collapsible workspace panels and
- * the API-token field.
- *
- * Extracted from `App.tsx` without behaviour change.  The panels here are
- * *navigation* into the workbench tabs rather than the panels themselves, so
- * this component only lists and selects.
- */
+/** The workbench's conversation list; application pages live in AppNavigation. */
 export function SessionSidebar({
   hidden = false,
   children,
@@ -28,54 +14,32 @@ export function SessionSidebar({
   onSelectSession,
   onStartSession,
   onRemoveActiveSession,
-  onOpenLibrary,
-  onOpenSettings,
 }: {
-  onOpenLibrary: () => void;
-  onOpenSettings: () => void;
   hidden?: boolean;
   children?: ReactNode;
   sessions: Session[];
   activeSessionId: string | null;
   sessionRunStatuses: Record<string, string>;
   isSending: boolean;
-  openWorkspacePanel: string | null;
-  workspaceLoading: string | null;
-  profile: UserProfile | null;
-  papers: Paper[];
-  dailyRuns: Run[];
-  keywords: DailyKeyword[];
-  keywordDraft: string;
-  workspaceSettings: WorkspaceSettings | null;
-  settingsDraft: { model: string; rag_enabled: boolean; pdf_max_pages: number; daily_search_enabled: boolean };
-  apiKeyDraft: string;
   onSelectSession: (sessionId: string) => void;
   onStartSession: () => void;
   onRemoveActiveSession: () => void;
-  onToggleWorkspacePanel: (panel: string) => void;
-  onOpenProfile: () => void;
-  onSelectDailyRun: (runId: string) => void;
-  onOpenDailyCenter: () => void;
-  onAddDailyKeyword: (event: FormEvent<HTMLFormElement>) => void;
-  onRemoveDailyKeyword: (keyword: string) => void;
-  onKeywordDraftChange: (value: string) => void;
-  onSaveWorkspaceSettings: (event: FormEvent<HTMLFormElement>) => void;
-  onSettingsDraftChange: Dispatch<SetStateAction<{ model: string; rag_enabled: boolean; pdf_max_pages: number; daily_search_enabled: boolean }>>;
-  onApiKeyDraftChange: (value: string) => void;
-  onApplyApiKey: () => void;
 }) {
   return (
     // Keep one real root: App assigns this entire rail to one grid area.
     <aside id="session-sidebar" className="session-sidebar" aria-label="会话列表" hidden={hidden}>
       <div className="sidebar-heading">
-        <div><p className="eyebrow">工作区</p><h2>会话</h2></div>
-        <button className="button button-secondary" onClick={() => void onStartSession()} aria-label="新建会话">＋ 新建对话</button>
+        <h2>对话</h2>
+        <button type="button" className="icon-button" onClick={() => void onStartSession()} aria-label="新建会话" title="新建对话">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M9 3H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5M11 13l-4 1 1-4 8-8 3 3Z" /></svg>
+        </button>
       </div>
-      <nav className="session-list">
+      <nav className="session-list" aria-label="对话列表">
         {sessions.map((session) => (
           <button
             key={session.thread_id}
             className={`session-item ${session.thread_id === activeSessionId ? "active" : ""}`}
+            aria-current={session.thread_id === activeSessionId ? "true" : undefined}
             onClick={() => void onSelectSession(session.thread_id)}
           >
             <strong title={session.title}>{session.title}</strong>
@@ -93,10 +57,6 @@ export function SessionSidebar({
           删除当前会话
         </button>
       )}
-      <nav className="sidebar-main-nav" aria-label="工作区导航">
-        <button className="sidebar-nav-button" aria-label="论文库" onClick={onOpenLibrary}>▤ 论文库</button>
-      </nav>
-      <button className="sidebar-nav-button sidebar-settings" aria-label="设置" onClick={onOpenSettings}>⚙ 设置</button>
       {children}
     </aside>
   );

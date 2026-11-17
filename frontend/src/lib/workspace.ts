@@ -13,6 +13,8 @@ import type {
 
 export type ResearchMode = "chat" | "research";
 
+export type AppPage = "workspace" | "library" | "settings";
+
 export type WorkspacePanel =
   | "profile"
   | "papers"
@@ -23,8 +25,6 @@ export type Notice = { kind: "error" | "info"; text: string } | null;
 
 export type WorkbenchTab =
   | { id: "chat"; kind: "chat"; title: string }
-  | { id: "library"; kind: "library"; title: string }
-  | { id: "settings"; kind: "settings"; title: string }
   | { id: string; kind: "paper"; title: string; documentId: string }
   | { id: "profile"; kind: "profile"; title: string; profile: UserProfile }
   | { id: "daily"; kind: "daily"; title: string }

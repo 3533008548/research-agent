@@ -1,9 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent } from "react";
 import { ReaderErrorBoundary } from "./components/ReaderErrorBoundary";
-
-import {
-  updateWorkspaceSettings,
-} from "./api";
+import { AppNavigation } from "./components/AppNavigation";
 import {
   statusLabel,
 } from "./lib/labels";
@@ -14,19 +11,13 @@ import { DailyPanel } from "./components/workspace/DailyPanel";
 import { DailyRunPanel, ProfilePanel } from "./components/workspace/SimplePanels";
 import { RunsPanel } from "./components/workspace/RunsPanel";
 import { userFacingError } from "./lib/errors";
-import type { Notice, WorkbenchTab, WorkspacePanel } from "./lib/workspace";
+import type { AppPage, Notice, WorkbenchTab } from "./lib/workspace";
 import { useConversation } from "./hooks/useConversation";
 import { useDailyWorkspace } from "./hooks/useDailyWorkspace";
-import { useProfile } from "./hooks/useProfile";
 import { useRunCenter } from "./hooks/useRunCenter";
-import { useWorkspaceChrome } from "./hooks/useWorkspaceChrome";
 import { useWorkspaceLayout } from "./hooks/useWorkspaceLayout";
 import { SidebarResizeHandle } from "./components/SidebarResizeHandle";
 import { SessionSidebar } from "./components/workspace/SessionSidebar";
-import {
-  type Paper,
-  type WorkspaceSettings,
-} from "./types";
 
 
 import { LibraryPanel } from "./components/workspace/LibraryPanel";
@@ -51,7 +42,9 @@ export function App() {
   const [apiKeyDraft, setApiKeyDraft] = useState(() => sessionStorage.getItem(API_TOKEN_KEY) || "");
 
 
-  const layout = useWorkspaceLayout();
+  const [appPage, setAppPage] = useState<AppPage>("workspace");
+  const [settingsOpened, setSettingsOpened] = useState(false);
+  const layout = useWorkspaceLayout(appPage === "workspace");
   const { chatDocked, setChatDocked } = layout;
   const chatDockedRef = useRef(chatDocked);
   useLayoutEffect(() => { chatDockedRef.current = chatDocked; }, [chatDocked]);
@@ -71,8 +64,6 @@ export function App() {
   const [showRunTools, setShowRunTools] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [notice, setNotice] = useState<Notice>(null);
-  const [openWorkspacePanel, setOpenWorkspacePanel] = useState<WorkspacePanel | null>(null);
-  const [workspaceLoading, setWorkspaceLoading] = useState<WorkspacePanel | null>(null);
   const [workbenchTabs, setWorkbenchTabs] = useState<WorkbenchTab[]>([
     { id: "chat", kind: "chat", title: "对话" },
   ]);
@@ -84,14 +75,10 @@ export function App() {
       layout.showRight();
     } else setActiveWorkbenchTabId(tabId);
   }, [layout.showRight]);
-  const [papers, setPapers] = useState<Paper[]>([]);
-  const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null);
-  const [settingsDraft, setSettingsDraft] = useState({
-    model: "",
-    rag_enabled: true,
-    pdf_max_pages: 15,
-    daily_search_enabled: false,
-  });
+  const openWorkbenchTab = useCallback((tabId: string) => {
+    setAppPage("workspace");
+    activateWorkbenchTab(tabId);
+  }, [activateWorkbenchTab]);
 
   const {
     canSteerCurrentRun,
@@ -153,14 +140,13 @@ export function App() {
     loadKeywords,
     replaceDailyRuns,
     loadDailyCenter,
-    openDailyCenter,
     updateDailyPaper,
     startDailyAction,
   } = useDailyWorkspace({
     apiKey,
     setNotice,
     setWorkbenchTabs,
-    setActiveWorkbenchTabId,
+    setActiveWorkbenchTabId: openWorkbenchTab,
   });
 
   const {
@@ -190,29 +176,7 @@ export function App() {
     setSessionUsage,
     replaceDailyRuns,
     setWorkbenchTabs,
-    setActiveWorkbenchTabId,
-  });
-
-  const { profile, setProfile, openProfile } = useProfile({
-    apiKey,
-    setNotice,
-    setWorkbenchTabs,
-    setActiveWorkbenchTabId,
-  });
-
-  const {
-    toggleWorkspacePanel,
-  } = useWorkspaceChrome({
-    apiKey,
-    setNotice,
-    setProfile,
-    setPapers,
-    setWorkspaceSettings,
-    setSettingsDraft,
-    openWorkspacePanel,
-    setOpenWorkspacePanel,
-    setWorkspaceLoading,
-    loadKeywords,
+    setActiveWorkbenchTabId: openWorkbenchTab,
   });
 
 
@@ -260,24 +224,23 @@ export function App() {
     void loadWorkspace();
   }, [loadWorkspace]);
 
-  function openUtility(kind: "library"|"settings") {
-    const tab: WorkbenchTab = kind === "library" ? {id:"library",kind:"library",title:"论文库"} : {id:"settings",kind:"settings",title:"设置"};
-    setWorkbenchTabs(tabs => tabs.some(t => t.id === kind) ? tabs : [...tabs, tab]);
-    setActiveWorkbenchTabId(kind);
-    setShowRunTools(false);
-    if (kind === "library") { void library.load(); void toggleWorkspacePanel("papers"); }
+  function navigate(page: AppPage) {
+    setAppPage(page);
+    endChatDrag();
+    if (page === "settings") setSettingsOpened(true);
+    if (page === "library") void library.load();
   }
   function openPaper(document: LibraryDocument) {
     const id = `paper:${document.id}`;
     setWorkbenchTabs(tabs => tabs.some(t => t.id === id) ? tabs : [...tabs, {id, kind:"paper", title:document.name, documentId:document.id}]);
-    setActiveWorkbenchTabId(id);
+    openWorkbenchTab(id);
     setShowRunTools(false);
   }
   function readWithAssistant(document: LibraryDocument) {
     const prompt = `请阅读论文“${document.name}”，调用 read_pdf，url_or_path 使用 ${JSON.stringify(`library/${document.id}.pdf`)}，max_pages 使用 ${Math.min(document.pages, 100)}，并建立可检索的论文索引。`;
     setDraft(draft.trim() ? `${draft}\n\n${prompt}` : prompt);
     setMode("chat");
-    activateWorkbenchTab("chat");
+    openWorkbenchTab("chat");
   }
   useEffect(() => {
     setSelectedDocument(current => current ? library.data.documents.find(d => d.id === current.id) || null : null);
@@ -295,23 +258,6 @@ export function App() {
 
   const selectedRun = runCenterRuns.find((run) => run.run_id === selectedRunId) || null;
 
-  async function saveWorkspaceSettings(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    try {
-      const settings = await updateWorkspaceSettings(apiKey, settingsDraft);
-      setWorkspaceSettings(settings);
-      setSettingsDraft({
-        model: settings.model,
-        rag_enabled: settings.rag_enabled,
-        pdf_max_pages: settings.pdf_max_pages,
-        daily_search_enabled: settings.daily_search_enabled,
-      });
-      setNotice({ kind: "info", text: "设置已保存；重启服务后生效。" });
-    } catch (error) {
-      setNotice({ kind: "error", text: userFacingError(error) });
-    }
-  }
-
   function applyApiKey() {
     const nextKey = apiKeyDraft.trim();
     if (nextKey) {
@@ -322,7 +268,7 @@ export function App() {
     setApiKey(nextKey);
   }
 
-  const inspectingDaily = activeWorkbenchTab?.kind === "daily" || activeWorkbenchTab?.kind === "dailyRun" || (activeWorkbenchTab?.kind === "settings" && settingsSection === "daily");
+  const inspectingDaily = activeWorkbenchTab?.kind === "daily" || activeWorkbenchTab?.kind === "dailyRun";
   const inspectedRun = inspectingDaily ? dailyCurrentRun : currentRun;
   const inspectedEvents = inspectingDaily ? dailyRunEvents : runEvents;
   const activeSessionTitle = sessions.find((session) => session.thread_id === activeSessionId)?.title || "对话";
@@ -330,43 +276,24 @@ export function App() {
 
   return (
     <main className="app-shell">
+      <AppNavigation page={appPage} onNavigate={navigate} />
+      <div className="app-pages">
       <div
+        id="app-page-workspace"
+        hidden={appPage !== "workspace"}
         ref={layout.workspaceRef}
         style={layout.workspaceStyle}
         className={["workspace", !layout.leftVisible && "workspace-left-hidden", !layout.rightVisible && "workspace-right-hidden"].filter(Boolean).join(" ")}
       >
         <SessionSidebar
           hidden={!layout.leftVisible}
-          onOpenLibrary={() => openUtility("library")}
-          onOpenSettings={() => openUtility("settings")}
           sessions={sessions}
           activeSessionId={activeSessionId}
           sessionRunStatuses={sessionRunStatuses}
           isSending={isSending}
-          openWorkspacePanel={openWorkspacePanel}
-          workspaceLoading={workspaceLoading}
-          profile={profile}
-          papers={papers}
-          dailyRuns={dailyRuns}
-          keywords={keywords}
-          keywordDraft={keywordDraft}
-          workspaceSettings={workspaceSettings}
-          settingsDraft={settingsDraft}
-          apiKeyDraft={apiKeyDraft}
           onSelectSession={(sessionId) => void selectSession(sessionId)}
           onStartSession={() => void startSession()}
           onRemoveActiveSession={() => void removeActiveSession()}
-          onToggleWorkspacePanel={(panel) => void toggleWorkspacePanel(panel as WorkspacePanel)}
-          onOpenProfile={() => void openProfile()}
-          onSelectDailyRun={(runId) => void selectDailyRun(runId)}
-          onOpenDailyCenter={() => void openDailyCenter()}
-          onAddDailyKeyword={(event) => void addDailyKeyword(event)}
-          onRemoveDailyKeyword={(keyword) => void removeDailyKeyword(keyword)}
-          onKeywordDraftChange={setKeywordDraft}
-          onSaveWorkspaceSettings={(event) => void saveWorkspaceSettings(event)}
-          onSettingsDraftChange={setSettingsDraft}
-          onApiKeyDraftChange={setApiKeyDraft}
-          onApplyApiKey={applyApiKey}
         >
           {layout.leftResizeProps && <SidebarResizeHandle {...layout.leftResizeProps} />}
         </SessionSidebar>
@@ -442,23 +369,19 @@ export function App() {
             ><SidebarIcon side="right" /></button>
           </div>
 
-          {notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
+          {appPage === "workspace" && notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
           {!layout.rightVisible && runNeedsAttention && (
             <p className="run-alert" role="status">
               <span>任务{statusLabel(inspectedRun.status)}{inspectedRun.error_type ? `：${inspectedRun.error_type}` : ""}</span>
               <button className="text-button" type="button" onClick={showRunDetails}>查看运行详情</button>
             </p>
           )}
-          {workbenchTabs.some(t => t.kind === "library") && <div className="workbench-preserved" hidden={activeWorkbenchTab?.kind !== "library"}><LibraryPanel apiKey={apiKey} {...library} onOpen={openPaper} onSelect={setSelectedDocument}/></div>}
-          {workbenchTabs.some(t => t.kind === "settings") && <div className="workbench-preserved" hidden={activeWorkbenchTab?.kind !== "settings"}><SettingsPanel apiKey={apiKey} apiKeyDraft={apiKeyDraft} onApiKeyDraftChange={setApiKeyDraft} onApplyApiKey={applyApiKey} keywords={keywords} keywordDraft={keywordDraft} onKeywordDraftChange={setKeywordDraft} onAddKeyword={e => void addDailyKeyword(e)} onRemoveKeyword={word => void removeDailyKeyword(word)} section={settingsSection} onSectionChange={setSettingsSection} onLoadDaily={() => {void loadKeywords();void loadDailyCenter();}}>
-            <DailyPanel digest={dailyDigest} loading={dailyLoading} action={dailyAction} searchDraft={dailySearchDraft} runs={dailyRuns} isSending={dailySending} onSearchDraftChange={setDailySearchDraft} onStartDailyAction={kind => void startDailyAction(kind)} onLoadDailyCenter={() => void loadDailyCenter()} onUpdatePaper={(paper,status) => void updateDailyPaper(paper,status)} onSelectRun={id => void selectDailyRun(id)}/>
-          </SettingsPanel></div>}
           <Suspense fallback={<p>正在加载阅读器…</p>}>{workbenchTabs.filter(t => t.kind === "paper").map(tab => {
             if (tab.kind !== "paper") return null;
             const document = library.data.documents.find(d => d.id === tab.documentId);
-            return document && <div key={tab.id} className="reader-boundary-host" hidden={activeWorkbenchTab?.id !== tab.id}><ReaderErrorBoundary><PaperReader apiKey={apiKey} document={document} active={activeWorkbenchTab?.id === tab.id} toolsHost={readerTools} onShowTools={showReaderTools} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/></ReaderErrorBoundary></div>;
+            return document && <div key={tab.id} className="reader-boundary-host" hidden={activeWorkbenchTab?.id !== tab.id}><ReaderErrorBoundary><PaperReader apiKey={apiKey} document={document} active={appPage === "workspace" && activeWorkbenchTab?.id === tab.id} toolsHost={readerTools} onShowTools={showReaderTools} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/></ReaderErrorBoundary></div>;
           })}</Suspense>
-          {["library","settings","paper"].includes(activeWorkbenchTab?.kind || "") ? null : activeWorkbenchTab?.kind === "profile" ? (
+          {activeWorkbenchTab?.kind === "paper" ? null : activeWorkbenchTab?.kind === "profile" ? (
             <ProfilePanel profile={activeWorkbenchTab.profile} />
           ) : activeWorkbenchTab?.kind === "dailyRun" ? (
             <DailyRunPanel title={activeWorkbenchTab.title} detail={activeWorkbenchTab.detail} />
@@ -525,9 +448,9 @@ export function App() {
           </div>}
           <div id="right-chat-panel" role="tabpanel" aria-label={activeSessionTitle} ref={setRightChatHost} className="chat-host" hidden={!chatDocked || rightPane !== "chat"} />
           <div id="right-tools-panel" className="right-tools-host" hidden={chatDocked && rightPane !== "tools"}>
-          {(activeWorkbenchTab?.kind === "library" || activeWorkbenchTab?.kind === "paper") && !showRunTools ? <section className="context-panel">
-            <div className="context-toolbar"><strong>{activeWorkbenchTab.kind === "paper" ? "阅读辅助" : "文件详情"}</strong><button className="text-button" onClick={() => setShowRunTools(true)}>运行</button></div>
-            <div className="run-inspector-content">{activeWorkbenchTab.kind === "paper" ? <div ref={setReaderTools}/> : selectedDocument ? <div className="file-details"><h2>{selectedDocument.name}</h2><dl><dt>文件大小</dt><dd>{fileSize(selectedDocument.size_bytes)}</dd><dt>页数</dt><dd>{selectedDocument.pages} 页</dd><dt>文件夹</dt><dd>{library.data.folders.find(f => f.id === selectedDocument.folder_id)?.name || "未分类"}</dd><dt>阅读进度</dt><dd>{selectedDocument.progress.page ? `第 ${selectedDocument.progress.page} 页` : "尚未阅读"}</dd></dl><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => openPaper(selectedDocument)}>继续阅读 →</button><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => readWithAssistant(selectedDocument)}>交给助手阅读</button></div> : <p className="panel-hint">勾选论文查看详情；点击名称打开独立阅读页。</p>}</div>
+          {activeWorkbenchTab?.kind === "paper" && !showRunTools ? <section className="context-panel">
+            <div className="context-toolbar"><strong>阅读辅助</strong><button className="text-button" onClick={() => setShowRunTools(true)}>运行</button></div>
+            <div className="run-inspector-content"><div ref={setReaderTools}/></div>
           </section> : <RunInspector
             embedded
             run={inspectedRun}
@@ -581,6 +504,24 @@ export function App() {
           }}>
           <div><span className="dock-preview-icon" aria-hidden="true">{chatDocked ? "↖" : "⇥"}</span><strong>{chatDocked ? "松开，移回工作台" : "松开，在右侧打开对话"}</strong><span>{chatDocked ? "对话回到顶部标签" : "中央继续阅读，右侧随时提问"}</span></div>
         </div>}
+      </div>
+      <section id="app-page-library" className="application-page" aria-label="论文库页面" hidden={appPage !== "library"}>
+        {appPage === "library" && notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
+        <div className={`library-layout ${selectedDocument ? "with-details" : ""}`}>
+          <LibraryPanel apiKey={apiKey} {...library} onOpen={openPaper} onSelect={setSelectedDocument}/>
+          {selectedDocument && <aside className="library-details" aria-label="文件详情">
+            <h2>文件详情</h2>
+            <div className="file-details"><h3>{selectedDocument.name}</h3><dl><dt>文件大小</dt><dd>{fileSize(selectedDocument.size_bytes)}</dd><dt>页数</dt><dd>{selectedDocument.pages} 页</dd><dt>文件夹</dt><dd>{library.data.folders.find(f => f.id === selectedDocument.folder_id)?.name || "未分类"}</dd><dt>阅读进度</dt><dd>{selectedDocument.progress.page ? `第 ${selectedDocument.progress.page} 页` : "尚未阅读"}</dd></dl><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => openPaper(selectedDocument)}>继续阅读 →</button><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => readWithAssistant(selectedDocument)}>交给助手阅读</button></div>
+          </aside>}
+        </div>
+      </section>
+      <section id="app-page-settings" className="application-page" aria-label="设置页面" hidden={appPage !== "settings"}>
+        {appPage === "settings" && notice && <p className={`notice notice-${notice.kind}`}>{notice.text}</p>}
+        {settingsOpened && <SettingsPanel apiKey={apiKey} apiKeyDraft={apiKeyDraft} onApiKeyDraftChange={setApiKeyDraft} onApplyApiKey={applyApiKey} keywords={keywords} keywordDraft={keywordDraft} onKeywordDraftChange={setKeywordDraft} onAddKeyword={e => void addDailyKeyword(e)} onRemoveKeyword={word => void removeDailyKeyword(word)} section={settingsSection} onSectionChange={setSettingsSection} onLoadDaily={() => {void loadKeywords().catch(error => setNotice({kind: "error", text: userFacingError(error)}));void loadDailyCenter();}}>
+          <DailyPanel digest={dailyDigest} loading={dailyLoading} action={dailyAction} searchDraft={dailySearchDraft} runs={dailyRuns} isSending={dailySending} onSearchDraftChange={setDailySearchDraft} onStartDailyAction={kind => void startDailyAction(kind)} onLoadDailyCenter={() => void loadDailyCenter()} onUpdatePaper={(paper,status) => void updateDailyPaper(paper,status)} onSelectRun={id => void selectDailyRun(id)}/>
+          {dailyCurrentRun && <div className="settings-run-inspector"><RunInspector embedded run={dailyCurrentRun} events={dailyRunEvents} onCancel={() => void stopDailyRun()} onRetry={() => void startDailyAction("retry")} onOpenRunCenter={() => void openRunCenter()} cancelling={dailyCancelling}/></div>}
+        </SettingsPanel>}
+      </section>
       </div>
     </main>
   );

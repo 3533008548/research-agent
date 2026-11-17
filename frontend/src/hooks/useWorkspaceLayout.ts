@@ -47,7 +47,7 @@ function persistPreferences(preferences: WorkspaceLayoutPreferences) {
 }
 
 /** UI-only preferences: hiding a pane never changes a session, run or SSE stream. */
-export function useWorkspaceLayout() {
+export function useWorkspaceLayout(active = true) {
   const workspaceRef = useRef<HTMLDivElement>(null);
   const [preferences, setPreferences] = useState(readPreferences);
   const preferencesRef = useRef(preferences);
@@ -80,7 +80,11 @@ export function useWorkspaceLayout() {
   useLayoutEffect(() => {
     const workspace = workspaceRef.current;
     if (!workspace) return;
-    const measure = () => setWorkspaceWidth(workspace.getBoundingClientRect().width);
+    const measure = () => {
+      const width = workspace.getBoundingClientRect().width;
+      // An application page can hide the mounted workbench. Zero is not a resize.
+      if (width > 0) setWorkspaceWidth(width);
+    };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(workspace);
@@ -115,12 +119,12 @@ export function useWorkspaceLayout() {
 
   useLayoutEffect(() => {
     const drag = dragRef.current;
-    if (drag && !(drag.side === "left" ? leftResizable : rightResizable)) {
+    if (drag && (!active || !(drag.side === "left" ? leftResizable : rightResizable))) {
       // A hidden or unmounted handle may not deliver lostpointercapture
       // back through React. End the drag when it is no longer resizable.
       finishDrag();
     }
-  }, [leftResizable, rightResizable, draggingSide, finishDrag]);
+  }, [active, leftResizable, rightResizable, draggingSide, finishDrag]);
 
   const setWidth = (side: SidebarSide, value: number, persist: boolean) => {
     const limits = side === "left" ? widths.leftBounds : widths.rightBounds;

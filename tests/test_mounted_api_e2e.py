@@ -123,7 +123,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         profile.get_by_text("尚未形成用户画像。", exact=True).wait_for()
         self.assertGreater(profile.bounding_box()["width"], 300)
         self._assert_no_horizontal_page_overflow()
-        self.page.get_by_role("tab").first.click()
+        self.page.get_by_role("button", name="工作台", exact=True).click()
         self._send("功能移除后的对话检查")
         self.page.locator(".message-assistant").filter(has_text="来自 FastAPI：功能移除后的对话检查").wait_for()
         self.assertEqual(len(self._state()["calls"]), 1)
@@ -252,10 +252,10 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         # Cross the old 1120px breakpoint in both directions, including a
         # browser zoom-equivalent CSS viewport and a short restored window.
         for width, height in ((1440, 900), (1121, 800), (1120, 800), (1000, 600),
-                              (915, 600), (761, 600), (1280, 720), (1440, 900)):
+                              (915, 600), (817, 600), (1280, 720), (1440, 900)):
             with self.subTest(viewport=(width, height)):
                 self._set_viewport({"width": width, "height": height})
-                self.page.wait_for_function("document.querySelector('.workspace').clientWidth === innerWidth")
+                self.page.wait_for_function("document.querySelector('.workspace').clientWidth === innerWidth - 56")
                 center = self.page.locator(".conversation").bounding_box()
                 right = self.page.locator(".run-inspector").bounding_box()
                 self.assertAlmostEqual(right["y"], center["y"], delta=1)
@@ -432,7 +432,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         compact = message.bounding_box()["height"]
         self.assertLessEqual(compact, 40)
         self.assertGreater(self.page.locator(".composer").bounding_box()["width"], 860)
-        for width in (1700, 1000, 761):
+        for width in (1700, 1000, 817):
             self._set_viewport({"width": width, "height": 800})
             self.page.wait_for_function("""() => {
                 const list = document.querySelector('.message-list').getBoundingClientRect();
@@ -725,6 +725,89 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
         self.assertEqual(self.page.get_by_role("button", name="关系审查", exact=True).count(), 0)
 
+    def test_application_pages_preserve_conversation_reader_and_unsaved_settings(self) -> None:
+        self._set_viewport({"width": 1440, "height": 900})
+        self.page.locator(".session-item.active").wait_for()
+        import fitz
+        with fitz.open() as document:
+            document.new_page().insert_text((50, 80), "Navigation fixture, first page")
+            document.new_page().insert_text((50, 80), "Navigation fixture, second page")
+            uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                "file": {"name": "navigation.pdf", "mimeType": "application/pdf", "buffer": document.tobytes()},
+            })
+        self.assertEqual(uploaded.status, 201)
+        navigation = self.page.get_by_role("navigation", name="应用导航", exact=True)
+        message = self.page.get_by_label("消息", exact=True)
+        message.fill("切换页面后继续写的草稿")
+        self.page.evaluate("window.originalComposer = document.querySelector('.composer')")
+        navigation.get_by_role("button", name="论文库", exact=True).click()
+        self.assertFalse(self.page.locator(".workspace").is_visible())
+        self.assertEqual(self.page.get_by_role("tab").count(), 0)
+        search = self.page.get_by_role("textbox", name="搜索论文", exact=True)
+        search.fill("navigation")
+        self.page.get_by_role("checkbox", name="选择 navigation.pdf", exact=True).check()
+        self.assertTrue(self.page.get_by_role("complementary", name="文件详情", exact=True).is_visible())
+        navigation.get_by_role("button", name="设置", exact=True).click()
+        self.page.get_by_role("textbox", name="模型", exact=True).fill("unsaved-model-draft")
+        navigation.get_by_role("button", name="论文库", exact=True).click()
+        self.assertEqual(search.input_value(), "navigation")
+        self.assertTrue(self.page.get_by_role("checkbox", name="选择 navigation.pdf", exact=True).is_checked())
+        self.page.get_by_role("button", name="navigation.pdf", exact=True).click()
+        self.page.locator(".textLayer span").first.wait_for()
+        self.assertEqual(navigation.get_by_role("button", name="工作台", exact=True).get_attribute("aria-current"), "page")
+        self.page.get_by_role("button", name="下一页", exact=True).click()
+        self.page.locator(".textLayer span").filter(has_text="second page").wait_for()
+        self.page.get_by_role("spinbutton", name="缩放比例", exact=True).fill("150")
+        self.page.get_by_role("spinbutton", name="缩放比例", exact=True).blur()
+        self.page.wait_for_function("document.querySelector('.pdf-viewport').scrollHeight > 1000")
+        self.page.locator('.pdf-viewport').evaluate("el => el.scrollTop = 300")
+        self.page.wait_for_timeout(100)
+        reading_top = self.page.locator('.pdf-viewport').evaluate("el => el.scrollTop")
+        self.page.evaluate("window.originalCanvas = document.querySelector('.pdf-sheet canvas')")
+        navigation.get_by_role("button", name="设置", exact=True).click()
+        self.assertEqual(self.page.get_by_role("textbox", name="模型", exact=True).input_value(), "unsaved-model-draft")
+        navigation.get_by_role("button", name="工作台", exact=True).click()
+        self.assertEqual(self.page.get_by_role("spinbutton", name="页码", exact=True).input_value(), "2")
+        self.assertEqual(self.page.get_by_role("spinbutton", name="缩放比例", exact=True).input_value(), "150")
+        self.page.locator('.textLayer span').first.wait_for()
+        self.assertAlmostEqual(self.page.locator('.pdf-viewport').evaluate("el => el.scrollTop"), reading_top, delta=3)
+        self.assertTrue(self.page.evaluate("window.originalCanvas === document.querySelector('.pdf-sheet canvas')"))
+        self.assertEqual(self.page.get_by_role("tab", name="navigation.pdf", exact=True).get_attribute("aria-selected"), "true")
+        self.page.locator(".conversation .draggable-chat-tab button").click()
+        self.assertEqual(message.input_value(), "切换页面后继续写的草稿")
+        self.assertTrue(self.page.evaluate("window.originalComposer === document.querySelector('.composer')"))
+        self.assertEqual(self.page.locator('.workbench-tabs').get_by_role("tab").count(), 2)
+        self.page.get_by_role("button", name="隐藏会话侧栏", exact=True).click()
+        self.page.get_by_role("button", name="隐藏运行检查器", exact=True).click()
+        for width in (1440, 1000, 817, 816, 390, 320, 1440):
+            self._set_viewport({"width": width, "height": 900})
+            for name in ("论文库", "设置", "工作台"):
+                button = navigation.get_by_role("button", name=name, exact=True)
+                button.focus()
+                button.press("Enter")
+                self.assertEqual(button.get_attribute("aria-current"), "page")
+                self.assertAlmostEqual(navigation.bounding_box()["width"], 56, delta=1)
+                self._assert_no_horizontal_page_overflow()
+        self.assertFalse(self.page.locator('.session-sidebar').is_visible())
+        self.assertFalse(self.page.locator('.run-inspector').is_visible())
+        self.assertEqual(message.input_value(), "切换页面后继续写的草稿")
+        self.assertEqual(self._state()["calls"], [])
+
+    def test_application_page_switch_does_not_interrupt_a_running_chat(self) -> None:
+        cancelled = []
+        self.page.on("request", lambda request: cancelled.append(request.url)
+                     if request.url.endswith("/cancel") else None)
+        self._send("__slow__")
+        self.page.get_by_text("旧会话片段", exact=True).wait_for(timeout=8_000)
+        self.page.get_by_role("button", name="设置", exact=True).click()
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.wait_for_function("document.querySelector('.message-assistant')?.textContent.includes('慢请求完成')")
+        self.assertTrue(self.page.locator('#app-page-library').is_visible(), "后台结果不应抢回工作台页面")
+        self.page.get_by_role("button", name="工作台", exact=True).click()
+        self.page.locator(".message-assistant").filter(has_text="慢请求完成").wait_for()
+        self.assertEqual(len(self._state()["calls"]), 1)
+        self.assertEqual(cancelled, [])
+
     def test_reader_chunk_failure_keeps_workbench_and_recovers_after_reload(self) -> None:
         import fitz
         with fitz.open() as document:
@@ -741,7 +824,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertEqual(self.page.locator(".session-sidebar").count(), 1)
         self.page.get_by_role("button", name="设置", exact=True).click()
         self.page.get_by_role("button", name="保存通用设置", exact=True).wait_for()
-        self.page.get_by_role("tab", name="recovery.pdf", exact=True).click()
+        self.page.get_by_role("button", name="工作台", exact=True).click()
         self.page.unroute(pattern)
         self.page.get_by_role("button", name="重新加载界面", exact=True).click()
         self.page.get_by_role("button", name="论文库", exact=True).click()
@@ -749,7 +832,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.locator(".textLayer span").first.wait_for()
         self.assertGreater(self.page.locator(".pdf-sheet canvas").evaluate("el => el.width"), 100)
 
-    def test_workspace_layout_keeps_sessions_and_tools_in_the_left_rail(self) -> None:
+    def test_workspace_layout_gives_sessions_the_full_sidebar_and_fixed_navigation(self) -> None:
         # Use the fixture's real session API so navigation remains usable;
         # repeated wide characters exercise the longest persisted titles.
         for index in range(12):
@@ -763,9 +846,12 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.wait_for_function("document.querySelectorAll('.session-item').length === 13")
 
         sidebar = self.page.locator(".workspace > aside.session-sidebar")
-        self.assertEqual(sidebar.count(), 1, "会话与工具必须共用工作区的一个侧栏列")
+        self.assertEqual(sidebar.count(), 1, "对话必须整体占据工作台的一列")
         self.assertEqual(sidebar.locator(".session-list").count(), 1)
-        self.assertEqual(sidebar.locator(".sidebar-settings").count(), 1)
+        self.assertEqual(sidebar.get_by_role("button", name="设置", exact=True).count(), 0)
+        self.assertEqual(sidebar.get_by_role("button", name="论文库", exact=True).count(), 0)
+        self.assertEqual(self.page.locator(".app-navigation button").count(), 3)
+        self.assertEqual(self.page.locator(".app-navigation [role=separator]").count(), 0)
         self.assertEqual(sidebar.get_by_role("button", name="每日检索", exact=True).count(), 0)
         self.assertEqual(sidebar.get_by_role("button", name="用户画像", exact=True).count(), 0)
         self.assertEqual(self.page.locator(".workspace > *").count(), 3)
@@ -775,7 +861,10 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             (1440, 900, "three_columns"),
             (1000, 900, "three_columns"),
             (1000, 600, "three_columns"),
+            (817, 600, "three_columns"),
+            (816, 844, "stacked"),
             (390, 844, "stacked"),
+            (320, 844, "stacked"),
         ):
             with self.subTest(viewport=f"{width}x{height}"):
                 self._set_viewport({"width": width, "height": height})
@@ -790,7 +879,8 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
                     };
                     return {
                         workspace: box('.workspace'), sidebar: box('.session-sidebar'),
-                        sessions: box('.session-list'), utilities: box('.sidebar-settings'),
+                        sessions: box('.session-list'), navigation: box('.app-navigation'),
+                        settings: box('.app-navigation-settings'),
                         conversation: box('.conversation'), inspector: box('.run-inspector'),
                         composer: box('.composer'), viewport: window.innerWidth,
                         documentWidth: document.documentElement.scrollWidth,
@@ -798,14 +888,17 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
                 }""")
                 self.assertAlmostEqual(boxes["workspace"]["y"], 0, delta=1)
                 self.assertLessEqual(boxes["documentWidth"], boxes["viewport"] + 1)
-                for name in ("workspace", "sidebar", "sessions", "utilities", "conversation", "inspector", "composer"):
+                self.assertAlmostEqual(boxes["navigation"]["width"], 56, delta=1)
+                self.assertAlmostEqual(boxes["sidebar"]["x"], boxes["navigation"]["right"], delta=1)
+                self.assertLessEqual(boxes["settings"]["bottom"], height + 1)
+                for name in ("workspace", "sidebar", "sessions", "navigation", "conversation", "inspector", "composer"):
                     box = boxes[name]
                     self.assertGreater(box["width"], 0, name)
                     self.assertGreater(box["height"], 0, name)
                     self.assertGreaterEqual(box["x"], -1, name)
                     self.assertLessEqual(box["right"], width + 1, name)
                     self.assertLessEqual(box["scrollWidth"], box["clientWidth"] + 1, name)
-                for name in ("sessions", "utilities"):
+                for name in ("sessions",):
                     self.assertGreaterEqual(boxes[name]["x"], boxes["sidebar"]["x"] - 1)
                     self.assertLessEqual(boxes[name]["right"], boxes["sidebar"]["right"] + 1)
                     self.assertGreaterEqual(boxes[name]["y"], boxes["sidebar"]["y"] - 1)
@@ -818,6 +911,8 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
                     self.assertLessEqual(left["right"], center["x"] + 1)
                     self.assertLessEqual(center["right"], right["x"] + 1)
                     self.assertLessEqual(boxes["composer"]["bottom"], height + 1)
+                    self.assertGreater(boxes["sessions"]["height"], height * 0.75,
+                                       "会话列表应使用侧栏高度，不再受原来的 32vh 上限限制")
                 else:
                     self.assertGreaterEqual(center["y"], left["bottom"] - 1)
                     self.assertGreaterEqual(right["y"], center["bottom"] - 1)
@@ -830,14 +925,14 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
                     "element => element.scrollHeight > element.clientHeight"
                 ))
                 self.page.locator(".session-item").last.scroll_into_view_if_needed()
-                settings = sidebar.get_by_role("button", name="设置", exact=True)
+                settings = self.page.get_by_role("button", name="设置", exact=True)
                 settings.scroll_into_view_if_needed()
                 self.assertTrue(settings.is_visible())
                 self.assertTrue(settings.evaluate("""button => {
-                    const panel = button.closest('.session-sidebar').getBoundingClientRect();
+                    const panel = button.closest('.app-navigation').getBoundingClientRect();
                     const toggle = button.getBoundingClientRect();
                     return toggle.bottom <= panel.bottom + 1 && toggle.top >= panel.top - 1;
-                }"""), "矮窗口工具面板应滚动，不能把按钮压扁并裁切文字")
+                }"""), "全局导航始终独立可用")
                 composer = self.page.locator(".composer textarea")
                 composer.fill("布局回归检查，不提交任务")
                 self.assertEqual(composer.input_value(), "布局回归检查，不提交任务")
@@ -915,6 +1010,11 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertTrue(self.page.evaluate("window.originalReader === document.querySelector('.pdf-sheet canvas')"))
         self.assertTrue(self.page.locator(".paper-reader").is_visible())
         self._wait_for_width(".session-sidebar", 240)
+        self._wait_for_width(".run-inspector", 480)
+        for name in ("论文库", "设置", "工作台"):
+            self.page.get_by_role("button", name=name, exact=True).click()
+        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+        self.assertEqual(rail.get_by_label("消息", exact=True).input_value(), "保留这份草稿")
         self._wait_for_width(".run-inspector", 480)
         self._send("边读论文边讨论")
         rail.locator(".message-assistant").filter(has_text="来自 FastAPI：边读论文边讨论").wait_for()
@@ -1088,8 +1188,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         created = self.page.request.post(f"{self.base_url}/api/v1/sessions", data={"title": "延迟读取的会话"})
         session_id = created.json()["thread_id"]
         self.page.reload(wait_until="domcontentloaded")
-        self.page.get_by_role("button", name="论文库", exact=True).click()
-        self.page.get_by_role("button", name="设置", exact=True).click()
+        self.page.get_by_role("button", name="历史运行", exact=True).click()
         pending = []
         self.page.route(f"**/sessions/{session_id}/messages", lambda route: pending.append((route, route.fetch())))
         self.page.locator(".session-item").filter(has_text="延迟读取的会话").click()
@@ -1098,11 +1197,11 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
             self.page.wait_for_timeout(20)
         self.assertTrue(pending)
         self._drag_chat_tab(True)
-        self.assertTrue(self.page.locator(".settings-page").is_visible())
+        self.assertTrue(self.page.get_by_role("tab", name="运行中心", exact=True).get_attribute("aria-selected") == "true")
         route, response = pending.pop()
         route.fulfill(response=response)
         self.page.wait_for_function("!document.querySelector('.composer textarea').disabled")
-        self.assertTrue(self.page.locator(".settings-page").is_visible(), "晚到的会话响应不能切换中央页面")
+        self.assertTrue(self.page.get_by_role("tab", name="运行中心", exact=True).get_attribute("aria-selected") == "true", "晚到的会话响应不能切换中央页面")
         self.assertTrue(self.page.locator(".right-workspace .composer").is_visible())
 
     def test_docking_keeps_history_scroll_position(self) -> None:
@@ -1118,6 +1217,10 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.mouse.wheel(0, -600)
         self.page.wait_for_timeout(250)
         top = listing.evaluate("el => el.scrollTop")
+        for name in ("论文库", "设置", "工作台"):
+            self.page.get_by_role("button", name=name, exact=True).click()
+        self.page.wait_for_timeout(150)
+        self.assertAlmostEqual(listing.evaluate("el => el.scrollTop"), top, delta=3)
         self._drag_chat_tab(True)
         self.page.wait_for_timeout(250)
         self.assertAlmostEqual(listing.evaluate("el => el.scrollTop"), top, delta=3)
@@ -1143,7 +1246,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.locator(".right-workspace .composer").wait_for()
 
     def test_sidebars_resize_show_hide_and_restore_saved_preferences(self) -> None:
-        self._set_viewport({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1496, "height": 900})
         response = self.page.request.post(
             f"{self.base_url}/api/v1/sessions", data={"title": "W" * 20},
         )
@@ -1195,7 +1298,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self._set_viewport({"width": 390, "height": 844})
         self._assert_no_horizontal_page_overflow()
         self.assertFalse(self.page.get_by_role("separator", name="调整会话侧栏宽度", exact=True).is_visible())
-        self._set_viewport({"width": 1440, "height": 900})
+        self._set_viewport({"width": 1496, "height": 900})
         self._wait_for_width(".session-sidebar", 420)
         self._wait_for_width(".run-inspector", 540)
 
