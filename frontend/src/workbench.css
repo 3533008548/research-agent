@@ -503,6 +503,26 @@
 .pdf-sheet canvas {
   display: block;
 }
+.paper-area-picker { position:absolute; inset:0; z-index:4; cursor:crosshair; touch-action:none; user-select:none; }
+.message-assistant a[href^="#paper-ref/"] {
+  display: inline-block; vertical-align: .13em; padding: 0 .42em; border-radius: .4em;
+  background: #e8f1f2; color: #215963; font-size: .8em; line-height: 1.55; text-decoration: none;
+}
+.message-assistant a[href^="#paper-ref/"]:is(:hover, :focus-visible) { outline: 1px solid currentColor; }
+.citation-preview {
+  position: fixed; z-index: 100; box-sizing: border-box; overflow: auto; padding: .7rem;
+  background: #fff; color: #243847; border: 1px solid #c9d7dc; border-radius: .5rem;
+  box-shadow: 0 6px 24px #20364a30; font-size: .85rem;
+}
+.citation-preview strong { display: block; margin-bottom: .45rem; overflow-wrap: anywhere; }
+.citation-preview img { width: 100%; height: auto; display: block; }
+.highlight-layer .paper-reference-highlight { background:#70c3ed45; outline:1px solid #458caf; }
+.paper-citations { display:flex; align-items:center; gap:.35rem; flex-wrap:wrap; }
+.paper-citation { display:flex; max-width:100%; align-items:center; padding:.2rem .4rem; border:1px solid #49728d; border-radius:.35rem; background:#172c3f; }
+.paper-citation-source { min-width:0; display:flex; align-items:center; gap:.4rem; text-align:left; border:0; background:transparent; color:#d8edff; padding:.15rem; }
+.paper-citation-source img { max-width:5.5rem; max-height:2.6rem; object-fit:contain; }
+.paper-citation-source span { min-width:0; }
+.paper-citation-source b,.paper-citation-source small { display:block; max-width:22em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.76rem; }
 .pdf-sheet .textLayer {
   opacity: 1;
 }

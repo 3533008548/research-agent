@@ -14,6 +14,8 @@ import {
   patchDocument,
   type LibraryDocument,
   type NoteAnchor,
+  type PaperLocation,
+  type PaperReference,
   type PaperNote,
 } from "../../lib/library";
 import { userFacingError } from "../../lib/errors";
@@ -32,6 +34,8 @@ type Props = {
   active: boolean;
   toolsHost: HTMLElement | null;
   onShowTools: () => void;
+  onReference: (reference: PaperReference) => void;
+  location: PaperLocation | null;
   onProgress: (id: string, progress: LibraryDocument["progress"]) => void;
 };
 export function PaperReader({
@@ -40,6 +44,8 @@ export function PaperReader({
   active,
   toolsHost,
   onShowTools,
+  onReference,
+  location,
   onProgress,
 }: Props) {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null),
@@ -55,6 +61,11 @@ export function PaperReader({
     [space, setSpace] = useState(false),
     [anchor, setAnchor] = useState<NoteAnchor | null>(null),
     [side, setSide] = useState<"notes" | "translation">("notes");
+  const [areaMode, setAreaMode] = useState(false);
+  const [areaBox, setAreaBox] = useState<NoteAnchor["rects"][number] | null>(null);
+  const areaStart = useRef<{ x: number; y: number; page: number; pointer: number } | null>(null);
+  const pendingLocation = useRef<PaperLocation | null>(null);
+  const renderedPage = useRef<number | null>(null);
   const [translation, setTranslation] = useState(""),
     [translationOk, setTranslationOk] = useState(false),
     [translating, setTranslating] = useState(false),
@@ -85,6 +96,15 @@ export function PaperReader({
     } | null>(null);
   const restoreScroll = useRef<number | null>(doc.progress.scroll_top || 0);
   const [scrollTop, setScrollTop] = useState(doc.progress.scroll_top || 0);
+  useEffect(() => {
+    if (!location || location.document_id !== doc.id) return;
+    pendingLocation.current = location;
+    restoreScroll.current = null;
+    zoomAnchor.current = null;
+    setPage(location.page);
+    const [x, y, right, bottom] = location.bounds.map(n => n / 1e6);
+    setAnchor({ page: location.page, quote: "", rects: [{ x, y, width: right - x, height: bottom - y }] });
+  }, [location, doc.id]);
   const effectiveScale =
     fit === "width"
       ? Math.max(0.25, Math.min(4, (available.width - 40) / size.width))
@@ -296,6 +316,7 @@ export function PaperReader({
         await layer.render();
         if (cancelled) return;
         renderedSize.current = { width: view.width, height: view.height };
+        renderedPage.current = page;
         const za = zoomAnchor.current;
         if (za && viewport.current) {
           const el = viewport.current;
@@ -322,6 +343,16 @@ export function PaperReader({
       layer?.cancel();
     };
   }, [pdf, page, effectiveScale, size.width, size.height, active]);
+  useEffect(() => {
+    const target = pendingLocation.current, el = viewport.current, paper = sheet.current;
+    if (!active || rendering || renderedPage.current !== page || !el || !paper || target?.page !== page) return;
+    const [x, y] = target.bounds;
+    const box = paper.getBoundingClientRect(), frame = el.getBoundingClientRect();
+    if (frame.bottom <= 0 || frame.top >= window.innerHeight) el.scrollIntoView({ block: "nearest" });
+    el.scrollTop += box.top - frame.top + y / 1e6 * box.height - 32;
+    el.scrollLeft += box.left - frame.left + x / 1e6 * box.width - 24;
+    pendingLocation.current = null;
+  }, [active, rendering, location, page]);
   useEffect(() => {
     if (!active || !pdf) return;
     const timer = setTimeout(() => {
@@ -393,8 +424,33 @@ export function PaperReader({
       window.removeEventListener("blur", up);
     };
   }, [active, effectiveScale]);
+  function reference(value: NoteAnchor) {
+    if (!value.rects.length) return;
+    const left = Math.min(...value.rects.map(r => r.x));
+    const top = Math.min(...value.rects.map(r => r.y));
+    const right = Math.min(1, Math.max(...value.rects.map(r => r.x + r.width)));
+    const bottom = Math.min(1, Math.max(...value.rects.map(r => r.y + r.height)));
+    const bounds: PaperReference["bounds"] = [
+      Math.round(left * 1e6), Math.round(top * 1e6), Math.round(right * 1e6), Math.round(bottom * 1e6),
+    ];
+    if (bounds[0] >= bounds[2] || bounds[1] >= bounds[3]) return;
+    let preview: string | undefined;
+    if (!value.quote && canvas.current) {
+      const source = canvas.current;
+      const width = (right - left) * source.width, height = (bottom - top) * source.height;
+      const ratio = Math.min(1, 360 / width, 120 / height);
+      const thumbnail = window.document.createElement("canvas");
+      thumbnail.width = Math.max(1, Math.round(width * ratio));
+      thumbnail.height = Math.max(1, Math.round(height * ratio));
+      thumbnail.getContext("2d")?.drawImage(source, left * source.width, top * source.height,
+        width, height, 0, 0, thumbnail.width, thumbnail.height);
+      preview = thumbnail.toDataURL();
+    }
+    onReference({ document_id: doc.id, name: doc.name, page: value.page,
+      kind: value.quote ? "text" : "area", bounds, quote: value.quote, preview });
+  }
   function selection() {
-    if (pan || space || rendering) return;
+    if (pan || space || rendering || areaMode) return;
     const selected = window.getSelection();
     if (!selected || selected.isCollapsed || !sheet.current) return;
     const range = selected.getRangeAt(0);
@@ -411,14 +467,32 @@ export function PaperReader({
         height: Math.min(1, r.height / box.height),
       }));
     translateAbort.current?.abort();
-    setAnchor({
-      page,
-      quote: text.slice(0, 12000),
-      rects: rects.slice(0, 300),
-    });
+    if (text.length > 12000 || rects.length > 300) {
+      setError("选段过长，请缩小选择范围。");
+      return;
+    }
+    const value = { page, quote: text, rects };
+    setAnchor(value);
+    reference(value);
+  }
+  function areaPoint(event: React.PointerEvent<HTMLDivElement>) {
+    const box = event.currentTarget.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(1, (event.clientX - box.left) / box.width)),
+      y: Math.max(0, Math.min(1, (event.clientY - box.top) / box.height)),
+    };
+  }
+  function areaRect(event: React.PointerEvent<HTMLDivElement>) {
+    const start = areaStart.current;
+    if (!start || start.page !== page || start.pointer !== event.pointerId) return null;
+    const end = areaPoint(event);
+    return {
+      x: Math.min(start.x, end.x), y: Math.min(start.y, end.y),
+      width: Math.abs(end.x - start.x), height: Math.abs(end.y - start.y),
+    };
   }
   async function translate() {
-    if (!anchor) return;
+    if (!anchor?.quote) return;
     onShowTools();
     const selected = anchor;
     translateAbort.current?.abort();
@@ -539,8 +613,11 @@ export function PaperReader({
         <button aria-pressed={fit === "page"} onClick={() => setFit("page")}>
           整页
         </button>
-        <button aria-pressed={pan} onClick={() => setPan((p) => !p)}>
+        <button aria-pressed={pan} onClick={() => {setAreaMode(false);setPan(p => !areaMode && !p);}}>
           {pan ? "手形拖动" : "选择文字"}
+        </button>
+        <button aria-pressed={areaMode} onClick={() => {setPan(false);setAreaMode(v=>!v);}}>
+          框选引用
         </button>
       </div>
       <form
@@ -618,7 +695,28 @@ export function PaperReader({
         >
           <canvas ref={canvas} style={{ width: "100%", height: "100%" }} />
           <div className="textLayer" ref={textLayer} />
+          {areaMode && !space && <div className="paper-area-picker" aria-label="拖动框选引用区域"
+            onPointerDown={e => {
+              if (rendering || !e.isPrimary || e.button !== 0) return;
+              e.preventDefault();
+              e.currentTarget.setPointerCapture(e.pointerId);
+              areaStart.current = { ...areaPoint(e), page, pointer: e.pointerId };
+              setAreaBox(null);
+            }}
+            onPointerMove={e => { if (areaStart.current) setAreaBox(areaRect(e)); }}
+            onPointerCancel={() => { areaStart.current = null; setAreaBox(null); }}
+            onPointerUp={e => {
+              const rect = areaRect(e), frame = e.currentTarget.getBoundingClientRect();
+              areaStart.current = null;
+              setAreaBox(null);
+              if (!rect || rendering || rect.width * frame.width < 4 || rect.height * frame.height < 4) return;
+              const value = { page, quote: "", rects: [rect] };
+              setAnchor(value);
+              reference(value);
+            }} />}
           <div className="highlight-layer">
+            {(areaBox ? [areaBox] : anchor?.page===page ? anchor.rects : []).map((r,i)=>
+              <span key={"picked-"+i} className="paper-reference-highlight" style={{left:r.x*100+"%",top:r.y*100+"%",width:r.width*100+"%",height:r.height*100+"%"}} />)}
             {notes
               .filter((n) => n.anchor?.page === page)
               .flatMap((n) =>
@@ -642,11 +740,11 @@ export function PaperReader({
           {rendering
             ? "正在渲染…"
             : anchor
-              ? `第 ${anchor.page} 页 · 已选 ${anchor.quote.length} 字`
-              : "划选文字后可翻译或添加批注"}
+              ? `第 ${anchor.page} 页 · ${anchor.quote ? "已选 "+anchor.quote.length+" 字" : "已选区域"}`
+              : "选中文字或框选图表，可在会话中引用"}
         </span>
         <button
-          disabled={!anchor || translating}
+          disabled={!anchor?.quote || translating}
           onClick={() => void translate()}
         >
           翻译选段

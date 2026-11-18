@@ -1,3 +1,4 @@
+import type { PaperReference } from "./lib/library";
 import {
   ApiError,
   type BadcaseCandidate,
@@ -210,12 +211,15 @@ export function createRun(
   uploadId?: string,
   researchScope: ResearchScope = "both",
   resume = false,
+  paperReferences: PaperReference[] = [],
 ): Promise<RunStart> {
   return request("/runs", apiKey, {
     method: "POST",
     body: JSON.stringify(
       kind === "chat"
-        ? { kind, session_id: sessionId, message: content || undefined, upload_id: uploadId }
+        ? { kind, session_id: sessionId, message: content || undefined, upload_id: uploadId,
+            paper_selections: paperReferences.length ? paperReferences.map(({document_id,page,kind,bounds,quote}) =>
+              ({document_id,page,kind,bounds,quote})) : undefined }
         : {
           kind, session_id: sessionId, query: content || undefined,
           scope: researchScope, resume: resume || undefined,

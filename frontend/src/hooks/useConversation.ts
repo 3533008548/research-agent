@@ -15,6 +15,7 @@ import {
   uploadWorkspaceFile,
 } from "../api";
 import { userFacingError } from "../lib/errors";
+import { formatPaperReference } from "../lib/library";
 import { appendRunEvent, displayMessages, type ResearchMode } from "../lib/labels";
 import { stopTiming, timingFromRun } from "../lib/runTiming";
 import { useSessionConversationState } from "./useSessionConversationState";
@@ -61,10 +62,10 @@ export function useConversation({
   );
   const { state, getSession, bindSession, sessionRunStatuses } = useSessionConversationState(activeSessionId);
   const { messages, sessionUsage, draft, mode, researchScope, currentRun, runEvents,
-    isCancelling, attachment, isUploading } = state;
+    isCancelling, attachment, isUploading, paperReferences } = state;
   const isSending = state.isSending || state.loading || isPendingRun(currentRun);
   const { setMessages, setSessionUsage, setDraft, setMode, setResearchScope, setCurrentRun,
-    setRunEvents, setIsSending, setIsCancelling, setAttachment, setIsUploading } = bindSession(activeSessionId);
+    setRunEvents, setIsSending, setIsCancelling, setAttachment, setIsUploading, setPaperReferences } = bindSession(activeSessionId);
   const activeSessionRef = useRef(activeSessionId);
   const streams = useRef(new Map<string, AbortController>());
   const navigation = useRef(0);
@@ -310,6 +311,8 @@ export function useConversation({
     event?.preventDefault();
     const content = resumeResearch ? "" : (retryContent || draft.trim());
     const pendingAttachment = resumeResearch ? null : attachment;
+    const references = resumeResearch || retryContent ? [] : paperReferences;
+    if (references.length && !content) return;
     if ((!content && !pendingAttachment && !resumeResearch) || isUploading) {
       return;
     }
@@ -322,7 +325,7 @@ export function useConversation({
       if (!content) {
         return;
       }
-      if (pendingAttachment) {
+      if (pendingAttachment || references.length) {
         setNotice({ kind: "info", text: "运行中补充暂只支持文本；请先移除已暂存的附件，或等待当前任务结束后再发送。" });
         return;
       }
@@ -357,15 +360,16 @@ export function useConversation({
     }
 
     const requestMode: ResearchMode = resumeResearch ? "research" : (requestedMode || mode);
-    if (requestMode === "research" && pendingAttachment) {
+    if (requestMode === "research" && (pendingAttachment || references.length)) {
       setNotice({ kind: "info", text: "请先在普通对话中发送并索引附件，再发起深度研究。" });
       return;
     }
     const shownContent = resumeResearch ? "继续上次深度研究" : [
       pendingAttachment ? `📎 ${pendingAttachment.filename}` : "",
       content,
-    ].filter(Boolean).join("\n");
-    if (!resumeResearch && !retryContent) {
+      ...references.map(formatPaperReference),
+    ].filter(Boolean).join(references.length ? "\n\n" : "\n");
+    if (!resumeResearch && !retryContent && !references.length) {
       setDraft("");
     }
     setIsSending(true);
@@ -383,10 +387,14 @@ export function useConversation({
     try {
       const started = await createRun(
         apiKey, requestMode, activeSessionId, content, pendingAttachment?.upload_id,
-        researchScope, resumeResearch,
+        researchScope, resumeResearch, references,
       );
       if (!resumeResearch) {
         setAttachment(null);
+        if (references.length) {
+          setPaperReferences(current => current.filter(ref => !references.includes(ref)));
+          setDraft(current => current === draft ? "" : current);
+        }
       }
       const run: Run = {
         run_id: started.run_id,
@@ -511,6 +519,8 @@ export function useConversation({
     isSending,
     isCancelling,
     attachment,
+    paperReferences,
+    setPaperReferences,
     isUploading,
     setDraft,
     setMode,

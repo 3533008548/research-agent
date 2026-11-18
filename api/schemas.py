@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from paper_selections import PaperSelection
 
 
 class SessionCreateRequest(BaseModel):
@@ -192,6 +193,7 @@ class RunCreateRequest(BaseModel):
     session_id: str | None = Field(default=None, max_length=120)
     message: str | None = Field(default=None, max_length=12_000)
     upload_id: str | None = Field(default=None, max_length=80)
+    paper_selections: list[PaperSelection] = Field(default_factory=list, max_length=2)
     query: str | None = Field(default=None, max_length=12_000)
     scope: Literal["both", "local", "public"] = "both"
     resume: bool = False

@@ -133,6 +133,8 @@ def query_algorithm_evidence(query: str, paper_ids, paths, *, section=None) -> s
         except Exception as exc:
             lines.append(f"❌ 算法原页取证未完成：{type(exc).__name__}: {exc}。不得用标题或正文解释补写伪代码。")
             continue
+        from paper_selections import element_citations
+        links, _ = element_citations(paths, {"source_file": document_map["source_file"], "pages": result["pages"]})
         found = set()
         for page in result["pages"]:
             for element in page["elements"]:
@@ -144,6 +146,8 @@ def query_algorithm_evidence(query: str, paper_ids, paths, *, section=None) -> s
                     f"原页区域（调用 describe_image，task=transcribe_algorithm 核对，无需用户截图）：{element['asset_path']}",
                     element["text"],
                 ])
+                if element["id"] in links:
+                    lines.append(links[element["id"]])
         for item in result["diagnostics"]:
             lines.append(f"⚠️ p.{item['page']} {item.get('label', '')}：{item.get('detail') or item['code']}")
         for page in result.get("fallback_pages", []):

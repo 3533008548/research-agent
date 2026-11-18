@@ -37,6 +37,7 @@ from llm_client import (
     RequestPriority,
 )
 from prompts import SYSTEM_PROMPT
+from paper_selections import visual_parts
 from run_contract import safe_error_details
 from tool_catalog import get_tool_schemas
 from tool_runtime import ToolExecutionContext, ToolRuntime
@@ -203,6 +204,7 @@ def build_graph(
     tool_context: ToolExecutionContext | None = None,
     force_tool_name: str | None = None,
     steer_provider: Callable[[str], list[str]] | None = None,
+    selection_paths=None,
 ):
     # A graph must use the process-wide client owned by ResearchAgent. Creating
     # one here would silently defeat shared admission control in multi-agent
@@ -301,12 +303,16 @@ def build_graph(
         metadata = dict(state.get("metadata") or {})
         metadata.pop("stream_incomplete", None)
         ensure_active("llm")
+        current_question = next((m.get("content", "") for m in reversed(state.get("messages", []))
+                                 if m.get("role") == "user"), "")
+        crops = visual_parts(current_question, selection_paths) if isinstance(current_question, str) else []
+        request_model = vision_model if crops else model
         messages = sanitize_model_messages(
             list(state.get("messages", [])),
             # DeepSeek Flash enables thinking by default.  Its tool protocol
             # rejects a historical tool turn that lacks the returned CoT.
             require_reasoning_content_for_tools=(
-                model == "deepseek-flash" and bool(tool_schemas)
+                request_model == "deepseek-flash" and bool(tool_schemas)
             ),
         )
         inject_running_guidance(messages, "llm")
@@ -346,6 +352,11 @@ def build_graph(
         # 对话上下文不会替代核心约束提示词。
         profile_text = profile_manager.summary() if profile_manager else ""
         prompt = system_prompt or SYSTEM_PROMPT
+        prompt += ("\n陈述来自论文的观点、数据或方法时，在支持它的那句话后紧接原文引用。"
+                   "工具片段附有 Markdown 原文链接时，原样复制该片段的链接。"
+                   "本轮用户选区可用对应的 [S1] 或 [S2]。没有定位依据时不要编造链接、坐标或页码。")
+        if isinstance(current_question, str) and "#paper-ref/" in current_question:
+            prompt += "\n用户已附论文原文选区。优先依据本轮文字或裁图回答，用 [S1]、[S2] 标注对应证据；缺少上下文时指出需要哪一处。"
         if tool_schemas:
             from tool_results import RESULT_GUIDANCE
             prompt += '\n\n工具结果读取规则：' + RESULT_GUIDANCE
@@ -376,8 +387,15 @@ def build_graph(
             if recent:
                 messages.append({"role": "system", "content": f"[对话摘要] {recent}"})
 
+        if crops:
+            # The graph checkpoint retains compact, reproducible source links.
+            # Only the outgoing vision request contains encoded image bytes.
+            index = next(i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user")
+            messages[index] = {**messages[index], "content": [
+                {"type": "text", "text": messages[index]["content"]}, *crops,
+            ]}
         payload = {
-            "model": model, "messages": messages,
+            "model": request_model, "messages": messages,
             "temperature": 0.7, "stream": stream_callback is not None,
         }
         # An empty tool list with ``tool_choice=auto`` is rejected by some
@@ -409,7 +427,7 @@ def build_graph(
             )
         )
         request_started = time.perf_counter()
-        emit("llm_request_started", model=model, stream=stream_callback is not None)
+        emit("llm_request_started", model=request_model, stream=stream_callback is not None)
         request_failure_emitted = False
 
         def emit_request_failed(error) -> None:
@@ -944,9 +962,12 @@ def build_graph(
             verify_budget = llm_client.new_request_budget(
                 verify_policy,
             )
-            emit("verify_request_started", model=model, verification_round=verify_round, **verify_budget.metrics())
+            review_crops = visual_parts(user_q, selection_paths)
+            review_model = vision_model if review_crops else model
+            review_content = [{"type": "text", "text": verify_prompt}, *review_crops] if review_crops else verify_prompt
+            emit("verify_request_started", model=review_model, verification_round=verify_round, **verify_budget.metrics())
             resp = llm_client.post(
-                {"model": model, "messages": [{"role": "user", "content": verify_prompt}],
+                {"model": review_model, "messages": [{"role": "user", "content": review_content}],
                  "stream": False, "temperature": 0.1},
                 stream=False,
                 on_status=_verify_status,

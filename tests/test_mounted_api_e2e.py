@@ -715,6 +715,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
 
     def test_paper_library_keeps_reading_without_relation_review(self) -> None:
         self.page.locator(".session-item.active").wait_for()
+        self.page.get_by_label("消息", exact=True).fill("我的阅读草稿")
         self.page.route("**/api/v1/workspace/papers", lambda route: route.fulfill(json=[{
             "paper_id": "paper-library-test", "title": "已有论文", "chunks": 3,
             "indexed_at": "2026-11-10", "relation_count": 0,
@@ -732,6 +733,11 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.get_by_role("button", name="交给助手阅读", exact=True).wait_for()
         self.assertEqual(self.page.get_by_role("button", name="复现实验", exact=True).count(), 0)
         self.assertEqual(self.page.get_by_role("button", name="关系审查", exact=True).count(), 0)
+        self.page.get_by_role("button", name="阅读并提问", exact=True).click()
+        self.page.locator(".textLayer span").filter(has_text="An indexed library paper").first.wait_for()
+        composer = self.page.locator(".right-workspace .composer")
+        self.assertEqual(composer.get_by_label("消息", exact=True).input_value(), "我的阅读草稿")
+        self.assertEqual(self._state()["calls"], [])
 
     def test_application_pages_preserve_conversation_reader_and_unsaved_settings(self) -> None:
         self._set_viewport({"width": 1440, "height": 900})
@@ -1089,6 +1095,110 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.reload(wait_until="domcontentloaded")
         self.page.locator(".conversation .composer").wait_for()
         self.assertEqual(self.page.locator(".right-workspace .draggable-chat-tab").count(), 0)
+
+    def test_paper_selections_attach_to_current_chat_without_writing_a_question(self) -> None:
+        import fitz
+        self._set_viewport({"width": 1440, "height": 900})
+        with fitz.open() as document:
+            document.new_page().insert_text((50, 80), "A selected passage.")
+            document.new_page().insert_text((50, 80), "Figure on the second page")
+            uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                "file": {"name": "selection.pdf", "mimeType": "application/pdf", "buffer": document.tobytes()},
+            })
+        self.assertEqual(uploaded.status, 201)
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="selection.pdf", exact=True).click()
+        line = self.page.locator(".textLayer span").filter(has_text="A selected passage.").first
+        line.wait_for()
+        box = line.bounding_box()
+        y = box["y"] + box["height"] / 2
+        self.page.mouse.move(box["x"] + 0.5, y)
+        self.page.mouse.down()
+        self.page.mouse.move(box["x"] + box["width"] - 0.5, y, steps=8)
+        self.page.mouse.up()
+        composer = self.page.locator(".right-workspace .composer")
+        chip = composer.locator(".paper-citation")
+        chip.filter(has_text="A selected passage.").wait_for()
+        question = composer.get_by_label("消息", exact=True)
+        send = composer.get_by_role("button", name="发送", exact=True)
+        self.assertEqual(question.input_value(), "")
+        self.assertTrue(send.is_disabled())
+        question.fill("这段话与第二页的图有什么联系？请引用 [S1]。")
+        composer.get_by_role("button", name="＋ 加一处对照").click()
+        self.page.get_by_role("button", name="下一页", exact=True).click()
+        self.page.locator(".textLayer span").filter(has_text="Figure on the second page").first.wait_for()
+        self.page.get_by_role("button", name="框选引用", exact=True).click()
+        picker = self.page.locator(".paper-area-picker").bounding_box()
+        self.page.mouse.move(picker["x"] + 25, picker["y"] + 30)
+        self.page.mouse.down()
+        self.page.mouse.move(picker["x"] + 170, picker["y"] + 95, steps=6)
+        self.page.mouse.up()
+        chip.locator("img").wait_for()
+        self.assertEqual(chip.count(), 2)
+        authored = "这段话与第二页的图有什么联系？请引用 [S1]。"
+        self.assertEqual(question.input_value(), authored)
+        self.assertEqual(self._state()["calls"], [])
+        with self.page.expect_response(lambda r: r.url.endswith("/api/v1/runs") and r.status == 503):
+            self.page.route("**/api/v1/runs", lambda route: route.fulfill(
+                status=503, json={"detail": "fixture: offline"}), times=1)
+            send.click()
+        self.assertEqual(question.input_value(), authored)
+        self.assertEqual(chip.count(), 2)
+        send.click()
+        self._wait_for_run_status("completed")
+        self.assertEqual(chip.count(), 0)
+        call, = self._state()["calls"]
+        self.assertTrue(call["message"].startswith(authored + "\n\n"))
+        self.assertIn("> A selected passage.", call["message"])
+        self.assertIn("/2/area/", call["message"])
+        # The fixture echoes the authored [S1] in the assistant reply.
+        citation = self.page.locator(".message-assistant").get_by_role("link", name="S1", exact=True).first
+        citation.hover()
+        preview = self.page.get_by_role("tooltip")
+        preview.get_by_text("selection.pdf · 第 1 页", exact=True).wait_for()
+        self.assertTrue(preview.locator("img").get_attribute("src").startswith("data:image/png;base64,"))
+        self.assertEqual(self.page.get_by_label("页码", exact=True).input_value(), "2")
+        self.page.keyboard.press("Escape")
+        preview.wait_for(state="hidden")
+        citation.focus()
+        preview.locator("img").wait_for()
+        citation.click()
+        self.page.wait_for_function("""document.querySelector('input[aria-label="页码"]').value === '1'""")
+        self.page.locator(".paper-reference-highlight").first.wait_for()
+
+    def test_saved_answer_with_a_retrieved_citation_opens_an_unopened_paper(self) -> None:
+        import fitz
+        from paper_selections import element_citations
+        from runtime_paths import RuntimePaths
+
+        with fitz.open() as pdf:
+            pdf.new_page()
+            page = pdf.new_page()
+            page.insert_text((70, 100), "The observed delay decreased.")
+            box = list(page.search_for("The observed delay decreased.")[0])
+            response = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
+                "file": {"name": "delay.pdf", "mimeType": "application/pdf", "buffer": pdf.tobytes()},
+            })
+        self.assertEqual(response.status, 201)
+        document_id = response.json()["id"]
+        links, _ = element_citations(RuntimePaths.from_root(self.tmp.name), {
+            "document_id": document_id, "pages": [{"page": 2, "elements": [{"id": "result", "bbox": box}]}],
+        })
+        self.page.route("**/api/v1/sessions/*/messages", lambda route: route.fulfill(json=[
+            {"role": "user", "content": "研究发现了什么？"},
+            {"role": "assistant", "content": "实验中观察到的时延下降了。" + links["result"]},
+        ]))
+        self.page.reload()
+        citation = self.page.locator(".message-assistant").get_by_role("link", name="第2页")
+        citation.hover()
+        preview = self.page.get_by_role("tooltip")
+        preview.get_by_text("delay.pdf · 第 2 页", exact=True).wait_for()
+        self.assertIn("observed delay", preview.locator("img").get_attribute("alt"))
+        self.assertEqual(self.page.locator(".paper-reader").count(), 0)
+        citation.click()
+        self.page.locator(".textLayer span").filter(has_text="The observed delay decreased.").first.wait_for()
+        self.assertEqual(self.page.get_by_label("页码", exact=True).input_value(), "2")
+        self.page.locator(".paper-reference-highlight").first.wait_for()
 
     def test_reading_tools_open_from_paper_while_chat_is_docked(self) -> None:
         self._set_viewport({"width": 1440, "height": 900})

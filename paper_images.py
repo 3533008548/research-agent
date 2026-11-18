@@ -163,6 +163,19 @@ def render_image_entry(source: Path, entry: dict) -> Path:
     return target
 
 
+def image_citations(paths, source, entries):
+    from paper_selections import element_citations
+
+    pages = []
+    for entry in entries:
+        element = {**entry, "id": entry["asset_path"]}
+        pages.append({"page": entry["page"], "elements": [element]})
+    if not pages:
+        return {}
+    source_file = source.relative_to(paths.papers_dir.resolve()).as_posix()
+    return element_citations(paths, {"source_file": source_file, "pages": pages})[0]
+
+
 def resolve_paper_image(args, paper_store, paths) -> tuple[Path, str]:
     catalog, source = paper_image_catalog(args.get('paper_id_or_title', ''), paper_store, paths)
     figure, page = args.get('figure'), args.get('page')
@@ -179,7 +192,8 @@ def resolve_paper_image(args, paper_store, paths) -> tuple[Path, str]:
                      'label': '原页', 'asset_kind': 'page',
                      'asset_path': str(paths.images_dir / f"{catalog['source_sha256'][:16]}_images_v{IMAGE_VERSION}_p{int(page):03d}_page.png")}
     target = render_image_entry(source, entry)
-    return target, image_source_note(entry, catalog['title'])
+    link = image_citations(paths, source, [entry]).get(entry['asset_path'], '')
+    return target, (image_source_note(entry, catalog['title']) + ' ' + link).strip()
 
 
 def image_source_note(entry: dict, title: str = '') -> str:
@@ -205,14 +219,18 @@ def asset_source_note(path: Path) -> str:
     return ''
 
 
-def format_image_catalog(catalog, source, *, figure=None, page=None, offset=0, limit=10) -> str:
+def format_image_catalog(catalog, source, *, figure=None, page=None, offset=0, limit=10, paths=None) -> str:
     entries = select_images(catalog, figure=figure, page=page)
     offset, limit = max(0, int(offset)), max(1, min(10, int(limit)))
     rows = []
     used = 0
-    for entry in entries[offset:offset + limit]:
+    batch = entries[offset:offset + limit]
+    links = image_citations(paths, source, batch) if paths else {}
+    for entry in batch:
         kind = '整页原图（包含该图）' if entry['asset_kind'] == 'page' else '图片区域'
         row = f"{entry['label']} · p.{entry['page']} · {kind}\n{entry['caption'][:160]}\n图片路径：{entry['asset_path']}"
+        if entry["asset_path"] in links:
+            row += "\n" + links[entry["asset_path"]]
         if rows and used + len(row) > 6000:
             break
         render_image_entry(source, entry)

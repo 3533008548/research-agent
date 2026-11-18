@@ -449,6 +449,13 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         image_header += f"已导出 {len(images)} 张图片（前 8 项）：\n" + "\n".join(f"  - {item}" for item in images[:8]) + "\n"
     else:
         image_header += "本次未导出图片；可按论文和 page 查看原页，不代表原 PDF 没有图。\n"
+    from paper_selections import element_citations
+    citations, snapshot = element_citations(paths, document_map)
+    if snapshot:
+        document_map["document_id"] = snapshot
+        for page_record in parsed_document.get("pages", []):
+            for element in page_record.get("elements", []):
+                element["citation"] = citations.get(element.get("id"), "")
     result = image_header + "\n" + reader.render_document(parsed_document)
     warnings = [item["message"] for item in quality.get("issues", []) if item.get("severity") == "warning"]
     if warnings:

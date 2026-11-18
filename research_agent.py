@@ -1033,6 +1033,7 @@ class ResearchAgent:
             token_usage=usage,
             checkpoint_db=self.cfg.checkpoint_db,
             vision_model=self.cfg.vision_model,
+            selection_paths=self.cfg.runtime_paths,
             stream_callback=on_token,
             event_callback=event_callback,
             cancel_event=cancel_event,

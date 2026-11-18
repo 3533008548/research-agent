@@ -5,7 +5,7 @@
 
 ## 使用
 
-1. 运行 `release/Research-Assistant-Setup-0.2.8.exe` 安装，启动“Research Assistant”。
+1. 运行 `release/Research-Assistant-Setup-0.2.9.exe` 安装，启动“Research Assistant”。
 2. 在工作台左下角的“设置 → 通用”填写模型 API Key。密钥通过 Electron safeStorage 使用 Windows 系统加密，保存后自动重启后台。没有密钥也能整理、阅读 PDF 和写笔记。
 3. 最左侧固定窄栏的小房子、书本和齿轮分别切换工作台、论文库、设置页面。论文库支持多文件导入、文件夹、重命名、移动、搜索、回收站和恢复；点击论文名称返回工作台并打开阅读标签。
 4. 阅读器支持 25%～400% 缩放、Ctrl＋滚轮、适应宽度、整页显示、手形拖动、空格临时拖动、查找文字、划选翻译和页码批注。笔记自动保存，失败时保留本机草稿；版本冲突可另存为新笔记。

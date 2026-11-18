@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from api.auth import require_api_key
 from library_store import LibraryStore, LibraryConflict
+from paper_selections import PaperSelection, region_preview
 
 router = APIRouter(prefix='/api/v1/library', dependencies=[Depends(require_api_key)])
 
@@ -95,6 +96,12 @@ def pdf_file(identifier: str, store: Store):
     return FileResponse(store.file(identifier), media_type='application/pdf',
                         filename=store.get(identifier)['name'], content_disposition_type='inline',
                         headers={'Cache-Control': 'private, no-cache', 'X-Content-Type-Options': 'nosniff'})
+
+
+@router.post('/citation-preview')
+def citation_preview(selection: PaperSelection, store: Store):
+    image, text = region_preview(store, selection, max_dimension=900)
+    return {"name": store.get(selection.document_id)["name"], "image": image, "text": text[:2500]}
 
 
 @router.patch('/documents/{identifier}')

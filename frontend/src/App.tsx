@@ -23,7 +23,7 @@ import { SessionSidebar } from "./components/workspace/SessionSidebar";
 import { LibraryPanel } from "./components/workspace/LibraryPanel";
 import { SettingsPanel } from "./components/workspace/SettingsPanel";
 import { useLibrary } from "./hooks/useLibrary";
-import { type LibraryDocument, fileSize } from "./lib/library";
+import { type LibraryDocument, type PaperReference, type PaperLocation, paperReferenceLink, fileSize } from "./lib/library";
 const PaperReader = lazy(() => import("./components/workspace/PaperReader").then(module => ({default: module.PaperReader})));
 
 const API_TOKEN_KEY = "research-agent.api-token";
@@ -49,6 +49,8 @@ export function App() {
   const chatDockedRef = useRef(chatDocked);
   useLayoutEffect(() => { chatDockedRef.current = chatDocked; }, [chatDocked]);
   const [rightPane, setRightPane] = useState<"chat" | "tools">("chat");
+  const [referenceLocation, setReferenceLocation] = useState<PaperLocation | null>(null);
+  const [comparisonSource, setComparisonSource] = useState<PaperReference | null>(null);
   const [draggingChat, setDraggingChat] = useState(false);
   const [dropHovered, setDropHovered] = useState(false);
   const [centerChatHost, setCenterChatHost] = useState<HTMLDivElement | null>(null);
@@ -96,6 +98,8 @@ export function App() {
     isSending,
     isCancelling,
     attachment,
+    paperReferences,
+    setPaperReferences,
     isUploading,
     setDraft,
     setMode,
@@ -232,9 +236,50 @@ export function App() {
   }
   function openPaper(document: LibraryDocument) {
     const id = `paper:${document.id}`;
+    setReferenceLocation(null);
     setWorkbenchTabs(tabs => tabs.some(t => t.id === id) ? tabs : [...tabs, {id, kind:"paper", title:document.name, documentId:document.id}]);
     openWorkbenchTab(id);
     setShowRunTools(false);
+  }
+  function showReadingChat() {
+    setMode("chat");
+    setRightPane("chat");
+    if (chatDocked) {
+      layout.showRight();
+    } else {
+      chatScrollTop.current = messageListRef.current?.scrollTop || 0;
+      setChatDocked(true);
+    }
+  }
+  function openPaperWithChat(document: LibraryDocument) {
+    openPaper(document);
+    showReadingChat();
+  }
+  const comparing = paperReferences.length === 1 && paperReferences[0] === comparisonSource;
+  function addPaperReference(reference: PaperReference) {
+    if (!activeSessionId) {
+      setNotice({ kind: "info", text: "请先新建会话，再引用所选内容。" });
+      return;
+    }
+    if (comparing && paperReferenceLink(paperReferences[0]) === paperReferenceLink(reference)) return;
+    setPaperReferences(comparing ? [paperReferences[0], reference] : [reference]);
+    setComparisonSource(null);
+    showReadingChat();
+    requestAnimationFrame(() => {
+      const input = rightChatHost?.querySelector<HTMLTextAreaElement>(".composer textarea");
+      input?.focus({ preventScroll: true });
+      if (layout.layoutMode === "stacked") input?.scrollIntoView({ block: "nearest" });
+    });
+  }
+  async function locateReference(location: PaperLocation) {
+    let document = library.data.documents.find(d => d.id === location.document_id && !d.trashed);
+    if (!document) document = (await library.load())?.documents.find(d => d.id === location.document_id && !d.trashed);
+    if (!document || location.page > document.pages) {
+      setNotice({ kind: "info", text: "原论文已移除，或引用页码已失效。" });
+      return;
+    }
+    openPaperWithChat(document);
+    setReferenceLocation({ ...location });
   }
   function readWithAssistant(document: LibraryDocument) {
     const prompt = `请阅读论文“${document.name}”，调用 read_pdf，url_or_path 使用 ${JSON.stringify(`library/${document.id}.pdf`)}，max_pages 使用 ${Math.min(document.pages, 100)}，并建立可检索的论文索引。`;
@@ -379,7 +424,7 @@ export function App() {
           <Suspense fallback={<p>正在加载阅读器…</p>}>{workbenchTabs.filter(t => t.kind === "paper").map(tab => {
             if (tab.kind !== "paper") return null;
             const document = library.data.documents.find(d => d.id === tab.documentId);
-            return document && <div key={tab.id} className="reader-boundary-host" hidden={activeWorkbenchTab?.id !== tab.id}><ReaderErrorBoundary><PaperReader apiKey={apiKey} document={document} active={appPage === "workspace" && activeWorkbenchTab?.id === tab.id} toolsHost={readerTools} onShowTools={showReaderTools} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/></ReaderErrorBoundary></div>;
+            return document && <div key={tab.id} className="reader-boundary-host" hidden={activeWorkbenchTab?.id !== tab.id}><ReaderErrorBoundary><PaperReader apiKey={apiKey} document={document} active={appPage === "workspace" && activeWorkbenchTab?.id === tab.id} toolsHost={readerTools} onShowTools={showReaderTools} onReference={addPaperReference} location={referenceLocation?.document_id===document.id ? referenceLocation : null} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/></ReaderErrorBoundary></div>;
           })}</Suspense>
           {activeWorkbenchTab?.kind === "paper" ? null : activeWorkbenchTab?.kind === "profile" ? (
             <ProfilePanel profile={activeWorkbenchTab.profile} />
@@ -480,6 +525,14 @@ export function App() {
               canSteerCurrentRun={canSteerCurrentRun}
               activeSessionId={activeSessionId}
               attachment={attachment}
+              paperReferences={paperReferences}
+              onLocateReference={locateReference}
+              onRemoveReference={index => {
+                setPaperReferences(current => current.filter((_, i) => i !== index));
+                setComparisonSource(null);
+              }}
+              comparing={comparing}
+              onToggleCompare={() => setComparisonSource(comparing ? null : paperReferences[0])}
               messageListRef={messageListRef}
               uploadInputRef={uploadInputRef}
               setDraft={setDraft}
@@ -511,7 +564,11 @@ export function App() {
           <LibraryPanel apiKey={apiKey} {...library} onOpen={openPaper} onSelect={setSelectedDocument}/>
           {selectedDocument && <aside className="library-details" aria-label="文件详情">
             <h2>文件详情</h2>
-            <div className="file-details"><h3>{selectedDocument.name}</h3><dl><dt>文件大小</dt><dd>{fileSize(selectedDocument.size_bytes)}</dd><dt>页数</dt><dd>{selectedDocument.pages} 页</dd><dt>文件夹</dt><dd>{library.data.folders.find(f => f.id === selectedDocument.folder_id)?.name || "未分类"}</dd><dt>阅读进度</dt><dd>{selectedDocument.progress.page ? `第 ${selectedDocument.progress.page} 页` : "尚未阅读"}</dd></dl><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => openPaper(selectedDocument)}>继续阅读 →</button><button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => readWithAssistant(selectedDocument)}>交给助手阅读</button></div>
+            <div className="file-details"><h3>{selectedDocument.name}</h3><dl><dt>文件大小</dt><dd>{fileSize(selectedDocument.size_bytes)}</dd><dt>页数</dt><dd>{selectedDocument.pages} 页</dd><dt>文件夹</dt><dd>{library.data.folders.find(f => f.id === selectedDocument.folder_id)?.name || "未分类"}</dd><dt>阅读进度</dt><dd>{selectedDocument.progress.page ? `第 ${selectedDocument.progress.page} 页` : "尚未阅读"}</dd></dl>
+              <button className="button button-primary" disabled={selectedDocument.trashed} onClick={() => openPaperWithChat(selectedDocument)}>阅读并提问</button>
+              <button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => openPaper(selectedDocument)}>继续阅读 →</button>
+              <button className="button button-secondary" disabled={selectedDocument.trashed} onClick={() => readWithAssistant(selectedDocument)} title="准备整篇论文的阅读与索引请求">交给助手阅读</button>
+            </div>
           </aside>}
         </div>
       </section>

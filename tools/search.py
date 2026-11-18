@@ -134,6 +134,17 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
             document_map = load_document_map(paths, str(r["paper_id"]))
             if document_map is not None:
                 context, locator = related_context(document_map, element_id)
+                chunk = next((c for c in document_map.get("chunks", []) if c.get("id") == element_id), {})
+                source_ids = set(chunk.get("source_element_ids") or [])
+                if source_ids:
+                    from paper_selections import element_citations
+                    links, _ = element_citations(paths, document_map, source_ids)
+                    for page in document_map.get("pages", []):
+                        for element in page.get("elements", []):
+                            link = links.get(element.get("id"))
+                            if link:
+                                excerpt = (element.get("text") or element.get("caption") or "")[:150]
+                                context += f"\n{link} {excerpt}"
         if not locator:
             # Older indexes have page metadata without document-map element IDs.
             # Preserve that provenance; never infer a page from source prose.

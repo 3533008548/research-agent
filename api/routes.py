@@ -42,6 +42,7 @@ from api.schemas import (
 )
 from run_contract import bounded_timing_metrics, latest_error_details
 from workspace_uploads import UploadValidationError
+from paper_selections import referenced_message
 
 
 router = APIRouter(prefix="/api/v1")
@@ -713,10 +714,20 @@ def create_chat(payload: ChatCreateRequest, request: Request) -> dict:
 def create_run(payload: RunCreateRequest, request: Request) -> dict:
     """Create any externally runnable task through the one public run contract."""
     try:
+        if payload.paper_selections and (payload.kind != "chat" or not (payload.message or "").strip()):
+            raise HTTPException(422, "请在普通对话中输入这次引用的问题")
         if payload.kind == "chat":
             if not payload.session_id:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="chat requires session_id")
             message = str(payload.message or "").strip()
+            if payload.paper_selections:
+                library = request.app.state.library_store
+                if library is None:
+                    raise HTTPException(503, "论文库暂不可用")
+                try:
+                    message = referenced_message(message, payload.paper_selections, library)
+                except KeyError:
+                    raise HTTPException(404, "引用的论文已移除，请重新选择") from None
             if payload.upload_id:
                 try:
                     message = _workspace_uploads(request).agent_message(payload.upload_id, message)

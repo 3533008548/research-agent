@@ -12,7 +12,7 @@ type Props = {
   data: LibraryData;
   loading: boolean;
   error: string;
-  load: () => Promise<void>;
+  load: () => Promise<LibraryData | undefined>;
   update: (
     id: string,
     change: Partial<LibraryDocument>,

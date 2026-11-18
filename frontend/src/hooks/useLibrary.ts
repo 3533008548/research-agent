@@ -13,8 +13,10 @@ export function useLibrary(apiKey: string) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await libraryRequest<LibraryData>(apiKey));
+      const loaded = await libraryRequest<LibraryData>(apiKey);
+      setData(loaded);
       setError("");
+      return loaded;
     } catch (e) {
       setError(userFacingError(e));
     } finally {

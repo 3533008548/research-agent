@@ -1,10 +1,12 @@
 import { useLayoutEffect, useRef, type Dispatch, type FormEvent, type SetStateAction } from "react";
 
 import { ChatMessage } from "../ChatMessage";
+import { CitationPreview } from "./CitationPreview";
 import { ResearchWorkbench } from "../ResearchWorkbench";
 import { modeLabel, type DisplayMessage, type ResearchMode } from "../../lib/labels";
 import type { ResearchProject, ResearchScope, Run, WorkspaceUpload } from "../../types";
 import { useChatScroll } from "../../hooks/useChatScroll";
+import { parsePaperLocation, paperCitationDefinitions, paperReferenceLink, type PaperReference, type PaperLocation } from "../../lib/library";
 
 /**
  * The chat tab: the transcript, the composer and the mode switch.
@@ -29,6 +31,7 @@ export function ChatPanel({
   canSteerCurrentRun,
   activeSessionId,
   attachment,
+  paperReferences, onLocateReference, onRemoveReference, comparing, onToggleCompare,
   messageListRef,
   uploadInputRef,
   setDraft,
@@ -53,6 +56,11 @@ export function ChatPanel({
   canSteerCurrentRun: boolean;
   activeSessionId: string | null;
   attachment: WorkspaceUpload | null;
+  paperReferences: PaperReference[];
+  onLocateReference: (location: PaperLocation) => void;
+  onRemoveReference: (index: number) => void;
+  comparing: boolean;
+  onToggleCompare: () => void;
   messageListRef: React.RefObject<HTMLDivElement | null>;
   uploadInputRef: React.RefObject<HTMLInputElement | null>;
   setDraft: Dispatch<SetStateAction<string>>;
@@ -94,14 +102,32 @@ export function ChatPanel({
     if (mode === "research") researchRef.current?.scrollIntoView({ block: "start" });
   }, [mode, activeSessionId]);
 
+  const hasReferences = paperReferences.length > 0;
+  const hasInput = Boolean(draft.trim()) || (Boolean(attachment) && !hasReferences);
+  const blockedMode = (canSteerCurrentRun && (Boolean(attachment) || hasReferences))
+    || (mode === "research" && hasReferences);
+  let citationDefinitions = "";
   return (
       <>
-        <div className="message-list" ref={messageListRef} aria-live="polite">
+        <div className="message-list" ref={messageListRef} aria-live="polite" onClick={event => {
+          const href = (event.target as Element).closest("a")?.getAttribute("href");
+          const location = href && parsePaperLocation(href);
+          if (location) {
+            event.preventDefault();
+            onLocateReference(location);
+          }
+        }}>
           <div className="message-thread" ref={threadRef}>
           {isLoading ? (
             <p className="empty-state">正在加载会话…</p>
           ) : messages.length ? (
-            messages.map((message) => <ChatMessage key={message.id} message={message} />)
+            messages.map(message => {
+              if (message.role === "user") citationDefinitions = paperCitationDefinitions(message.content);
+              const displayed = message.role === "assistant" && message.content && citationDefinitions
+                ? { ...message, content: message.content + "\n\n" + citationDefinitions }
+                : message;
+              return <ChatMessage key={message.id} message={displayed} />;
+            })
           ) : mode === "chat" ? (
             <div className="empty-state">
               <h2>{activeSessionId ? "从一个研究问题、论文或假设开始。" : "新建一个会话，开始研究。"}</h2>
@@ -116,6 +142,7 @@ export function ChatPanel({
           </div>
         </div>
 
+        <CitationPreview list={messageListRef} apiKey={apiKey} sessionId={activeSessionId} />
         <form className="composer" aria-label="消息输入区" onSubmit={(event) => void sendMessage(event)}>
           <input
             ref={uploadInputRef}
@@ -133,6 +160,18 @@ export function ChatPanel({
               </span>
             </div>
           )}
+          {hasReferences && <div className="paper-citations" aria-label="待发送的论文引用">
+            {paperReferences.map((ref, index) => <div className="paper-citation" key={paperReferenceLink(ref)}>
+              <button type="button" className="paper-citation-source" title="在原页定位" onClick={() => onLocateReference(ref)}>
+                {ref.preview && <img src={ref.preview} alt="原页裁图" />}
+                <span><b>S{index + 1} · 第 {ref.page} 页 · {ref.name}</b>
+                  <small>{ref.quote || "框选区域"}</small></span>
+              </button>
+              <button type="button" className="text-button" aria-label={`移除引用 S${index + 1}`} onClick={() => onRemoveReference(index)}>×</button>
+            </div>)}
+            {paperReferences.length === 1 && <button type="button" className="text-button" aria-pressed={comparing}
+              onClick={onToggleCompare}>{comparing ? "选择对照中 · 取消" : "＋ 加一处对照"}</button>}
+          </div>}
           <textarea
             ref={textareaRef}
             aria-label="消息"
@@ -180,7 +219,7 @@ export function ChatPanel({
               <button
                 className="button button-primary"
                 type="submit"
-                disabled={isUploading || (!draft.trim() && !attachment) || !activeSessionId || (isSending && !canSteerCurrentRun) || (canSteerCurrentRun && Boolean(attachment))}
+                disabled={!hasInput || !activeSessionId || isUploading || (isSending && !canSteerCurrentRun) || blockedMode}
               >
                 {canSteerCurrentRun ? "发送补充" : isSending ? "任务进行中…" : mode === "research" ? "开始研究" : "发送"}
               </button>

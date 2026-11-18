@@ -192,6 +192,7 @@ class PaperReader:
             elements = list(page_record.get("elements") or [])
             for element in elements:
                 kind = element.get("kind")
+                start = len(lines)
                 if kind == "text":
                     text = str(element.get("text") or "").strip()
                     if text:
@@ -209,6 +210,8 @@ class PaperReader:
                     note = " [OCR 转写；符号需核对原页]" if element.get("extraction_method") == "ocr" else ""
                     lines.extend(["", str(element.get("caption") or element.get("label")) + note,
                                   str(element.get("text") or "")])
+                if len(lines) > start and element.get("citation"):
+                    lines.append(element["citation"])
             page_texts.append("\n".join(lines).strip())
 
         full_text = "\n\n".join(page_texts)

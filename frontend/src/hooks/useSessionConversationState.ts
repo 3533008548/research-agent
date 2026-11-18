@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState, type SetStateAction } from "react";
 
 import type { DisplayMessage, ResearchMode } from "../lib/labels";
+import type { PaperReference } from "../lib/library";
 import type { ResearchScope, Run, RunEvent, SessionUsage, WorkspaceUpload } from "../types";
 
 function emptyConversation() {
@@ -15,6 +16,7 @@ function emptyConversation() {
     isSending: false,
     isCancelling: false,
     attachment: null as WorkspaceUpload | null,
+    paperReferences: [] as PaperReference[],
     isUploading: false,
     loading: false,
     loaded: false,
@@ -62,6 +64,7 @@ export function useSessionConversationState(activeSessionId: string | null) {
       setIsSending: field("isSending"),
       setIsCancelling: field("isCancelling"),
       setAttachment: field("attachment"),
+      setPaperReferences: field("paperReferences"),
       setIsUploading: field("isUploading"),
       setLoading: field("loading"),
       setLoaded: field("loaded"),
