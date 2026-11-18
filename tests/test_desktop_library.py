@@ -14,8 +14,8 @@ from fastapi.testclient import TestClient
 from api.auth import APIKeyAuthenticator
 from api.library_routes import router
 from api.local_queue import LocalBroker, LocalDailyBroker, LocalResearchBroker
-from library_store import LibraryConflict, LibraryStore
-from runtime_paths import RuntimePaths
+from papers.library import LibraryConflict, LibraryStore
+from infra.runtime_paths import RuntimePaths
 from tests import test_run_dispatcher as dispatcher_tests
 
 
@@ -103,7 +103,7 @@ class LibraryTests(unittest.TestCase):
 
     def test_imported_display_names_are_readable_and_listed_with_real_paths(self):
         from tools.read_pdf import _resolve_local_pdf
-        from search_api import list_downloaded_papers
+        from integrations.public_search import list_downloaded_papers
         doc = self.store.import_file('中文论文.pdf', io.BytesIO(pdf_bytes()))
         self.assertEqual(_resolve_local_pdf(doc['name'], self.paths.papers_dir), self.store.file(doc['id']))
         with patch.dict(os.environ, {'APP_DATA_DIR': str(self.paths.root)}):
@@ -123,7 +123,7 @@ class LibraryTests(unittest.TestCase):
     def test_ingestion_preserves_library_source_path_and_card_lookup(self):
         from tools.read_pdf import handle_read_pdf
         from tools.paper_card import _find_source_pdf
-        from paper_artifacts import load_document_map
+        from papers.artifacts import load_document_map
         document = self.store.import_file('Research paper.pdf', io.BytesIO(pdf_bytes(
             'Research question and evidence are linked to the source.\n'
             'Methods and limitations remain available for later verification.')))
@@ -242,7 +242,7 @@ class LocalQueueTests(unittest.TestCase):
 
     def test_daily_worker_completes_persisted_local_job(self):
         from api.redis_runs import RedisDailyRunManager, RedisDailyRunWorker
-        from scheduler import Scheduler
+        from agent.daily.scheduler import Scheduler
         scheduler = Scheduler(str(Path(self.temp.name) / 'daily.db'))
         self.addCleanup(scheduler.close)
         broker = LocalDailyBroker(self.path)

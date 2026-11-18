@@ -9,9 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from research_projects import ResearchProjects, ResearchBudgetExceeded
-from session_store import SessionStore
-from autonomous_research import AutonomousResearch, BudgetedClient, ResearchResponseError
+from agent.research.projects import ResearchProjects, ResearchBudgetExceeded
+from sessions.store import SessionStore
+from agent.research.autonomous import AutonomousResearch, BudgetedClient, ResearchResponseError
 
 
 class TestPersistentResearch(unittest.TestCase):
@@ -152,8 +152,8 @@ class TestPersistentResearch(unittest.TestCase):
         self.assertEqual(snapshot["question"], "比较两种方法")
 
     def test_pdf_page_anchors_and_cross_worker_unit_ids_are_preserved(self):
-        from research_orchestrator import ResearchOrchestrator
-        from research_evidence import attach_evidence_units
+        from agent.research.orchestrator import ResearchOrchestrator
+        from agent.research.evidence import attach_evidence_units
         messages = [{"role": "assistant", "tool_calls": [{"id": "pdf", "function": {
             "name": "read_pdf", "arguments": '{"url_or_path":"https://example.org/paper.pdf"}'}}]},
             {"role": "tool", "tool_call_id": "pdf", "content": "📄 PDF\n━━━ 第 1 页 ━━━\nfirst\n━━━ 第 2 页 ━━━\nsecond"}]
@@ -181,7 +181,7 @@ class TestPersistentResearch(unittest.TestCase):
 
     def test_query_pages_survive_tool_extraction_and_persistence(self):
         from tools.search import handle_query_papers
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
         store = Mock()
         store.query_with_timeout.return_value = ([
             {"paper_id": "p", "title": "Paper", "page": 8, "page_end": 9, "element_id": "",
@@ -306,7 +306,7 @@ class TestPersistentResearch(unittest.TestCase):
         self.assertFalse(self.store.outbox())
 
     def test_worker_checkpoint_evidence_is_returned_when_later_model_call_fails(self):
-        from research_orchestrator import ResearchOrchestrator, _WorkerSpec
+        from agent.research.orchestrator import ResearchOrchestrator, _WorkerSpec
         graph = Mock()
         graph.invoke.side_effect = ResearchResponseError("empty_response")
         graph.get_state.return_value = SimpleNamespace(values={"messages": [
@@ -314,7 +314,7 @@ class TestPersistentResearch(unittest.TestCase):
             {"role": "tool", "tool_call_id": "q", "content": "📚 检索结果\n  1. [Paper · p.8 · 定理章节] 距离: 0.1\n     " + "condition " * 120}]})
         orchestrator = ResearchOrchestrator(session_store=self.sessions, api_key="test", model="test", llm_client=Mock(),
                                             paper_store=None, verify_timeout_seconds=3)
-        with patch("research_orchestrator.build_graph", return_value=graph):
+        with patch("agent.research.orchestrator.build_graph", return_value=graph):
             result = orchestrator._run_worker(_WorkerSpec("local", "researcher1", {"query_papers"}, "check"),
                 "question", {}, None, run_id="research-test", autonomous=True)
         self.assertEqual(result["error"], "empty_response")
@@ -346,8 +346,8 @@ class TestPersistentResearch(unittest.TestCase):
         def model(**kwargs):
             value = responses.pop(0)
             return value if isinstance(value, str) else json.dumps(value)
-        with patch("autonomous_research.ResearchOrchestrator._call_model", side_effect=model), patch(
-            "autonomous_research.ResearchOrchestrator._run_worker",
+        with patch("agent.research.autonomous.ResearchOrchestrator._call_model", side_effect=model), patch(
+            "agent.research.autonomous.ResearchOrchestrator._run_worker",
             return_value={"evidence": [{"source": "paper", "excerpt": "text"}], "answer": "observed"}) as worker:
             for _ in range(6):
                 queued = self.store.outbox()
@@ -386,7 +386,7 @@ class TestPersistentResearch(unittest.TestCase):
             manager.projects.close()
 
     def test_source_scope_is_enforced_before_pdf_tool_execution(self):
-        from tool_runtime import ToolRuntime, ToolExecutionContext
+        from tools.runtime import ToolRuntime, ToolExecutionContext
         for scope, source in [("local", "https://example.org/a.pdf"), ("public", "private.pdf")]:
             executor = Mock()
             runtime = ToolRuntime(ToolExecutionContext(run_kind="research", research_scope=scope,
@@ -469,7 +469,7 @@ class TestPersistentResearch(unittest.TestCase):
             calls.append(kwargs["stage"])
             if kwargs["stage"] == "lead":
                 if len(calls) == 1:
-                    from llm_client import LLMRequestTimeoutError
+                    from integrations.llm_client import LLMRequestTimeoutError
                     raise LLMRequestTimeoutError("simulated first request timeout")
                 if len(calls) == 2:
                     return json.dumps({"action": "research", "tasks": [
@@ -486,8 +486,8 @@ class TestPersistentResearch(unittest.TestCase):
             return {"evidence": [{"source": "paper", "excerpt": "text"}], "answer": "local finding"}
         thread = threading.Thread(target=dispatcher.run_forever, args=(stop,))
         try:
-            with patch("autonomous_research.ResearchOrchestrator._call_model", side_effect=model), patch(
-                    "autonomous_research.ResearchOrchestrator._run_worker", side_effect=research):
+            with patch("agent.research.autonomous.ResearchOrchestrator._call_model", side_effect=model), patch(
+                    "agent.research.autonomous.ResearchOrchestrator._run_worker", side_effect=research):
                 run = manager.start(session["thread_id"], "q")
                 thread.start()
                 until = time.monotonic() + 12

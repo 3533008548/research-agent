@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from run_contract import SSE_EVENT_TYPES, bounded_timing_metrics, safe_error_details
+from runs.contract import SSE_EVENT_TYPES, bounded_timing_metrics, safe_error_details
 
 
 def _bounded_text(value: object, limit: int) -> str:

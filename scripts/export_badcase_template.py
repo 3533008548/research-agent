@@ -16,8 +16,8 @@ if sys.platform == "win32":
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from badcase_store import BadcaseStore, promotion_template
-from runtime_paths import RuntimePaths
+from runs.badcases import BadcaseStore, promotion_template
+from infra.runtime_paths import RuntimePaths
 
 
 def main() -> int:

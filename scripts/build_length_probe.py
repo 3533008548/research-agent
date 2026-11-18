@@ -33,9 +33,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    from config import Config
-    from embeddings import build_embedder
-    from paper_store import PaperStore
+    from infra.config import Config
+    from papers.embeddings import build_embedder
+    from papers.store import PaperStore
 
     config = Config.load()
     embedder = build_embedder(

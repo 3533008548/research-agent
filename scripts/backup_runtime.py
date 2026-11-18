@@ -19,7 +19,7 @@ if sys.platform == "win32":
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from runtime_paths import RuntimePaths
+from infra.runtime_paths import RuntimePaths
 
 
 def _backup_sqlite(source: Path, destination: Path) -> None:

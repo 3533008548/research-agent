@@ -15,11 +15,11 @@ from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
 
-from cancellation import raise_if_cancelled
-from daily_orchestrator import DailyResearchOrchestrator
-from research_orchestrator import ResearchOrchestrator
-from scheduler import Scheduler
-from session_store import SessionStore
+from infra.cancellation import raise_if_cancelled
+from agent.daily.orchestrator import DailyResearchOrchestrator
+from agent.research.orchestrator import ResearchOrchestrator
+from agent.daily.scheduler import Scheduler
+from sessions.store import SessionStore
 
 from .runtime_fakes import FixtureResponse, FixtureSourceRouter, ScriptedResearchModels
 
@@ -147,8 +147,8 @@ def _r02_tool_trace_sanitization(context: RuntimeContext) -> RuntimeCaseResult:
     case = CASES_BY_ID["R02"]
     started = time.perf_counter()
     assertions: list[dict[str, Any]] = []
-    from config import Config
-    from research_agent import ResearchAgent
+    from infra.config import Config
+    from agent.service import ResearchAgent
 
     class _FixturePaperStore:
         def query_with_timeout(
@@ -278,7 +278,7 @@ def _r04_daily_partial_failure_resume(context: RuntimeContext) -> RuntimeCaseRes
         store.add_keyword("offline replay")
         router = FixtureSourceRouter(context.fixtures_dir, failed_sources={"openaire"}, seed=context.seed)
         orchestrator = _new_daily_orchestrator(store)
-        with patch("daily_orchestrator.requests.get", side_effect=router.get):
+        with patch("agent.daily.orchestrator.requests.get", side_effect=router.get):
             first = orchestrator.run("daily")
             calls_after_first = dict(router.calls)
             resumed = orchestrator.run("daily", resume=True)
@@ -321,7 +321,7 @@ def _r05_cancellation_propagation(context: RuntimeContext) -> RuntimeCaseResult:
             raise_if_cancelled(event, "offline cancellation")
             raise AssertionError("cancellation did not propagate to curator")
 
-        with patch("daily_orchestrator.requests.get", side_effect=router.get), \
+        with patch("agent.daily.orchestrator.requests.get", side_effect=router.get), \
              patch.object(orchestrator, "_curate", side_effect=cancel_at_curator):
             result = orchestrator.run("daily", cancel_event=cancel_event)
         context.event("curator", "cancelled")

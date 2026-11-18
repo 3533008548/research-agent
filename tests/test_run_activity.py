@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from api.sse import public_sse_event
-from research_projects import ResearchProjects
-from run_contract import graph_activity_event
-from tool_runtime import ToolRuntime, ToolExecutionContext
+from agent.research.projects import ResearchProjects
+from runs.contract import graph_activity_event
+from tools.runtime import ToolRuntime, ToolExecutionContext
 
 
 class TestRunActivity(unittest.TestCase):

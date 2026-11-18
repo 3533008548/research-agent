@@ -4,15 +4,14 @@
 
 import sys
 from pathlib import Path
-from paper_artifacts import (
-    TITLE_MATCH_THRESHOLD,
+from papers.artifacts import (
     load_document_map,
     related_context,
-    title_match_score,
 )
-from paper_relations import relation_type_label
-from search_api import list_downloaded_papers, search_public_papers
-from runtime_paths import get_runtime_paths
+from papers.scope import resolve_scope
+from papers.relations import relation_type_label
+from integrations.public_search import list_downloaded_papers, search_public_papers
+from infra.runtime_paths import get_runtime_paths
 
 
 def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
@@ -35,48 +34,6 @@ def handle_search_papers(args: dict, **kw) -> str:
     return search_public_papers(query, limit=limit, source=source)
 
 
-def _resolve_scope(paper_store, raw) -> tuple[list[str] | None, str]:
-    """Resolve an explicit paper scope, refusing to silently widen it.
-
-    A scope the user stated must never degrade into an unscoped search: that
-    silently reintroduces cross-paper pollution, which is exactly what scoping
-    exists to prevent.  An unresolvable reference is therefore an error.
-    """
-    if raw is None:
-        return None, ""
-    values = raw if isinstance(raw, (list, tuple)) else [raw]
-    values = [str(item or "").strip() for item in values]
-    values = [item for item in values if item]
-    if not values:
-        return None, ""
-    papers = list(paper_store.list_papers() or [])
-    if not papers:
-        return None, "论文库为空，无法限定检索范围。"
-    resolved: list[str] = []
-    for needle in values:
-        by_id = next(
-            (item for item in papers if needle == str(item.get("paper_id") or "")), None,
-        )
-        if by_id is not None:
-            resolved.append(str(by_id.get("paper_id")))
-            continue
-        scored = sorted(
-            (
-                (title_match_score(needle, str(item.get("title") or "")), index, item)
-                for index, item in enumerate(papers)
-            ),
-            key=lambda entry: (-entry[0], entry[1]),
-        )
-        best_score, _, best = scored[0]
-        if best is None or best_score < TITLE_MATCH_THRESHOLD:
-            options = "；".join(
-                f"{item.get('title')}（{item.get('paper_id')}）" for item in papers[:5]
-            )
-            return None, f"无法限定到论文“{needle}”。已索引论文：{options or '无'}"
-        resolved.append(str(best.get("paper_id")))
-    return list(dict.fromkeys(resolved)), ""
-
-
 def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     if not paper_store:
         return "❌ RAG 功能未启用。"
@@ -88,17 +45,17 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
     section = str(section_value).strip() if section_value is not None else None
     section = section or None
     if "paper_id_or_title" in args:
-        scope, scope_error = _resolve_scope(paper_store, args.get("paper_id_or_title"))
+        scope, scope_error = resolve_scope(paper_store, args.get("paper_id_or_title"))
         if scope_error:
             return f"❌ {scope_error}"
     else:
         scope = None
-    from paper_algorithms import query_algorithm_evidence
+    from papers.algorithms import query_algorithm_evidence
 
     algorithm_evidence = query_algorithm_evidence(query, scope, get_runtime_paths(), section=section)
     if algorithm_evidence is not None:
         return algorithm_evidence
-    from paper_images import figure_numbers
+    from papers.images import figure_numbers
     image_prefix = ""
     numbers = figure_numbers(query)
     if scope and numbers:
@@ -137,7 +94,7 @@ def handle_query_papers(args: dict, paper_store=None, **kw) -> str:
                 chunk = next((c for c in document_map.get("chunks", []) if c.get("id") == element_id), {})
                 source_ids = set(chunk.get("source_element_ids") or [])
                 if source_ids:
-                    from paper_selections import element_citations
+                    from papers.selections import element_citations
                     links, _ = element_citations(paths, document_map, source_ids)
                     for page in document_map.get("pages", []):
                         for element in page.get("elements", []):

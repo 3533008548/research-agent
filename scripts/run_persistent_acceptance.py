@@ -126,16 +126,16 @@ def single_run(output, timeout, run_name="single"):
     The original tool output and deterministic source IDs are both exposed.
     The model chooses all retrieval and stopping decisions, and self-reviews.
     """
-    from config import Config
-    from paper_store import PaperStore
-    from llm_client import LLMClient, RequestPolicy, RequestPriority
-    from autonomous_research import BudgetedClient
-    from research_projects import ResearchProjects, ResearchBudgetExceeded, fingerprint
-    from research_orchestrator import ResearchOrchestrator, CITATION_EMISSION_RULE, CITATION_EXISTENCE_RULE
-    from research_evidence import attach_evidence_units, audit_citations
-    from tool_catalog import get_tool_schemas
-    from tool_runtime import ToolExecutionContext, ToolRuntime
-    from graph_builder import sanitize_model_messages
+    from infra.config import Config
+    from papers.store import PaperStore
+    from integrations.llm_client import LLMClient, RequestPolicy, RequestPriority
+    from agent.research.autonomous import BudgetedClient
+    from agent.research.projects import ResearchProjects, ResearchBudgetExceeded, fingerprint
+    from agent.research.orchestrator import ResearchOrchestrator, CITATION_EMISSION_RULE, CITATION_EXISTENCE_RULE
+    from agent.research.evidence import attach_evidence_units, audit_citations
+    from tools.catalog import get_tool_schemas
+    from tools.runtime import ToolExecutionContext, ToolRuntime
+    from agent.graph import sanitize_model_messages
     import threading
 
     target = output / run_name

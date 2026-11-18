@@ -30,27 +30,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Packages that live in this repository rather than coming from PyPI.
-LOCAL_MODULES = {path.stem for path in ROOT.glob("*.py")} | {
-    "api", "tools", "papers", "evals",
-}
-
-# The modules whose top-level imports constitute the shipped runtime surface.
-# One-off analysis scripts under the repository root are deliberately excluded:
-# they are not installed into the image and are not part of the product.
-SHIPPED_SURFACE = (
-    "api_server.py",
-    "api_worker.py",
-    "research_agent.py",
-    "mcp_server.py",
-    "mcp_client.py",
-    "daily_orchestrator.py",
-    "graph_builder.py",
-    "tool_runtime.py",
-    "tool_catalog.py",
-    "paper_store.py",
-    "llm_client.py",
-)
+SHIPPED_PACKAGES = ("agent", "api", "infra", "integrations", "papers", "runs", "sessions", "tools")
+ENTRY_POINTS = ("research_agent.py", "api_server.py", "api_worker.py", "desktop_backend.py", "mcp_server.py")
+LOCAL_MODULES = {path.stem for path in ROOT.glob("*.py")} | set(SHIPPED_PACKAGES) | {"evals"}
+# PyMuPDF also ships the legacy fitz import used by the PDF library.
+IMPORT_DISTRIBUTIONS = {"fitz": "pymupdf"}
 
 PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^\s;#]+)")
 
@@ -70,13 +54,9 @@ def _lock_pins() -> set[str]:
 
 
 def _shipped_files() -> list[Path]:
-    files: list[Path] = []
-    for package in ("api", "tools", "papers"):
+    files = [ROOT / name for name in ENTRY_POINTS]
+    for package in SHIPPED_PACKAGES:
         files.extend((ROOT / package).rglob("*.py"))
-    for name in SHIPPED_SURFACE:
-        path = ROOT / name
-        if path.exists():
-            files.append(path)
     return files
 
 
@@ -139,7 +119,7 @@ class LockCoverageTests(unittest.TestCase):
             for name in _required_imports(path):
                 if name in stdlib or name in LOCAL_MODULES:
                     continue
-                if _normalize(name) not in pins:
+                if _normalize(IMPORT_DISTRIBUTIONS.get(name, name)) not in pins:
                     missing.setdefault(name, []).append(path.name)
         self.assertEqual(
             missing, {},

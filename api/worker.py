@@ -1,0 +1,116 @@
+"""Process entrypoint for all durable FastAPI runs.
+
+Every API instance only enqueues work. This single worker process owns the
+model client and SQLite writes, while Redis carries shared queue/cancellation/
+SSE state. Separate consumers let interactive chat run even when a background
+task is already waiting on a source or model request.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import threading
+from pathlib import Path
+from concurrent.futures import TimeoutError as FutureTimeout
+
+from api.redis_runs import (
+    RedisChatRunBroker,
+    RedisChatRunWorker,
+    RedisDailyRunBroker,
+    RedisDailyRunManager,
+    RedisDailyRunWorker,
+    RedisResearchRunBroker,
+    RedisResearchRunWorker,
+)
+from api.run_dispatcher import RunDispatcher, worker_process_lock
+from infra.config import Config
+from agent.daily.startup import enqueue_enabled_daily_run
+from agent.daily.orchestrator import DailyResearchOrchestrator
+from agent.service import ResearchAgent
+from agent.daily.scheduler import Scheduler
+
+
+def warm_rag_before_consuming(agent, *, timeout_seconds: float = 90.0) -> None:
+    """Keep the first user run from paying the local encoder cold-start cost."""
+    future = agent.start_rag_warmup()
+    if future is None:
+        return
+    print("      🔥 正在预热本地嵌入模型…", flush=True)
+    try:
+        future.result(timeout=max(1.0, float(timeout_seconds)))
+    except FutureTimeout:
+        print("      ⚠️ 嵌入模型预热超过 90 秒，Worker 将继续启动并保留关键词回退。", flush=True)
+    except Exception as exc:
+        print(f"      ⚠️ 嵌入模型预热失败（{type(exc).__name__}），Worker 将继续启动并保留关键词回退。", flush=True)
+    else:
+        print("      ✅ 本地嵌入模型预热完成", flush=True)
+
+
+def main() -> None:
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    if not redis_url:
+        raise RuntimeError("REDIS_URL is required for api_worker")
+    cfg = Config.load()
+    with worker_process_lock(Path(cfg.checkpoint_db).parent / "api-worker.lock"):
+        run_worker(cfg, redis_url)
+
+
+def run_worker(cfg, redis_url: str) -> None:
+    chat_concurrency = worker_concurrency("CHAT_RUN_CONCURRENCY", 2)
+    research_concurrency = worker_concurrency("RESEARCH_RUN_CONCURRENCY", 2)
+    agent = ResearchAgent(cfg=cfg)
+    warm_rag_before_consuming(agent)
+    chat_broker = RedisChatRunBroker(redis_url)
+    research_broker = RedisResearchRunBroker(redis_url)
+    daily_broker = RedisDailyRunBroker(redis_url)
+    for broker in (chat_broker, research_broker, daily_broker):
+        broker.ping()
+    chat_worker = RedisChatRunWorker(
+        agent, chat_broker,
+        claim_idle_ms=int(os.getenv("CHAT_RUN_CLAIM_IDLE_MS", "120000")),
+    )
+    research_worker = RedisResearchRunWorker(
+        agent, research_broker,
+        claim_idle_ms=int(os.getenv("RESEARCH_RUN_CLAIM_IDLE_MS", "120000")),
+    )
+    scheduler = Scheduler(cfg.daily_db, request_timeout_seconds=cfg.daily_request_timeout_seconds)
+    daily_orchestrator = DailyResearchOrchestrator(
+        scheduler=scheduler,
+        llm_client=agent.llm_client,
+        model=agent.model,
+        request_timeout_seconds=cfg.daily_request_timeout_seconds,
+        max_keyword_concurrency=cfg.daily_keyword_concurrency,
+        max_results_per_keyword=cfg.daily_max_results_per_keyword,
+        daily_sources=cfg.daily_sources,
+        openalex_api_key=cfg.openalex_api_key,
+        ieee_api_key=cfg.ieee_api_key,
+    )
+    daily_worker = RedisDailyRunWorker(
+        daily_orchestrator, scheduler, daily_broker,
+        claim_idle_ms=int(os.getenv("DAILY_RUN_CLAIM_IDLE_MS", "120000")),
+        paper_store=agent.paper_store,
+    )
+    daily_manager = RedisDailyRunManager(scheduler, daily_broker)
+    startup_daily_run_id = enqueue_enabled_daily_run(cfg, daily_manager)
+    if startup_daily_run_id:
+        print(f"      📰 已提交每日自动检索: {startup_daily_run_id}")
+
+    # All executors share the Agent and its process-wide model semaphore.
+    # Each kind's admission queue is bounded; chat/research share session ordering.
+    dispatcher = RunDispatcher({
+        "chat": (chat_worker, chat_concurrency),
+        "research": (research_worker, research_concurrency),
+        "daily": (daily_worker, 1),
+    })
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    dispatcher.run_forever(stop)
+
+
+def worker_concurrency(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if not 1 <= value <= 8:
+        raise ValueError(f"{name} must be between 1 and 8")
+    return value

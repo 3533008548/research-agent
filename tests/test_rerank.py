@@ -216,7 +216,7 @@ class NoVectorStoreTest(unittest.TestCase):
             "import papers.rerank as r\n"
             "assert r.apply_scores([{'text':'a'}], [1.0])[0]['reranked']\n"
             "bad = [m for m in ('torch', 'transformers', 'sentence_transformers',\n"
-            "                   'chromadb', 'paper_store') if m in sys.modules]\n"
+            "                   'chromadb', 'papers.store') if m in sys.modules]\n"
             "assert not bad, 'rerank pulled in: ' + ','.join(bad)\n"
             "print('OK')\n"
         )

@@ -66,8 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.per_paper < 1:
         build_parser().error("--per-paper 必须大于 0")
 
-    from paper_store import PaperStore
-    from runtime_paths import RuntimePaths
+    from papers.store import PaperStore
+    from infra.runtime_paths import RuntimePaths
 
     paths = (
         RuntimePaths.from_root(args.data_dir) if args.data_dir else RuntimePaths.from_root("runtime")

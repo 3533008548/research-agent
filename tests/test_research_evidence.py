@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from research_evidence import (
+from agent.research.evidence import (
     ANCHOR_KINDS,
     analysis_metrics,
     attach_evidence_units,
@@ -176,7 +176,7 @@ class TestResearchBoundaryPlanning(unittest.TestCase):
         an external MCP server.  Calling it unbound would pass the scope
         string in the ``self`` slot, so build a real instance instead.
         """
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         return ResearchOrchestrator(
             session_store=None,
@@ -188,7 +188,7 @@ class TestResearchBoundaryPlanning(unittest.TestCase):
         )
 
     def test_public_scope_has_a_dedicated_boundary_worker(self):
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         specs = self._orchestrator()._worker_specs("public")
         self.assertEqual([spec.role for spec in specs], ["public", "boundary"])
@@ -201,7 +201,7 @@ class TestResearchBoundaryPlanning(unittest.TestCase):
         self.assertIn("主动核查反例、负面结果或适用边界", plan["completion_criteria"])
 
     def test_only_the_public_worker_may_reach_an_external_mcp_server(self):
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         orchestrator = ResearchOrchestrator(
             session_store=None,
@@ -218,7 +218,7 @@ class TestResearchBoundaryPlanning(unittest.TestCase):
         self.assertNotIn("mcp__arxiv__search", specs["boundary"].allowed_tools)
 
     def test_renumber_keeps_boundary_evidence_inside_prompt_cap(self):
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         cards = [
             {
@@ -239,12 +239,12 @@ class TestPhaseBoundaryAndCitationRules(unittest.TestCase):
 
     @staticmethod
     def _orchestrator():
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         return object.__new__(ResearchOrchestrator)
 
     def test_every_stage_input_carries_its_own_boundary(self):
-        from research_orchestrator import PHASE_BOUNDARY, ResearchOrchestrator
+        from agent.research.orchestrator import PHASE_BOUNDARY, ResearchOrchestrator
 
         spec = TestResearchBoundaryPlanning._orchestrator()._worker_specs("local")[0]
         worker = ResearchOrchestrator._worker_input("q", {"subtasks": []}, spec)
@@ -263,7 +263,7 @@ class TestPhaseBoundaryAndCitationRules(unittest.TestCase):
         )
 
     def test_synthesis_carries_the_citation_existence_iron_rule(self):
-        from research_orchestrator import CITATION_EMISSION_RULE, CITATION_EXISTENCE_RULE
+        from agent.research.orchestrator import CITATION_EMISSION_RULE, CITATION_EXISTENCE_RULE
 
         evidence = [{
             "id": "E1", "source": "s", "source_type": "query_papers",
@@ -275,7 +275,7 @@ class TestPhaseBoundaryAndCitationRules(unittest.TestCase):
         self.assertIn("counts as FAIL", prompt)
 
     def test_render_answer_strips_the_hidden_layer_and_reports_audit(self):
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         evidence = [{"id": "E1", "source": "s", "researcher": "local", "source_type": "query_papers"}]
         report = "时延下降 [E1] <!--ref:E1--><!--anchor:page:7-->"

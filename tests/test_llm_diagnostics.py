@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import requests
 
-from llm_client import (
+from integrations.llm_client import (
     LLMClient, LLMCircuitOpenError, LLMQueueFullError,
     LLMRequestFailedError, LLMRequestTimeoutError, RequestPolicy,
 )
@@ -41,13 +41,13 @@ class TestLLMDiagnostics(unittest.TestCase):
     def test_nonstream_read_timeout_policy_does_not_change_chat_defaults(self):
         client = LLMClient("test-key", "https://example.test", read_timeout_seconds=30)
         policy = RequestPolicy(deadline_seconds=120, read_timeout_seconds=90, max_retries=0)
-        with patch("llm_client.requests.post", return_value=Response()) as post:
+        with patch("integrations.llm_client.requests.post", return_value=Response()) as post:
             client.post({}, budget=client.new_request_budget(policy))
             self.assertEqual(post.call_args.kwargs["timeout"][1], 90)
             client.post({})
             self.assertEqual(post.call_args.kwargs["timeout"][1], 30)
         short = client.new_request_budget(RequestPolicy(deadline_seconds=5, read_timeout_seconds=90))
-        with patch("llm_client.requests.post", return_value=Response()) as post:
+        with patch("integrations.llm_client.requests.post", return_value=Response()) as post:
             client.post({}, budget=short)
             self.assertLessEqual(post.call_args.kwargs["timeout"][1], 5)
 
@@ -55,7 +55,7 @@ class TestLLMDiagnostics(unittest.TestCase):
         client = LLMClient("sk-private-key", "https://private.example/with-secret", max_retries=2)
         response = Response(401, headers={"X-Request-ID": "req-401-safe", "Authorization": "Bearer secret"},
                             text="private upstream body and sk-private-key")
-        with patch("llm_client.requests.post", return_value=response) as post:
+        with patch("integrations.llm_client.requests.post", return_value=response) as post:
             with self.assertRaises(LLMRequestFailedError) as raised:
                 client.post({"messages": [{"content": "private prompt"}]})
         details = raised.exception.error_details
@@ -73,7 +73,7 @@ class TestLLMDiagnostics(unittest.TestCase):
     def test_unavailable_retry_after_is_not_counted_as_an_executed_retry(self):
         client = LLMClient("test-key", "https://example.test", max_retries=2, request_deadline_seconds=1)
         response = Response(429, headers={"Retry-After": "120"})
-        with patch("llm_client.requests.post", return_value=response) as post:
+        with patch("integrations.llm_client.requests.post", return_value=response) as post:
             with self.assertRaises(LLMRequestFailedError) as raised:
                 client.post({})
         self.assertEqual(raised.exception.error_details["http_status"], 429)
@@ -83,10 +83,10 @@ class TestLLMDiagnostics(unittest.TestCase):
 
     def test_retry_exhaustion_reports_the_last_real_http_response(self):
         client = LLMClient("test-key", "https://example.test", max_retries=1)
-        with patch("llm_client.requests.post", side_effect=[
+        with patch("integrations.llm_client.requests.post", side_effect=[
             Response(500, headers={"request-id": "req-first"}),
             Response(503, headers={"request-id": "req-last"}),
-        ]), patch("llm_client.time.sleep"):
+        ]), patch("integrations.llm_client.time.sleep"):
             with self.assertRaises(LLMRequestFailedError) as raised:
                 client.post({})
         details = raised.exception.error_details
@@ -101,7 +101,7 @@ class TestLLMDiagnostics(unittest.TestCase):
         ):
             with self.subTest(code=code):
                 client = LLMClient("test-key", "https://example.test", max_retries=0)
-                with patch("llm_client.requests.post", side_effect=error):
+                with patch("integrations.llm_client.requests.post", side_effect=error):
                     with self.assertRaises(LLMRequestTimeoutError) as raised:
                         client.post({})
                 details = raised.exception.error_details
@@ -118,7 +118,7 @@ class TestLLMDiagnostics(unittest.TestCase):
                                    queue_size=queue_size, request_deadline_seconds=duration)
                 client._slots.acquire()
                 try:
-                    with patch("llm_client.requests.post") as post:
+                    with patch("integrations.llm_client.requests.post") as post:
                         with self.assertRaises((LLMQueueFullError, LLMRequestTimeoutError)) as raised:
                             client.post({})
                     details = raised.exception.error_details
@@ -132,7 +132,7 @@ class TestLLMDiagnostics(unittest.TestCase):
     def test_circuit_rejection_has_its_own_code_and_zero_attempts(self):
         client = LLMClient("test-key", "https://example.test", circuit_failure_threshold=1)
         client._circuit.record_failure()
-        with patch("llm_client.requests.post") as post:
+        with patch("integrations.llm_client.requests.post") as post:
             with self.assertRaises(LLMCircuitOpenError) as raised:
                 client.post({})
         self.assertEqual(raised.exception.error_details["code"], "LLM_CIRCUIT_OPEN")
@@ -144,13 +144,13 @@ class TestLLMDiagnostics(unittest.TestCase):
             with self.subTest(value=request_id):
                 client = LLMClient("sk-private-key", "https://example.test", max_retries=0)
                 response = Response(401, headers={"X-Request-ID": request_id, "X-Api-Key": "secret"})
-                with patch("llm_client.requests.post", return_value=response):
+                with patch("integrations.llm_client.requests.post", return_value=response):
                     with self.assertRaises(LLMRequestFailedError) as raised:
                         client.post({})
                 self.assertNotIn("request_id", raised.exception.error_details)
 
     def _graph(self, client, response):
-        from graph_builder import build_graph
+        from agent.graph import build_graph
         budget = client.new_request_budget()
         events = []
         tokens = []
@@ -171,7 +171,7 @@ class TestLLMDiagnostics(unittest.TestCase):
         response = Response(headers={"request-id": "req-stream"}, lines=lines)
         try:
             with patch.object(client, "new_request_budget", return_value=budget), \
-                 patch("llm_client.requests.post", return_value=response) as post:
+                 patch("integrations.llm_client.requests.post", return_value=response) as post:
                 with self.assertRaises(LLMRequestTimeoutError) as raised:
                     graph.invoke({"messages": [{"role": "user", "content": "private prompt"}], "metadata": {}},
                                  config={"configurable": {"thread_id": "deadline"}})
@@ -194,7 +194,7 @@ class TestLLMDiagnostics(unittest.TestCase):
         graph, _budget, events, tokens = self._graph(client, None)
         response = Response(lines=['data: {"choices":[{"delta":{"content":"已有内容"}}]}'])
         try:
-            with patch("llm_client.requests.post", return_value=response) as post:
+            with patch("integrations.llm_client.requests.post", return_value=response) as post:
                 result = graph.invoke({"messages": [{"role": "user", "content": "问题"}], "metadata": {}},
                                       config={"configurable": {"thread_id": "partial"}})
             self.assertIn("已有内容", result["messages"][-1]["content"])
@@ -216,7 +216,7 @@ class TestLLMDiagnostics(unittest.TestCase):
         ])
         try:
             with patch.object(client, "new_request_budget", return_value=budget), \
-                 patch("llm_client.requests.post", side_effect=[failed, recovered]):
+                 patch("integrations.llm_client.requests.post", side_effect=[failed, recovered]):
                 result = graph.invoke({"messages": [{"role": "user", "content": "问题"}], "metadata": {}},
                                       config={"configurable": {"thread_id": "recovered"}})
             self.assertEqual(result["messages"][-1]["content"], "完成")
@@ -237,14 +237,14 @@ class TestLLMDiagnostics(unittest.TestCase):
         return "data:" + json.dumps({"choices": [{"delta": delta, "finish_reason": reason}], "usage": usage})
 
     def _invoke_streams(self, responses, *, retries=2, verify=False, client=None, usage=None):
-        from graph_builder import build_graph
+        from agent.graph import build_graph
         client = client or LLMClient("test-key", "https://example.test", max_retries=retries, max_concurrency=1)
         events, tokens = [], []
         graph = build_graph(api_key="test-key", checkpoint_db=":memory:", enable_verify=verify,
                             llm_client=client, stream_callback=tokens.append,
                             token_usage=usage, event_callback=events.append)
         try:
-            with patch("llm_client.requests.post", side_effect=responses) as post:
+            with patch("integrations.llm_client.requests.post", side_effect=responses) as post:
                 result = graph.invoke({"messages": [{"role": "user", "content": "question"}], "metadata": {}},
                                       config={"configurable": {"thread_id": "recovery"}})
             self.assertTrue(client._slots.acquire(blocking=False))
@@ -327,7 +327,7 @@ class TestLLMDiagnostics(unittest.TestCase):
     def test_truncated_tool_arguments_are_discarded_before_execution(self):
         broken = {"index": 0, "id": "broken", "function": {"name": "list_papers", "arguments": '{"bad":'}}
         for reason in (None, "tool_calls"):
-            with patch("graph_builder.execute_tool") as execute:
+            with patch("agent.graph.execute_tool") as execute:
                 result, _, _, post = self._invoke_streams([
                     Response(lines=[self._chunk(tools=[broken], reasoning="old", reason=reason)]),
                     Response(lines=[self._chunk("complete", reason="stop"), "data: [DONE]"]),
@@ -338,7 +338,7 @@ class TestLLMDiagnostics(unittest.TestCase):
 
     def test_completed_tool_is_not_reexecuted_when_final_answer_replays(self):
         tool = {"index": 0, "id": "once", "function": {"name": "list_papers", "arguments": '{}'}}
-        with patch("graph_builder.execute_tool", return_value="saved tool evidence") as execute:
+        with patch("agent.graph.execute_tool", return_value="saved tool evidence") as execute:
             result, _, _, post = self._invoke_streams([
                 Response(lines=[self._chunk(tools=[tool], reason="tool_calls"), "data: [DONE]"]),
                 Response(lines=[self._chunk("unfinished answer")]),
@@ -349,7 +349,7 @@ class TestLLMDiagnostics(unittest.TestCase):
         self.assertEqual(post.call_args_list[1].kwargs["json"], post.call_args_list[2].kwargs["json"])
 
     def test_new_default_allows_healthy_output_past_old_45_second_cutoff(self):
-        from config import Config
+        from infra.config import Config
         self.assertEqual(Config().api_request_deadline_seconds, 180)
         client = LLMClient("test-key", "https://example.test")
         budget = client.new_request_budget()
@@ -393,7 +393,7 @@ class TestLLMDiagnostics(unittest.TestCase):
         self.assertNotIn("reasoning_content", result["messages"][-1])
 
     def test_real_http_connection_drop_recovers_with_the_same_request(self):
-        from graph_builder import build_graph
+        from agent.graph import build_graph
         bodies, tokens = [], []
         chunk = self._chunk
         class Handler(BaseHTTPRequestHandler):
@@ -442,8 +442,8 @@ class TestLLMDiagnostics(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_cancel_during_recovery_releases_slot_and_never_replays(self):
-        from cancellation import RequestCancelledError
-        from graph_builder import build_graph
+        from infra.cancellation import RequestCancelledError
+        from agent.graph import build_graph
         cancelled = threading.Event()
         client = LLMClient("test-key", "https://example.test", max_concurrency=1)
         response = Response(lines=[self._chunk("partial")])
@@ -454,7 +454,7 @@ class TestLLMDiagnostics(unittest.TestCase):
                             llm_client=client, stream_callback=lambda _token: None,
                             event_callback=event, cancel_event=cancelled)
         try:
-            with patch("llm_client.requests.post", return_value=response) as post:
+            with patch("integrations.llm_client.requests.post", return_value=response) as post:
                 with self.assertRaises(RequestCancelledError):
                     graph.invoke({"messages": [{"role": "user", "content": "question"}], "metadata": {}},
                                  config={"configurable": {"thread_id": "cancel-recovery"}})
@@ -466,14 +466,14 @@ class TestLLMDiagnostics(unittest.TestCase):
             graph.checkpointer.conn.close()
 
     def test_recovered_agent_run_persists_complete_answer_and_success(self):
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
         with tempfile.TemporaryDirectory() as tmp:
             agent = ResearchAgent(Config(deepseek_key="test-key", rag_enabled=False,
                                          data_dir=tmp, api_max_concurrency=1))
             session_id = agent.thread_id
             try:
-                with patch("llm_client.requests.post", side_effect=[
+                with patch("integrations.llm_client.requests.post", side_effect=[
                     Response(lines=[self._chunk("discarded draft")]),
                     Response(lines=[self._chunk("complete answer", reason="stop"), "data: [DONE]"]),
                 ]) as post:

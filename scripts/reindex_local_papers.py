@@ -14,18 +14,18 @@ if str(PROJECT_ROOT) not in sys.path:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
-from paper_artifacts import (
+from papers.artifacts import (
     attach_image_assets,
     build_document_map,
     remove_document_map,
     title_match_score,
     write_document_map,
 )
-from paper_quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
-from paper_relations import PaperRelationStore
-from paper_store import PaperStore
-from pdf_reader import PaperReader, extract_images
-from runtime_paths import RuntimePaths
+from papers.quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
+from papers.relations import PaperRelationStore
+from papers.store import PaperStore
+from papers.reader import PaperReader, extract_images
+from infra.runtime_paths import RuntimePaths
 from tools.read_pdf import resolve_paper_title
 
 # A title is the same paper above this score, even when a readable file name
@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     relation_store = PaperRelationStore(paths)
     # Passing the relation store lets delete_paper clear edges that were not
     # carried over; remap runs first so valid ones survive the new paper_id.
-    from config import Config
+    from infra.config import Config
     cfg = Config.load()
     store = PaperStore(
         persist_dir=str(paths.chroma_dir), relation_store=relation_store,
@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
                     str(pdf_path), max_pages=args.max_pages, output_dir=paths.images_dir,
                 )
                 attach_image_assets(parsed_document, images)
-                from pdf_ocr import attach_visual_assets
+                from papers.ocr import attach_visual_assets
                 attach_visual_assets(parsed_document, pdf_path, paths.images_dir)
             except Exception:
                 # A PDF can still have useful text and tables when image rendering fails.

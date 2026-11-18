@@ -40,9 +40,9 @@ from api.schemas import (
     WorkspaceSettingsUpdateRequest,
     WorkspaceUploadResponse,
 )
-from run_contract import bounded_timing_metrics, latest_error_details
-from workspace_uploads import UploadValidationError
-from paper_selections import referenced_message
+from runs.contract import bounded_timing_metrics, latest_error_details
+from api.workspace_uploads import UploadValidationError
+from papers.selections import referenced_message
 
 
 router = APIRouter(prefix="/api/v1")

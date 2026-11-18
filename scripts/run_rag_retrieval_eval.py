@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         ks = parse_ks(args.ks)
         if args.timeout_seconds <= 0:
             raise RagEvalError("timeout-seconds 必须大于 0")
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         persist_dir = None
         if args.data_dir:
@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             # Read the real reranker budget from config.  Leaving these at their
             # constructor defaults silently evaluates a different setup than the
             # one the service runs, which hides both cost and quality effects.
-            from config import Config
+            from infra.config import Config
 
             reranker_config = Config.load()
             options["reranker_candidate_limit"] = (
@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.collection:
             options["collection_name"] = args.collection
         if args.model:
-            from embeddings import build_embedder
+            from papers.embeddings import build_embedder
 
             options["embedder"] = build_embedder(
                 args.model, max_length=args.max_length, device="cpu",

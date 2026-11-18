@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from context_engine import prepare_model_context
-from tool_results import ToolResultStore, result_header
-from tool_runtime import ToolRuntime, ToolExecutionContext
+from agent.context import prepare_model_context
+from tools.results import ToolResultStore, result_header
+from tools.runtime import ToolRuntime, ToolExecutionContext
 
 
 class TestToolResults(unittest.TestCase):
@@ -24,9 +24,9 @@ class TestToolResults(unittest.TestCase):
             allowed_tool_names=allowed, research_scope=scope), executor=MagicMock(return_value=self.raw if raw is None else raw))
 
     def test_timeout_reason_survives_runtime_storage_and_live_projection(self):
-        from llm_client import LLMRequestTimeoutError
-        from tool_errors import failure_details
-        from run_contract import graph_activity_event
+        from integrations.llm_client import LLMRequestTimeoutError
+        from tools.errors import failure_details
+        from runs.contract import graph_activity_event
         from api.sse import public_sse_event
         details = {'code': 'LLM_RESPONSE_TIMEOUT', 'phase': 'response_headers', 'cause_type': 'ReadTimeout',
                    'elapsed_ms': 30995, 'deadline_ms': 60000, 'attempts': 1, 'retries_used': 0,
@@ -52,7 +52,7 @@ class TestToolResults(unittest.TestCase):
         self.assertIn('不能据此断言原文不存在', reread)
 
     def test_unknown_and_legacy_failures_do_not_invent_transport_diagnostics(self):
-        from tool_errors import failure_details
+        from tools.errors import failure_details
         runtime = self.runtime()
         runtime._executor.side_effect = ValueError('PRIVATE prompt and key')
         result = runtime.execute('read_pdf', {})
@@ -70,9 +70,9 @@ class TestToolResults(unittest.TestCase):
         self.assertLess(len(forged.execute('read_pdf', {})), 1200)
 
     def test_http_retry_classification_and_failure_compaction_are_conservative(self):
-        from llm_client import LLMRequestFailedError
-        from tool_errors import failure_from_exception, failure_details
-        from context_engine import _slim_old_message, _archive_context
+        from integrations.llm_client import LLMRequestFailedError
+        from tools.errors import failure_from_exception, failure_details
+        from agent.context import _slim_old_message, _archive_context
         for status, retry in ((401, False), (403, False), (400, False), (429, True), (503, True)):
             failure = failure_from_exception(LLMRequestFailedError('PRIVATE', error_details={'code': 'LLM_HTTP_ERROR', 'http_status': status}))
             self.assertIs(failure_details(failure)['retryable'], retry)
@@ -83,9 +83,9 @@ class TestToolResults(unittest.TestCase):
     def test_image_failures_preserve_reason_close_response_and_never_cache_invalid_output(self):
         import os
         from tools.describe import handle_describe_image
-        from tool_errors import failure_details
-        from llm_client import LLMRequestTimeoutError
-        from cancellation import RequestCancelledError
+        from tools.errors import failure_details
+        from integrations.llm_client import LLMRequestTimeoutError
+        from infra.cancellation import RequestCancelledError
         root = Path(self.tmp.name)
         images = root / 'derived' / 'images'
         images.mkdir(parents=True)
@@ -177,13 +177,13 @@ class TestToolResults(unittest.TestCase):
         self.assertIn('FINAL_WITNESS', self.runtime().execute('search_tool_result', {'result_id': result_id, 'query': 'FINAL_WITNESS'}))
 
     def test_helpers_are_available_to_restricted_workers_without_widening_sources(self):
-        from tool_catalog import get_tool_schemas
+        from tools.catalog import get_tool_schemas
         names = {x['function']['name'] for x in get_tool_schemas({'query_papers'})}
         self.assertEqual(names, {'query_papers', 'list_tool_results', 'read_tool_result', 'search_tool_result'})
         self.assertEqual(get_tool_schemas(set()), [])
 
     def test_all_existing_tool_limits_preserve_full_source(self):
-        from tool_catalog import get_tool_definition
+        from tools.catalog import get_tool_definition
         for name in ('read_pdf', 'query_papers', 'describe_image', 'search_papers'):
             runtime, view, result_id = self.saved(self.runtime(), name)
             self.assertLessEqual(len(view), get_tool_definition(name).result_limit)
@@ -215,7 +215,7 @@ class TestToolResults(unittest.TestCase):
             self.assertIn('FINAL_WITNESS', steered.messages[-2]['content'])
 
     def test_legacy_truncated_message_never_claims_full_original_is_preserved(self):
-        from context_engine import _slim_old_message
+        from agent.context import _slim_old_message
         result = _slim_old_message({'role': 'tool', 'content': 'old ' * 2000 + '截断至 12000'})
         self.assertIn('旧版', result['content'])
         self.assertNotIn('完整原文仍在', result['content'])
@@ -262,7 +262,7 @@ class TestToolResults(unittest.TestCase):
         self.assertTrue(result.endswith('[]'))
 
     def test_deleting_session_removes_results_and_keeps_other_sessions(self):
-        from session_store import SessionStore
+        from sessions.store import SessionStore
         sessions = SessionStore(self.db)
         try:
             a = sessions.create(title='A')['thread_id']
@@ -284,7 +284,7 @@ class TestToolResults(unittest.TestCase):
         self.assertNotIn(result_id, json.dumps(events))
 
     def test_worker_result_belongs_to_parent_session_and_keeps_scope(self):
-        from session_store import SessionStore
+        from sessions.store import SessionStore
         sessions = SessionStore(self.db)
         try:
             parent = sessions.create(title='Parent')['thread_id']
@@ -302,7 +302,7 @@ class TestToolResults(unittest.TestCase):
             sessions.close()
 
     def test_research_cards_preserve_result_reference_without_mistaking_header_for_source(self):
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
         runtime, page, result_id = self.saved(self.runtime(raw='[Original Paper · p.4] Native evidence.\n' * 300))
         search = runtime.execute('search_tool_result', {'result_id': result_id, 'query': 'Native evidence'})
         messages = []
@@ -350,8 +350,8 @@ class TestToolResults(unittest.TestCase):
             self.assertIn('"total_results": 1', listing)
 
     def test_graph_can_recover_saved_tail_after_restart_and_history_compaction(self):
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
         _, old, result_id = self.saved()
         calls = []
         def model_request(*args, **kwargs):
@@ -383,7 +383,7 @@ class TestToolResults(unittest.TestCase):
                     {'role': 'tool', 'tool_call_id': 'old', 'content': old}]
         messages.extend({'role': 'user' if i % 2 == 0 else 'assistant', 'content': '历史' * 1200} for i in range(100))
         messages.append({'role': 'user', 'content': '核对刚才论文的最后一行'})
-        with patch('llm_client.requests.post', side_effect=model_request):
+        with patch('integrations.llm_client.requests.post', side_effect=model_request):
             app = build_graph(api_key='test', checkpoint_db=self.db, enable_verify=False,
                 allowed_tool_names={'query_papers'}, llm_client=LLMClient('test', 'https://example.test/chat', max_retries=0),
                 tool_context=ToolExecutionContext(session_id='a', result_db=self.db, allowed_tool_names=frozenset({'query_papers'})))

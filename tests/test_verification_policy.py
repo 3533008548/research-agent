@@ -2,9 +2,9 @@
 import unittest
 from unittest.mock import patch
 
-from graph_builder import build_graph, merge_messages, sanitize_model_messages
-from llm_client import LLMClient
-from verification import classify_review, verification_prompt
+from agent.graph import build_graph, merge_messages, sanitize_model_messages
+from integrations.llm_client import LLMClient
+from agent.verification import classify_review, verification_prompt
 
 
 class Response:
@@ -70,7 +70,7 @@ class TestVerificationPolicy(unittest.TestCase):
         replies = [Response("[严重] 回答 x=3 与原文 x=2 矛盾。[需修正]\n\n[轻微] 文风冗长。[需修正]"),
                    Response("已修正的回答正文。" * 30 + "x=2。"),
                    Response("[严重] 仍有矛盾，需对照原文确认。[需修正]")]
-        with patch("llm_client.requests.post", side_effect=replies) as post:
+        with patch("integrations.llm_client.requests.post", side_effect=replies) as post:
             # Begin at the real verifier node, then follow its real feedback through the graph.
             update = app.get_graph().nodes["verify"].data.invoke(state)
             self.assertNotIn("文风冗长", update["metadata"]["verify_feedback"])
@@ -90,7 +90,7 @@ class TestVerificationPolicy(unittest.TestCase):
     def test_minor_only_finishes_without_calling_writer(self):
         events = []
         app = self.app(events)
-        with patch("llm_client.requests.post", return_value=Response("[轻微] 表述有待完善。[需修正]")) as post:
+        with patch("integrations.llm_client.requests.post", return_value=Response("[轻微] 表述有待完善。[需修正]")) as post:
             result = app.get_graph().nodes["verify"].data.invoke(self.state())
         self.assertEqual(post.call_count, 1)
         self.assertFalse(result.get("metadata", {}).get("verify_feedback"))
@@ -100,7 +100,7 @@ class TestVerificationPolicy(unittest.TestCase):
     def test_truncated_ok_is_inconclusive(self):
         events = []
         app = self.app(events)
-        with patch("llm_client.requests.post", return_value=Response("OK", "length")):
+        with patch("integrations.llm_client.requests.post", return_value=Response("OK", "length")):
             result = app.get_graph().nodes["verify"].data.invoke(self.state())
         self.assertIn("未返回可用结论", result["messages"][-1]["content"])
         self.assertEqual(events[-1]["type"], "verify_inconclusive")
@@ -110,7 +110,7 @@ class TestVerificationPolicy(unittest.TestCase):
         app = self.app(events)
         state = self.state()
         state["messages"][-1]["content"] = "超长回答" * 7000
-        with patch("llm_client.requests.post", return_value=Response("OK")):
+        with patch("integrations.llm_client.requests.post", return_value=Response("OK")):
             result = app.get_graph().nodes["verify"].data.invoke(state)
         self.assertIn("只核对了部分内容", result["messages"][-1]["content"])
         self.assertEqual(events[-1]["type"], "verify_inconclusive")
@@ -130,7 +130,7 @@ class TestVerificationPolicy(unittest.TestCase):
                           llm_client=LLMClient("test", "https://example.test/chat"))
         self.addCleanup(app.checkpointer.conn.close)
         draft, repaired = "初稿 x=3。" * 30, "修正稿 x=2。" * 30
-        with patch("llm_client.requests.post", side_effect=[Stream(draft), Response("[严重] x=3 与原文 x=2 矛盾。[需修正]"), Stream(repaired), Response("OK")]):
+        with patch("integrations.llm_client.requests.post", side_effect=[Stream(draft), Response("[严重] x=3 与原文 x=2 矛盾。[需修正]"), Stream(repaired), Response("OK")]):
             result = app.invoke(self.state(), config={"configurable": {"thread_id": "stream-repair"}})
         self.assertEqual("".join(streamed), draft)
         self.assertEqual(result["messages"][-1]["content"], repaired)
@@ -142,14 +142,14 @@ class TestVerificationPolicy(unittest.TestCase):
         state = self.state()
         state["messages"] += [{"role": "user", "content": "只说明安装方法"},
                               {"role": "assistant", "content": "安装说明。" * 40}]
-        with patch("llm_client.requests.post") as post:
+        with patch("integrations.llm_client.requests.post") as post:
             app.get_graph().nodes["verify"].data.invoke(state)
         post.assert_not_called()
 
     def test_verifier_sees_earlier_image_failure_and_later_result_even_with_pdf_hits(self):
         import json
-        from tool_errors import ToolFailure
-        from verification import verification_tool_inputs
+        from tools.errors import ToolFailure
+        from agent.verification import verification_tool_inputs
         app = self.app([])
         messages = [{'role': 'user', 'content': '原文图中有哪些结构？'}]
         def call(identifier, name, args, text):
@@ -165,7 +165,7 @@ class TestVerificationPolicy(unittest.TestCase):
         self.assertEqual(failures[0].split(']')[0], evidence[-1].split(']')[0])
         self.assertNotEqual(evidence[-2].split(']')[0], evidence[-1].split(']')[0])
         messages.append({'role': 'assistant', 'content': '图中已经核实有两个节点。'})
-        with patch('llm_client.requests.post', return_value=Response('OK')) as post:
+        with patch('integrations.llm_client.requests.post', return_value=Response('OK')) as post:
             app.get_graph().nodes['verify'].data.invoke({'messages': messages, 'metadata': {}})
         prompt = post.call_args.kwargs['json']['messages'][0]['content']
         self.assertIn('<tool_failures>', prompt)
@@ -177,19 +177,19 @@ class TestVerificationPolicy(unittest.TestCase):
         self.assertIn('never source evidence', prompt)
 
     def test_only_failure_still_reaches_review_and_does_not_become_factual_evidence(self):
-        from tool_errors import ToolFailure
+        from tools.errors import ToolFailure
         app = self.app([])
         messages = [{'role': 'user', 'content': '你觉得图里的结构怎么样？'},
                     {'role': 'tool', 'content': ToolFailure(code='TOOL_SOURCE_NOT_FOUND', phase='resolve_source', retryable=False)},
                     {'role': 'assistant', 'content': '我已经看图核实过了。'}]
-        with patch('llm_client.requests.post', return_value=Response('OK')) as post:
+        with patch('integrations.llm_client.requests.post', return_value=Response('OK')) as post:
             app.get_graph().nodes['verify'].data.invoke({'messages': messages, 'metadata': {}})
         prompt = post.call_args.kwargs['json']['messages'][0]['content']
         self.assertNotIn('TOOL_SOURCE_NOT_FOUND', prompt.split('<tool_evidence>')[1].split('</tool_evidence>')[0])
         self.assertIn('TOOL_SOURCE_NOT_FOUND', prompt.split('<tool_failures>')[1])
 
     def test_failure_summary_is_bounded_and_discloses_omissions(self):
-        from verification import verification_tool_inputs
+        from agent.verification import verification_tool_inputs
         messages = [{'role': 'tool', 'content': '❌ 原始工具失败 ' + 'a' * 5000} for _ in range(20)]
         evidence, failures = verification_tool_inputs(messages)
         self.assertFalse(evidence)
@@ -215,7 +215,7 @@ class TestVerificationPolicy(unittest.TestCase):
 
     def test_repair_prompt_requires_full_answer_to_current_user(self):
         app = self.app([])
-        with patch("llm_client.requests.post", return_value=Response("[严重] x=3 与 x=2 冲突。[需修正]")):
+        with patch("integrations.llm_client.requests.post", return_value=Response("[严重] x=3 与 x=2 冲突。[需修正]")):
             result = app.get_graph().nodes["verify"].data.invoke(self.state())
         feedback = result["metadata"]["verify_feedback"]
         self.assertIn("完整最终答复", feedback)
@@ -226,7 +226,7 @@ class TestVerificationPolicy(unittest.TestCase):
         draft = "初稿声称 x=3。" * 30
         final = "入库成功。以下为完整摘要，原文给出的 x=2。" * 15
         config = {"configurable": {"thread_id": "two-turns"}}
-        with patch("llm_client.requests.post", side_effect=[Response(draft),
+        with patch("integrations.llm_client.requests.post", side_effect=[Response(draft),
                    Response("[严重] x=3 与 x=2 矛盾。[需修正]"), Response(final), Response("OK"),
                    Response("已完成本轮操作。")]) as post:
             app.invoke(self.state(), config=config)

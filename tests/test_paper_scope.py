@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 
-from tools.search import _resolve_scope
+from papers.scope import resolve_scope
 
 
 class _Store:
@@ -22,46 +25,59 @@ PAPERS = [
 
 
 class TestScopeResolution(unittest.TestCase):
+    def test_scope_and_catalog_do_not_initialize_tool_handlers(self):
+        subprocess.run(
+            [sys.executable, "-c", (
+                "import sys, papers.scope, tools.catalog\n"
+                "assert 'tools.dispatch' not in sys.modules\n"
+                "from tools import execute_tool\n"
+                "from tools.dispatch import execute_tool as dispatch\n"
+                "assert execute_tool is dispatch"
+            )],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+        )
+
     def test_no_argument_means_unscoped(self):
-        scope, error = _resolve_scope(_Store(PAPERS), None)
+        scope, error = resolve_scope(_Store(PAPERS), None)
         self.assertIsNone(scope)
         self.assertEqual(error, "")
 
     def test_empty_values_are_treated_as_unscoped(self):
         for raw in ("", "   ", [], ["", "  "]):
-            scope, error = _resolve_scope(_Store(PAPERS), raw)
+            scope, error = resolve_scope(_Store(PAPERS), raw)
             self.assertIsNone(scope, raw)
             self.assertEqual(error, "", raw)
 
     def test_paper_id_resolves_directly(self):
-        scope, error = _resolve_scope(_Store(PAPERS), "paper-aaa")
+        scope, error = resolve_scope(_Store(PAPERS), "paper-aaa")
         self.assertEqual(scope, ["paper-aaa"])
         self.assertEqual(error, "")
 
     def test_title_resolves_with_punctuation_differences(self):
-        scope, error = _resolve_scope(_Store(PAPERS), "Deep RL for TSN A Survey")
+        scope, error = resolve_scope(_Store(PAPERS), "Deep RL for TSN A Survey")
         self.assertEqual(scope, ["paper-aaa"])
         self.assertEqual(error, "")
 
     def test_multiple_papers_resolve_for_comparison_questions(self):
-        scope, error = _resolve_scope(_Store(PAPERS), ["paper-aaa", "Attention Is All You Need"])
+        scope, error = resolve_scope(_Store(PAPERS), ["paper-aaa", "Attention Is All You Need"])
         self.assertEqual(scope, ["paper-aaa", "paper-bbb"])
         self.assertEqual(error, "")
 
     def test_duplicates_collapse(self):
-        scope, _error = _resolve_scope(_Store(PAPERS), ["paper-aaa", "Deep RL for TSN: A Survey"])
+        scope, _error = resolve_scope(_Store(PAPERS), ["paper-aaa", "Deep RL for TSN: A Survey"])
         self.assertEqual(scope, ["paper-aaa"])
 
     def test_unresolvable_scope_is_an_error_not_a_silent_widening(self):
         # Silently falling back to an unscoped search is exactly the pollution
         # scoping exists to prevent, so it must fail loudly instead.
-        scope, error = _resolve_scope(_Store(PAPERS), "Quantum Error Correction")
+        scope, error = resolve_scope(_Store(PAPERS), "Quantum Error Correction")
         self.assertIsNone(scope)
         self.assertIn("无法限定到论文", error)
         self.assertIn("paper-aaa", error)
 
     def test_empty_library_reports_instead_of_returning_empty_scope(self):
-        scope, error = _resolve_scope(_Store([]), "anything")
+        scope, error = resolve_scope(_Store([]), "anything")
         self.assertIsNone(scope)
         self.assertIn("论文库为空", error)
 

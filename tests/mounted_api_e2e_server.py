@@ -26,9 +26,9 @@ import uvicorn
 from api.app import create_app, mount_react_frontend
 from api.run_dispatcher import RunDispatcher
 from api.redis_runs import RedisChatRunBroker, RedisChatRunManager, RedisChatRunWorker, RedisResearchRunBroker, RedisResearchRunManager
-from config import Config
-from llm_client import LLMRequestFailedError, LLMRequestTimeoutError
-from session_store import SessionStore
+from infra.config import Config
+from integrations.llm_client import LLMRequestFailedError, LLMRequestTimeoutError
+from sessions.store import SessionStore
 
 
 class _E2EAgent:
@@ -86,8 +86,8 @@ class _E2EAgent:
         history = self._histories.setdefault(session_id, [])
         history.append({"role": "user", "content": message})
         if message == "__verify_repair_limit__":
-            from research_agent import ResearchAgent
-            from run_contract import graph_activity_event
+            from agent.service import ResearchAgent
+            from runs.contract import graph_activity_event
             events = [
                 {"type": "verify_request_started", "verification_round": 1},
                 {"type": "verify_revision_requested", "verification_round": 1},
@@ -103,8 +103,8 @@ class _E2EAgent:
             self._traces[session_id] = {"outcome": "success"}
             return answer
         if message == "__verify_timeout__":
-            from research_agent import ResearchAgent
-            from run_contract import graph_activity_event
+            from agent.service import ResearchAgent
+            from runs.contract import graph_activity_event
             failure = {"type": "verify_request_failed", "error_type": "LLMRequestTimeoutError", "duration_ms": 45010,
                 "error_details": {"code": "LLM_RESPONSE_TIMEOUT", "phase": "response_headers", "elapsed_ms": 45010,
                     "deadline_ms": 45000, "attempts": 1, "retries_used": 0, "response_body": "PRIVATE_DIAGNOSTIC"}}
@@ -116,9 +116,9 @@ class _E2EAgent:
             self._traces[session_id] = {"outcome": "success"}
             return answer
         if message in {"__tools__", "__vision_timeout__"}:
-            from research_agent import ResearchAgent
-            from run_contract import graph_activity_event
-            from tool_runtime import ToolExecutionContext, ToolRuntime
+            from agent.service import ResearchAgent
+            from runs.contract import graph_activity_event
+            from tools.runtime import ToolExecutionContext, ToolRuntime
             def emit(kind, **details):
                 event = {"type": kind, **details}
                 ResearchAgent._persist_chat_event(self, session_id, _kwargs["run_id"], event, 0)

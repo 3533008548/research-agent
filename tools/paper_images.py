@@ -1,6 +1,6 @@
 """Model-facing lookup for exported figures and their source-page fallbacks."""
-from paper_images import paper_image_catalog, format_image_catalog
-from runtime_paths import get_runtime_paths
+from papers.images import paper_image_catalog, format_image_catalog
+from infra.runtime_paths import get_runtime_paths
 
 
 def handle_list_paper_images(args: dict, *, paper_store=None, **_kwargs) -> str:

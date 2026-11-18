@@ -7,11 +7,11 @@ from unittest.mock import patch
 import fitz
 from pydantic import ValidationError
 
-from graph_builder import build_graph
-from library_store import LibraryStore
-from llm_client import LLMClient
-from paper_selections import PaperSelection, element_citations, referenced_message, region_preview
-from runtime_paths import RuntimePaths
+from agent.graph import build_graph
+from papers.library import LibraryStore
+from integrations.llm_client import LLMClient
+from papers.selections import PaperSelection, element_citations, referenced_message, region_preview
+from infra.runtime_paths import RuntimePaths
 from tests.test_verification_policy import Response
 
 
@@ -38,7 +38,7 @@ class PaperSelectionTests(unittest.TestCase):
         config = {"configurable": {"thread_id": "selected-region"}}
         for reference, model in ((area, "vision-test"), (text, "text-test")):
             question = referenced_message("我的问题", [reference], self.library)
-            with patch("llm_client.requests.post", return_value=Response("答复 [S1]")) as post:
+            with patch("integrations.llm_client.requests.post", return_value=Response("答复 [S1]")) as post:
                 state = self.graph.invoke({"messages": [{"role": "user", "content": question}]}, config=config)
             payload = post.call_args.kwargs["json"]
             self.assertEqual(payload["model"], model)
@@ -61,7 +61,7 @@ class PaperSelectionTests(unittest.TestCase):
             {"role": "tool", "content": "📚 Related evidence.", "tool_call_id": "t"},
             {"role": "assistant", "content": "原图展示的颜色。" * 20},
         ]}
-        with patch("llm_client.requests.post", return_value=Response("OK")) as post:
+        with patch("integrations.llm_client.requests.post", return_value=Response("OK")) as post:
             self.graph.get_graph().nodes["verify"].data.invoke(state)
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["model"], "vision-test")

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from api.redis_runs import _safe_status_event
 from api.sse import format_sse, public_sse_event
-from run_contract import (
+from runs.contract import (
     TERMINAL_STAGE_STATUSES,
     bounded_timing_metrics,
     safe_metrics,
@@ -90,7 +90,7 @@ class DailyStageClockTests(unittest.TestCase):
     """The clock itself, exercised without a scheduler or any network."""
 
     def _orchestrator(self):
-        from daily_orchestrator import DailyResearchOrchestrator
+        from agent.daily.orchestrator import DailyResearchOrchestrator
 
         return DailyResearchOrchestrator(scheduler=None, llm_client=None)
 
@@ -146,9 +146,9 @@ class DailyRunTimelineTests(unittest.TestCase):
         import json
         from unittest.mock import patch
 
-        from daily_orchestrator import DailyResearchOrchestrator
+        from agent.daily.orchestrator import DailyResearchOrchestrator
         from evals.runtime_fakes import FixtureSourceRouter
-        from scheduler import Scheduler
+        from agent.daily.scheduler import Scheduler
 
         fixtures = Path(__file__).resolve().parents[1] / "evals" / "fixtures" / "providers"
         if not fixtures.is_dir():
@@ -164,7 +164,7 @@ class DailyRunTimelineTests(unittest.TestCase):
                     max_keyword_concurrency=1, max_results_per_keyword=1,
                 )
                 seen: list[dict] = []
-                with patch("daily_orchestrator.requests.get", side_effect=router.get):
+                with patch("agent.daily.orchestrator.requests.get", side_effect=router.get):
                     result = orchestrator.run("daily", on_progress=seen.append)
             finally:
                 store.close()
@@ -186,7 +186,7 @@ class DailyRunTimelineTests(unittest.TestCase):
                     scheduler=store, llm_client=None, model="",
                     max_keyword_concurrency=1, max_results_per_keyword=1,
                 )
-                with patch("daily_orchestrator.requests.get", side_effect=router.get):
+                with patch("agent.daily.orchestrator.requests.get", side_effect=router.get):
                     persisted_run = orchestrator.run("daily")
                 rows = store.get_daily_agent_events(persisted_run.run_id)
             finally:
@@ -212,9 +212,9 @@ class DailyTimelineProjectionTests(unittest.TestCase):
     def _daily_run_with_events(self, tmp: str, failed_sources=()):
         from unittest.mock import patch
 
-        from daily_orchestrator import DailyResearchOrchestrator
+        from agent.daily.orchestrator import DailyResearchOrchestrator
         from evals.runtime_fakes import FixtureSourceRouter
-        from scheduler import Scheduler
+        from agent.daily.scheduler import Scheduler
 
         fixtures = Path(__file__).resolve().parents[1] / "evals" / "fixtures" / "providers"
         store = Scheduler(str(Path(tmp) / "daily.db"))
@@ -224,7 +224,7 @@ class DailyTimelineProjectionTests(unittest.TestCase):
             scheduler=store, llm_client=None, model="",
             max_keyword_concurrency=1, max_results_per_keyword=1,
         )
-        with patch("daily_orchestrator.requests.get", side_effect=router.get):
+        with patch("agent.daily.orchestrator.requests.get", side_effect=router.get):
             orchestrator.run("daily")
         # The store stays open on purpose: the caller asserts against the same
         # database the run wrote to, which is the point of the test.
@@ -271,7 +271,7 @@ class DailyTimelineProjectionTests(unittest.TestCase):
 
     def test_unknown_run_yields_no_events_rather_than_raising(self):
         from api.routes import _daily_timeline_events
-        from scheduler import Scheduler
+        from agent.daily.scheduler import Scheduler
 
         with tempfile.TemporaryDirectory() as tmp:
             store = Scheduler(str(Path(tmp) / "daily.db"))

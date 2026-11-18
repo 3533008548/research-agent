@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcp_client import ExternalToolRegistry, McpServerSpec
+from integrations.mcp_client import ExternalToolRegistry, McpServerSpec
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -75,7 +75,7 @@ class McpClientEndToEndTests(unittest.TestCase):
             self.assertTrue(tool.qualified_name.startswith("mcp__self__"))
 
     def test_the_tool_is_visible_to_the_model(self):
-        from tool_catalog import get_tool_schemas
+        from tools.catalog import get_tool_schemas
 
         names = {schema["function"]["name"] for schema in get_tool_schemas()}
         self.assertIn("mcp__self__retrieval_metrics", names)

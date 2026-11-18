@@ -4,13 +4,13 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
-from conversation_reference import (
+from sessions.references import (
     observe_assistant_message,
     observe_user_message,
     render_reference_context,
 )
-from context_engine import prepare_model_context
-from session_store import SessionStore
+from agent.context import prepare_model_context
+from sessions.store import SessionStore
 
 
 class TestConversationReference(unittest.TestCase):
@@ -92,8 +92,8 @@ class TestConversationReference(unittest.TestCase):
                 store.close()
 
     def test_agent_injects_persisted_resolution_before_model_call(self):
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         class _FakeApp:
             state = None
@@ -118,8 +118,8 @@ class TestConversationReference(unittest.TestCase):
                 agent.sessions.close()
 
     def test_agent_replays_relevant_prior_visible_message_only_for_reference_turn(self):
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         class _FakeApp:
             state = None
@@ -142,8 +142,8 @@ class TestConversationReference(unittest.TestCase):
                 agent.sessions.close()
 
     def test_deep_research_receives_resolved_reference_context(self):
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         captured = {}
 
@@ -171,7 +171,7 @@ class TestConversationReference(unittest.TestCase):
             try:
                 state, _ = observe_user_message({}, "请比较论文A、论文B和论文C。")
                 agent.sessions.save_reference_state(agent.thread_id, state)
-                with patch("research_agent.ResearchOrchestrator", _FakeOrchestrator), \
+                with patch("agent.service.ResearchOrchestrator", _FakeOrchestrator), \
                      patch.object(agent, "_build_app", return_value=_FakeApp()):
                     self.assertEqual(agent.research("按第二个方向继续研究"), "研究报告")
                 self.assertEqual(captured["query"], "按第二个方向继续研究")
@@ -211,8 +211,8 @@ class TestModelContextEngine(unittest.TestCase):
         self.assertLess(prepared.prepared_tokens, prepared.original_tokens)
 
     def test_graph_uses_compacted_view_without_rewriting_state_messages(self):
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
 
         class _Response:
             status_code = 200
@@ -238,7 +238,7 @@ class TestModelContextEngine(unittest.TestCase):
             for index in range(28)
         ]
         client = LLMClient("test-key", "https://example.test/chat", max_retries=0)
-        with patch("llm_client.requests.post", return_value=_Response()) as post:
+        with patch("integrations.llm_client.requests.post", return_value=_Response()) as post:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
                 allowed_tool_names=set(),

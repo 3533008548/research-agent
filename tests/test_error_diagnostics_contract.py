@@ -17,8 +17,8 @@ from unittest.mock import patch
 
 from api.redis_runs import _safe_status_event
 from api.sse import format_sse, public_sse_event
-from run_contract import safe_error_details
-from session_store import SessionStore
+from runs.contract import safe_error_details
+from sessions.store import SessionStore
 
 
 PRIVATE_TEXT = "PRIVATE_PROMPT_AND_AUTHORIZATION"
@@ -199,7 +199,7 @@ class DurableErrorDetailsTests(unittest.TestCase):
 
     def test_in_process_manager_exception_persists_and_streams_safe_details(self) -> None:
         from api.run_manager import ChatRunManager
-        from llm_client import LLMRequestFailedError
+        from integrations.llm_client import LLMRequestFailedError
 
         def fail_model(*_args, **_kwargs):
             raise LLMRequestFailedError("Human-readable failure", error_details=contaminated_details())
@@ -274,8 +274,8 @@ class PublicErrorDetailsTests(unittest.TestCase):
 
 class ResearchAgentPartialFailureTests(unittest.TestCase):
     def test_failed_final_model_stream_keeps_partial_answer_and_durable_diagnostics(self) -> None:
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         details = {
             "code": "LLM_STREAM_TIMEOUT",
@@ -312,7 +312,7 @@ class ResearchAgentPartialFailureTests(unittest.TestCase):
             agent = ResearchAgent(Config(deepseek_key="test-key", rag_enabled=False, data_dir=tmp))
             tokens: list[str] = []
             try:
-                with patch("research_agent.build_graph", autospec=True, side_effect=build_interrupted_graph):
+                with patch("agent.service.build_graph", autospec=True, side_effect=build_interrupted_graph):
                     answer = agent.step("分析这个问题", on_token=tokens.append)
                 self.assertEqual(answer, partial_answer)
                 self.assertEqual(tokens, ["已经收到的正文。"])

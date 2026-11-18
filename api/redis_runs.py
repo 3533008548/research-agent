@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from api.sse import format_sse
-from cancellation import RequestCancelledError
+from infra.cancellation import RequestCancelledError
 from papers.metrics import load_published as load_published_retrieval_metrics
 from papers.metrics import publish as publish_retrieval_metrics
-from run_contract import bounded_timing_metrics, execution_metadata, safe_error_details, latest_error_details
+from runs.contract import bounded_timing_metrics, execution_metadata, safe_error_details, latest_error_details
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled", "partial_failed"}
@@ -739,7 +739,7 @@ class RedisResearchRunManager(_RedisRunStream):
     def __init__(self, agent, broker: RedisResearchRunBroker, *, persistent: bool = True) -> None:
         self.agent = agent
         self.broker = broker
-        from research_projects import ResearchProjects
+        from agent.research.projects import ResearchProjects
         self.projects = ResearchProjects(agent.sessions.db_path)
         self.persistent = persistent
 
@@ -902,7 +902,7 @@ class RedisResearchRunWorker(_RedisRunWorker):
 
     def _process(self, job: QueuedResearchRun) -> None:
         if job.job_id:
-            from autonomous_research import AutonomousResearch
+            from agent.research.autonomous import AutonomousResearch
             manager = self.project_manager
             task = AutonomousResearch(self.agent, manager.projects).execute(
                 job.job_id, getattr(self._execution_local, "cancel_event", None), check=self._check_execution)

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from api.sse import format_sse
-from run_contract import latest_error_details, safe_error_details
+from runs.contract import latest_error_details, safe_error_details
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}

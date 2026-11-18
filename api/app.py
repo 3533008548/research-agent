@@ -13,11 +13,11 @@ from fastapi.staticfiles import StaticFiles
 from api.auth import APIKeyAuthenticator
 from api.routes import router
 from api.run_manager import ChatRunManager
-from badcase_store import BadcaseStore
-from paper_relations import PaperRelationStore
-from scheduler import Scheduler
-from workspace_uploads import WorkspaceUploadStore
-from library_store import LibraryStore
+from runs.badcases import BadcaseStore
+from papers.relations import PaperRelationStore
+from agent.daily.scheduler import Scheduler
+from api.workspace_uploads import WorkspaceUploadStore
+from papers.library import LibraryStore
 from api.library_routes import router as library_router
 
 
@@ -29,7 +29,7 @@ def _default_badcase_store(agent) -> BadcaseStore:
     session_db = getattr(getattr(agent, "sessions", None), "db_path", "")
     if session_db:
         return BadcaseStore(str(Path(session_db).parent / "badcases.db"))
-    from runtime_paths import get_runtime_paths
+    from infra.runtime_paths import get_runtime_paths
     return BadcaseStore(str(get_runtime_paths().badcases_db))
 
 

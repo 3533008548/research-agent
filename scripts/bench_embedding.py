@@ -28,7 +28,7 @@ import time
 import numpy as np
 from chromadb.utils import embedding_functions
 
-from embeddings import MiniLMEmbedder
+from papers.embeddings import MiniLMEmbedder
 
 # The embedder paper_store.py actually uses.
 fn = MiniLMEmbedder()

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cancellation import RequestCancelledError
-from llm_client import RequestPolicy, RequestPriority
-from paper_artifacts import (
+from infra.cancellation import RequestCancelledError
+from integrations.llm_client import RequestPolicy, RequestPriority
+from papers.artifacts import (
     create_source_map,
     build_source_map_from_document,
     fallback_paper_card,
@@ -19,7 +19,7 @@ from paper_artifacts import (
     update_document_map_source_file,
     write_paper_artifact,
 )
-from runtime_paths import get_runtime_paths
+from infra.runtime_paths import get_runtime_paths
 
 
 def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:

@@ -1,23 +1,14 @@
 """Profile mutations must be exact, scoped, idempotent and truthful."""
 
-import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from user_profile import ProfileManager
-from tool_schemas import _raw_tool_schemas
-
-
-# The profile handlers have no third-party dependencies. Load the leaf module
-# directly so these persistence regressions also run without the PDF/RAG stack.
-_spec = importlib.util.spec_from_file_location(
-    "profile_handlers", Path(__file__).resolve().parents[1] / "tools" / "profile_tool.py",
-)
-_handlers = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_handlers)
+from sessions.profile import ProfileManager
+from tools.schemas import _raw_tool_schemas
+from tools import profile_tool as _handlers
 
 
 class TestUserProfile(unittest.TestCase):

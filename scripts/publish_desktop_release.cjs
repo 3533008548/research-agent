@@ -36,14 +36,14 @@ async function main() {
   console.log(`已验证 v${result.version}：安装包、SHA-512 和更新元数据。`);
   if (args.includes('--verify-only')) return;
   const run = (command, values) => execFileSync(command, values, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).trim();
-  if (run('git', ['status', '--porcelain'])) throw Error('请先提交代码和更新说明，再发布与提交对应的安装包。');
+  if (run('git', ['status', '--porcelain'])) throw Error('请先确认工作区干净，再发布与提交对应的安装包。');
   const commit = run('git', ['rev-parse', 'HEAD']);
   const notes = path.join(root, `desktop/releases/${result.version}.md`);
-  if (!fs.existsSync(notes)) throw Error(`缺少更新说明：${notes}`);
+  const noteArgs = fs.existsSync(notes) ? ['--notes-file', notes] : ['--generate-notes'];
   const tag = `v${result.version}`;
   // The release stays hidden until all three files have uploaded successfully.
   console.log(run('gh', ['release', 'create', tag, ...result.artifacts, '--repo', result.repository,
-    '--target', commit, '--title', `Research Assistant ${result.version}`, '--notes-file', notes, '--draft']));
+    '--target', commit, '--title', `Research Assistant ${result.version}`, ...noteArgs, '--draft']));
   if (args.includes('--publish')) {
     console.log(run('gh', ['release', 'edit', tag, '--repo', result.repository, '--draft=false', '--latest']));
     console.log('版本已发布，客户端可在设置中检查更新。');

@@ -18,15 +18,15 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from tool_catalog import (
+from tools.catalog import (
     ToolDefinition,
     clear_external_tools,
     get_tool_definition,
     get_tool_schemas,
     register_external_tools,
 )
-from tool_runtime import ToolExecutionContext, ToolRuntime
-from tool_errors import failure_details
+from tools.runtime import ToolExecutionContext, ToolRuntime
+from tools.errors import failure_details
 
 
 def _shutdown_loop(loop, thread) -> None:
@@ -99,8 +99,8 @@ class CatalogIntegrationTests(unittest.TestCase):
     def test_builtin_consistency_check_still_holds(self):
         # The catalog's own invariant is about *this* repository's tools; an
         # external server must not be able to weaken it.
-        from tools import _EXECUTABLE_TOOL_NAMES
-        from tool_catalog import TOOL_NAMES
+        from tools.dispatch import _EXECUTABLE_TOOL_NAMES
+        from tools.catalog import TOOL_NAMES
 
         self.assertEqual(TOOL_NAMES, _EXECUTABLE_TOOL_NAMES)
 
@@ -125,13 +125,13 @@ class DispatchTests(unittest.TestCase):
     def test_execute_tool_routes_to_the_external_handler(self):
         seen: list[dict] = []
         register_external_tools([_external_definition(handler=lambda args: seen.append(args) or "ok")])
-        from tools import execute_tool
+        from tools.dispatch import execute_tool
 
         self.assertEqual(execute_tool("mcp__demo__lookup", {"q": 1}), "ok")
         self.assertEqual(seen, [{"q": 1}])
 
     def test_unknown_tool_still_reports_unknown(self):
-        from tools import execute_tool
+        from tools.dispatch import execute_tool
 
         self.assertIn("未知工具", execute_tool("mcp__nope__x", {}))
 
@@ -151,7 +151,7 @@ class RuntimeInheritanceTests(unittest.TestCase):
         )])
         runtime = ToolRuntime(ToolExecutionContext(run_kind="research"))
         result = runtime.execute("mcp__demo__lookup", {})
-        from tool_results import result_header
+        from tools.results import result_header
         self.assertLessEqual(len(result), 200)
         meta = result_header(result)
         self.assertEqual(meta['total_chars'], 5000)
@@ -233,7 +233,7 @@ class RuntimeInheritanceTests(unittest.TestCase):
 
 class NamingTests(unittest.TestCase):
     def test_external_names_are_namespaced(self):
-        from mcp_client import EXTERNAL_TOOL_PREFIX, ExternalTool
+        from integrations.mcp_client import EXTERNAL_TOOL_PREFIX, ExternalTool
 
         tool = ExternalTool(
             server="arxiv", remote_name="search_papers",
@@ -275,7 +275,7 @@ class CircuitBreakerTests(unittest.TestCase):
         """
         import asyncio
 
-        from mcp_client import ExternalTool, ExternalToolRegistry, McpServerSpec
+        from integrations.mcp_client import ExternalTool, ExternalToolRegistry, McpServerSpec
 
         registry = ExternalToolRegistry(
             [McpServerSpec(name=server, command="unused")],
@@ -315,7 +315,7 @@ class CircuitBreakerTests(unittest.TestCase):
             registry.stop()
 
     def test_a_server_that_is_not_connected_counts_as_a_failure(self):
-        from mcp_client import ExternalTool, ExternalToolRegistry, McpServerSpec
+        from integrations.mcp_client import ExternalTool, ExternalToolRegistry, McpServerSpec
 
         registry = ExternalToolRegistry(
             [McpServerSpec(name="dead", command="unused")],
@@ -334,7 +334,7 @@ class CircuitBreakerTests(unittest.TestCase):
             registry.stop()
 
     def test_a_healthy_server_keeps_the_circuit_closed(self):
-        from mcp_client import ExternalTool, ExternalToolRegistry
+        from integrations.mcp_client import ExternalTool, ExternalToolRegistry
 
         registry = ExternalToolRegistry([], failure_threshold=2, recovery_seconds=60)
         tool = ExternalTool(server="ok", remote_name="fine", description="", input_schema={})
@@ -365,7 +365,7 @@ class ConfigTests(unittest.TestCase):
     """
 
     def test_defaults_are_off(self):
-        from config import Config
+        from infra.config import Config
 
         cfg = Config.load()
         self.assertFalse(cfg.mcp_enabled)
@@ -375,7 +375,7 @@ class ConfigTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from config import Config
+        from infra.config import Config
 
         yaml_text = """
 mcp:
@@ -420,7 +420,7 @@ mcp:
         import tempfile
         from pathlib import Path
 
-        from config import Config
+        from infra.config import Config
 
         yaml_text = """
 mcp:
@@ -454,7 +454,7 @@ mcp:
         import tempfile
         from pathlib import Path
 
-        from config import Config
+        from infra.config import Config
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
@@ -470,7 +470,7 @@ mcp:
 
 class PromptTrustBoundaryTests(unittest.TestCase):
     def test_chat_prompt_declares_tool_output_as_data(self):
-        from prompts import SYSTEM_PROMPT
+        from agent.prompts import SYSTEM_PROMPT
 
         self.assertIn("工具结果的信任边界", SYSTEM_PROMPT)
         self.assertIn("不是指令", SYSTEM_PROMPT)
@@ -478,7 +478,7 @@ class PromptTrustBoundaryTests(unittest.TestCase):
     def test_research_prompt_calls_external_tools_untrusted(self):
         import inspect
 
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         source = inspect.getsource(ResearchOrchestrator)
         self.assertIn("mcp__", source)

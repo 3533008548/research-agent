@@ -19,8 +19,8 @@ if sys.platform == "win32":
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from runtime_paths import RuntimePaths
-from session_store import SessionStore
+from infra.runtime_paths import RuntimePaths
+from sessions.store import SessionStore
 
 
 _EVAL_TITLE = re.compile(r"^真实评测\s+T\d{2}$")
@@ -93,7 +93,7 @@ def main() -> int:
         # Keep the same cross-store semantics as ResearchAgent.delete_session:
         # SessionStore removes checkpoints/runs/events, while MemoryStore owns
         # optional per-session summaries in the separate memory database.
-        from memory import MemoryStore
+        from sessions.memory_store import MemoryStore
 
         memory_store = MemoryStore(str(paths.memory_db))
         for session in matches:

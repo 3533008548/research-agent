@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="要审计的集合名，例如迁移后的 papers_v2")
     args = parser.parse_args(argv)
 
-    from runtime_paths import RuntimePaths
+    from infra.runtime_paths import RuntimePaths
 
     paths = RuntimePaths.from_root(args.data_dir)
     chroma_dir = str(paths.chroma_dir)

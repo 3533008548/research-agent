@@ -273,7 +273,7 @@ def _run_scenario(agent, scheduler, scenario: dict[str, Any], *, research_scope:
         state["sessions_distinct"] = source["thread_id"] != target["thread_id"]
         trace = _trace_summary(agent.get_last_trace(str(target["thread_id"])))
     elif mode == "daily_search":
-        from daily_orchestrator import DailyResearchOrchestrator
+        from agent.daily.orchestrator import DailyResearchOrchestrator
 
         orchestrator = DailyResearchOrchestrator(
             scheduler=scheduler,
@@ -508,9 +508,9 @@ def run_acceptance(
     agent = None
     scheduler = None
     try:
-        from config import Config
-        from research_agent import ResearchAgent
-        from scheduler import Scheduler
+        from infra.config import Config
+        from agent.service import ResearchAgent
+        from agent.daily.scheduler import Scheduler
 
         config = Config.load({"data_dir": str(runtime_root), "rag_enabled": with_rag})
         agent = ResearchAgent(config)

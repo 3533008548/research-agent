@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from research_orchestrator import ResearchOrchestrator
+from agent.research.orchestrator import ResearchOrchestrator
 
 
 def _orchestrator(**kwargs) -> ResearchOrchestrator:
@@ -85,7 +85,7 @@ class TestPlannerSubtasksReachTheResearchers(unittest.TestCase):
         self.assertEqual([item["id"] for item in plan["subtasks"]], ["public", "boundary"])
 
     def test_the_worker_actually_receives_the_planned_focus(self):
-        from research_orchestrator import _WorkerSpec
+        from agent.research.orchestrator import _WorkerSpec
 
         plan = _orchestrator()._parse_plan(
             '{"objective":"x","subtasks":[{"id":"task-1","focus":"检索 TSN 调度方案"}]}',
@@ -232,7 +232,7 @@ class TestCitationGateEndToEnd(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import patch
 
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
@@ -299,7 +299,7 @@ class TestCitationGateEndToEnd(unittest.TestCase):
         self.assertEqual(saved["status"], "completed")
 
     def test_a_critic_timeout_preserves_the_report_without_passing_it(self):
-        from llm_client import LLMRequestTimeoutError
+        from integrations.llm_client import LLMRequestTimeoutError
 
         result, saved = self._run(
             "结论 [E1]<!--ref:E1--><!--anchor:page:3-->",
@@ -410,7 +410,7 @@ class TestCitationGateEndToEnd(unittest.TestCase):
                     ]},
                 )
                 orchestrator = _orchestrator()
-                with patch("research_orchestrator.build_graph", return_value=app):
+                with patch("agent.research.orchestrator.build_graph", return_value=app):
                     worker = orchestrator._run_worker(
                         orchestrator._worker_specs("public")[0], "q", {}, None,
                     )
@@ -452,7 +452,7 @@ class TestCitationGateEndToEnd(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import patch
 
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))

@@ -7,12 +7,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from paper_artifacts import (
+from papers.artifacts import (
     load_document_map,
     title_match_key,
     title_match_score,
 )
-from runtime_paths import RuntimePaths
+from infra.runtime_paths import RuntimePaths
 
 
 class _Store:
@@ -105,7 +105,7 @@ class TestSourcePdfResolution(unittest.TestCase):
         self.assertEqual(kind, "")
 
     def test_stale_document_map_is_repaired_after_a_rename(self):
-        from paper_artifacts import update_document_map_source_file
+        from papers.artifacts import update_document_map_source_file
 
         # The user renamed the file to a readable title, leaving the recorded
         # download name behind.

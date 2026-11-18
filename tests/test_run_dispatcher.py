@@ -17,7 +17,7 @@ from api.redis_runs import (
     RedisChatRunWorker, RedisResearchRunBroker, RedisResearchRunManager, RedisResearchRunWorker,
 )
 from api.run_dispatcher import RunDispatcher, worker_process_lock
-from session_store import SessionStore
+from sessions.store import SessionStore
 
 
 class _Broker:
@@ -351,8 +351,8 @@ class TestRedisRunDispatcher(TestRunDispatcher):
 class TestConcurrentAgentPersistence(unittest.TestCase):
     def test_real_graph_checkpoints_and_usage_are_session_scoped(self):
         from concurrent.futures import ThreadPoolExecutor
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         barrier = threading.Barrier(2)
 
@@ -387,7 +387,7 @@ class TestConcurrentAgentPersistence(unittest.TestCase):
             agent = ResearchAgent(Config(deepseek_key="test", rag_enabled=False, data_dir=directory, api_max_retries=0))
             try:
                 sessions = [agent.create_session(label)["thread_id"] for label in ("A", "B")]
-                with patch("llm_client.requests.post", side_effect=respond) as post, ThreadPoolExecutor(2) as pool:
+                with patch("integrations.llm_client.requests.post", side_effect=respond) as post, ThreadPoolExecutor(2) as pool:
                     futures = [pool.submit(agent.step, f"hello {label}", session_id=sid, on_token=lambda _: None)
                                for label, sid in zip(("A", "B"), sessions)]
                     self.assertEqual([future.result(timeout=10) for future in futures], ["reply-A", "reply-B"])

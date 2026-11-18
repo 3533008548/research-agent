@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from api.auth import require_api_key
-from library_store import LibraryStore, LibraryConflict
-from paper_selections import PaperSelection, region_preview
+from papers.library import LibraryStore, LibraryConflict
+from papers.selections import PaperSelection, region_preview
 
 router = APIRouter(prefix='/api/v1/library', dependencies=[Depends(require_api_key)])
 
@@ -162,7 +162,7 @@ async def translate(identifier: str, body: TranslateBody, store: Store, request:
     cancel = threading.Event()
 
     def execute():
-        from llm_client import RequestPolicy
+        from integrations.llm_client import RequestPolicy
         response = agent.llm_client.post({
             'model': agent.model, 'stream': False, 'max_tokens': 4096,
             'messages': [

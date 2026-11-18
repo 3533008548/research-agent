@@ -5,6 +5,12 @@
 !.env.example
 frontend/node_modules
 frontend/dist
+desktop/node_modules
+desktop/release
+build
+.visual_check
+.tmp-relation-tests
+.workbuddy
 runtime
 backups
 __pycache__

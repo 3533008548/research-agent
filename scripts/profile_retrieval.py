@@ -67,8 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    from config import Config
-    from paper_store import PaperStore
+    from infra.config import Config
+    from papers.store import PaperStore
 
     config = Config.load()
     collection = args.collection or config.rag_embedding_collection

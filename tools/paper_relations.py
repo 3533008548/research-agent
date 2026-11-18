@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from paper_artifacts import TITLE_MATCH_THRESHOLD, title_match_score
-from paper_relations import PaperRelationStore, relation_type_label
-from runtime_paths import get_runtime_paths
+from papers.artifacts import TITLE_MATCH_THRESHOLD, title_match_score
+from papers.relations import PaperRelationStore, relation_type_label
+from infra.runtime_paths import get_runtime_paths
 
 
 def _relation_store(paper_store) -> PaperRelationStore | None:

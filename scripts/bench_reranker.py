@@ -41,7 +41,7 @@ def _make_store(config):
     ChromaDB connection, which swamped the signal on a noisy host.  Only the
     cross-encoder differs between configurations, so only that is swapped.
     """
-    from paper_store import PaperStore
+    from papers.store import PaperStore
 
     return PaperStore(
         persist_dir=Path(config.chroma_dir),
@@ -80,7 +80,7 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=3, help="轮数，配置间交叉执行")
     args = parser.parse_args()
 
-    from config import Config
+    from infra.config import Config
 
     config = Config.load()
     print(f"集合 {config.rag_embedding_collection} | 模型 {config.rag_reranker_model}")
@@ -125,7 +125,7 @@ def main() -> int:
 
 
 def _chunk_count(config) -> int:
-    from paper_store import PaperStore
+    from papers.store import PaperStore
 
     store = PaperStore(
         persist_dir=Path(config.chroma_dir),

@@ -173,8 +173,8 @@ def run_real_evaluation(
     try:
         # Config also synchronizes APP_DATA_DIR for tools that do not receive a
         # Config instance. This must happen before the agent opens any store.
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         config = Config.load({"data_dir": str(runtime_root), "rag_enabled": with_rag})
         agent = ResearchAgent(config)

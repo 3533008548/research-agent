@@ -2,9 +2,9 @@
 
 import unittest
 
-from prompts import SYSTEM_PROMPT
-from tool_catalog import get_tool_schemas
-from tools import execute_tool
+from agent.prompts import SYSTEM_PROMPT
+from tools.catalog import get_tool_schemas
+from tools.dispatch import execute_tool
 
 
 class TestRemovedResearchDocuments(unittest.TestCase):

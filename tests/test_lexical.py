@@ -238,7 +238,7 @@ class NoVectorStoreTest(unittest.TestCase):
             # Needs a term long enough to survive the >=2-character rule;
             # 'a b' tokenizes to nothing, so postings would be empty.
             "assert l.build_index([('alpha beta', None)])['postings']['alpha']\n"
-            "bad = [m for m in ('chromadb','paper_store','embeddings','numpy','torch')\n"
+            "bad = [m for m in ('chromadb','papers.store','papers.embeddings','numpy','torch')\n"
             "       if m in sys.modules]\n"
             "assert not bad, 'lexical pulled in: ' + ','.join(bad)\n"
             "print('OK')\n"
@@ -251,7 +251,7 @@ class NoVectorStoreTest(unittest.TestCase):
         self.assertIn("OK", result.stdout)
 
     def test_bm25_constants_live_here_not_in_paper_store(self):
-        import paper_store
+        from papers import store as paper_store
 
         self.assertFalse(hasattr(paper_store, "BM25_K1"))
         self.assertEqual(lexical.BM25_K1, 1.5)

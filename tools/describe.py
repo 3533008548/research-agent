@@ -4,10 +4,10 @@ import base64
 import json
 from pathlib import Path
 
-from llm_client import RequestPolicy, RequestPriority
-from runtime_paths import get_runtime_paths
-from cancellation import RequestCancelledError, raise_if_cancelled
-from tool_errors import ToolFailure, failure_from_exception
+from integrations.llm_client import RequestPolicy, RequestPriority
+from infra.runtime_paths import get_runtime_paths
+from infra.cancellation import RequestCancelledError, raise_if_cancelled
+from tools.errors import ToolFailure, failure_from_exception
 
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -37,7 +37,7 @@ def handle_describe_image(
         if image_path:
             return ToolFailure(code='TOOL_INVALID_ARGUMENT', phase='validate', retryable=False)
         try:
-            from paper_images import resolve_paper_image
+            from papers.images import resolve_paper_image
             resolved, source_note = resolve_paper_image(args, paper_store, paths)
             image_path = str(resolved)
         except (ValueError, OSError, TypeError) as exc:
@@ -66,7 +66,7 @@ def handle_describe_image(
     if p is None or not p.is_file():
         return ToolFailure(code='TOOL_SOURCE_NOT_FOUND', phase='resolve_source', retryable=False)
     if not source_note:
-        from paper_images import asset_source_note
+        from papers.images import asset_source_note
         source_note = asset_source_note(p)
     if p.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
         return ToolFailure(code='TOOL_UNSUPPORTED_FORMAT', phase='validate', retryable=False)

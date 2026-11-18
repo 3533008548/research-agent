@@ -297,7 +297,7 @@ class NoStoreConstructionTest(unittest.TestCase):
             "import sys\n"
             "import papers.chunking as c\n"
             "assert c.chunk_text('## A\\n\\n内容。' * 80, 300, 50)\n"
-            "banned = [m for m in ('chromadb', 'paper_store', 'embeddings',\n"
+            "banned = [m for m in ('chromadb', 'papers.store', 'papers.embeddings',\n"
             "                       'sentence_transformers') if m in sys.modules]\n"
             "assert not banned, 'chunking pulled in: ' + ','.join(banned)\n"
             "print('OK')\n"

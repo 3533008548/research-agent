@@ -1168,8 +1168,8 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
 
     def test_saved_answer_with_a_retrieved_citation_opens_an_unopened_paper(self) -> None:
         import fitz
-        from paper_selections import element_citations
-        from runtime_paths import RuntimePaths
+        from papers.selections import element_citations
+        from infra.runtime_paths import RuntimePaths
 
         with fitz.open() as pdf:
             pdf.new_page()

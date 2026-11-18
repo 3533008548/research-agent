@@ -14,16 +14,16 @@ from pathlib import Path
 
 import requests
 
-from paper_artifacts import (
+from papers.artifacts import (
     attach_image_assets,
     build_document_map,
     load_document_map,
     remove_document_map,
     write_document_map,
 )
-from paper_quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
-from pdf_reader import PaperReader, extract_images
-from runtime_paths import RuntimePaths, get_runtime_paths
+from papers.quality import prepare_document_map, quality_failure_summary, verify_index_round_trip
+from papers.reader import PaperReader, extract_images
+from infra.runtime_paths import RuntimePaths, get_runtime_paths
 
 
 MAX_PDF_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -296,7 +296,7 @@ def _resolve_local_pdf(path_text: str, papers_dir: Path) -> Path:
             raise ValueError(f"本地 PDF 必须先通过论文库导入。当前论文目录：{base}") from exc
         if candidate.suffix.lower() != ".pdf" or not candidate.is_file():
             raise ValueError(f"未找到可读取的 PDF 文件：{candidate}") from exc
-        from library_store import LibraryStore
+        from papers.library import LibraryStore
 
         library = LibraryStore(RuntimePaths.from_root(base.parent.parent))
         with candidate.open("rb") as source:
@@ -306,7 +306,7 @@ def _resolve_local_pdf(path_text: str, papers_dir: Path) -> Path:
         return library.file(document["id"])
     # Display names differ from the content-addressed filenames in the library.
     if not candidate.is_file() and requested.parent == Path("."):
-        from library_store import LibraryStore
+        from papers.library import LibraryStore
 
         library = LibraryStore(RuntimePaths.from_root(base.parent.parent))
         matches = [item for item in library.list()["documents"]
@@ -371,7 +371,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
     source_file = pdf_path.relative_to(pdf_dir.resolve()).as_posix()
     fallback_stem = pdf_path.stem
     if pdf_path.parent.name == "library":
-        from library_store import LibraryStore
+        from papers.library import LibraryStore
 
         try:
             fallback_stem = Path(LibraryStore(paths).get(pdf_path.stem)["name"]).stem
@@ -419,7 +419,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
     existing_ids = _existing_paper_ids(paper_store, paths, title, source_file) if paper_store else []
     images: list[str] = []
     try:
-        from pdf_ocr import attach_visual_assets
+        from papers.ocr import attach_visual_assets
 
         images = extract_images(
             str(pdf_path), max_pages=max_pages, output_dir=paths.images_dir,
@@ -449,7 +449,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         image_header += f"已导出 {len(images)} 张图片（前 8 项）：\n" + "\n".join(f"  - {item}" for item in images[:8]) + "\n"
     else:
         image_header += "本次未导出图片；可按论文和 page 查看原页，不代表原 PDF 没有图。\n"
-    from paper_selections import element_citations
+    from papers.selections import element_citations
     citations, snapshot = element_citations(paths, document_map)
     if snapshot:
         document_map["document_id"] = snapshot
@@ -510,7 +510,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
 
     if paper_store:
         try:
-            from memory import MemoryStore
+            from sessions.memory_store import MemoryStore
 
             owns_memory_store = memory_store is None
             store = memory_store or MemoryStore(str(paths.memory_db))

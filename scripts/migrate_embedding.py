@@ -31,8 +31,8 @@ if str(PROJECT_ROOT) not in sys.path:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
-from embeddings import build_embedder  # noqa: E402
-from paper_store import DEFAULT_COLLECTION_NAME, PaperStore  # noqa: E402
+from papers.embeddings import build_embedder  # noqa: E402
+from papers.store import DEFAULT_COLLECTION_NAME, PaperStore  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    from runtime_paths import RuntimePaths
+    from infra.runtime_paths import RuntimePaths
 
     paths = RuntimePaths.from_root(args.data_dir)
     paths.ensure_initialized()

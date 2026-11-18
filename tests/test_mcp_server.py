@@ -16,8 +16,8 @@ import inspect
 import unittest
 from unittest.mock import PropertyMock, patch
 
-from config import Config
-from mcp_server import (
+from infra.config import Config
+from integrations.mcp_server import (
     READ_ONLY_TOOLS,
     McpToolError,
     RetrievalService,
@@ -43,7 +43,7 @@ class ToolSurfaceTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in described], list(READ_ONLY_TOOLS))
 
     def test_describe_reuses_internal_schemas(self):
-        from tool_catalog import get_tool_definition
+        from tools.catalog import get_tool_definition
 
         for item in RetrievalService().describe():
             expected = get_tool_definition(item["name"])
@@ -52,7 +52,7 @@ class ToolSurfaceTests(unittest.TestCase):
             self.assertEqual(item["input_schema"], function["parameters"])
 
     def test_tools_declare_an_output_schema(self):
-        from mcp_server import build_server
+        from integrations.mcp_server import build_server
 
         # A bare `-> dict` annotation makes FastMCP emit no output schema, and
         # the result then reaches clients as a JSON *string* rather than
@@ -80,7 +80,7 @@ class ToolSurfaceTests(unittest.TestCase):
         self.assertIsNone(list(server._tool_manager.list_tools())[0].output_schema)
 
     def test_server_registers_every_declared_tool(self):
-        from mcp_server import build_server
+        from integrations.mcp_server import build_server
 
         server, service = build_server(_service_without_store())
         try:
@@ -101,7 +101,7 @@ class StructuredOutputTests(unittest.TestCase):
             "authors": ["Ada Lovelace"], "sources": ["openalex"], "relevance_score": 0.91,
         }]
         with patch(
-            "search_api.search_public_records",
+            "integrations.public_search.search_public_records",
             return_value=(records, {"accepted": 1, "rejected": 0, "rejection_reason": "多源相关性门控"}, []),
         ):
             payload = service.search_papers("deterministic scheduling")
@@ -117,7 +117,7 @@ class StructuredOutputTests(unittest.TestCase):
     def test_search_reports_provider_failures(self):
         # A caller must be able to tell "no matches" from "source unreachable".
         with patch(
-            "search_api.search_public_records",
+            "integrations.public_search.search_public_records",
             return_value=([], {"accepted": 0, "rejected": 0, "rejection_reason": ""}, ["arXiv 超时"]),
         ):
             payload = RetrievalService().search_papers("anything")
@@ -134,7 +134,7 @@ class StructuredOutputTests(unittest.TestCase):
     def test_search_limit_is_clamped(self):
         captured: dict = {}
         with patch(
-            "search_api.search_public_records",
+            "integrations.public_search.search_public_records",
             side_effect=lambda q, limit, source: (captured.update({"limit": limit}) or ([], {}, [])),
         ):
             RetrievalService().search_papers("tsn", limit=99)
@@ -155,8 +155,8 @@ class StructuredOutputTests(unittest.TestCase):
         # it. Building with defaults would serve a materially worse ranking than
         # production, and nothing would fail loudly — so assert the values are
         # actually forwarded rather than merely asserting the default is False.
-        from config import Config
-        from paper_store import PaperStore
+        from infra.config import Config
+        from papers.store import PaperStore
 
         captured: dict = {}
 
@@ -168,8 +168,8 @@ class StructuredOutputTests(unittest.TestCase):
         cfg.rag_enabled = True
         cfg.rag_reranker_enabled = True
         service = RetrievalService(cfg=cfg)
-        with patch.dict("sys.modules", {"paper_store": type("m", (), {"PaperStore": _FakeStore})}), patch(
-            "paper_relations.PaperRelationStore", lambda *_a, **_k: None,
+        with patch.dict("sys.modules", {"papers.store": type("m", (), {"PaperStore": _FakeStore})}), patch(
+            "papers.relations.PaperRelationStore", lambda *_a, **_k: None,
         ):
             service.paper_store
 
@@ -263,7 +263,7 @@ class StructuredOutputTests(unittest.TestCase):
 
     def test_list_papers_returns_structured_files(self):
         with patch(
-            "search_api.list_downloaded_records",
+            "integrations.public_search.list_downloaded_records",
             return_value=[{"filename": "a.pdf", "title": "a", "size_kb": 10, "modified_at": "2026-01-01 00:00"}],
         ):
             payload = RetrievalService().list_papers()
@@ -290,7 +290,7 @@ class StdioSafetyTests(unittest.TestCase):
         import io
         import sys
 
-        from mcp_server import _reserve_transport_stdout
+        from integrations.mcp_server import _reserve_transport_stdout
 
         # A real binary-backed stream, because that is what the transport
         # re-wraps; io.StringIO has no .buffer and would not exercise the path.
@@ -316,7 +316,7 @@ class StdioSafetyTests(unittest.TestCase):
         import io
         import sys
 
-        from mcp_server import _reserve_transport_stdout
+        from integrations.mcp_server import _reserve_transport_stdout
 
         original_out, original_err = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
@@ -347,7 +347,7 @@ class WarmUpOrderingTests(unittest.TestCase):
     """
 
     def test_warm_up_touches_the_store(self):
-        from mcp_server import _warm_store
+        from integrations.mcp_server import _warm_store
 
         service = _service_without_store()
         with patch.object(
@@ -359,7 +359,7 @@ class WarmUpOrderingTests(unittest.TestCase):
         self.assertEqual(store.call_count, 1)
 
     def test_warm_up_survives_a_broken_corpus(self):
-        from mcp_server import _warm_store
+        from integrations.mcp_server import _warm_store
 
         service = RetrievalService()
 
@@ -372,7 +372,7 @@ class WarmUpOrderingTests(unittest.TestCase):
     def test_main_warms_before_serving(self):
         import inspect
 
-        from mcp_server import main
+        from integrations.mcp_server import main
 
         source = inspect.getsource(main)
         warm_at = source.index("_warm_store(service)")

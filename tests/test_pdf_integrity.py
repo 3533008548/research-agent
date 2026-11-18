@@ -7,9 +7,9 @@ from unittest.mock import patch, MagicMock
 
 import pymupdf
 
-from pdf_reader import PaperReader
-from paper_artifacts import build_document_map, related_context
-from paper_quality import prepare_document_map, verify_index_round_trip
+from papers.reader import PaperReader
+from papers.artifacts import build_document_map, related_context
+from papers.quality import prepare_document_map, verify_index_round_trip
 
 
 class TestPdfIntegrity(unittest.TestCase):
@@ -19,7 +19,7 @@ class TestPdfIntegrity(unittest.TestCase):
         self.path = Path(self.tmp.name) / "algorithm.pdf"
 
     def token_store(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
         from types import SimpleNamespace
         store = PaperStore.__new__(PaperStore)
         store._embed_fn = SimpleNamespace(tokenize=list)
@@ -30,8 +30,8 @@ class TestPdfIntegrity(unittest.TestCase):
 
     def test_token_split_map_matches_index_and_preserves_chinese_provenance(self):
         import copy
-        from paper_artifacts import write_document_map, load_document_map
-        from runtime_paths import RuntimePaths
+        from papers.artifacts import write_document_map, load_document_map
+        from infra.runtime_paths import RuntimePaths
 
         text = "时间敏感网络通过多径冗余保障可靠性。" * 55
         doc = {"paper_id": "p", "title": "中文论文", "chunks": [
@@ -124,7 +124,7 @@ class TestPdfIntegrity(unittest.TestCase):
 
     def test_native_algorithm_and_tall_column_survive_into_chunks(self):
         self.make_panel(tall=True)
-        with patch("pdf_ocr.ocr_region", side_effect=AssertionError("native text must not use OCR")):
+        with patch("papers.ocr.ocr_region", side_effect=AssertionError("native text must not use OCR")):
             m, q = self.parse_map()
         self.assertTrue(q["accepted"], q)
         content = "\n".join(c["text"] for c in m["chunks"])
@@ -137,7 +137,7 @@ class TestPdfIntegrity(unittest.TestCase):
             self.assertNotIn("averBand", pdf[0].get_text())
             self.assertFalse(pdf[0].get_image_info())
         body = "1 Function Route(paths):\n2 for edge in paths do\n3 Return paths with smallest averBand"
-        with patch("pdf_ocr.ocr_region", return_value=body) as ocr:
+        with patch("papers.ocr.ocr_region", return_value=body) as ocr:
             m, q = self.parse_map()
         self.assertTrue(q["accepted"], q)
         self.assertTrue(any(c["kind"] == "algorithm" and "averBand" in c["text"] for c in m["chunks"]))
@@ -146,7 +146,7 @@ class TestPdfIntegrity(unittest.TestCase):
     def test_punctuationless_vector_panel_fails_closed_when_ocr_fails(self):
         self.make_panel(vector=True, tall=True, caption="Algorithm 4 Routing Algorithm")
         for tables in (True, False):
-            with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
+            with patch("papers.ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
                 d = PaperReader(max_pages=1).parse_document(self.path, extract_tables=tables)
             _, q = prepare_document_map(build_document_map(d, paper_id="p", title="Paper", source_file=self.path.name), requested_pages=1)
             self.assertFalse(q["accepted"], q)
@@ -154,7 +154,7 @@ class TestPdfIntegrity(unittest.TestCase):
 
     def test_native_punctuationless_panel_preserves_algorithm_identity(self):
         self.make_panel(caption="Algorithm 4 Routing Algorithm")
-        with patch("pdf_ocr.ocr_region", side_effect=AssertionError("native body must not use OCR")):
+        with patch("papers.ocr.ocr_region", side_effect=AssertionError("native body must not use OCR")):
             m, q = self.parse_map()
         self.assertTrue(q["accepted"], q)
         self.assertTrue(any(c["kind"] == "algorithm" and "averBand" in c["text"] for c in m["chunks"]))
@@ -164,7 +164,7 @@ class TestPdfIntegrity(unittest.TestCase):
         with pymupdf.open(self.path) as pdf:
             pdf[0].insert_text((50, 220), "Input graph and candidate paths.\nOutput the best feasible path, then return to the caller.", fontsize=8)
             pdf.saveIncr()
-        with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")) as ocr:
+        with patch("papers.ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")) as ocr:
             _, q = self.parse_map()
         ocr.assert_called_once()
         self.assertFalse(q["accepted"])
@@ -183,14 +183,14 @@ class TestPdfIntegrity(unittest.TestCase):
             for y in (36, 54, 260):
                 page.draw_line((350, y), (550, y))
             pdf.save(self.path)
-        with patch("pdf_ocr.ocr_region", side_effect=AssertionError("prose must not be OCRed")) as ocr:
+        with patch("papers.ocr.ocr_region", side_effect=AssertionError("prose must not be OCRed")) as ocr:
             d = PaperReader().parse_document(self.path)
         ocr.assert_not_called()
         self.assertFalse(d['pages'][0]['extraction_diagnostics'])
 
     def test_algorithm_transcription_does_not_reuse_generic_image_description(self):
         from tools.describe import handle_describe_image
-        from runtime_paths import RuntimePaths
+        from infra.runtime_paths import RuntimePaths
         paths = RuntimePaths.from_root(Path(self.tmp.name) / 'runtime')
         paths.ensure_initialized()
         image = paths.images_dir / 'algorithm.png'
@@ -210,8 +210,8 @@ class TestPdfIntegrity(unittest.TestCase):
 
     def scoped_algorithm_store(self, *, source_file="algorithm.pdf"):
         import shutil
-        from paper_artifacts import write_document_map
-        from runtime_paths import RuntimePaths
+        from papers.artifacts import write_document_map
+        from infra.runtime_paths import RuntimePaths
         paths = RuntimePaths.from_root(Path(self.tmp.name) / "runtime")
         paths.ensure_initialized()
         shutil.copyfile(self.path, paths.papers_dir / "algorithm.pdf")
@@ -233,7 +233,7 @@ class TestPdfIntegrity(unittest.TestCase):
         body = "1 Function Route(paths):\n" + "\n".join(f"{i} for edge in path do keep candidate" for i in range(2, 90)) + "\n90 Return finalWitness"
         original_map = next(paths.paper_artifacts_dir.glob('*/document_map.json')).read_bytes()
         with patch("tools.search.get_runtime_paths", return_value=paths), \
-             patch("pdf_ocr.ocr_region", return_value=body) as ocr:
+             patch("papers.ocr.ocr_region", return_value=body) as ocr:
             result = handle_query_papers({"query": "解释算法四", "paper_id_or_title": "p", "top_k": 1}, paper_store=store)
             again = handle_query_papers({"query": "Algorithm 4", "paper_id_or_title": "p"}, paper_store=store)
         self.assertIn(body, result)
@@ -248,25 +248,25 @@ class TestPdfIntegrity(unittest.TestCase):
         self.assertEqual(len(list(paths.images_dir.glob('*.png'))), 1)
 
     def test_algorithm_read_failure_is_explicit_and_retried_after_recovery(self):
-        from paper_algorithms import query_algorithm_evidence
+        from papers.algorithms import query_algorithm_evidence
         self.make_panel(vector=True, tall=True, caption="Algorithm 4 Routing Algorithm")
         paths, _ = self.scoped_algorithm_store()
-        with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
+        with patch("papers.ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
             failed = query_algorithm_evidence("Algorithm 4", ["p"], paths)
         self.assertIn("OCR unavailable", failed)
         self.assertIn("尚未恢复", failed)
         self.assertIn("原页备用图", failed)
         self.assertTrue(list(paths.images_dir.glob('*algorithm-page.png')))
         self.assertFalse(list(paths.paper_artifacts_dir.glob('*/algorithms-*.json')))
-        with patch("pdf_ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return repairedWitness"):
+        with patch("papers.ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return repairedWitness"):
             recovered = query_algorithm_evidence("Algorithm 4", ["p"], paths)
         self.assertIn("repairedWitness", recovered)
 
     def test_algorithm_lookup_does_not_escape_paper_scope_or_source_directory(self):
-        from paper_algorithms import query_algorithm_evidence
+        from papers.algorithms import query_algorithm_evidence
         self.make_panel()
         paths, _ = self.scoped_algorithm_store(source_file=str(self.path))
-        with patch("paper_algorithms._read_regions", side_effect=AssertionError("must not open outside managed PDFs")):
+        with patch("papers.algorithms._read_regions", side_effect=AssertionError("must not open outside managed PDFs")):
             result = query_algorithm_evidence("Algorithm 4", ["p"], paths)
         self.assertIn("不可读", result)
         self.assertIsNone(query_algorithm_evidence("Algorithm 4", None, paths))
@@ -274,7 +274,7 @@ class TestPdfIntegrity(unittest.TestCase):
         self.assertIn("缺少原 PDF 路径", query_algorithm_evidence("Algorithm 4", ["other-paper"], paths))
 
     def test_algorithm_read_checks_source_pages_beyond_old_index_coverage(self):
-        from paper_algorithms import query_algorithm_evidence
+        from papers.algorithms import query_algorithm_evidence
         self.make_panel(caption="Algorithm 4 Routing Algorithm")
         with pymupdf.open(self.path) as pdf:
             pdf.new_page(pno=0).insert_text((40, 50), "Introductory text before the algorithm page.")
@@ -286,7 +286,7 @@ class TestPdfIntegrity(unittest.TestCase):
         self.assertIn("averBand", result)
 
     def test_scoped_pseudocode_request_without_number_recovers_algorithms(self):
-        from paper_algorithms import query_algorithm_evidence
+        from papers.algorithms import query_algorithm_evidence
         self.make_panel(caption="Algorithm 4 Routing Algorithm")
         paths, _ = self.scoped_algorithm_store()
         for query in ('解释这篇论文的伪代码', 'show the pseudocode'):
@@ -295,7 +295,7 @@ class TestPdfIntegrity(unittest.TestCase):
             self.assertIn('averBand', result)
 
     def test_numbered_algorithm_lookup_does_not_substitute_another_number(self):
-        from paper_algorithms import query_algorithm_evidence
+        from papers.algorithms import query_algorithm_evidence
         self.make_panel(caption="Algorithm 40 Routing Algorithm")
         paths, _ = self.scoped_algorithm_store()
         result = query_algorithm_evidence("Algorithm 4", ["p"], paths)
@@ -303,23 +303,23 @@ class TestPdfIntegrity(unittest.TestCase):
         self.assertIn('尚未恢复算法 4', result)
 
     def test_algorithm_source_cache_invalidates_when_pdf_changes(self):
-        from paper_algorithms import query_algorithm_evidence
+        from papers.algorithms import query_algorithm_evidence
         self.make_panel(vector=True, caption="Algorithm 4 Routing Algorithm")
         paths, _ = self.scoped_algorithm_store()
         source = paths.papers_dir / "algorithm.pdf"
-        with patch("pdf_ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return oldWitness"):
+        with patch("papers.ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return oldWitness"):
             self.assertIn("oldWitness", query_algorithm_evidence("Algorithm 4", ["p"], paths))
         with pymupdf.open(source) as pdf:
             pdf.set_metadata({"title": "Changed source"})
             pdf.saveIncr()
-        with patch("pdf_ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return newWitness") as ocr:
+        with patch("papers.ocr.ocr_region", return_value="1 Function Route(paths):\n2 for edge in paths do\n3 Return newWitness") as ocr:
             result = query_algorithm_evidence("Algorithm 4", ["p"], paths)
         self.assertIn("newWitness", result)
         self.assertNotIn("oldWitness", result)
         ocr.assert_called_once()
 
     def test_explicit_algorithm_locator_bypasses_semantic_distractors(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
         store = PaperStore.__new__(PaperStore)
         store._collection = MagicMock()
         store._collection.get.return_value = {
@@ -343,7 +343,7 @@ class TestPdfIntegrity(unittest.TestCase):
     def test_ocr_failure_cannot_pass_either_parser_strategy(self):
         self.make_panel(raster=True)
         for tables in (True, False):
-            with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("missing language data")):
+            with patch("papers.ocr.ocr_region", side_effect=RuntimeError("missing language data")):
                 d = PaperReader(max_pages=1).parse_document(self.path, extract_tables=tables)
             m, q = prepare_document_map(build_document_map(d, paper_id="p", title="Paper", source_file=self.path.name), requested_pages=1)
             self.assertFalse(q["accepted"])
@@ -351,15 +351,15 @@ class TestPdfIntegrity(unittest.TestCase):
 
     def test_caption_only_ocr_is_rejected(self):
         self.make_panel(raster=True)
-        with patch("pdf_ocr.ocr_region", return_value="Algorithm 4: Least Bandwidth Consumption"):
+        with patch("papers.ocr.ocr_region", return_value="Algorithm 4: Least Bandwidth Consumption"):
             _, q = self.parse_map()
         self.assertFalse(q["accepted"])
 
     def test_ocr_is_searchable_and_keeps_provenance_and_crop(self):
-        from pdf_ocr import attach_visual_assets
+        from papers.ocr import attach_visual_assets
         self.make_panel(raster=True)
         body = "1 Function LBC(paths, r):\n2 for edge in paths do\n3 add edge to edgeList\n4 Return paths with smallest averBand"
-        with patch("pdf_ocr.ocr_region", return_value=body):
+        with patch("papers.ocr.ocr_region", return_value=body):
             m, q = self.parse_map()
         self.assertTrue(q["accepted"], q)
         assets = attach_visual_assets(m, self.path, Path(self.tmp.name) / "images")
@@ -389,7 +389,7 @@ class TestPdfIntegrity(unittest.TestCase):
         self.assertIn("native_text_loss", {i["code"] for i in q["issues"]})
 
     def test_prose_algorithm_reference_is_not_a_missing_panel(self):
-        from pdf_ocr import ALGORITHM_CAPTION
+        from papers.ocr import ALGORITHM_CAPTION
         self.assertIsNone(ALGORITHM_CAPTION.match("Algorithm 4 provides the optimized path."))
         self.assertIsNotNone(ALGORITHM_CAPTION.match("Algorithm 4: Optimized path"))
 
@@ -402,13 +402,13 @@ class TestPdfIntegrity(unittest.TestCase):
             page.apply_redactions()
             doc.save(Path(self.tmp.name) / "scan.pdf")
         self.path = Path(self.tmp.name) / "scan.pdf"
-        with patch("pdf_ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
+        with patch("papers.ocr.ocr_region", side_effect=RuntimeError("OCR unavailable")):
             _, q = self.parse_map()
         self.assertFalse(q["accepted"])
 
     def test_local_tesseract_recovers_raster_algorithm(self):
         try:
-            from pdf_ocr import resolve_ocr_tessdata
+            from papers.ocr import resolve_ocr_tessdata
             tessdata = resolve_ocr_tessdata('eng')
         except RuntimeError:
             self.skipTest("Tesseract language data not installed")
@@ -421,7 +421,7 @@ class TestPdfIntegrity(unittest.TestCase):
 
     def test_packaged_ocr_uses_bundled_language_data_without_system_install(self):
         import sys
-        from pdf_ocr import resolve_ocr_tessdata
+        from papers.ocr import resolve_ocr_tessdata
         bundled = Path(self.tmp.name) / 'bundle' / 'tessdata'
         bundled.mkdir(parents=True)
         for language in ('eng', 'chi_sim'):
@@ -432,10 +432,10 @@ class TestPdfIntegrity(unittest.TestCase):
             self.assertEqual(resolve_ocr_tessdata('eng+chi_sim'), str(bundled))
 
     def test_missing_ocr_data_identifies_page_region_and_reason(self):
-        from pdf_ocr import OCRLanguageDataError
-        from paper_quality import quality_failure_summary
+        from papers.ocr import OCRLanguageDataError
+        from papers.quality import quality_failure_summary
         self.make_panel(raster=True)
-        with patch('pdf_ocr.resolve_ocr_tessdata', side_effect=OCRLanguageDataError('缺少 OCR 语言数据（eng）')):
+        with patch('papers.ocr.resolve_ocr_tessdata', side_effect=OCRLanguageDataError('缺少 OCR 语言数据（eng）')):
             _, quality = self.parse_map()
         self.assertFalse(quality['accepted'])
         summary = quality_failure_summary(quality)
@@ -456,7 +456,7 @@ class TestPdfIntegrity(unittest.TestCase):
 
 class TestPdfImages(unittest.TestCase):
     def setUp(self):
-        from runtime_paths import RuntimePaths
+        from infra.runtime_paths import RuntimePaths
         from types import SimpleNamespace
         import json
         self.tmp = tempfile.TemporaryDirectory()
@@ -488,7 +488,7 @@ class TestPdfImages(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def test_vector_figures_have_real_page_assets_and_exact_numbers(self):
-        from paper_images import extract_pdf_images, figure_numbers
+        from papers.images import extract_pdf_images, figure_numbers
         with pymupdf.open(self.source) as pdf:
             self.assertFalse(pdf[0].get_image_info())
         catalog = extract_pdf_images(self.source, self.paths.images_dir)
@@ -500,7 +500,7 @@ class TestPdfImages(unittest.TestCase):
             self.assertEqual(figure_numbers(query), expected)
 
     def test_image_cache_respects_source_content_and_requested_pages(self):
-        from pdf_reader import extract_images
+        from papers.reader import extract_images
         (self.paths.images_dir / 'figure-fixture_p14_Figure4.png').write_bytes(b'stale')
         one = extract_images(str(self.source), 1, self.paths.images_dir)
         two = extract_images(str(self.source), 2, self.paths.images_dir)
@@ -515,7 +515,7 @@ class TestPdfImages(unittest.TestCase):
         self.assertTrue(Path(changed[0]).is_file())
 
     def test_old_map_recovers_beyond_index_and_regenerates_deleted_images(self):
-        from paper_images import resolve_paper_image
+        from papers.images import resolve_paper_image
         args = {'paper_id_or_title': 'fixture', 'figure': '图四十'}
         target, note = resolve_paper_image(args, self.store, self.paths)
         self.assertIn('p.2', note)
@@ -527,7 +527,7 @@ class TestPdfImages(unittest.TestCase):
         self.assertEqual(self.map_path.read_bytes(), self.old_map)
 
     def test_lookup_is_registered_and_returns_complete_paginated_paths(self):
-        from tool_runtime import ToolRuntime, ToolExecutionContext
+        from tools.runtime import ToolRuntime, ToolExecutionContext
         runtime = ToolRuntime(ToolExecutionContext())
         result = runtime.execute('list_paper_images', {'paper_id_or_title': 'fixture', 'limit': 1}, paper_store=self.store)
         self.assertIn('offset=1', result)
@@ -546,7 +546,7 @@ class TestPdfImages(unittest.TestCase):
         self.assertNotIn('Figure 40', result)
 
     def test_unknown_figure_does_not_substitute_and_page_fallback_is_available(self):
-        from paper_images import resolve_paper_image
+        from papers.images import resolve_paper_image
         with self.assertRaisesRegex(ValueError, '未定位'):
             resolve_paper_image({'paper_id_or_title': 'fixture', 'figure': '9'}, self.store, self.paths)
         path, note = resolve_paper_image({'paper_id_or_title': 'fixture', 'page': 2}, self.store, self.paths)
@@ -557,7 +557,7 @@ class TestPdfImages(unittest.TestCase):
 
     def test_source_outside_library_is_rejected(self):
         import json
-        from paper_images import paper_image_catalog
+        from papers.images import paper_image_catalog
         mapping = json.loads(self.old_map)
         mapping['source_file'] = '../../outside.pdf'
         self.map_path.write_text(json.dumps(mapping))
@@ -566,7 +566,7 @@ class TestPdfImages(unittest.TestCase):
 
     def test_describe_by_number_and_listed_path_both_preserve_target_figure(self):
         from tools.describe import handle_describe_image
-        from paper_images import resolve_paper_image
+        from papers.images import resolve_paper_image
         client = MagicMock()
         client.post.return_value.json.return_value = {'choices': [{'message': {'content': 'verified vector image'}}]}
         target, _ = resolve_paper_image({'paper_id_or_title': 'fixture', 'figure': '4'}, self.store, self.paths)
@@ -579,14 +579,14 @@ class TestPdfImages(unittest.TestCase):
             self.assertTrue(content[1]['image_url']['url'].startswith('data:image/png;base64,'))
 
     def test_read_pdf_image_directory_survives_actual_runtime_truncation(self):
-        from tool_runtime import ToolRuntime, ToolExecutionContext
+        from tools.runtime import ToolRuntime, ToolExecutionContext
         from types import SimpleNamespace
         store = SimpleNamespace(list_papers=lambda: [], index_document_map=lambda doc, **kw: doc['paper_id'])
         with patch.object(PaperReader, 'render_document', return_value='Long original prose. ' * 2000):
             result = ToolRuntime(ToolExecutionContext()).execute('read_pdf',
                 {'url_or_path': self.source.name, 'title': 'Figure Fixture Paper', 'max_pages': 2},
                 paper_store=store, memory_store=MagicMock())
-        from tool_results import result_header
+        from tools.results import result_header
         self.assertTrue(result_header(result)['has_more'])
         self.assertLessEqual(len(result), 12000)
         self.assertIn('论文 ID', result)
@@ -595,9 +595,9 @@ class TestPdfImages(unittest.TestCase):
         self.assertIn('_p002_Figure40_', result)
 
     def test_map_attaches_only_exact_figure_and_page_and_exposes_asset(self):
-        from paper_artifacts import attach_image_assets
+        from papers.artifacts import attach_image_assets
         parsed = PaperReader(max_pages=2).parse_document(self.source)
-        from pdf_reader import extract_images
+        from papers.reader import extract_images
         assets = extract_images(str(self.source), 2, self.paths.images_dir)
         attach_image_assets(parsed, list(reversed(assets)))
         doc = build_document_map(parsed, paper_id='fixture', title='Fixture', source_file=self.source.name)

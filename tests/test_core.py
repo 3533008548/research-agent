@@ -203,7 +203,7 @@ class TestFastAPIService(unittest.TestCase):
             return QueuedDailyRun("daily-job-1", run_id, kind)
 
     def setUp(self):
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         self.tmp = tempfile.mkdtemp()
         self.store = SessionStore(str(Path(self.tmp) / "checkpoint.db"))
@@ -249,7 +249,7 @@ class TestFastAPIService(unittest.TestCase):
             self.assertEqual(client.get(f"/api/v1/sessions/{session_id}/runs").json(), [])
 
     def test_legacy_reproduction_rows_survive_upgrade_without_blocking_chat(self):
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         session_id = self.store.create("升级前会话")["thread_id"]
         db_path = self.store.db_path
@@ -369,7 +369,7 @@ class TestFastAPIService(unittest.TestCase):
     def test_workspace_routes_keep_profile_keywords_and_settings_outside_chat_state(self):
         from fastapi.testclient import TestClient
         from api.app import create_app
-        from runtime_paths import RuntimePaths
+        from infra.runtime_paths import RuntimePaths
 
         paths = RuntimePaths.from_root(Path(self.tmp) / "workspace-runtime")
         self.agent.cfg = SimpleNamespace(
@@ -800,7 +800,7 @@ class TestFastAPIService(unittest.TestCase):
 
     def test_durable_worker_executes_queued_daily_run(self):
         from api.redis_runs import RedisDailyRunManager, RedisDailyRunWorker
-        from scheduler import Scheduler
+        from agent.daily.scheduler import Scheduler
 
         scheduler = Scheduler(str(Path(self.tmp) / "daily.db"))
         broker = self._FakeDailyBroker()
@@ -830,7 +830,7 @@ class TestRetrievalAdmissionPolicy(unittest.TestCase):
     """工程解释不应为了生成引用而触发昂贵的文献工具链。"""
 
     def test_engineering_questions_disable_retrieval_tools(self):
-        from research_agent import should_answer_without_tools
+        from agent.service import should_answer_without_tools
 
         self.assertTrue(should_answer_without_tools(
             "首次 RAG 检索遇到嵌入模型下载很慢时，系统应如何保证结果？"
@@ -843,7 +843,7 @@ class TestRetrievalAdmissionPolicy(unittest.TestCase):
         ))
 
     def test_explicit_evidence_requests_keep_retrieval_tools(self):
-        from research_agent import should_answer_without_tools
+        from agent.service import should_answer_without_tools
 
         self.assertFalse(should_answer_without_tools(
             "检索三篇关于动态负载 TSN 鲁棒性的论文并给出引用。"
@@ -858,7 +858,7 @@ class TestPdfReaderLayout(unittest.TestCase):
 
     def test_reader_reads_the_left_column_before_the_right_column(self):
         import pymupdf
-        from pdf_reader import PaperReader
+        from papers.reader import PaperReader
 
         with tempfile.TemporaryDirectory() as tmp:
             pdf_path = Path(tmp) / "two-columns.pdf"
@@ -878,7 +878,7 @@ class TestPdfReaderLayout(unittest.TestCase):
         self.assertNotIn("─── 右栏 ───", text)
 
     def test_index_cleaning_drops_the_reader_status_preamble(self):
-        from paper_store import clean_index_text, chunk_text
+        from papers.store import clean_index_text, chunk_text
 
         reader_text = (
             "📄 **PDF 解析完成**\n文件名: sample.pdf | 总页数: 1 | 已读: 1 | 提取: 42 字符\n\n"
@@ -892,7 +892,7 @@ class TestPdfReaderLayout(unittest.TestCase):
         self.assertTrue(any(chunk["section"] == "Abstract" for chunk in chunks))
 
     def test_reader_rejects_an_impossible_table_box(self):
-        from pdf_reader import PaperReader
+        from papers.reader import PaperReader
 
         page = SimpleNamespace(height=1_000)
         self.assertFalse(PaperReader._valid_table_bbox([10, 20, 300, 16_000], page))
@@ -916,7 +916,7 @@ class TestReadPDFFlow(unittest.TestCase):
 
     def test_extract_text_from_pdf(self):
         """pdfplumber 能否从显式样本或本地运行时论文提取文本。"""
-        from pdf_reader import PaperReader
+        from papers.reader import PaperReader
         sample = _pdf_test_sample()
         if sample is None:
             self.skipTest("未设置 PDF_TEST_SAMPLE，且本地运行时论文目录没有 PDF 文件")
@@ -927,7 +927,7 @@ class TestReadPDFFlow(unittest.TestCase):
 
     def test_chunk_text(self):
         """分块函数正确切分"""
-        from paper_store import chunk_text
+        from papers.store import chunk_text
         text = "第一段。\n\n第二段内容较多。" * 20
         chunks = chunk_text(text, chunk_size=200, overlap=50)
         self.assertGreater(len(chunks), 0)
@@ -938,7 +938,7 @@ class TestReadPDFFlow(unittest.TestCase):
 
     def test_index_and_dedup(self):
         """索引 + 去重"""
-        from paper_store import PaperStore
+        from papers.store import PaperStore
         store = PaperStore(persist_dir=self.tmp)
         pid1 = store.index_paper("测试论文内容 A B C", title="TestPaper")
         self.assertTrue(pid1)
@@ -964,7 +964,7 @@ class TestQueryPapers(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
-        from paper_store import PaperStore
+        from papers.store import PaperStore
         cls.store = PaperStore(persist_dir=cls.tmp)
         cls.store.index_paper(
             "注意力机制是Transformer的核心。多头注意力使用多个注意力头并行计算。"
@@ -996,7 +996,7 @@ class TestQueryPapers(unittest.TestCase):
 
     def test_delete_paper(self):
         """删除论文"""
-        from paper_store import PaperStore
+        from papers.store import PaperStore
         s2 = PaperStore(persist_dir=self.tmp)
         pid = s2.index_paper("要被删除的内容", title="DeleteMe")
         count_before = len(s2.list_papers())
@@ -1007,7 +1007,7 @@ class TestQueryPapers(unittest.TestCase):
 
 class TestToolResponsiveness(unittest.TestCase):
     def test_network_tsn_search_rejects_unrelated_provider_hit(self):
-        from search_api import search_openalex
+        from integrations.public_search import search_openalex
 
         class _Response:
             @staticmethod
@@ -1042,7 +1042,7 @@ class TestToolResponsiveness(unittest.TestCase):
                     },
                 ]}
 
-        with patch("search_api.requests.get", return_value=_Response()) as get:
+        with patch("integrations.public_search.requests.get", return_value=_Response()) as get:
             result = search_openalex(
                 "DiffTSN Time-Sensitive Networking scheduling bursty traffic",
             )
@@ -1057,7 +1057,7 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertNotIn("delay tolerant", result.casefold())
 
     def test_time_sensitive_networking_full_name_enables_strict_filter(self):
-        from search_api import _filter_public_papers
+        from integrations.public_search import _filter_public_papers
 
         accepted, quality = _filter_public_papers(
             "Time-Sensitive Networking scheduling bursty traffic",
@@ -1069,7 +1069,7 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertIn("未命中 Time-Sensitive Networking 或 TSN", quality["rejection_reason"])
 
     def test_network_tsn_search_requires_a_material_condition(self):
-        from search_api import _filter_public_papers
+        from integrations.public_search import _filter_public_papers
 
         accepted, quality = _filter_public_papers(
             "TSN scheduling under bursty traffic",
@@ -1083,7 +1083,7 @@ class TestToolResponsiveness(unittest.TestCase):
         import time
         import threading
         from concurrent.futures import ThreadPoolExecutor
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         store = PaperStore.__new__(PaperStore)
         store._query_executor = ThreadPoolExecutor(max_workers=1)
@@ -1109,7 +1109,7 @@ class TestToolResponsiveness(unittest.TestCase):
     def test_startup_warmup_primes_embedding_without_querying_or_mutating_papers(self):
         import threading
         from concurrent.futures import ThreadPoolExecutor
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         calls = []
         store = PaperStore.__new__(PaperStore)
@@ -1145,7 +1145,7 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertEqual(store.query, "TSN scheduling")
 
     def test_hybrid_query_promotes_exact_term_and_renders_its_mode(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
         from tools.search import handle_query_papers
 
         class _Collection:
@@ -1204,7 +1204,7 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertIn("混合分:", rendering)
 
     def test_hybrid_query_keeps_large_collections_on_semantic_path(self):
-        from paper_store import HYBRID_LEXICAL_MAX_CHUNKS, PaperStore
+        from papers.store import HYBRID_LEXICAL_MAX_CHUNKS, PaperStore
 
         class _Collection:
             get_called = False
@@ -1234,7 +1234,7 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertFalse(store._collection.get_called)
 
     def test_reranker_only_reorders_existing_candidates(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         class _Reranker:
             def predict(self, pairs, **_kwargs):
@@ -1257,7 +1257,7 @@ class TestToolResponsiveness(unittest.TestCase):
         self.assertEqual(store._reranker.pairs[0], ("which evidence", "first candidate"))
 
     def test_bm25_scores_the_chunk_body_not_repeated_paper_title(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         class _Collection:
             @staticmethod
@@ -1289,8 +1289,8 @@ class TestPaperRelations(unittest.TestCase):
     """Explicit paper relations stay auditable and only assist retrieval."""
 
     def test_store_persists_directed_relation_and_one_hop_hints(self):
-        from paper_relations import PaperRelationStore
-        from runtime_paths import RuntimePaths
+        from papers.relations import PaperRelationStore
+        from infra.runtime_paths import RuntimePaths
 
         with tempfile.TemporaryDirectory() as tmp:
             store = PaperRelationStore(RuntimePaths.from_root(Path(tmp) / "runtime"))
@@ -1321,8 +1321,8 @@ class TestPaperRelations(unittest.TestCase):
             self.assertEqual(reopened.list(), [])
 
     def test_handler_requires_user_confirmation_and_anchors(self):
-        from paper_relations import PaperRelationStore
-        from runtime_paths import RuntimePaths
+        from papers.relations import PaperRelationStore
+        from infra.runtime_paths import RuntimePaths
         from tools.paper_relations import (
             handle_delete_paper_relation,
             handle_list_paper_relations,
@@ -1371,7 +1371,7 @@ class TestPaperRelations(unittest.TestCase):
             ))
 
     def test_relation_expansion_requires_a_topic_matched_chunk(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         class _Relations:
             @staticmethod
@@ -1473,7 +1473,7 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(last_content, "", "空回复应安全处理")
 
     def test_sanitize_model_messages_drops_incomplete_assistant_history(self):
-        from graph_builder import sanitize_model_messages
+        from agent.graph import sanitize_model_messages
 
         messages = [
             {"role": "user", "content": "问题"},
@@ -1503,7 +1503,7 @@ class TestVerifyNode(unittest.TestCase):
         ))
 
     def test_deepseek_sanitizer_drops_legacy_tool_turn_without_reasoning_content(self):
-        from graph_builder import sanitize_model_messages
+        from agent.graph import sanitize_model_messages
 
         messages = [
             {"role": "user", "content": "旧任务"},
@@ -1530,8 +1530,8 @@ class TestVerifyNode(unittest.TestCase):
         self.assertNotIn("legacy-call", str(sanitized))
 
     def test_graph_preserves_reasoning_content_across_tool_turns(self):
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
 
         responses = [
             self._FakeResponse({
@@ -1547,8 +1547,8 @@ class TestVerifyNode(unittest.TestCase):
                 "reasoning_content": "工具结果足够回答。",
             }),
         ]
-        with patch("llm_client.requests.post", side_effect=responses) as post, \
-             patch("graph_builder.execute_tool", return_value="论文列表"):
+        with patch("integrations.llm_client.requests.post", side_effect=responses) as post, \
+             patch("agent.graph.execute_tool", return_value="论文列表"):
             app = build_graph(
                 api_key="test-key", model="deepseek-flash", checkpoint_db=":memory:",
                 enable_verify=False, allowed_tool_names={"list_papers"},
@@ -1572,7 +1572,7 @@ class TestVerifyNode(unittest.TestCase):
 
     def test_stream_preserves_reasoning_content_without_scope_error(self):
         """流式 reasoning delta 不能因闭包作用域而中断对话。"""
-        from graph_builder import build_graph
+        from agent.graph import build_graph
 
         class _StreamingResponse:
             status_code = 200
@@ -1631,8 +1631,8 @@ class TestVerifyNode(unittest.TestCase):
         self.assertEqual(result["messages"][-1]["reasoning_content"], "先梳理问题。")
 
     def test_bounded_tool_rounds_ignore_previous_turn_tool_history(self):
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
 
         responses = [
             self._FakeResponse({
@@ -1659,8 +1659,8 @@ class TestVerifyNode(unittest.TestCase):
             {"role": "assistant", "content": "旧任务完成"},
             {"role": "user", "content": "提交本轮修改"},
         ]
-        with patch("llm_client.requests.post", side_effect=responses) as post, \
-             patch("graph_builder.execute_tool", side_effect=["完整上下文", "✅ 已提交"]):
+        with patch("integrations.llm_client.requests.post", side_effect=responses) as post, \
+             patch("agent.graph.execute_tool", side_effect=["完整上下文", "✅ 已提交"]):
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
                 max_tool_rounds=2, allowed_tool_names={"list_papers"},
@@ -1679,8 +1679,8 @@ class TestVerifyNode(unittest.TestCase):
 
     def test_graph_builds_correctly(self):
         """图结构正常编译（不调用 API）"""
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
         app = build_graph(
             api_key="test-key", model="deepseek-chat", checkpoint_db=":memory:",
             llm_client=LLMClient("test-key", "https://example.test/chat"),
@@ -1696,8 +1696,8 @@ class TestVerifyNode(unittest.TestCase):
             app.checkpointer.conn.close()
 
     def test_forced_paper_list_calls_the_tool_once(self):
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
 
         responses = [
             self._FakeResponse({
@@ -1712,8 +1712,8 @@ class TestVerifyNode(unittest.TestCase):
             }),
             self._FakeResponse({"content": "已列出本地论文。"}),
         ]
-        with patch("llm_client.requests.post", side_effect=responses) as post, \
-             patch("graph_builder.execute_tool", return_value="已索引论文：TSN 论文") as execute:
+        with patch("integrations.llm_client.requests.post", side_effect=responses) as post, \
+             patch("agent.graph.execute_tool", return_value="已索引论文：TSN 论文") as execute:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
                 allowed_tool_names={"list_indexed_papers"},
@@ -1739,7 +1739,7 @@ class TestVerifyNode(unittest.TestCase):
 
     def test_verify_clears_retry_metadata_after_success(self):
         """修正后的回复通过验证后，不应把旧反馈带入下一轮对话。"""
-        from graph_builder import build_graph
+        from agent.graph import build_graph
 
         responses = [
             self._FakeResponse({
@@ -1752,8 +1752,8 @@ class TestVerifyNode(unittest.TestCase):
             self._FakeResponse({"content": "这是一段超过一百字符的工具结果总结。" * 5}),
             self._FakeResponse({"content": "OK"}),
         ]
-        with patch("llm_client.requests.post", side_effect=responses):
-            from llm_client import LLMClient
+        with patch("integrations.llm_client.requests.post", side_effect=responses):
+            from integrations.llm_client import LLMClient
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:",
                 llm_client=LLMClient("test-key", "https://example.test/chat"),
@@ -1776,15 +1776,15 @@ class TestVerifyNode(unittest.TestCase):
 
     def test_graph_reads_memory_by_current_session(self):
         """不同 thread_id 只能注入自己的对话摘要，不能共用 research-main。"""
-        from graph_builder import build_graph
+        from agent.graph import build_graph
 
         class _Memory:
             def get_recent_summary(self, thread_id):
                 return thread_id
 
         responses = [self._FakeResponse({"content": "收到"}) for _ in range(2)]
-        from llm_client import LLMClient
-        with patch("llm_client.requests.post", side_effect=responses) as post:
+        from integrations.llm_client import LLMClient
+        with patch("integrations.llm_client.requests.post", side_effect=responses) as post:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", memory_store=_Memory(),
                 llm_client=LLMClient("test-key", "https://example.test/chat"),
@@ -1813,9 +1813,9 @@ class TestVerifyNode(unittest.TestCase):
     def test_verify_uses_short_timeout_without_poisoning_main_circuit(self):
         """验证超时只打开其局部熔断器，不能阻断主模型或 Curator。"""
         import requests
-        from graph_builder import build_graph
-        from llm_client import LLMClient
-        from resilience import CircuitBreaker
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
+        from infra.resilience import CircuitBreaker
 
         responses = [
             self._FakeResponse({
@@ -1835,7 +1835,7 @@ class TestVerifyNode(unittest.TestCase):
         client = LLMClient(
             "test-key", "https://example.test/chat", max_retries=0,
         )
-        with patch("llm_client.requests.post", side_effect=responses) as post:
+        with patch("integrations.llm_client.requests.post", side_effect=responses) as post:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", token_usage=usage,
                 verify_timeout_seconds=4, verify_guard=guard, llm_client=client,
@@ -1873,9 +1873,9 @@ class TestVerifyNode(unittest.TestCase):
 
     def test_verify_default_budget_allows_recovery_without_marking_run_failed(self):
         import requests
-        from graph_builder import build_graph
-        from llm_client import LLMClient
-        from resilience import CircuitBreaker
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
+        from infra.resilience import CircuitBreaker
         events = []
         guard = CircuitBreaker(failure_threshold=1, recovery_seconds=60)
         responses = [
@@ -1885,7 +1885,7 @@ class TestVerifyNode(unittest.TestCase):
             requests.exceptions.ConnectionError("transient"),
             self._FakeResponse({"content": "OK"}),
         ]
-        with patch("llm_client.requests.post", side_effect=responses) as post:
+        with patch("integrations.llm_client.requests.post", side_effect=responses) as post:
             app = build_graph(api_key="test-key", checkpoint_db=":memory:", verify_guard=guard,
                 llm_client=LLMClient("test-key", "https://example.test/chat"), event_callback=events.append)
             try:
@@ -1905,7 +1905,7 @@ class TestVerifyNode(unittest.TestCase):
     def test_stream_retries_same_model_before_first_token(self):
         """流式连接在尚未输出 token 时可以安全重放一次同模型请求。"""
         import requests
-        from graph_builder import build_graph
+        from agent.graph import build_graph
 
         class _StreamingResponse:
             status_code = 200
@@ -1993,7 +1993,7 @@ class TestScheduler(unittest.TestCase):
     """每日检索的本地命令路径，不调用外部论文 API。"""
 
     def test_retry_today_and_temporary_search(self):
-        from scheduler import Scheduler
+        from agent.daily.scheduler import Scheduler
 
         with tempfile.TemporaryDirectory() as tmp:
             scheduler = Scheduler(str(Path(tmp) / "daily.db"))
@@ -2011,7 +2011,7 @@ class TestScheduler(unittest.TestCase):
 
     def test_parallel_search_passes_short_timeouts_to_each_source(self):
         """三源检索并行执行，单源请求必须使用配置的短超时。"""
-        from scheduler import Scheduler
+        from agent.daily.scheduler import Scheduler
 
         class _HttpResponse:
             def __init__(self, content=b"", payload=None):
@@ -2053,7 +2053,7 @@ class TestPaperArtifacts(unittest.TestCase):
 
     def test_card_prompt_and_draft_require_why_how_what_slots(self):
         """P0-5: WHY/HOW/WHAT makes a card comparable across papers."""
-        from paper_artifacts import (
+        from papers.artifacts import (
             CARD_COMPARISON_HEADING,
             audit_paper_card,
             fallback_paper_card,
@@ -2077,7 +2077,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(audit["missing_comparison_slots"], [])
 
     def test_missing_comparison_slots_are_reported_without_failing_the_card(self):
-        from paper_artifacts import CARD_HEADINGS, audit_paper_card
+        from papers.artifacts import CARD_HEADINGS, audit_paper_card
 
         source_map = {"paper_id": "paper-1", "blocks": [{"id": "S001", "page": 1, "text": "x"}]}
         card = "\n".join(
@@ -2090,9 +2090,9 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(audit["missing_comparison_slots"], ["WHY", "HOW", "WHAT"])
 
     def test_cross_page_continuation_is_one_logical_chunk_with_page_range(self):
-        from paper_artifacts import build_document_map, related_context
-        from paper_quality import assess_document_map
-        from paper_store import PaperStore
+        from papers.artifacts import build_document_map, related_context
+        from papers.quality import assess_document_map
+        from papers.store import PaperStore
 
         parsed = {
             "source_file": "sample.pdf", "total_pages": 4, "processed_pages": 4,
@@ -2142,7 +2142,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(report["stats"]["cross_page_chunks"], 1)
 
     def test_cross_page_join_requires_an_unfinished_body_paragraph(self):
-        from paper_artifacts import build_document_map
+        from papers.artifacts import build_document_map
 
         parsed = {
             "source_file": "sample.pdf", "total_pages": 4, "processed_pages": 4,
@@ -2167,7 +2167,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual([(chunk["page"], chunk["page_end"]) for chunk in text_chunks], [(3, 3), (4, 4)])
 
     def test_cross_page_blocks_do_not_chain_past_two_pages_or_missed_heading(self):
-        from paper_artifacts import build_document_map
+        from papers.artifacts import build_document_map
 
         parsed = {
             "source_file": "sample.pdf", "total_pages": 5, "processed_pages": 5,
@@ -2203,7 +2203,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual([(chunk["page"], chunk["page_end"]) for chunk in text_chunks], [(3, 4), (5, 5)])
 
     def test_cross_page_long_logical_block_splits_without_an_orphan_tail(self):
-        from paper_artifacts import build_document_map
+        from papers.artifacts import build_document_map
 
         parsed = {
             "source_file": "sample.pdf", "total_pages": 4, "processed_pages": 4,
@@ -2232,7 +2232,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertTrue(all((chunk["page"], chunk["page_end"]) == (3, 4) for chunk in text_chunks))
 
     def test_document_map_keeps_table_figure_and_nearby_text_on_the_same_page(self):
-        from paper_artifacts import (
+        from papers.artifacts import (
             attach_image_assets,
             build_document_map,
             build_source_map_from_document,
@@ -2277,8 +2277,8 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(locator, "p.3 · Table 2")
 
     def test_query_tool_adds_related_context_for_a_page_mapped_result(self):
-        from paper_artifacts import build_document_map, write_document_map
-        from runtime_paths import RuntimePaths
+        from papers.artifacts import build_document_map, write_document_map
+        from infra.runtime_paths import RuntimePaths
         from tools.search import handle_query_papers
 
         parsed = {
@@ -2322,8 +2322,8 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertIn("explains the table", result)
 
     def test_obsolete_document_map_cleanup_never_removes_a_nonempty_artifact_directory(self):
-        from paper_artifacts import build_document_map, remove_document_map, write_document_map
-        from runtime_paths import RuntimePaths
+        from papers.artifacts import build_document_map, remove_document_map, write_document_map
+        from infra.runtime_paths import RuntimePaths
 
         parsed = {
             "source_file": "sample.pdf", "total_pages": 1, "processed_pages": 1,
@@ -2436,7 +2436,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(source, "PDF 元数据")
 
     def test_quality_gate_merges_an_orphan_formula_fragment_without_losing_sources(self):
-        from paper_quality import prepare_document_map
+        from papers.quality import prepare_document_map
 
         document_map = {
             "total_pages": 1,
@@ -2465,7 +2465,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(prepared["chunks"][0]["source_element_ids"], ["p001-t01", "p001-t02"])
 
     def test_quality_gate_rejects_untraceable_chunks_and_index_round_trip_loss(self):
-        from paper_quality import assess_document_map, verify_index_round_trip
+        from papers.quality import assess_document_map, verify_index_round_trip
 
         document_map = {
             "total_pages": 1,
@@ -2554,8 +2554,8 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertIn("备用文本解析", result)
 
     def test_paper_card_prefers_the_persisted_document_map(self):
-        from paper_artifacts import build_document_map, write_document_map
-        from runtime_paths import RuntimePaths
+        from papers.artifacts import build_document_map, write_document_map
+        from infra.runtime_paths import RuntimePaths
         from tools.paper_card import handle_generate_paper_card
 
         parsed = {
@@ -2591,7 +2591,7 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertIn("已生成证据草稿", result)
 
     def test_source_map_keeps_page_and_section_anchors(self):
-        from paper_artifacts import build_source_map_from_reader_text
+        from papers.artifacts import build_source_map_from_reader_text
 
         reader_text = (
             "📄 **PDF 解析完成**\n文件名: sample.pdf | 总页数: 2 | 已读: 2 | 提取: 90 字符\n\n"
@@ -2608,8 +2608,8 @@ class TestPaperArtifacts(unittest.TestCase):
         self.assertEqual(source_map["blocks"][1]["section"], "Experiments")
 
     def test_evidence_card_writes_only_under_runtime_and_rejects_bad_anchor(self):
-        from paper_artifacts import CARD_HEADINGS, audit_paper_card, write_paper_artifact
-        from runtime_paths import RuntimePaths
+        from papers.artifacts import CARD_HEADINGS, audit_paper_card, write_paper_artifact
+        from infra.runtime_paths import RuntimePaths
 
         source_map = {
             "paper_id": "paper-1",
@@ -2662,7 +2662,7 @@ class TestPaperArtifacts(unittest.TestCase):
             self.assertTrue((runtime / "derived" / "paper_artifacts" / "paper-1" / "paper-card.md").is_file())
 
     def test_paper_card_tool_uses_shared_client_with_a_low_priority_policy(self):
-        from paper_artifacts import CARD_HEADINGS
+        from papers.artifacts import CARD_HEADINGS
         from tools.paper_card import handle_generate_paper_card
 
         class _Store:
@@ -2716,7 +2716,7 @@ class TestPaperArtifacts(unittest.TestCase):
 
 class TestPaperRecordNormalization(unittest.TestCase):
     def test_ieee_normalization_only_exposes_explicit_open_access_pdf(self):
-        from ieee_xplore import ieee_records
+        from integrations.ieee_xplore import ieee_records
 
         records = ieee_records({"articles": [
             {
@@ -2755,7 +2755,7 @@ class TestPaperRecordNormalization(unittest.TestCase):
         self.assertEqual(records[2]["open_access_pdf_url"], "")
 
     def test_deduplication_prefers_doi_and_merges_provider_metadata(self):
-        from paper_records import deduplicate_paper_records
+        from papers.records import deduplicate_paper_records
 
         records = [
             {
@@ -2777,7 +2777,7 @@ class TestPaperRecordNormalization(unittest.TestCase):
         self.assertEqual(merged[0]["abstract"], "longer abstract")
 
     def test_merged_public_search_keeps_source_labels_and_partial_failure(self):
-        from search_api import search_public_papers
+        from integrations.public_search import search_public_papers
 
         openalex = [{
             "title": "Shared Paper", "abstract": "TSN scheduling under bursty traffic.",
@@ -2789,8 +2789,8 @@ class TestPaperRecordNormalization(unittest.TestCase):
             "doi": "10.1/shared", "year": 2025, "citation_count": 0,
             "sources": ["arxiv"], "source_ids": {"arxiv": "2501.00001"},
         }]
-        with patch("search_api._fetch_openalex_records", return_value=(openalex, None, "TSN")), patch(
-            "search_api._fetch_arxiv_records", return_value=(arxiv, "arXiv API 请求失败: timeout"),
+        with patch("integrations.public_search._fetch_openalex_records", return_value=(openalex, None, "TSN")), patch(
+            "integrations.public_search._fetch_arxiv_records", return_value=(arxiv, "arXiv API 请求失败: timeout"),
         ):
             result = search_public_papers("TSN scheduling under bursty traffic", limit=5)
 
@@ -2799,9 +2799,9 @@ class TestPaperRecordNormalization(unittest.TestCase):
         self.assertIn("未完成来源", result)
 
     def test_ieee_search_is_disabled_without_request(self):
-        from search_api import search_ieee
+        from integrations.public_search import search_ieee
 
-        with patch("search_api.requests.get") as request_get:
+        with patch("integrations.public_search.requests.get") as request_get:
             result = search_ieee(
                 "TSN scheduling under bursty traffic", limit=3, api_key="ieee-test-key",
             )
@@ -2832,8 +2832,8 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
         )
 
     def test_daily_run_deduplicates_then_uses_one_batch_curator(self):
-        from daily_orchestrator import DailyResearchOrchestrator
-        from scheduler import Scheduler
+        from agent.daily.orchestrator import DailyResearchOrchestrator
+        from agent.daily.scheduler import Scheduler
 
         class _Response:
             def __init__(self, content):
@@ -2905,8 +2905,8 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 scheduler.close()
 
     def test_source_sets_keep_arxiv_out_of_daily_and_send_raw_source_keys(self):
-        from daily_orchestrator import DailyResearchOrchestrator
-        from scheduler import Scheduler
+        from agent.daily.orchestrator import DailyResearchOrchestrator
+        from agent.daily.scheduler import Scheduler
 
         class _Response:
             def raise_for_status(self):
@@ -2927,7 +2927,7 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 )
                 self.assertEqual(orchestrator.daily_sources, ("openalex", "openaire", "dblp"))
                 self.assertEqual(orchestrator.temporary_sources, ("openalex", "arxiv"))
-                with patch("daily_orchestrator.requests.get", return_value=_Response()) as request_get:
+                with patch("agent.daily.orchestrator.requests.get", return_value=_Response()) as request_get:
                     self.assertEqual(orchestrator._openalex_scout("TSN", None), [])
                 self.assertEqual(request_get.call_args.kwargs["params"]["api_key"], "oa-test-key")
 
@@ -2941,8 +2941,8 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 scheduler.close()
 
     def test_ieee_scout_is_disabled_without_request(self):
-        from daily_orchestrator import DailyResearchOrchestrator
-        from scheduler import Scheduler
+        from agent.daily.orchestrator import DailyResearchOrchestrator
+        from agent.daily.scheduler import Scheduler
 
         class _Response:
             def raise_for_status(self):
@@ -2967,7 +2967,7 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 orchestrator = DailyResearchOrchestrator(
                     scheduler=scheduler, ieee_api_key="ieee-test-key",
                 )
-                with patch("daily_orchestrator.requests.get", return_value=_Response()) as request_get:
+                with patch("agent.daily.orchestrator.requests.get", return_value=_Response()) as request_get:
                     candidates = orchestrator._ieee_scout("TSN scheduling", None)
 
                 request_get.assert_not_called()
@@ -2976,8 +2976,8 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 scheduler.close()
 
     def test_resume_reuses_saved_candidates_without_fetching_again(self):
-        from daily_orchestrator import DailyResearchOrchestrator
-        from scheduler import Scheduler
+        from agent.daily.orchestrator import DailyResearchOrchestrator
+        from agent.daily.scheduler import Scheduler
 
         with tempfile.TemporaryDirectory() as tmp:
             scheduler = Scheduler(str(Path(tmp) / "daily.db"))
@@ -3004,8 +3004,8 @@ class TestDailyMultiAgentOrchestration(unittest.TestCase):
                 scheduler.close()
 
     def test_critic_is_conditional_for_small_or_low_quality_candidate_sets(self):
-        from daily_orchestrator import DailyResearchOrchestrator
-        from scheduler import Scheduler
+        from agent.daily.orchestrator import DailyResearchOrchestrator
+        from agent.daily.scheduler import Scheduler
 
         class _Response:
             def __init__(self, content):
@@ -3062,8 +3062,8 @@ class TestConversationMemory(unittest.TestCase):
     """长期辅助记忆保持会话隔离，并在达到阈值后有界压缩。"""
 
     def test_memory_search_combines_current_session_summary_and_paper_facts(self):
-        from memory import MemoryStore
-        from tools import execute_tool
+        from sessions.memory_store import MemoryStore
+        from tools.dispatch import execute_tool
 
         with tempfile.TemporaryDirectory() as tmp:
             memory = MemoryStore(str(Path(tmp) / "memory.db"))
@@ -3088,7 +3088,7 @@ class TestConversationMemory(unittest.TestCase):
         self.assertIn("DiffTSN", result)
 
     def test_summary_policy_skips_short_history_and_compacts_long_history(self):
-        from conversation_memory import maybe_store_conversation_summary
+        from sessions.summary_policy import maybe_store_conversation_summary
 
         class _Memory:
             stored = []
@@ -3153,8 +3153,8 @@ class TestSessionStore(unittest.TestCase):
     """多会话注册、旧历史迁移与硬删除边界。"""
 
     def test_legacy_migration_and_isolated_hard_delete(self):
-        from session_store import SessionStore, LEGACY_THREAD_ID
-        from memory import MemoryStore
+        from sessions.store import SessionStore, LEGACY_THREAD_ID
+        from sessions.memory_store import MemoryStore
 
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_db = Path(tmp) / "checkpoint.db"
@@ -3220,7 +3220,7 @@ class TestSessionStore(unittest.TestCase):
 
     def test_cleanup_orphaned_checkpoints_keeps_registered_sessions(self):
         """早期删除遗留的 checkpoint 不能在运行时数据库中持续累积。"""
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_db = Path(tmp) / "checkpoint.db"
@@ -3280,7 +3280,7 @@ class TestSessionStore(unittest.TestCase):
 
     def test_research_run_is_session_scoped_and_deleted_with_session(self):
         """深度研究的可恢复中间态必须跟随会话删除，不能成为孤儿数据。"""
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
@@ -3314,7 +3314,7 @@ class TestSessionStore(unittest.TestCase):
 
     def test_chat_run_events_are_safe_and_deleted_with_their_session(self):
         """The operation log is session-scoped and keeps only approved metrics."""
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
@@ -3361,8 +3361,8 @@ class TestSessionStore(unittest.TestCase):
 
     def test_daily_timeline_adapter_hides_daily_event_messages(self):
         """Daily data stays in its own DB and raw keyword messages are never rendered."""
-        from scheduler import Scheduler
-        from session_store import SessionStore
+        from agent.daily.scheduler import Scheduler
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             sessions = SessionStore(str(Path(tmp) / "checkpoint.db"))
@@ -3384,8 +3384,8 @@ class TestSessionStore(unittest.TestCase):
 
     def test_event_schema_migrates_existing_databases_and_hides_legacy_payloads(self):
         """Adding the shared contract must not require users to rebuild local SQLite files."""
-        from scheduler import Scheduler
-        from session_store import SessionStore
+        from agent.daily.scheduler import Scheduler
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_db = Path(tmp) / "checkpoint.db"
@@ -3471,7 +3471,7 @@ class TestResearchOrchestration(unittest.TestCase):
         }
 
     def _orchestrator(self, store):
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         return ResearchOrchestrator(
             session_store=store,
@@ -3483,10 +3483,10 @@ class TestResearchOrchestration(unittest.TestCase):
         )
 
     def test_research_worker_uses_bounded_tool_rounds(self):
-        from research_orchestrator import RESEARCH_WORKER_MAX_TOOL_ROUNDS, _WorkerSpec
+        from agent.research.orchestrator import RESEARCH_WORKER_MAX_TOOL_ROUNDS, _WorkerSpec
 
         with tempfile.TemporaryDirectory() as tmp:
-            from session_store import SessionStore
+            from sessions.store import SessionStore
 
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
             try:
@@ -3508,7 +3508,7 @@ class TestResearchOrchestration(unittest.TestCase):
                 spec = _WorkerSpec(
                     role="public", label="公开研究员", allowed_tools={"search_papers"}, instruction="收集证据",
                 )
-                with patch("research_orchestrator.build_graph", return_value=_App()) as build:
+                with patch("agent.research.orchestrator.build_graph", return_value=_App()) as build:
                     worker = orchestrator._run_worker(
                         spec, "研究问题", {"subtasks": []}, None, run_id="research-run-1",
                     )
@@ -3526,7 +3526,7 @@ class TestResearchOrchestration(unittest.TestCase):
                 store.close()
 
     def test_network_tsn_question_keeps_networking_domain_constraint(self):
-        from research_orchestrator import ResearchOrchestrator, _WorkerSpec
+        from agent.research.orchestrator import ResearchOrchestrator, _WorkerSpec
 
         prompt = ResearchOrchestrator._worker_input(
             "评估 TSN 在突发流量负载下的调度条件",
@@ -3537,7 +3537,7 @@ class TestResearchOrchestration(unittest.TestCase):
         self.assertIn("do not reinterpret", prompt)
 
     def test_network_tsn_public_search_normalizer_rejects_video_terms(self):
-        from research_orchestrator import ResearchOrchestrator, _WorkerSpec
+        from agent.research.orchestrator import ResearchOrchestrator, _WorkerSpec
 
         spec = _WorkerSpec("public", "公开研究员", {"search_papers"}, "收集公开证据")
         normalize = ResearchOrchestrator._worker_tool_argument_normalizer(
@@ -3560,7 +3560,7 @@ class TestResearchOrchestration(unittest.TestCase):
         )
 
     def test_public_evidence_persists_provider_relevance_metadata(self):
-        from research_orchestrator import ResearchOrchestrator
+        from agent.research.orchestrator import ResearchOrchestrator
 
         cards = ResearchOrchestrator._evidence_from_messages([
             {"role": "assistant", "tool_calls": [{
@@ -3597,7 +3597,7 @@ class TestResearchOrchestration(unittest.TestCase):
 
     def test_completed_research_runs_one_bounded_revision_and_persists_report(self):
         with tempfile.TemporaryDirectory() as tmp:
-            from session_store import SessionStore
+            from sessions.store import SessionStore
 
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
             try:
@@ -3641,8 +3641,8 @@ class TestResearchOrchestration(unittest.TestCase):
                 store.close()
 
     def test_critic_timeout_keeps_partial_evidence_report_with_unknown_quality(self):
-        from llm_client import LLMRequestTimeoutError
-        from session_store import SessionStore
+        from integrations.llm_client import LLMRequestTimeoutError
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
@@ -3679,8 +3679,8 @@ class TestResearchOrchestration(unittest.TestCase):
 
 
     def test_synthesis_timeout_returns_partial_cited_evidence_fallback_with_unknown_quality(self):
-        from llm_client import LLMRequestTimeoutError
-        from session_store import SessionStore
+        from integrations.llm_client import LLMRequestTimeoutError
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
@@ -3724,8 +3724,8 @@ class TestResearchOrchestration(unittest.TestCase):
 
     def test_research_turn_is_visible_as_only_user_and_final_report(self):
         """研究员的内部工具消息不得污染普通会话历史。"""
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         with tempfile.TemporaryDirectory() as tmp:
             agent = ResearchAgent(Config(deepseek_key="test-key", rag_enabled=False, data_dir=tmp))
@@ -3749,7 +3749,7 @@ class TestResearchOrchestration(unittest.TestCase):
 
     def test_continue_reuses_saved_evidence_without_replanning_or_workers(self):
         with tempfile.TemporaryDirectory() as tmp:
-            from session_store import SessionStore
+            from sessions.store import SessionStore
 
             store = SessionStore(str(Path(tmp) / "checkpoint.db"))
             try:
@@ -3815,12 +3815,12 @@ class TestLLMClient(unittest.TestCase):
 
     def test_non_retryable_http_error_exposes_api_detail(self):
         import requests
-        from llm_client import LLMClient, LLMRequestFailedError
+        from integrations.llm_client import LLMClient, LLMRequestFailedError
 
         response = self._Response(status_code=400, text='{"error":{"message":"invalid messages"}}')
         client = LLMClient("test-key", "https://example.test/chat", max_retries=0)
 
-        with patch("llm_client.requests.post", return_value=response):
+        with patch("integrations.llm_client.requests.post", return_value=response):
             with self.assertRaises(LLMRequestFailedError) as raised:
                 client.post({"model": "deepseek-v4-flash", "messages": []})
         self.assertIn("400", str(raised.exception))
@@ -3828,7 +3828,7 @@ class TestLLMClient(unittest.TestCase):
 
     def test_retries_same_model_after_timeout(self):
         import requests
-        from llm_client import LLMClient
+        from integrations.llm_client import LLMClient
 
         client = LLMClient(
             "test-key", "https://example.test/chat", max_retries=1,
@@ -3836,9 +3836,9 @@ class TestLLMClient(unittest.TestCase):
             request_deadline_seconds=20,
         )
         payload = {"model": "deepseek-v4-flash", "messages": [], "stream": False}
-        with patch("llm_client.requests.post", side_effect=[
+        with patch("integrations.llm_client.requests.post", side_effect=[
             requests.exceptions.ReadTimeout("slow"), self._Response(),
-        ]) as post, patch("llm_client.time.sleep"):
+        ]) as post, patch("integrations.llm_client.time.sleep"):
             response = client.post(payload)
 
         self.assertEqual(response.status_code, 200)
@@ -3849,7 +3849,7 @@ class TestLLMClient(unittest.TestCase):
 
     def test_request_policy_controls_budget_and_retry_limit(self):
         import requests
-        from llm_client import LLMClient, LLMRequestTimeoutError, RequestPolicy, RequestPriority
+        from integrations.llm_client import LLMClient, LLMRequestTimeoutError, RequestPolicy, RequestPriority
 
         client = LLMClient("test-key", "https://example.test/chat", max_retries=2)
         policy = RequestPolicy(
@@ -3857,7 +3857,7 @@ class TestLLMClient(unittest.TestCase):
             deadline_seconds=4, max_retries=0,
         )
         budget = client.new_request_budget(policy)
-        with patch("llm_client.requests.post", side_effect=requests.exceptions.ReadTimeout("slow")) as post:
+        with patch("integrations.llm_client.requests.post", side_effect=requests.exceptions.ReadTimeout("slow")) as post:
             with self.assertRaises(LLMRequestTimeoutError):
                 client.post({"model": "deepseek-v4-flash", "messages": []}, budget=budget)
 
@@ -3868,7 +3868,7 @@ class TestLLMClient(unittest.TestCase):
 
     def test_background_work_preserves_interactive_capacity(self):
         import threading
-        from llm_client import LLMClient, RequestPolicy, RequestPriority
+        from integrations.llm_client import LLMClient, RequestPolicy, RequestPriority
 
         client = LLMClient(
             "test-key", "https://example.test/chat", max_concurrency=2,
@@ -3879,7 +3879,7 @@ class TestLLMClient(unittest.TestCase):
         pending = []
         errors = []
 
-        with patch("llm_client.requests.post", side_effect=[
+        with patch("integrations.llm_client.requests.post", side_effect=[
             self._Response(), self._Response(), self._Response(),
         ]) as post:
             first_background = client.post(payload, stream=True, policy=background)
@@ -3909,14 +3909,14 @@ class TestLLMClient(unittest.TestCase):
 
     def test_opens_circuit_after_exhausted_same_model_failures(self):
         import requests
-        from llm_client import LLMClient, LLMCircuitOpenError, LLMRequestTimeoutError
+        from integrations.llm_client import LLMClient, LLMCircuitOpenError, LLMRequestTimeoutError
 
         client = LLMClient(
             "test-key", "https://example.test/chat", max_retries=0,
             circuit_failure_threshold=1, circuit_recovery_seconds=60,
         )
         payload = {"model": "deepseek-v4-flash", "messages": [], "stream": False}
-        with patch("llm_client.requests.post", side_effect=requests.exceptions.ConnectionError("offline")) as post:
+        with patch("integrations.llm_client.requests.post", side_effect=requests.exceptions.ConnectionError("offline")) as post:
             with self.assertRaises(LLMRequestTimeoutError):
                 client.post(payload)
             with self.assertRaises(LLMCircuitOpenError):
@@ -3927,7 +3927,7 @@ class TestLLMClient(unittest.TestCase):
     def test_queue_wait_counts_toward_single_request_deadline(self):
         """排队耗尽的时间不能再额外获得一整段模型请求预算。"""
         import time
-        from llm_client import LLMClient, LLMRequestTimeoutError
+        from integrations.llm_client import LLMClient, LLMRequestTimeoutError
 
         client = LLMClient(
             "test-key", "https://example.test/chat", max_concurrency=1,
@@ -3936,7 +3936,7 @@ class TestLLMClient(unittest.TestCase):
         self.assertTrue(client._slots.acquire(blocking=False))
         started = time.monotonic()
         try:
-            with patch("llm_client.requests.post") as post:
+            with patch("integrations.llm_client.requests.post") as post:
                 with self.assertRaises(LLMRequestTimeoutError):
                     client.post({"model": "deepseek-v4-flash", "messages": []})
             self.assertFalse(post.called)
@@ -3946,13 +3946,13 @@ class TestLLMClient(unittest.TestCase):
 
     def test_cancelled_request_does_not_enter_model_queue(self):
         import threading
-        from cancellation import RequestCancelledError
-        from llm_client import LLMClient
+        from infra.cancellation import RequestCancelledError
+        from integrations.llm_client import LLMClient
 
         client = LLMClient("test-key", "https://example.test/chat")
         cancel_event = threading.Event()
         cancel_event.set()
-        with patch("llm_client.requests.post") as post:
+        with patch("integrations.llm_client.requests.post") as post:
             with self.assertRaises(RequestCancelledError):
                 client.post(
                     {"model": "deepseek-v4-flash", "messages": []},
@@ -3962,7 +3962,7 @@ class TestLLMClient(unittest.TestCase):
 
     def test_stream_holds_slot_and_clears_failure_only_after_done(self):
         """SSE 首包成功不应提前释放并发槽或清除熔断失败记录。"""
-        from llm_client import LLMClient
+        from integrations.llm_client import LLMClient
 
         client = LLMClient(
             "test-key", "https://example.test/chat", max_concurrency=1,
@@ -3970,7 +3970,7 @@ class TestLLMClient(unittest.TestCase):
         )
         client._circuit.record_failure()
         response = self._Response()
-        with patch("llm_client.requests.post", return_value=response):
+        with patch("integrations.llm_client.requests.post", return_value=response):
             streamed = client.post(
                 {"model": "deepseek-v4-flash", "messages": []}, stream=True,
             )
@@ -3988,9 +3988,9 @@ class TestCancellationPropagation(unittest.TestCase):
 
     def test_pre_cancelled_graph_skips_llm_and_tools(self):
         import threading
-        from cancellation import RequestCancelledError
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from infra.cancellation import RequestCancelledError
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
 
         cancel_event = threading.Event()
         cancel_event.set()
@@ -4009,8 +4009,8 @@ class TestCancellationPropagation(unittest.TestCase):
 
     def test_research_worker_graph_ends_without_verify_request(self):
         """研究员工具循环结束后不再额外调用一次 verify。"""
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
 
         class _Response:
             status_code = 200
@@ -4025,7 +4025,7 @@ class TestCancellationPropagation(unittest.TestCase):
                 return {"choices": [{"message": {"content": "已完成本地证据整理"}}]}
 
         with patch(
-            "llm_client.requests.post",
+            "integrations.llm_client.requests.post",
             return_value=_Response(),
         ) as post:
             app = build_graph(
@@ -4048,8 +4048,8 @@ class TestCancellationPropagation(unittest.TestCase):
 
     def test_bounded_research_worker_keeps_tool_evidence_without_recursion_error(self):
         """研究员达到工具轮次上限时应保留最后一轮证据并正常结束。"""
-        from graph_builder import build_graph
-        from llm_client import LLMClient
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
 
         class _Response:
             status_code = 200
@@ -4075,8 +4075,8 @@ class TestCancellationPropagation(unittest.TestCase):
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 }
 
-        with patch("llm_client.requests.post", return_value=_Response()) as post, \
-             patch("graph_builder.execute_tool", return_value="搜索结果 **TSN 证据论文**") as execute:
+        with patch("integrations.llm_client.requests.post", return_value=_Response()) as post, \
+             patch("agent.graph.execute_tool", return_value="搜索结果 **TSN 证据论文**") as execute:
             app = build_graph(
                 api_key="test-key", checkpoint_db=":memory:", enable_verify=False,
                 allowed_tool_names={"search_papers"}, max_tool_rounds=1,
@@ -4103,15 +4103,15 @@ class TestCancellationPropagation(unittest.TestCase):
         self.assertIn("TSN 证据论文", result["messages"][-1]["content"])
 
     def test_graph_requires_shared_llm_client(self):
-        from graph_builder import build_graph
+        from agent.graph import build_graph
 
         with self.assertRaisesRegex(ValueError, "shared llm_client"):
             build_graph(api_key="test-key", checkpoint_db=":memory:")
 
     def test_agent_returns_cancelled_status_without_building_graph(self):
         import threading
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         with tempfile.TemporaryDirectory() as tmp:
             agent = ResearchAgent(Config(deepseek_key="test-key", rag_enabled=False, data_dir=tmp))
@@ -4125,9 +4125,9 @@ class TestCancellationPropagation(unittest.TestCase):
 
     def test_agent_stops_an_inflight_graph_when_cancel_event_is_set(self):
         import threading
-        from cancellation import RequestCancelledError
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.cancellation import RequestCancelledError
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         class _SlowApp:
             def __init__(self, cancel_event):
@@ -4164,8 +4164,8 @@ class TestToolCatalog(unittest.TestCase):
     """工具声明必须在 Schema、运行时和分发器之间保持同源。"""
 
     def test_profile_read_replace_and_remove_through_runtime(self):
-        from tool_runtime import ToolExecutionContext, ToolRuntime
-        from user_profile import ProfileManager
+        from tools.runtime import ToolExecutionContext, ToolRuntime
+        from sessions.profile import ProfileManager
 
         with tempfile.TemporaryDirectory() as tmp:
             profile = ProfileManager(str(Path(tmp) / "profile.md"))
@@ -4194,8 +4194,8 @@ class TestToolCatalog(unittest.TestCase):
             ))
 
     def test_catalog_filters_capabilities_and_returns_independent_schemas(self):
-        from tool_catalog import TOOL_NAMES, get_tool_schemas
-        from tools import TOOL_NAMES as executable_names
+        from tools.catalog import TOOL_NAMES, get_tool_schemas
+        from tools.dispatch import TOOL_NAMES as executable_names
 
         self.assertEqual(TOOL_NAMES, executable_names)
         self.assertNotIn("update_experiment_project", TOOL_NAMES)
@@ -4217,7 +4217,7 @@ class TestToolRuntime(unittest.TestCase):
     """工具策略在现有分发器之前生效，且追踪中不保留参数或结果。"""
 
     def test_disallowed_tool_does_not_reach_dispatcher_or_expose_arguments(self):
-        from tool_runtime import ToolExecutionContext, ToolRuntime
+        from tools.runtime import ToolExecutionContext, ToolRuntime
 
         events = []
         dispatcher = MagicMock(return_value="不应执行")
@@ -4247,8 +4247,8 @@ class TestToolRuntime(unittest.TestCase):
 
     def test_runtime_bounds_output_and_stops_before_cancelled_dispatch(self):
         import threading
-        from cancellation import RequestCancelledError
-        from tool_runtime import ToolExecutionContext, ToolRuntime
+        from infra.cancellation import RequestCancelledError
+        from tools.runtime import ToolExecutionContext, ToolRuntime
 
         events = []
         dispatcher = MagicMock(return_value="x" * 3_200)
@@ -4260,7 +4260,7 @@ class TestToolRuntime(unittest.TestCase):
             executor=dispatcher,
         )
         result = runtime.execute("search_papers", {"query": "TSN"})
-        from tool_results import result_header
+        from tools.results import result_header
         self.assertTrue(result_header(result)['has_more'])
         self.assertEqual(result_header(result)['total_chars'], 3200)
         self.assertLessEqual(len(result), 3_000)
@@ -4280,7 +4280,7 @@ class TestToolRuntime(unittest.TestCase):
         blocked_dispatcher.assert_not_called()
 
     def test_runtime_passes_non_content_session_scope_to_memory_tool(self):
-        from tool_runtime import ToolExecutionContext, ToolRuntime
+        from tools.runtime import ToolExecutionContext, ToolRuntime
 
         dispatcher = MagicMock(return_value="记忆结果")
         runtime = ToolRuntime(
@@ -4355,7 +4355,7 @@ class TestCircuitBreaker(unittest.TestCase):
     def test_half_open_admits_a_single_probe_and_reopens_on_failure(self):
         """恢复期结束后只能有一个请求探测下游服务。"""
         import time
-        from resilience import CircuitBreaker
+        from infra.resilience import CircuitBreaker
 
         breaker = CircuitBreaker(failure_threshold=1, recovery_seconds=60)
         breaker.record_failure()
@@ -4376,7 +4376,7 @@ class TestBadcaseStore(unittest.TestCase):
     """Badcase 候选只保存可审计的机器元数据，不保留真实内容。"""
 
     def test_candidate_and_export_template_strip_run_content(self):
-        from badcase_store import BadcaseStore, promotion_template
+        from runs.badcases import BadcaseStore, promotion_template
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "runtime"
@@ -4433,7 +4433,7 @@ class TestBadcaseStore(unittest.TestCase):
 
 class TestDailyWorkerStartup(unittest.TestCase):
     def test_enabled_daily_search_queues_resume_or_today_run(self):
-        from api_worker import enqueue_enabled_daily_run
+        from agent.daily.startup import enqueue_enabled_daily_run
 
         class _Scheduler:
             def __init__(self, resumable):
@@ -4468,8 +4468,8 @@ class TestRuntimePaths(unittest.TestCase):
     """运行时数据必须与代码目录隔离，并允许通过环境/CLI 改根目录。"""
 
     def test_runtime_layout_and_user_settings_override_static_config(self):
-        from config import Config
-        from runtime_paths import RuntimePaths
+        from infra.config import Config
+        from infra.runtime_paths import RuntimePaths
 
         old_data_dir = os.environ.get("APP_DATA_DIR")
         try:
@@ -4509,7 +4509,7 @@ class TestRuntimePaths(unittest.TestCase):
                 os.environ["APP_DATA_DIR"] = old_data_dir
 
     def test_public_source_keys_use_dedicated_environment_variables(self):
-        from config import Config
+        from infra.config import Config
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
@@ -4522,7 +4522,7 @@ class TestRuntimePaths(unittest.TestCase):
             self.assertEqual(cfg.daily_sources, ("openalex", "openaire", "dblp"))
 
     def test_vision_model_uses_a_dedicated_environment_variable(self):
-        from config import Config
+        from infra.config import Config
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ, {"DEEPSEEK_VISION_MODEL": "deepseek-v4-flash-vision-exp"}, clear=False,
@@ -4559,8 +4559,8 @@ class TestRuntimePaths(unittest.TestCase):
                 copied.close()
 
     def test_backup_script_exports_primary_data_as_zip(self):
-        from badcase_store import BadcaseStore
-        from runtime_paths import RuntimePaths
+        from runs.badcases import BadcaseStore
+        from infra.runtime_paths import RuntimePaths
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4770,8 +4770,8 @@ class TestResearchBenchmark(unittest.TestCase):
         self.assertFalse(is_eval_session({"title": "普通 T11 讨论"}))
 
     def test_eval_cleanup_script_previews_then_deletes_session_data(self):
-        from runtime_paths import RuntimePaths
-        from session_store import SessionStore
+        from infra.runtime_paths import RuntimePaths
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4905,8 +4905,8 @@ class TestRequestTracing(unittest.TestCase):
     """真实调用前后都应产生脱敏的可评分追踪。"""
 
     def test_agent_discards_persisted_transient_status_on_session_load(self):
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         with tempfile.TemporaryDirectory() as tmp:
             agent = ResearchAgent(Config(
@@ -4934,8 +4934,8 @@ class TestRequestTracing(unittest.TestCase):
     def test_interrupted_stream_releases_slot_and_can_be_retried(self):
         """A partial SSE response must not block the next same-model request."""
         import requests
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         class _StreamingResponse:
             status_code = 200
@@ -4972,7 +4972,7 @@ class TestRequestTracing(unittest.TestCase):
                 api_max_concurrency=1, api_max_retries=0,
             ))
             try:
-                with patch("llm_client.requests.post", side_effect=[first, second]) as post:
+                with patch("integrations.llm_client.requests.post", side_effect=[first, second]) as post:
                     interrupted = agent.step("需要可靠重试的问题", on_token=lambda _token: None)
                     retry = agent.get_retry_input(agent.thread_id)
                     self.assertIn("输出中断", interrupted)
@@ -4991,8 +4991,8 @@ class TestRequestTracing(unittest.TestCase):
                 agent.sessions.close()
 
     def test_agent_exposes_last_trace_without_prompt_or_tool_payload(self):
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         class _FakeApp:
             def invoke(self, state, config):
@@ -5059,7 +5059,7 @@ class TestAgentToolBudget(unittest.TestCase):
     """
 
     def test_graph_steps_are_derived_from_rounds(self):
-        from research_agent import graph_steps_for_tool_rounds
+        from agent.service import graph_steps_for_tool_rounds
 
         self.assertEqual(graph_steps_for_tool_rounds(1), 4)
         self.assertEqual(graph_steps_for_tool_rounds(12), 26)
@@ -5068,7 +5068,7 @@ class TestAgentToolBudget(unittest.TestCase):
         self.assertEqual(graph_steps_for_tool_rounds(-3), 4)
 
     def test_every_named_budget_matches_its_rounds(self):
-        from research_agent import (
+        from agent.service import (
             MAX_AGENT_GRAPH_STEPS,
             MAX_AGENT_TOOL_ROUNDS,
             graph_steps_for_tool_rounds,
@@ -5084,14 +5084,14 @@ class TestAgentToolBudget(unittest.TestCase):
         The old 7-round budget died on the first failed tool call and forced the
         user to start over.  Cost is no longer a reason to keep it small.
         """
-        from research_agent import (
+        from agent.service import (
             MAX_AGENT_TOOL_ROUNDS,
         )
 
         self.assertGreaterEqual(MAX_AGENT_TOOL_ROUNDS, 20)
 
     def test_rounds_are_counted_per_turn_not_per_call(self):
-        from graph_builder import tool_rounds_in
+        from agent.graph import tool_rounds_in
 
         messages = [
             {"role": "user", "content": "读这篇论文"},
@@ -5110,7 +5110,7 @@ class TestAgentToolBudget(unittest.TestCase):
         self.assertEqual(tool_rounds_in(older), 1)
 
     def test_warning_nudge_is_only_emitted_when_budget_runs_out(self):
-        from graph_builder import budget_exhaustion_warning
+        from agent.graph import budget_exhaustion_warning
 
         warning = budget_exhaustion_warning(1)
         self.assertEqual(warning["role"], "system")
@@ -5122,7 +5122,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
     """Regression coverage for correctness and boundary issues found in code audit."""
 
     def test_rag_query_reorders_and_honors_top_k(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         class _Collection:
             def __init__(self):
@@ -5157,8 +5157,8 @@ class TestAuditRegressionFixes(unittest.TestCase):
         self.assertEqual(len(results), 2)
 
     def test_agent_sets_a_bounded_graph_recursion_limit(self):
-        from config import Config
-        from research_agent import MAX_AGENT_GRAPH_STEPS, ResearchAgent
+        from infra.config import Config
+        from agent.service import MAX_AGENT_GRAPH_STEPS, ResearchAgent
 
         class _FakeApp:
             config = None
@@ -5181,8 +5181,8 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 agent.sessions.close()
 
     def test_default_chat_keeps_the_optional_build_arguments_omitted(self):
-        from config import Config
-        from research_agent import ResearchAgent
+        from infra.config import Config
+        from agent.service import ResearchAgent
 
         class _FakeApp:
             def invoke(self, _state, config):
@@ -5208,8 +5208,8 @@ class TestAuditRegressionFixes(unittest.TestCase):
                 agent.sessions.close()
 
     def test_scoped_chat_uses_the_real_graph_builder_entry(self):
-        from config import Config
-        from research_agent import MAX_AGENT_TOOL_ROUNDS, ResearchAgent
+        from infra.config import Config
+        from agent.service import MAX_AGENT_TOOL_ROUNDS, ResearchAgent
 
         class _FakeApp:
             def invoke(self, _state, config):
@@ -5227,7 +5227,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
                     with self.subTest(message=message):
                         # Keep _build_app real; autospec also checks the actual
                         # build_graph signature instead of swallowing kwargs.
-                        with patch("research_agent.build_graph", autospec=True, return_value=_FakeApp()) as build:
+                        with patch("agent.service.build_graph", autospec=True, return_value=_FakeApp()) as build:
                             self.assertEqual(agent.step(message), "完成")
                         self.assertEqual(build.call_args.kwargs["allowed_tool_names"], allowed_tools)
                         self.assertEqual(build.call_args.kwargs["tool_round_budget"], MAX_AGENT_TOOL_ROUNDS)
@@ -5241,7 +5241,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
 
 
     def test_session_order_is_stable_for_fast_consecutive_creates(self):
-        from session_store import SessionStore
+        from sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(str(Path(tmp) / "sessions.db"))
@@ -5254,7 +5254,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
 
     def test_profile_updates_are_atomic_under_concurrent_agent_calls(self):
         from concurrent.futures import ThreadPoolExecutor
-        from user_profile import ProfileManager
+        from sessions.profile import ProfileManager
 
         with tempfile.TemporaryDirectory() as tmp:
             profile = ProfileManager(str(Path(tmp) / "profile.md"))
@@ -5266,7 +5266,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
             self.assertTrue(all(f"question-{index}" in content for index in range(16)))
 
     def test_optional_model_calls_do_not_clear_interactive_failure_signal(self):
-        from llm_client import LLMClient, RequestPolicy
+        from integrations.llm_client import LLMClient, RequestPolicy
 
         class _Response:
             status_code = 200
@@ -5286,12 +5286,12 @@ class TestAuditRegressionFixes(unittest.TestCase):
         client._circuit.record_failure()
         optional = RequestPolicy(purpose="curator", counts_toward_circuit=False)
 
-        with patch("llm_client.requests.post", return_value=_Response()):
+        with patch("integrations.llm_client.requests.post", return_value=_Response()):
             response = client.post({"model": "test", "messages": []}, policy=optional)
             response.close()
         self.assertEqual(client._circuit._failures, 1)
 
-        with patch("llm_client.requests.post", return_value=_Response()):
+        with patch("integrations.llm_client.requests.post", return_value=_Response()):
             stream = client.post(
                 {"model": "test", "messages": []}, stream=True, policy=optional,
             )
@@ -5299,7 +5299,7 @@ class TestAuditRegressionFixes(unittest.TestCase):
         self.assertEqual(client._circuit._failures, 1)
 
     def test_pdf_tool_rejects_local_path_outside_runtime(self):
-        from runtime_paths import RuntimePaths
+        from infra.runtime_paths import RuntimePaths
         from tools.read_pdf import handle_read_pdf
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -5416,7 +5416,7 @@ class TestPaperStoreProtocol(unittest.TestCase):
         import typing
         from typing import Protocol
 
-        from paper_store import PaperStoreProtocol
+        from papers.store import PaperStoreProtocol
 
         members: set[str] = set()
         getter = getattr(typing, "get_protocol_members", None)
@@ -5431,14 +5431,14 @@ class TestPaperStoreProtocol(unittest.TestCase):
         return members
 
     def test_paper_store_implements_protocol(self):
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         missing = [name for name in sorted(self._protocol_members())
                    if not hasattr(PaperStore, name)]
         self.assertEqual([], missing, f"PaperStore 缺少协议方法: {missing}")
 
     def test_noop_store_implements_protocol(self):
-        from paper_store import NoOpStore
+        from papers.store import NoOpStore
 
         missing = [name for name in sorted(self._protocol_members())
                    if not hasattr(NoOpStore, name)]
@@ -5446,7 +5446,7 @@ class TestPaperStoreProtocol(unittest.TestCase):
 
     def test_noop_store_returns_typed_empty_values(self):
         """A disabled store must degrade, not return None and crash callers."""
-        from paper_store import NoOpStore
+        from papers.store import NoOpStore
 
         store = NoOpStore()
         self.assertEqual([], store.query("anything"))
@@ -5461,8 +5461,8 @@ class TestPaperStoreProtocol(unittest.TestCase):
         """The store must accept an explicit embedder instead of hard-coding one."""
         import tempfile
 
-        from embeddings import MiniLMEmbedder
-        from paper_store import PaperStore
+        from papers.embeddings import MiniLMEmbedder
+        from papers.store import PaperStore
 
         embedder = MiniLMEmbedder()
         store = PaperStore(persist_dir=tempfile.mkdtemp(), embedder=embedder)
@@ -5472,7 +5472,7 @@ class TestPaperStoreProtocol(unittest.TestCase):
 
     def test_tokenizer_counts_full_length(self):
         """The tokenizer must not silently cap counts at its shipped truncation."""
-        from embeddings import MiniLMEmbedder
+        from papers.embeddings import MiniLMEmbedder
 
         text = "alpha beta gamma delta epsilon zeta eta theta. " * 60
         ids = MiniLMEmbedder().tokenize(text)
@@ -5482,8 +5482,8 @@ class TestPaperStoreProtocol(unittest.TestCase):
 
     def test_real_tokenizer_split_stays_under_the_ceiling(self):
         """The guard must respect the real model's 256-token ceiling."""
-        from embeddings import MiniLMEmbedder
-        from paper_store import limit_chunks_to_tokens
+        from papers.embeddings import MiniLMEmbedder
+        from papers.store import limit_chunks_to_tokens
 
         tokenize = MiniLMEmbedder().tokenize
         long_text = "alpha beta gamma delta epsilon zeta eta theta. " * 60
@@ -5498,7 +5498,7 @@ class TestPaperStoreProtocol(unittest.TestCase):
 
     def test_oversized_chunks_are_split_to_the_token_ceiling(self):
         """Character chunking cannot predict tokens, so oversize is re-split."""
-        from paper_store import limit_chunks_to_tokens
+        from papers.store import limit_chunks_to_tokens
 
         # A deterministic tokenizer keeps this assertion runnable everywhere,
         # including CI runners that never download the ONNX weights.
@@ -5518,14 +5518,14 @@ class TestPaperStoreProtocol(unittest.TestCase):
 
     def test_token_guard_degrades_when_tokenizer_is_unusable(self):
         """A backend whose weights are not downloaded yet must still index."""
-        from paper_store import limit_chunks_to_tokens
+        from papers.store import limit_chunks_to_tokens
 
         chunks = [{"text": "alpha beta gamma " * 100, "char_start": 0}]
         self.assertEqual(chunks, limit_chunks_to_tokens(chunks, lambda _t: None, 256))
         self.assertEqual(chunks, limit_chunks_to_tokens(chunks, lambda _t: [], 256))
 
     def test_token_guard_is_a_noop_when_tokenizer_missing(self):
-        from paper_store import limit_chunks_to_tokens
+        from papers.store import limit_chunks_to_tokens
 
         chunks = [{"text": "short chunk", "char_start": 0}]
         self.assertEqual(chunks, limit_chunks_to_tokens(chunks, None, 256))
@@ -5537,7 +5537,7 @@ class TestQwen3TokenizerCompatibility(unittest.TestCase):
 
     @staticmethod
     def _embedder_with(tokenizer):
-        from embeddings import Qwen3Embedder
+        from papers.embeddings import Qwen3Embedder
 
         # Skip __init__: constructing the real backend would download weights.
         embedder = Qwen3Embedder.__new__(Qwen3Embedder)
@@ -5589,7 +5589,7 @@ class TestLexicalPostingsIndex(unittest.TestCase):
 
     @staticmethod
     def _store():
-        from paper_store import PaperStore
+        from papers.store import PaperStore
 
         class _Collection:
             @staticmethod
@@ -5689,7 +5689,7 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
 
     @staticmethod
     def _weights_available() -> bool:
-        from embeddings import _MINILM_ONNX_DIR
+        from papers.embeddings import _MINILM_ONNX_DIR
 
         return (_MINILM_ONNX_DIR / "model.onnx").exists()
 
@@ -5699,7 +5699,7 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
 
         import numpy as np
         from chromadb.utils import embedding_functions
-        from embeddings import MiniLMOnnxEncoder
+        from papers.embeddings import MiniLMOnnxEncoder
 
         texts = [
             "Transformer models rely on self-attention.",
@@ -5720,7 +5720,7 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
             self.skipTest("ONNX 权重未下载（离线环境）")
 
         import numpy as np
-        from embeddings import MiniLMOnnxEncoder
+        from papers.embeddings import MiniLMOnnxEncoder
 
         vectors = np.asarray(MiniLMOnnxEncoder()(["unit length check"]), dtype=np.float32)
         self.assertAlmostEqual(float(np.linalg.norm(vectors[0])), 1.0, places=5)
@@ -5730,7 +5730,7 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
             self.skipTest("ONNX 权重未下载（离线环境）")
 
         import numpy as np
-        from embeddings import MiniLMOnnxEncoder
+        from papers.embeddings import MiniLMOnnxEncoder
 
         encoder = MiniLMOnnxEncoder(batch_size=2)
         texts = ["short", "a considerably longer sentence used to widen the batch"]
@@ -5739,7 +5739,7 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
         self.assertLess(float(np.abs(np.asarray(single) - batched).max()), 1e-5)
 
     def test_embedder_falls_back_when_the_fast_channel_is_unusable(self):
-        from embeddings import MiniLMEmbedder
+        from papers.embeddings import MiniLMEmbedder
 
         embedder = MiniLMEmbedder.__new__(MiniLMEmbedder)
         embedder._batch_size = 32
@@ -5747,7 +5747,7 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
         embedder._max_length = 256
         embedder._fn = lambda texts: [[0.0, 1.0] for _ in texts]
 
-        import embeddings
+        from papers import embeddings
 
         original = embeddings._MINILM_ONNX
         embeddings._MINILM_ONNX = {256: False}
@@ -5758,7 +5758,7 @@ class TestMiniLMFastEncoderEquivalence(unittest.TestCase):
 
     def test_max_length_clamps_to_the_onnx_position_limit(self):
         """256 is a sentence-transformers convention; the graph holds 512."""
-        from embeddings import MiniLMEmbedder, MiniLMOnnxEncoder
+        from papers.embeddings import MiniLMEmbedder, MiniLMOnnxEncoder
 
         self.assertEqual(MiniLMEmbedder(max_length=512).max_length, 512)
         self.assertEqual(MiniLMEmbedder(max_length=4096).max_length, 512)
@@ -5776,7 +5776,7 @@ class TestRerankerBudget(unittest.TestCase):
     """
 
     def test_config_carries_the_measured_budget(self):
-        from config import Config
+        from infra.config import Config
 
         cfg = Config.load()
         self.assertEqual(cfg.rag_reranker_candidate_limit, 12)

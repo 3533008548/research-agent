@@ -16,14 +16,14 @@ import sys
 import unittest
 from pathlib import Path
 
-from tool_catalog import clear_external_tools, get_tool_schemas
+from tools.catalog import clear_external_tools, get_tool_schemas
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _spec() -> "object":
-    from mcp_client import McpServerSpec
+    from integrations.mcp_client import McpServerSpec
 
     return McpServerSpec(
         name="self",
@@ -37,7 +37,7 @@ def _spec() -> "object":
 class WiredExternalToolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from mcp_client import ExternalToolRegistry
+        from integrations.mcp_client import ExternalToolRegistry
 
         cls.registry = ExternalToolRegistry([_spec()])
         cls.registry.start(timeout_seconds=180.0)
@@ -66,7 +66,7 @@ class WiredExternalToolTests(unittest.TestCase):
     def test_the_ordinary_dispatcher_reaches_the_external_tool(self):
         # This is the path the agent's tool loop uses.  If it returns the
         # server's payload, the wiring is complete.
-        from tools import execute_tool
+        from tools.dispatch import execute_tool
 
         result = execute_tool("mcp__self__retrieval_metrics", {})
         self.assertNotIn("未知工具", result)
@@ -74,7 +74,7 @@ class WiredExternalToolTests(unittest.TestCase):
         self.assertIn("duration_ms", result)
 
     def test_the_runtime_reaches_the_external_tool(self):
-        from tool_runtime import ToolExecutionContext, ToolRuntime
+        from tools.runtime import ToolExecutionContext, ToolRuntime
 
         runtime = ToolRuntime(ToolExecutionContext(run_kind="research"))
         result = runtime.execute("mcp__self__retrieval_metrics", {})
@@ -83,14 +83,14 @@ class WiredExternalToolTests(unittest.TestCase):
 
     def test_the_runtime_still_bounds_the_external_result(self):
         # The external tool inherits the result limit: it is the same runtime.
-        from tool_runtime import ToolExecutionContext, ToolRuntime
+        from tools.runtime import ToolExecutionContext, ToolRuntime
 
         runtime = ToolRuntime(ToolExecutionContext(run_kind="research"))
         result = runtime.execute("mcp__self__list_papers", {})
         self.assertLess(len(result), 20_000)
 
     def test_the_builtin_tools_still_work_alongside(self):
-        from tools import execute_tool
+        from tools.dispatch import execute_tool
 
         result = execute_tool("list_papers", {})
         self.assertNotIn("未知工具", result)
