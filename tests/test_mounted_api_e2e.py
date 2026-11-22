@@ -234,6 +234,15 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertNotEqual(self.page.evaluate("document.body.style.userSelect"), "none")
         self.assertNotEqual(self.page.evaluate("document.body.style.cursor"), "col-resize")
 
+    def _maximize_docked_chat(self) -> int:
+        handle = self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True)
+        max_width = int(handle.get_attribute("aria-valuemax"))
+        self.assertGreater(max_width, 800, "The wide desktop should allow resizing beyond the old cap")
+        handle.press("End")
+        self._wait_for_width(".run-inspector", max_width)
+        self.assertGreaterEqual(self._pane_width(".conversation"), 480)
+        return max_width
+
     def _assert_no_horizontal_page_overflow(self) -> None:
         self.assertTrue(self.page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth + 1"
@@ -1054,9 +1063,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.locator(".session-item").filter(has_text="浏览器 E2E 会话").click()
         self.page.wait_for_function("document.querySelector('.composer textarea').value === '第二份草稿'")
         self.assertTrue(self.page.locator(".paper-reader").is_visible())
-        self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True).press("End")
-        self._wait_for_width(".run-inspector", 800)
-        self.assertGreaterEqual(self._pane_width(".conversation"), 480)
+        max_width = self._maximize_docked_chat()
         self._set_viewport({"width": 1000, "height": 900})
         self._assert_no_horizontal_page_overflow()
         self.assertTrue(rail.get_by_role("button", name="发送", exact=True).is_visible())
@@ -1064,7 +1071,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self._assert_no_horizontal_page_overflow()
         self.assertTrue(rail.get_by_label("消息", exact=True).is_visible())
         self._set_viewport({"width": 1700, "height": 1000})
-        self._wait_for_width(".run-inspector", 800)
+        self._wait_for_width(".run-inspector", max_width)
         self._drag_chat_tab(False)
         self.page.locator(".conversation .composer").wait_for()
         self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "第二份草稿")
@@ -1078,18 +1085,17 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self._send("刷新后保留右侧对话")
         self.page.locator(".message-assistant").filter(has_text="来自 FastAPI：刷新后保留右侧对话").wait_for()
         self._drag_chat_tab(True)
-        self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True).press("End")
-        self._wait_for_width(".run-inspector", 800)
+        max_width = self._maximize_docked_chat()
         self.page.reload(wait_until="domcontentloaded")
         self.page.locator(".right-workspace .message-assistant").filter(has_text="来自 FastAPI：刷新后保留右侧对话").wait_for()
-        self._wait_for_width(".run-inspector", 800)
+        self._wait_for_width(".run-inspector", max_width)
         self.assertEqual(self.page.locator(".conversation .draggable-chat-tab").count(), 0)
         self.page.get_by_role("button", name="隐藏右侧栏", exact=True).click()
         self.page.reload(wait_until="domcontentloaded")
         self.assertFalse(self.page.locator(".right-workspace").is_visible())
         self.page.locator(".session-item.active").click()
         self.page.locator(".right-workspace .composer").wait_for()
-        self._wait_for_width(".run-inspector", 800)
+        self._wait_for_width(".run-inspector", max_width)
         self._drag_chat_tab(False)
         self.page.wait_for_function("document.activeElement === document.querySelector('.conversation .draggable-chat-tab button')")
         self.page.reload(wait_until="domcontentloaded")
