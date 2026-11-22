@@ -6,7 +6,7 @@ import threading
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from api.auth import require_api_key
@@ -199,12 +199,12 @@ def paper_translation(identifier: str, store: Store, request: Request, page: int
 
 
 @router.post('/documents/{identifier}/translation', status_code=202)
-def start_translation(identifier: str, store: Store, request: Request):
+def start_translation(identifier: str, store: Store, request: Request, on_open: bool = False):
     store.get(identifier)
     agent = request.app.state.agent
-    if not getattr(agent.cfg, 'deepseek_key', '') or agent.cfg.deepseek_key == 'desktop-unconfigured':
+    if not on_open and getattr(agent.cfg, 'deepseek_key', '') in (None, '', 'desktop-unconfigured'):
         raise HTTPException(409, '请先在设置中配置模型 API Key')
-    request.app.state.paper_translations.start(identifier)
+    request.app.state.paper_translations.start(identifier, on_open=on_open)
     return {'accepted': True}
 
 
@@ -233,6 +233,15 @@ def translated_pdf(identifier: str, store: Store):
     return FileResponse(translated_file(identifier, store), media_type="application/pdf",
                         filename=store.get(identifier)["name"].removesuffix(".pdf") + ".zh-CN.pdf",
                         content_disposition_type="inline", headers={"Cache-Control": "private, no-cache"})
+
+
+@router.get('/documents/{identifier}/translation/preview')
+def translated_page_preview(identifier: str, page: int, store: Store):
+    from papers.translated_pdf import preview_page
+    if not 1 <= page <= store.get(identifier)['pages']:
+        raise HTTPException(422, '页码超出论文范围')
+    return Response(preview_page(store, identifier, page), media_type="application/pdf",
+                    headers={"Cache-Control": "private, no-store"})
 
 
 @router.get('/translation-notices')

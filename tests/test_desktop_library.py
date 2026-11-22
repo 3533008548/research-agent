@@ -233,6 +233,80 @@ class LibraryTests(unittest.TestCase):
             with fitz.open(self.store.bundle(doc["id"]) / "中文译文.pdf") as pdf:
                 self.assertIn("译文", pdf[0].get_text())
 
+    def test_layout_migration_preserves_prose_and_original_visuals(self):
+        from papers.translations import PaperTranslations
+        from papers.translated_pdf import preview_page
+
+        with fitz.open() as pdf:
+            page = pdf.new_page()
+            page.insert_text((60, 70), "Original prose.")
+            page.draw_rect((55, 100, 245, 170))
+            page.insert_text((65, 140), "Time (day)")
+            pix = fitz.Pixmap(fitz.csRGB, (0, 0, 90, 20), False)
+            pix.clear_with(200)
+            page.insert_image((55, 200, 235, 240), pixmap=pix)
+            page.insert_text((65, 225), "Embedded image label")
+            page.insert_text((60, 290), "Table 1: Timing")
+            page.draw_rect((55, 300, 245, 370))
+            page.insert_text((65, 335), "Switch    12 ms")
+            page = pdf.new_page()
+            page.insert_text((60, 70), "References")
+            page.insert_text((60, 120), "[1] Author. Original title.")
+            page = pdf.new_page()
+            page.insert_text((60, 70), "[2] Another citation.")
+            page.insert_text((60, 150), "Appendix A")
+            page.insert_text((60, 200), "Supplementary prose.")
+            raw = pdf.tobytes()
+        doc = self.store.import_file("layout.pdf", io.BytesIO(raw), enqueue=False)
+        jobs = PaperTranslations(self.store)
+        jobs.start(doc["id"], on_open=True)
+        jobs.pause(doc["id"])
+        jobs.start(doc["id"], on_open=True)
+        self.assertEqual(jobs.status(doc["id"])["state"], "paused")
+        jobs.start(doc["id"])
+        with self.store.db() as db:
+            # Simulate saved segments from the old extraction rules.
+            db.executemany("INSERT INTO translation_segments VALUES(?,?,?,?,?,?,?)", [
+                (doc["id"], 1, "p001-t01", "text", "[]", "Original prose.", "正文译文"),
+                (doc["id"], 1, "old-label", "text", "[]", "Time (day)", "旧图例"),
+            ])
+        self.assertFalse(jobs.status(doc["id"])["segments"])
+        jobs.process_next(SimpleNamespace(cfg=SimpleNamespace(deepseek_key="")), threading.Event())
+        state = jobs.status(doc["id"])
+        self.assertEqual([s["source"] for s in state["segments"]], ["Original prose."])
+        self.assertEqual((state["done"], state["total"]), (1, 3))
+        self.assertEqual(jobs.status(doc["id"], 2)["segments"], [])
+        self.assertEqual([s["source"] for s in jobs.status(doc["id"], 3)["segments"]],
+                         ["Appendix A", "Supplementary prose."])
+        with fitz.open(stream=raw, filetype="pdf") as original, \
+             fitz.open(stream=preview_page(self.store, doc["id"], 1), filetype="pdf") as preview:
+            self.assertIn("正文译文", preview[0].get_text())
+            clip = fitz.Rect(50, 95, 250, 380)
+            self.assertEqual(original[0].get_pixmap(clip=clip).digest, preview[0].get_pixmap(clip=clip).digest)
+
+    def test_legacy_paper_with_deleted_index_can_start_translation_from_library(self):
+        from papers.artifacts import write_document_map
+        from papers.translations import manage_translation, source_segments
+
+        identifier = self.store.import_file("旧论文.pdf", io.BytesIO(pdf_bytes(
+            "This paragraph about verification contains the original evidence for the study. "
+            "Rebuilding the index should preserve all of its text and traceability.")), enqueue=False)["id"]
+        with patch.dict(os.environ, {"APP_DATA_DIR": str(self.paths.root)}):
+            self.assertEqual(json.loads(manage_translation({"action":"status"}))[0]["state"], "idle")
+            self.assertEqual(json.loads(manage_translation({"action":"start", "paper":identifier}))["state"], "queued")
+        write_document_map(self.paths, paper_id="old-index", document_map={"document_id":identifier,
+            "pages":[{"page":1,"elements":[]}], "chunks":[{"id":"stale","text":"old text"}]})
+        index = Mock()
+        def read_chunks(paper_id):
+            if paper_id == "old-index":
+                return []
+            return [{"element_id":chunk["id"], "text":chunk["text"]}
+                    for chunk in index.index_document_map.call_args.args[0]["chunks"]]
+        index.get_paper_chunks.side_effect = read_chunks
+        segments, _ = source_segments(self.store, identifier, threading.Event(), index)
+        self.assertTrue(any("original evidence" in row[-1] for row in segments))
+        index.index_document_map.assert_called_once()
+
     def test_agent_controls_survive_restart_and_duplicate_import(self):
         from papers.translations import PaperTranslations
         from tools.dispatch import execute_tool

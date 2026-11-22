@@ -72,13 +72,16 @@ export function PaperReader({
   const pendingLocation = useRef<PaperLocation | null>(null);
   const renderedPage = useRef<number | null>(null);
   const [bilingual, setBilingual] = useState(false);
-  useEffect(() => {
-    if (openTranslationRequest) setBilingual(true);
-  }, [openTranslationRequest]);
   const [textView, setTextView] = useState(false);
+  useEffect(() => {
+    if (openTranslationRequest) {
+      setBilingual(true);
+      setTextView(false);
+    }
+  }, [openTranslationRequest]);
   const showingTranslation = bilingual && toolsVisible;
   const [hoveredId, setHoveredId] = useState("");
-  const translation = usePaperTranslation(apiKey, doc.id, page, active);
+  const translation = usePaperTranslation(apiKey, doc.id, page, active && showingTranslation);
   const progress = translation.data;
   const running = progress?.state === "running" || progress?.state === "queued";
   const hovered = translation.segments.find(s => s.id === hoveredId);
@@ -728,7 +731,7 @@ export function PaperReader({
         </div>
       </div>
       </div>
-      {active && toolsHost && bilingual && createPortal(<aside className="paper-translation" aria-label="论文译文">
+      {active && toolsHost && showingTranslation && createPortal(<aside className="paper-translation" aria-label="论文译文">
         <header><strong>第 {page} 页译文</strong></header>
         <p role="status">{progress?.state === "queued" ? "等待翻译" : running && !progress?.total ? "正在解析论文…" :
           progress?.total ? `已译 ${progress.done} / ${progress.total} 段` : ""}</p>
@@ -739,9 +742,9 @@ export function PaperReader({
         {progress && progress.state !== "complete" && <button disabled={translation.busy} onClick={() => void translation.update(running ? "DELETE" : "POST")}>
           {running ? "暂停翻译" : progress.state === "idle" ? "翻译论文" : "继续翻译"}
         </button>}
-        {progress?.total && progress.page === page && !translation.segments.length ? <p>此页未提取到可翻译的段落。</p> : null}
-        {progress?.state === "complete" && <button onClick={() => setTextView(v=>!v)}>{textView ? "版式 PDF" : "段落文本"}</button>}
-        {progress?.state === "complete" && !textView ? <TranslatedPage apiKey={apiKey} documentId={doc.id} page={page}
+        {progress && progress.page === page && (progress.total > 0 || progress.state === "complete") && !translation.segments.length && <p>此页保留原版。</p>}
+        {progress && <button onClick={() => setTextView(v=>!v)}>{textView ? "版式 PDF" : "段落文本"}</button>}
+        {!textView ? <TranslatedPage apiKey={apiKey} documentId={doc.id} page={page} complete={progress?.state === "complete"}
           segments={translation.segments} hovered={hoveredId} onHover={id => {
             setHoveredId(id);
             const segment = translation.segments.find(s => s.id === id);
@@ -784,7 +787,11 @@ export function PaperReader({
               : "选中文字或框选图表，可在会话中引用"}
         </span>
         <button disabled={translation.busy} aria-pressed={showingTranslation} onClick={() => {
-          if (!showingTranslation) onShowTools(true);
+          if (!showingTranslation) {
+            setTextView(false);
+            onShowTools(true);
+            void translation.update("POST", true);
+          }
           setBilingual(!showingTranslation);
           setHoveredId("");
         }}>{showingTranslation ? "收起译文" : "查看译文"}</button>

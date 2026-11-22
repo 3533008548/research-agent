@@ -1229,6 +1229,10 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.locator(".right-workspace .draggable-chat-tab button").click()
         self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "保留对话草稿")
         self.page.get_by_role("button", name="查看译文", exact=True).click()
+        preview = self.page.locator(".paper-translation .translated-sheet [data-segment]").first
+        preview.hover()
+        self.page.locator(".translation-highlight").wait_for()
+        self.page.get_by_role("button", name="段落文本", exact=True).click()
         paragraph = self.page.locator(".paper-translation article").first
         paragraph.get_by_text("每个判断都需要证据。").wait_for()
         paragraph.hover()
@@ -1254,6 +1258,31 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         with fitz.open(stream=pdf.body(), filetype="pdf") as result:
             self.assertEqual(len(result), 2)
             self.assertIn("每个判断",result[1].get_text().replace("\n",""))
+
+    def test_view_translation_starts_missing_job_and_reuses_completed_file(self) -> None:
+        import io
+        import fitz
+        from infra.runtime_paths import RuntimePaths
+        from papers.library import LibraryStore
+
+        store = LibraryStore(RuntimePaths.from_root(self.tmp.name))
+        with fitz.open() as pdf:
+            pdf.new_page().insert_text((60, 80), "Legacy paper without a translation job.")
+            doc = store.import_file("legacy-open.pdf", io.BytesIO(pdf.tobytes()), enqueue=False)
+        status = f"{self.base_url}/api/v1/library/documents/{doc['id']}/translation"
+        self.assertEqual(self.page.request.get(status).json()["state"], "idle")
+        self.page.get_by_role("button", name="论文库", exact=True).click()
+        self.page.get_by_role("button", name="legacy-open.pdf", exact=True).click()
+        self.page.get_by_role("button", name="查看译文", exact=True).click()
+        self.page.get_by_role("button", name="独立打开 PDF ↗").wait_for()
+        self.assertEqual(self.page.request.get(status).json()["state"], "complete")
+        path = store.bundle(doc["id"]) / "中文译文.pdf"
+        stamp = path.stat().st_mtime_ns
+        self.page.get_by_role("button", name="收起译文").click()
+        with self.page.expect_response(lambda r: "on_open=true" in r.url and r.request.method == "POST"):
+            self.page.get_by_role("button", name="查看译文").click()
+        self.page.get_by_role("button", name="独立打开 PDF ↗").wait_for()
+        self.assertEqual(path.stat().st_mtime_ns, stamp)
 
     def test_translation_renders_latex_and_scrolls_wide_equations(self) -> None:
         self._set_viewport({"width": 1440, "height": 1000})

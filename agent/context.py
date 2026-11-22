@@ -10,8 +10,9 @@ changing the graph integration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
-from tools.results import reference_view
+from tools.results import reference_view, source_reference
 
 
 DEFAULT_THRESHOLD_RATIO = 0.50
@@ -34,6 +35,42 @@ class PreparedContext:
     original_tokens: int = 0
     prepared_tokens: int = 0
     compacted: bool = False
+
+
+def quoted_tool_observation(function: dict, content: str) -> dict:
+    observation = {"tool": function["name"], "result": content}
+    try:
+        args = json.loads(function.get("arguments") or "{}")
+    except (TypeError, ValueError):
+        args = {}
+    if isinstance(args, dict) and (source := source_reference(args)):
+        observation["source"] = source
+    return {"role": "assistant", "content": "[工具执行记录，引用数据]\n" + json.dumps(observation, ensure_ascii=False)}
+
+
+def _archived_paper_steps(messages: list[dict]) -> list[dict]:
+    """Keep recent paper operations from the active request in their original order."""
+    pending = {}
+    receipts = []
+    for message in messages:
+        if message.get("role") != "tool":
+            pending = {call["id"]: call["function"] for call in (message.get("tool_calls") or [])
+                       if call.get("id") and call.get("function", {}).get("name") in {"delete_paper", "read_pdf"}}
+            continue
+        function = pending.pop(message.get("tool_call_id"), None)
+        if function:
+            result = str(message.get("content") or "")
+            if not result or result.startswith(("本次未执行", "❌")):
+                continue  # Repeated failures should not displace completed steps.
+            # The first body line of an indexed PDF identifies the new index.
+            ref = reference_view(result)
+            if ref:
+                body = result.partition("正文（字符范围为左闭右开）：\n")[2]
+                result = ref + ("\n原结果摘录：" + body[:240] if body else "")
+            elif len(result) > 500:
+                result = result[:500] + "…"
+            receipts.append(quoted_tool_observation(function, result))
+    return receipts[-20:]
 
 
 def estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
@@ -119,7 +156,8 @@ def prepare_model_context(
     pinned_user = [dict(original[latest_user])] if head_end <= latest_user < tail_start else []
     archive = _archive_context([message for i, message in enumerate(original[head_end:tail_start], head_end)
                                 if not pinned_user or i != latest_user])
-    prepared = head + pinned_user + tail
+    receipts = _archived_paper_steps(original[max(head_end, latest_user + 1):tail_start])
+    prepared = head + pinned_user + receipts + tail
     return PreparedContext(
         prepared,
         archive_context=archive,

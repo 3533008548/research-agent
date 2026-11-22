@@ -7,13 +7,16 @@ type Props = {
   apiKey: string;
   documentId: string;
   page: number;
+  complete: boolean;
   segments: TranslationSegment[];
   hovered: string;
   onHover: (id: string) => void;
 };
 
-export function TranslatedPage({apiKey, documentId, page, segments, hovered, onHover}: Props) {
-  const url = `/api/v1/library/documents/${documentId}/translation/file`;
+export function TranslatedPage({apiKey, documentId, page, complete, segments, hovered, onHover}: Props) {
+  const base = `/api/v1/library/documents/${documentId}/translation`;
+  const completedOnPage = segments.filter(s => s.translation !== null).length;
+  const url = complete ? base + "/file" : base + `/preview?page=${page}&done=${completedOnPage}`;
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [error, setError] = useState("");
   const [ready, setReady] = useState(0);
@@ -21,6 +24,9 @@ export function TranslatedPage({apiKey, documentId, page, segments, hovered, onH
   const host = useRef<HTMLDivElement>(null), canvas = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
+    setPdf(null);
+    setError("");
+    setReady(0);
     const task = getDocument({url, httpHeaders: apiKey ? {"X-API-Key":apiKey} : {},
       cMapUrl:"/pdfjs/cmaps/", cMapPacked:true, standardFontDataUrl:"/pdfjs/standard_fonts/", wasmUrl:"/pdfjs/wasm/"});
     let alive = true;
@@ -38,7 +44,7 @@ export function TranslatedPage({apiKey, documentId, page, segments, hovered, onH
   useEffect(() => {
     if (!pdf || !width) return;
     let alive = true, task: RenderTask | undefined;
-    void pdf.getPage(page).then(async p => {
+    void pdf.getPage(complete ? page : 1).then(async p => {
       if (!alive) return;
       const buffer = document.createElement("canvas");
       const scale = width * Math.min(2, window.devicePixelRatio || 1) / p.getViewport({scale:1}).width;
@@ -54,7 +60,7 @@ export function TranslatedPage({apiKey, documentId, page, segments, hovered, onH
       setReady(page);
     }).catch(e => { if (alive) setError(userFacingError(e)); });
     return () => { alive = false; task?.cancel(); };
-  }, [pdf,page,width]);
+  }, [pdf,page,width,complete]);
 
   async function openFile() {
     try {
@@ -77,7 +83,7 @@ export function TranslatedPage({apiKey, documentId, page, segments, hovered, onH
   }
 
   return <>
-    <button className="text-button" disabled={!pdf} onClick={() => void openFile()}>独立打开 PDF ↗</button>
+    {complete && <button className="text-button" disabled={!pdf} onClick={() => void openFile()}>独立打开 PDF ↗</button>}
     {error && <p role="alert">{error}</p>}
     <div className="translated-sheet" ref={host}>
       <canvas aria-label={`第 ${page} 页中文 PDF`} ref={canvas} style={{visibility:ready===page?"visible":"hidden"}}/>

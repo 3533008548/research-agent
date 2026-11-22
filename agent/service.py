@@ -67,35 +67,18 @@ def graph_steps_for_tool_rounds(rounds: int) -> int:
     return max(1, int(rounds)) * GRAPH_STEPS_PER_TOOL_ROUND + GRAPH_STEPS_FINALIZE
 
 
-def _budget_exhausted_answer(app: Any, thread_id: str) -> str:
-    """Report what a recursion-limited run already accomplished.
-
-    LangGraph raises GraphRecursionError and discards the result, which used to
-    surface as "请缩小问题范围后重试" — throwing away every tool call the run had
-    already paid for.  The checkpoint still holds them, so name them.
-    """
-    head = "⚠️ 本轮已达到工具调用上限，已停止执行。"
-    steps: list[str] = []
-    try:
-        if app is not None:
-            snapshot = app.get_state({"configurable": {"thread_id": thread_id}})
-            values = getattr(snapshot, "values", None) or {}
-            for message in values.get("messages") or []:
-                if message.get("role") != "assistant":
-                    continue
-                for call in message.get("tool_calls") or []:
-                    name = str(call.get("function", {}).get("name") or "").strip()
-                    if name:
-                        steps.append(name)
-    except Exception:  # noqa: BLE001 - reporting progress must never mask the limit
-        steps = []
-    if not steps:
-        return head + "请缩小问题范围后重试（例如先检索一篇指定论文）。"
-    return (
-        f"{head}\n\n已完成 {len(steps)} 次工具调用：{'、'.join(steps[-8:])}。\n"
-        "这些结果仍保留在会话里 —— 直接说「继续」即可从中断处接着做，"
-        "或把任务拆小（例如只更新某一章）后再试。"
-    )
+def _budget_exhausted_answer(counts: dict[str, int]) -> str:
+    head = "⚠️ 本轮已达到工具轮数上限，已停止执行。"
+    total = sum(counts.values())
+    if not total:
+        return head + "本轮没有工具执行记录。"
+    completed = counts.get("completed", 0)
+    failed = counts.get("failed", 0)
+    other = total - completed - failed
+    detail = f"成功 {completed} 次，失败 {failed} 次"
+    if other:
+        detail += f"，取消或中断 {other} 次"
+    return f"{head}本轮实际调用 {total} 次（{detail}）。可在运行中心查看每次调用的结果。"
 
 
 # 普通对话。这个值只用于**防死循环**（模型陷入"重试→失败→再重试"），
@@ -490,6 +473,11 @@ class ResearchAgent:
                 # Keep partial text, but a failed final model stream must not
                 # become a successful run merely because it returned a string.
                 outcome = "llm_error" if last_model_event.get("type") == "llm_request_failed" else "success"
+                if result.get("metadata", {}).get("repeated_tool_failure"):
+                    outcome = "repeated_tool_failure"
+                    last_failure = next((event for event in reversed(trace_events)
+                                         if event.get("type") == "tool_failed"), {})
+                    error_details = safe_error_details(last_failure.get("error_details"))
                 return answer
             except RequestCancelledError:
                 answer = "⏹️ 请求已取消。"
@@ -507,12 +495,7 @@ class ResearchAgent:
                 return answer
             except Exception as e:
                 if type(e).__name__ == "GraphRecursionError":
-                    # The graph drops its result, but the checkpoint still holds
-                    # every tool result gathered so far.  Reporting them turns
-                    # "start over" into "continue from here".
-                    answer = _budget_exhausted_answer(
-                        locals().get("app"), thread_id,
-                    )
+                    answer = _budget_exhausted_answer(self.sessions.chat_tool_counts(chat_run_id))
                     outcome = "agent_limit"
                     return answer
                 answer = f"❌ Agent 错误: {type(e).__name__}: {e}"
@@ -540,7 +523,7 @@ class ResearchAgent:
                     duration_ms=duration_ms,
                     metrics={
                         "model_calls": usage.get("calls", 0) - usage_before.get("calls", 0),
-                        "tool_count": len(tool_events),
+                        "tool_count": sum(self.sessions.chat_tool_counts(chat_run_id).values()),
                         "event_count": len(trace_events),
                     },
                     error_type="" if run_status == "completed" else outcome,
@@ -552,7 +535,7 @@ class ResearchAgent:
                 }
                 self.sessions.add_run_event(
                     thread_id, chat_run_id, "chat", "single_agent", "run", run_status,
-                    summary=terminal_summaries[run_status],
+                    summary="已停止重复步骤" if outcome == "repeated_tool_failure" else terminal_summaries[run_status],
                     metrics={"duration_ms": duration_ms},
                     error_type="" if run_status == "completed" else outcome,
                     event_type="done",

@@ -12,6 +12,7 @@ from papers.scope import resolve_scope
 from papers.relations import relation_type_label
 from integrations.public_search import list_downloaded_papers, search_public_papers
 from infra.runtime_paths import get_runtime_paths
+from tools.errors import ToolFailure
 
 
 def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
@@ -206,7 +207,7 @@ def handle_delete_paper(args: dict, paper_store=None, **kw) -> str:
         if pid_or_title in p["paper_id"] or pid_or_title.lower() in p["title"].lower():
             found = p; break
     if not found:
-        return f"❌ 未找到论文: {pid_or_title}"
+        return ToolFailure(code="PAPER_INDEX_NOT_FOUND", phase="resolve_source", retryable=False)
     count = paper_store.delete_paper(found["paper_id"])
     # 删除对应的图片文件（标题 → stem 反推）
     deleted_imgs = 0

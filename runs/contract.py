@@ -49,7 +49,7 @@ TOOL_ERROR_CODES = frozenset({
     "TOOL_UNKNOWN", "TOOL_ACCESS_DENIED", "TOOL_SOURCE_SCOPE_DENIED", "TOOL_INVALID_ARGUMENT",
     "TOOL_SOURCE_NOT_FOUND", "TOOL_SOURCE_RESOLUTION_FAILED", "TOOL_UNSUPPORTED_FORMAT", "TOOL_INPUT_TOO_LARGE",
     "TOOL_NOT_CONFIGURED", "TOOL_SOURCE_READ_FAILED", "TOOL_RESPONSE_INVALID", "TOOL_RESULT_READ_FAILED",
-    "TOOL_RESULT_STORAGE_FAILED", "TOOL_EXECUTION_FAILED", "TOOL_REPORTED_FAILURE",
+    "TOOL_RESULT_STORAGE_FAILED", "TOOL_EXECUTION_FAILED", "TOOL_REPORTED_FAILURE", "PAPER_INDEX_NOT_FOUND",
 })
 _ERROR_PHASES = frozenset({"queue", "connect", "response_headers", "stream_read", "retry", "unknown",
                            "access", "validate", "resolve_source", "read_source", "parse_response", "execute", "result_storage"})

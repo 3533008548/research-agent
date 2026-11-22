@@ -48,11 +48,11 @@ export function usePaperTranslation(key: string, id: string, page: number, visib
     return () => { abort.abort(); clearTimeout(timer); };
   }, [key, path, page, visible, version]);
 
-  async function update(method: "POST" | "DELETE") {
+  async function update(method: "POST" | "DELETE", onOpen = false) {
     setBusy(true);
     setError("");
     try {
-      await libraryRequest(key, path, {method});
+      await libraryRequest(key, path + (onOpen ? "?on_open=true" : ""), {method});
       refresh(v => v + 1);
     } catch (e) {
       setError(userFacingError(e));

@@ -31,6 +31,7 @@ const ERROR_CODES: Record<string, string> = {
   TOOL_RESPONSE_INVALID: "模型响应为空或格式错误", TOOL_RESULT_READ_FAILED: "保存结果不可读",
   TOOL_RESULT_STORAGE_FAILED: "完整结果保存失败", TOOL_EXECUTION_FAILED: "工具执行异常",
   TOOL_REPORTED_FAILURE: "原工具未提供结构化原因",
+  PAPER_INDEX_NOT_FOUND: "未匹配到待删除的论文索引",
 };
 
 function nonnegative(value: unknown): value is number {

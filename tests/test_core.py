@@ -1502,7 +1502,7 @@ class TestVerifyNode(unittest.TestCase):
             for message in sanitized
         ))
 
-    def test_deepseek_sanitizer_drops_legacy_tool_turn_without_reasoning_content(self):
+    def test_deepseek_replays_matched_result_without_inventing_reasoning(self):
         from agent.graph import sanitize_model_messages
 
         messages = [
@@ -1524,10 +1524,88 @@ class TestVerifyNode(unittest.TestCase):
         )
         self.assertEqual(
             [message["role"] for message in sanitized],
-            ["user", "assistant", "user", "assistant", "tool"],
+            ["user", "assistant", "assistant", "user", "assistant", "tool"],
         )
+        self.assertEqual(json.loads(sanitized[1]["content"].split("\n", 1)[1]),
+                         {"tool": "list_papers", "result": "旧工具结果"})
+        self.assertEqual(set(sanitized[1]), {"role", "content"})
         self.assertEqual(sanitized[-2]["reasoning_content"], "需要读取新章节")
         self.assertNotIn("legacy-call", str(sanitized))
+
+    def test_reused_call_id_cannot_confirm_an_unfinished_deletion(self):
+        from agent.graph import sanitize_model_messages
+
+        def batch(name):
+            return {"role": "assistant", "tool_calls": [
+                {"id": "shared", "function": {"name": name, "arguments": "{}"}}]}
+
+        messages = [batch("delete_paper"), {"role": "user", "content": "列出论文"},
+                    batch("list_papers"), {"role": "tool", "tool_call_id": "shared", "content": "目录"}]
+        view = sanitize_model_messages(messages, require_reasoning_content_for_tools=True)
+        self.assertNotIn("delete_paper", str(view))
+        self.assertIn("list_papers", view[-1]["content"])
+
+    def test_reingest_observes_five_deletions_and_skips_duplicate_execution(self):
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
+
+        titles = ["Alpha", "Beta", "Gamma", "Delta", "Harp"]
+
+        def batch(name, targets, prefix, reasoning=None):
+            calls = []
+            for title in targets:
+                args = {"paper_id_or_title": title} if name == "delete_paper" else {"url_or_path": title + ".pdf"}
+                calls.append({"id": prefix + title, "type": "function", "function": {
+                    "name": name, "arguments": json.dumps(args)}})
+            message = {"content": None, "tool_calls": calls}
+            if reasoning:
+                message["reasoning_content"] = reasoning
+            return self._FakeResponse(message)
+
+        responses = [
+            batch("delete_paper", titles[:4], "early-", "查看删除结果"),
+            batch("delete_paper", titles[4:], "last-"),
+            batch("delete_paper", titles[4:], "again-"),
+            batch("read_pdf", titles, "rebuild-"),
+            self._FakeResponse({"content": "五篇均已重建"}),
+        ]
+        executed = []
+        events = []
+
+        def execute(name, args, **kwargs):
+            target = args.get("paper_id_or_title") or args["url_or_path"]
+            executed.append((name, target))
+            if name == "delete_paper":
+                return f"🗑️ 已删除: {target} (1 个块)"
+            return f"重建结果 {target}"
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("integrations.llm_client.requests.post", side_effect=responses) as post, \
+             patch("agent.graph.execute_tool", side_effect=execute):
+            app = build_graph(api_key="test", model="deepseek-flash", enable_verify=False,
+                              checkpoint_db=str(Path(tmp) / "graph.db"),
+                              allowed_tool_names={"delete_paper", "read_pdf"}, force_tool_name="delete_paper",
+                              event_callback=events.append, llm_client=LLMClient("test", "https://example.test"))
+            try:
+                result = app.invoke({"messages": [{"role": "user", "content": "删除后重新入库 " + ", ".join(titles)}],
+                                     "metadata": {}}, config={"configurable": {"thread_id": "five-papers"}})
+            finally:
+                app.checkpointer.conn.close()
+
+        payloads = [call.kwargs["json"] for call in post.call_args_list]
+        self.assertEqual(len(payloads), 5)
+        before_retry = payloads[2]["messages"]
+        for title in titles[:4]:
+            self.assertTrue(any(m["role"] == "tool" and title in m["content"] for m in before_retry))
+        self.assertIn("已删除: Harp", before_retry[-1]["content"])
+        self.assertEqual(set(before_retry[-1]), {"role", "content"})
+        self.assertEqual(payloads[2]["tool_choice"], "auto")
+        self.assertIn("本次未执行", payloads[3]["messages"][-1]["content"])
+        for title in titles:
+            self.assertIn("重建结果 " + title + ".pdf", str(payloads[-1]["messages"]))
+        self.assertEqual(executed, [("delete_paper", t) for t in titles] + [("read_pdf", t + ".pdf") for t in titles])
+        self.assertEqual(sum(e["type"] == "tool_finished" for e in events), 10)
+        self.assertEqual(result["messages"][-1]["content"], "五篇均已重建")
 
     def test_graph_preserves_reasoning_content_across_tool_turns(self):
         from agent.graph import build_graph
@@ -5115,7 +5193,67 @@ class TestAgentToolBudget(unittest.TestCase):
         warning = budget_exhaustion_warning(1)
         self.assertEqual(warning["role"], "system")
         self.assertIn("预算提醒", warning["content"])
-        self.assertIn("还剩 1 次", warning["content"])
+        self.assertIn("还剩 1 轮", warning["content"])
+
+    def test_repeated_delete_failure_is_not_executed_again_and_other_tools_can_run(self):
+        from agent.graph import build_graph
+        from integrations.llm_client import LLMClient
+        from tools.errors import ToolFailure
+
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            def execute(name, args, **kwargs):
+                if name == "delete_paper":
+                    return ToolFailure(code="PAPER_INDEX_NOT_FOUND", phase="resolve_source", retryable=False)
+                if name == "search_papers":
+                    return ToolFailure(code="LLM_CONNECTION_ERROR", retryable=True)
+                if name == "read_pdf":
+                    return f"📌 已按标题命名为：**{args['title']}**。论文 ID：`new-index`。质量检查通过。"
+                return "已列出原文"
+            with patch("agent.graph.execute_tool", side_effect=execute) as executor:
+                app = build_graph(api_key="test", checkpoint_db=str(Path(tmp) / "checkpoint.db"),
+                                  event_callback=events.append, llm_client=LLMClient("test", "http://localhost"))
+                node = app.get_graph().nodes["tools"].data
+                state = {"messages": [{"role":"user", "content":"重新入库"}], "metadata": {}}
+                def request(name, arguments):
+                    call = {"id": str(len(state["messages"])), "function":{"name":name, "arguments":arguments}}
+                    state["messages"].append({"role":"assistant", "tool_calls":[call]})
+                    result = node.invoke(state)
+                    state["messages"].extend(result["messages"])
+                    state["metadata"] = result["metadata"]
+                try:
+                    args = '{"paper_id_or_title": "Harp"}'
+                    request("delete_paper", args)
+                    request("delete_paper", args)
+                    self.assertIn("未执行", state["messages"][-1]["content"])
+                    request("list_papers", "{}")
+                    self.assertFalse(state["metadata"].get("all_tool_steps_blocked"))
+                    request("delete_paper", args)
+                    request("delete_paper", args)
+                    self.assertTrue(state["metadata"]["repeated_tool_failure"])
+                    self.assertEqual(state["messages"][-1]["role"], "assistant")
+                    self.assertEqual(executor.call_count, 2)
+                    self.assertEqual([e["type"] for e in events if e["type"] in {"tool_failed","tool_finished"}],
+                                     ["tool_failed", "tool_finished"])
+                    state["messages"].append({"role": "user", "content": "再查一次"})
+                    request("delete_paper", args)
+                    self.assertFalse(state["metadata"].get("repeated_tool_failure"))
+                    self.assertEqual(executor.call_count, 3)
+                    for _ in range(3):
+                        request("search_papers", '{"query":"TSN"}')
+                    self.assertEqual(executor.call_count, 5)
+                    self.assertIn("未执行", state["messages"][-1]["content"])
+                    request("search_papers", '{"query":"Harp"}')
+                    self.assertEqual(executor.call_count, 6)
+                    request("read_pdf", '{"url_or_path":"other.pdf","title":"Other"}')
+                    request("delete_paper", args)
+                    self.assertIn("本次未执行", state["messages"][-1]["content"])
+                    self.assertEqual(executor.call_count, 7)
+                    request("read_pdf", '{"url_or_path":"harp.pdf","title":"Harp"}')
+                    request("delete_paper", args)
+                    self.assertEqual(executor.call_count, 9)
+                finally:
+                    app.checkpointer.conn.close()
 
 
 class TestAuditRegressionFixes(unittest.TestCase):

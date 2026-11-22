@@ -8,9 +8,9 @@ def _raw_tool_schemas() -> list[dict]:
     return [
         {"type": "function", "function": {
             "name": "manage_paper_translation",
-            "description": "查看论文翻译进度和失败原因，根据用户要求暂停、继续或重试。仅凭唯一论文标题或文档 ID 操作；缺少标题可列出任务。",
+            "description": "查询论文翻译状态，或启动、暂停、继续、重试。status 不指定 paper 可列出论文（包括未翻译的旧论文，状态 idle）。旧论文补译直接用 start，无需删除或重新导入。使用列表中的文件名或文档 ID。",
             "parameters": {"type":"object","properties":{
-                "action":{"type":"string","enum":["status","pause","resume","retry"]},
+                "action":{"type":"string","enum":["status","start","pause","resume","retry"]},
                 "paper":{"type":"string","description":"论文名或文档 ID；查询全部任务时省略"}
             },"required":["action"]}
         }},
@@ -242,7 +242,7 @@ def _raw_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "delete_paper",
-                "description": "从 RAG 库删除一篇已索引论文。",
+                "description": "仅在用户要求删除索引时使用。删除后原文仍会出现在 list_papers。重新入库直接用 read_pdf，它会校验新索引后替换旧索引。索引已删或不存在时直接转到下一步。",
                 "parameters": {
                     "type": "object",
                     "properties": {

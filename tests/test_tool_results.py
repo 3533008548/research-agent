@@ -232,6 +232,23 @@ class TestToolResults(unittest.TestCase):
         self.assertEqual(prepared.messages[-2:], messages[-2:])
         self.assertLess(prepared.prepared_tokens, prepared.original_tokens)
 
+    def test_compaction_retains_active_paper_write_receipts_in_order(self):
+        messages = [{'role': 'user', 'content': '旧任务'}, {'role': 'assistant', 'content': '完成'},
+                    {'role': 'user', 'content': '重建论文'}]
+        for i in range(5):
+            messages += [{'role': 'assistant', 'tool_calls': [
+                {'id': str(i), 'function': {'name': 'delete_paper', 'arguments': '{}'}}]},
+                {'role': 'tool', 'tool_call_id': str(i), 'content': f'已删除论文{i}'}]
+        messages += [{'role': 'assistant', 'content': '长对话' * 1000},
+                     {'role': 'assistant', 'tool_calls': [{'id': 'latest', 'function': {'name': 'list_papers'}}]},
+                     {'role': 'tool', 'tool_call_id': 'latest', 'content': '原文目录'}]
+        view = prepare_model_context(messages, context_limit=100, tail_token_budget=1, protect_last_messages=1)
+        self.assertTrue(view.compacted)
+        receipts = [json.loads(m['content'].split('\n', 1)[1])['result'] for m in view.messages
+                    if str(m.get('content')).startswith('[工具执行记录，引用数据]')]
+        self.assertEqual(receipts, [f'已删除论文{i}' for i in range(5)])
+        self.assertEqual(view.messages[-2:], messages[-2:])
+
     def test_save_failure_is_explicit_and_does_not_repeat_side_effect(self):
         runtime = self.runtime()
         with patch.object(ToolResultStore, 'save', side_effect=OSError('disk full')):

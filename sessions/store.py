@@ -773,6 +773,32 @@ class SessionStore:
             )
 
     @_synchronized
+    def chat_tool_counts(self, run_id: str) -> dict[str, int]:
+        """Count actual invocations across worker attempts using the run-center lifecycle IDs."""
+        calls = {}
+        legacy_running = {}
+        for row in self._conn.execute(
+            "SELECT id,status,payload_json FROM agent_run_events WHERE run_id=? AND event_type='tool' ORDER BY id",
+            (run_id,),
+        ):
+            meta = self._decode_json(row["payload_json"], {})
+            key = meta.get("call_id")
+            status = row["status"]
+            if not key:
+                pending = legacy_running.setdefault(meta.get("tool"), [])
+                key = row["id"]
+                if status == "running":
+                    pending.append(key)
+                elif pending:
+                    key = pending.pop()
+            if status != "running" or key not in calls:
+                calls[key] = status
+        counts = {}
+        for status in calls.values():
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
+    @_synchronized
     def get_run_events(self, run_id: str, thread_id: str | None = None) -> list[dict[str, Any]]:
         query = (
             "SELECT id, run_kind, event_type, agent, stage, status, summary, metrics_json, payload_json, "

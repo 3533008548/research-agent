@@ -20,6 +20,7 @@ REASONS = {
     'LLM_CONTENT_FILTERED': '模型服务未返回可用内容',
     'LLM_REQUEST_FAILED': '模型请求失败，未记录具体传输阶段',
     'TOOL_UNKNOWN': '未知工具',
+    'PAPER_INDEX_NOT_FOUND': '未匹配到待删除的论文索引',
     'TOOL_ACCESS_DENIED': '当前角色无权调用此工具（not available）',
     'TOOL_SOURCE_SCOPE_DENIED': '来源超出了用户指定的研究范围',
     'TOOL_INVALID_ARGUMENT': '工具参数不合法或缺少必要参数',
@@ -68,6 +69,8 @@ class ToolFailure(str):
                   '重试性未知；先核对原因及已执行的副作用，不要盲目重复。')
         if code in {'TOOL_SOURCE_NOT_FOUND', 'TOOL_SOURCE_RESOLUTION_FAILED'}:
             action = '先用 list_paper_images 核对论文、图号或页码，再修正定位参数；不要猜图片路径。'
+        if code == 'PAPER_INDEX_NOT_FOUND':
+            action = '无需重复删除。重新入库请用 list_papers 的原文路径调用 read_pdf；补译已有论文可直接启动翻译。'
         text = ERROR_HEADER + json.dumps(meta, ensure_ascii=False, separators=(',', ':')) + '\n' + reason + '。' + action
         text += '\n这是工具状态，不是论文证据；不能据此断言原文不存在，也不能宣称已看图核实。'
         obj = super().__new__(cls, text)

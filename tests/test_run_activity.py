@@ -10,6 +10,26 @@ from tools.runtime import ToolRuntime, ToolExecutionContext
 
 
 class TestRunActivity(unittest.TestCase):
+    def test_budget_answer_counts_only_lifecycle_ids_for_this_run(self):
+        from agent.service import _budget_exhausted_answer
+        from sessions.store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(str(Path(tmp) / "checkpoint.db"))
+            try:
+                thread = store.create()["thread_id"]
+                for run, calls in [("old", [("a", "completed")]),
+                                   ("new", [("b", "completed"), ("c", "failed"), ("d", "running")])]:
+                    for call, status in calls:
+                        for event_status in ("running", status):
+                            store.add_run_event(thread, run, "chat", "single_agent", "tool", event_status,
+                                                metadata={"tool": "read_pdf", "call_id": call})
+                counts = store.chat_tool_counts("new")
+                self.assertEqual(counts, {"completed": 1, "failed": 1, "running": 1})
+                self.assertIn("实际调用 3 次（成功 1 次，失败 1 次，取消或中断 1 次）", _budget_exhausted_answer(counts))
+            finally:
+                store.close()
+
     def test_verification_verdict_and_round_survive_projection(self):
         event = public_sse_event(graph_activity_event({"type": "verify_unresolved", "verification_round": 2,
             "feedback": "PRIVATE"}))

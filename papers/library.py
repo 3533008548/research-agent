@@ -62,11 +62,21 @@ class LibraryStore:
                 CREATE INDEX IF NOT EXISTS translation_page ON translation_segments(document_id,page);
                 CREATE TABLE IF NOT EXISTS discovered(path TEXT PRIMARY KEY, signature TEXT NOT NULL);
             """)
-            if db.execute("PRAGMA user_version").fetchone()[0] < 1:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version < 2:
+                db.execute("BEGIN IMMEDIATE")
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version < 1:
                 db.execute("""INSERT OR IGNORE INTO translation_jobs(document_id,state,updated_at)
                               SELECT document_id, CASE WHEN count(*)=count(translation) THEN 'queued' ELSE 'paused' END,
                               CURRENT_TIMESTAMP FROM translation_segments GROUP BY document_id""")
                 db.execute("PRAGMA user_version=1")
+            if version < 2:
+                # Keep old translations until the worker can match them to the
+                # new page layout. Opening a legacy export requests a clean PDF.
+                db.execute("ALTER TABLE translation_jobs ADD COLUMN layout_ready INTEGER NOT NULL DEFAULT 0")
+                db.execute("UPDATE translation_jobs SET state='idle', error='', notified=1 WHERE state IN ('complete','failed')")
+                db.execute("PRAGMA user_version=2")
 
     @contextmanager
     def db(self):
