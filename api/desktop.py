@@ -67,13 +67,16 @@ def main():
                          daily_run_manager=daily_manager,
                          api_key=os.environ['API_AUTH_TOKEN'], require_api_key=True)
 
+        api_lifespan = app.router.lifespan_context
+
         @asynccontextmanager
         async def lifespan(_app):
             if configured:
                 worker.start()
                 enqueue_enabled_daily_run(cfg, daily_manager)
                 agent.start_rag_warmup()
-            yield
+            async with api_lifespan(_app):
+                yield
             stop.set()
             with dispatcher._lock:
                 for entry in dispatcher._entries.values():
@@ -99,6 +102,11 @@ def main():
         def desktop_status():
             return {'configured': configured, 'data_dir': str(cfg.runtime_paths.root),
                     'worker_alive': worker.is_alive(), 'queued': sum(b.queue_depth() for b in (chat, research, daily))}
+
+        @app.get('/api/v1/desktop/library/{identifier}/translation-path', dependencies=[Depends(require_api_key)])
+        def translated_path(identifier: str):
+            from api.library_routes import translated_file
+            return {"path": str(translated_file(identifier, app.state.library_store))}
 
         @app.post('/api/v1/desktop/shutdown', dependencies=[Depends(require_api_key)])
         def shutdown():

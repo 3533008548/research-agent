@@ -18,7 +18,10 @@ from tools.catalog import TOOL_NAMES, get_tool_definition
 from tools.results import RESULT_TOOLS
 
 
+from papers.translations import manage_translation
+
 _TOOL_HANDLERS = {
+    "manage_paper_translation": manage_translation,
     "search_papers": handle_search_papers,
     "read_pdf": handle_read_pdf,
     "generate_paper_card": handle_generate_paper_card,

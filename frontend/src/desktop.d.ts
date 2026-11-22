@@ -9,6 +9,7 @@ export interface DesktopUpdateState {
 declare global {
   interface Window {
     desktop?: {
+      openTranslation: (documentId: string) => Promise<void>;
       reportError: (message: string) => void;
       info: () => Promise<{
         configured: boolean;

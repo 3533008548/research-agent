@@ -200,9 +200,11 @@ class _E2EAgent:
         return f"{prefix}{message}"
 
 
-def create_e2e_app(data_dir: str, redis_url: str = ""):
+def create_e2e_app(data_dir: str, redis_url: str = "", port: int = 0):
     """Build an ASGI app serving the real React client against a fake agent."""
     cfg = Config.load({"data_dir": data_dir, "rag_enabled": False})
+    cfg.api_url = f"http://127.0.0.1:{port}/__e2e__/translate"
+    cfg.deepseek_key = "local-fixture"
     agent = _E2EAgent(cfg)
     manager = None
     research_manager = None
@@ -220,6 +222,18 @@ def create_e2e_app(data_dir: str, redis_url: str = ""):
     app = create_app(agent=agent, title="科研助手 API 浏览器 E2E", chat_run_manager=manager, research_run_manager=research_manager)
     app.state.e2e_uses_redis = bool(redis_url)
 
+
+    release_translation = threading.Event()
+
+    @app.post("/__e2e__/translate", include_in_schema=False)
+    def translate(payload: dict):
+        if payload["messages"][-1]["content"] == "Hold this page for concurrent chat.":
+            release_translation.wait(20)
+        return {"choices": [{"message": {"content": "每个判断都需要证据。"}, "finish_reason": "stop"}]}
+
+    @app.post("/__e2e__/finish-translation", include_in_schema=False)
+    def finish_translation():
+        release_translation.set()
 
     @app.get("/__e2e__/state", include_in_schema=False)
     def e2e_state() -> dict:
@@ -265,7 +279,7 @@ def main() -> None:
     parser.add_argument("--redis-url", default=os.getenv("E2E_REDIS_URL", ""))
     args = parser.parse_args()
     Path(args.data_dir).mkdir(parents=True, exist_ok=True)
-    app = create_e2e_app(args.data_dir, args.redis_url)
+    app = create_e2e_app(args.data_dir, args.redis_url, args.port)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 

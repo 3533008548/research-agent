@@ -189,6 +189,7 @@
 .reader-toolbar button,
 .reader-search button,
 .reader-selection button,
+.paper-translation button:not(.text-button),
 .reader-tools button:not(.text-button):not(.note-open),
 .settings-tabs button {
   padding: 0.45rem 0.7rem;
@@ -642,3 +643,34 @@
     min-height: 600px;
   }
 }
+.bilingual-reader { display: flex; flex: 1; min-height: 0; min-width: 0; gap: .5rem; }
+.paper-translation { flex: 0 1 42%; min-width: 0; overflow: auto; padding: .6rem; border-inline-start: 1px solid #536273; }
+.paper-translation header { display: flex; justify-content: space-between; align-items: center; gap: .4rem; flex-wrap: wrap; }
+.paper-translation article { padding: .4rem .55rem; border-inline-start: 2px solid transparent; }
+.paper-translation article.paired { background: #639dbe26; border-color: #589ebc; }
+.paper-translation .heading { font-weight: 700; }
+.paper-translation article .text-button { font-size: .72rem; }
+.highlight-layer .translation-highlight { background: #45add945; outline: 1px solid #4086a4; }
+
+.paper-translation [role=status] { color: #a7b2c4; font-size: .78rem; margin: .35rem 0; }
+.paper-translation progress { width: 100%; height: .3rem; accent-color: #72b6c7; }
+.paper-translation .translation-text > :first-child { margin-top: .3rem; }
+.paper-translation .translation-text > :last-child { margin-bottom: .35rem; }
+@media (hover: hover) {
+  .paper-translation article:not(:hover):not(:focus-within) .text-button { opacity: 0; }
+}
+@container workbench (max-width: 560px) {
+  .bilingual-reader { flex-direction: column; }
+  .paper-translation { border-inline-start: none; border-top: 1px solid #536273; }
+}
+.reader-tools .paper-translation, .paper-translation { border:0; padding:0; }
+.translated-sheet { position:relative; width:100%; margin-top:.6rem; }
+.translated-sheet canvas { display:block; width:100%; height:auto; }
+.translated-sheet [data-segment] { position:absolute; }
+.translated-sheet .paired { outline:1px solid #4086a4; background:#45add945; }
+.translation-toast { position:fixed; right:18px; bottom:18px; z-index:55; display:grid; gap:.4rem; max-width:min(340px,90vw); padding:1rem; color:#eff5ff; background:#243342; border:1px solid #54728b; border-radius:8px; box-shadow:0 4px 20px #0005; }
+.translation-toast span { overflow-wrap:anywhere; }
+.translation-toast { pointer-events:none; }
+.translation-toast button { pointer-events:auto; }
+body:has(.right-workspace.has-docked-chat:not([hidden]) .chat-host:not([hidden])) .translation-toast { bottom:6rem; }
+.translation-toast button { color:inherit; background:transparent; border:1px solid #667b8b; border-radius:4px; padding:.25rem .55rem; margin-right:.5rem; }

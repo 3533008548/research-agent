@@ -20,6 +20,7 @@ import { SidebarResizeHandle } from "./components/SidebarResizeHandle";
 import { SessionSidebar } from "./components/workspace/SessionSidebar";
 
 
+import { TranslationNotices } from "./components/workspace/TranslationNotices";
 import { LibraryPanel } from "./components/workspace/LibraryPanel";
 import { SettingsPanel } from "./components/workspace/SettingsPanel";
 import { useLibrary } from "./hooks/useLibrary";
@@ -62,6 +63,7 @@ export function App() {
   const library = useLibrary(apiKey);
   const [selectedDocument, setSelectedDocument] = useState<LibraryDocument | null>(null);
   const [settingsSection, setSettingsSection] = useState<"general"|"daily"|"profile">("general");
+  const [translationRequest, setTranslationRequest] = useState({id:"", sequence:0});
   const [readerTools, setReaderTools] = useState<HTMLDivElement | null>(null);
   const [showRunTools, setShowRunTools] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -219,10 +221,10 @@ export function App() {
     setShowRunTools(true);
     layout.showRight();
   }
-  function showReaderTools() {
+  function showReaderTools(translation = false) {
     setRightPane("tools");
     setShowRunTools(false);
-    layout.showRight();
+    layout.showRight(translation);
   }
   useEffect(() => {
     void loadWorkspace();
@@ -424,7 +426,7 @@ export function App() {
           <Suspense fallback={<p>正在加载阅读器…</p>}>{workbenchTabs.filter(t => t.kind === "paper").map(tab => {
             if (tab.kind !== "paper") return null;
             const document = library.data.documents.find(d => d.id === tab.documentId);
-            return document && <div key={tab.id} className="reader-boundary-host" hidden={activeWorkbenchTab?.id !== tab.id}><ReaderErrorBoundary><PaperReader apiKey={apiKey} document={document} active={appPage === "workspace" && activeWorkbenchTab?.id === tab.id} toolsHost={readerTools} onShowTools={showReaderTools} onReference={addPaperReference} location={referenceLocation?.document_id===document.id ? referenceLocation : null} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/></ReaderErrorBoundary></div>;
+            return document && <div key={tab.id} className="reader-boundary-host" hidden={activeWorkbenchTab?.id !== tab.id}><ReaderErrorBoundary><PaperReader apiKey={apiKey} document={document} active={appPage === "workspace" && activeWorkbenchTab?.id === tab.id} openTranslationRequest={translationRequest.id === document.id ? translationRequest.sequence : 0} toolsVisible={layout.rightVisible && !showRunTools && (!chatDocked || rightPane==="tools")} toolsHost={readerTools} onShowTools={showReaderTools} onReference={addPaperReference} location={referenceLocation?.document_id===document.id ? referenceLocation : null} onProgress={(id,progress) => {library.rememberProgress(id,progress);if(selectedDocument?.id===id)setSelectedDocument(current => current && {...current,progress});}}/></ReaderErrorBoundary></div>;
           })}</Suspense>
           {activeWorkbenchTab?.kind === "paper" ? null : activeWorkbenchTab?.kind === "profile" ? (
             <ProfilePanel profile={activeWorkbenchTab.profile} />
@@ -580,6 +582,15 @@ export function App() {
         </SettingsPanel>}
       </section>
       </div>
+      <TranslationNotices apiKey={apiKey} onOpen={async id => {
+        const data = await library.load();
+        const doc = data?.documents.find(item => item.id === id);
+        if (doc) {
+          openPaper(doc);
+          showReaderTools(true);
+          setTranslationRequest(old => ({id, sequence:old.sequence+1}));
+        }
+      }}/>
     </main>
   );
 }

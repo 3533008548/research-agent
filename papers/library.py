@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import uuid
@@ -43,8 +44,29 @@ class LibraryStore:
                     REFERENCES documents(id), content TEXT NOT NULL, anchor TEXT NOT NULL,
                     revision INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS notes_document ON notes(document_id);
+                CREATE TABLE IF NOT EXISTS paper_bundles(
+                    document_id TEXT PRIMARY KEY REFERENCES documents(id), directory TEXT NOT NULL UNIQUE);
+                CREATE TABLE IF NOT EXISTS translation_timing(
+                    document_id TEXT PRIMARY KEY REFERENCES documents(id), seconds REAL NOT NULL,segments INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS translation_jobs(
+                    document_id TEXT PRIMARY KEY REFERENCES documents(id), state TEXT NOT NULL,
+                    error TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL, notified INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS translation_segments(
+                    document_id TEXT NOT NULL REFERENCES documents(id), page INTEGER NOT NULL,
+                    id TEXT NOT NULL, kind TEXT NOT NULL, bounds TEXT NOT NULL, source TEXT NOT NULL,
+                    translation TEXT, PRIMARY KEY(document_id,id));
+                CREATE TABLE IF NOT EXISTS translation_warnings(
+                    document_id TEXT NOT NULL REFERENCES documents(id), page INTEGER NOT NULL,
+                    PRIMARY KEY(document_id,page));
+                CREATE INDEX IF NOT EXISTS translation_page ON translation_segments(document_id,page);
                 CREATE TABLE IF NOT EXISTS discovered(path TEXT PRIMARY KEY, signature TEXT NOT NULL);
             """)
+            if db.execute("PRAGMA user_version").fetchone()[0] < 1:
+                db.execute("""INSERT OR IGNORE INTO translation_jobs(document_id,state,updated_at)
+                              SELECT document_id, CASE WHEN count(*)=count(translation) THEN 'queued' ELSE 'paused' END,
+                              CURRENT_TIMESTAMP FROM translation_segments GROUP BY document_id""")
+                db.execute("PRAGMA user_version=1")
 
     @contextmanager
     def db(self):
@@ -64,7 +86,7 @@ class LibraryStore:
             raise ValueError("名称不能为空，且最多 240 个字符")
         return value
 
-    def import_file(self, filename, stream, folder_id=None):
+    def import_file(self, filename, stream, folder_id=None, *, enqueue=True):
         if Path(filename).suffix.lower() != ".pdf":
             raise ValueError("论文库目前支持 PDF 文件")
         temp = self.files / f".import-{uuid.uuid4().hex}"
@@ -76,11 +98,11 @@ class LibraryStore:
                     if size > 100 * 1024 * 1024:
                         raise ValueError("PDF 最大为 100 MB")
                     target.write(chunk)
-            return self.register(temp, Path(filename.replace('\\', '/')).name, folder_id)
+            return self.register(temp, Path(filename.replace('\\', '/')).name, folder_id, enqueue=enqueue)
         finally:
             temp.unlink(missing_ok=True)
 
-    def register(self, source: Path, name: str, folder_id=None):
+    def register(self, source: Path, name: str, folder_id=None, *, enqueue=True):
         import fitz
         name = self.name(name)
         try:
@@ -97,12 +119,16 @@ class LibraryStore:
         with source.open('rb') as handle:
             digest = hashlib.file_digest(handle, 'sha256').hexdigest()
         identifier = 'doc_' + digest
-        destination = self.files / f"{identifier}.pdf"
         with self.db() as db:
             # Serialize duplicate imports and protect an existing display name/folder.
             db.execute('BEGIN IMMEDIATE')
             if folder_id and not db.execute('SELECT 1 FROM folders WHERE id=?', (folder_id,)).fetchone():
                 raise ValueError("目标文件夹不存在")
+            old = db.execute("SELECT name FROM documents WHERE id=?", (identifier,)).fetchone()
+            db.execute('INSERT OR IGNORE INTO documents(id,name,sha256,size_bytes,pages,folder_id,created_at) VALUES(?,?,?,?,?,?,?)',
+                       (identifier, name, digest, source.stat().st_size, pages, folder_id, now()))
+            directory = self._bundle(db, identifier, old[0] if old else name)
+            destination = directory / "原文.pdf"
             if not destination.exists():
                 staging = self.files / f'.copy-{uuid.uuid4().hex}'
                 try:
@@ -110,8 +136,9 @@ class LibraryStore:
                     os.replace(staging, destination)
                 finally:
                     staging.unlink(missing_ok=True)
-            db.execute('INSERT OR IGNORE INTO documents(id,name,sha256,size_bytes,pages,folder_id,created_at) VALUES(?,?,?,?,?,?,?)',
-                       (identifier, name, digest, source.stat().st_size, pages, folder_id, now()))
+            if enqueue:
+                db.execute("INSERT OR IGNORE INTO translation_jobs(document_id,state,updated_at) VALUES(?,'queued',?)",
+                           (identifier, now()))
         return self.get(identifier, include_trash=True)
 
     def discover(self):
@@ -126,7 +153,7 @@ class LibraryStore:
             if previous and previous[0] == signature:
                 continue
             try:
-                self.register(path, path.name)
+                self.register(path, path.name, enqueue=False)
                 with self.db() as db:
                     db.execute('INSERT OR REPLACE INTO discovered VALUES(?,?)', (path.name, signature))
             except (ValueError, OSError) as exc:
@@ -152,10 +179,49 @@ class LibraryStore:
             raise KeyError(identifier)
         return self.document(row)
 
+    def _bundle(self, db, identifier, name):
+        row = db.execute("SELECT directory FROM paper_bundles WHERE document_id=?", (identifier,)).fetchone()
+        if row:
+            directory = self.files / row[0]
+        else:
+            stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', Path(name).stem)[:100].strip(' .') or '论文'
+            if re.fullmatch(r'(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', stem, re.I):
+                stem = '_' + stem
+            directory = self.files / stem
+            suffix = 0
+            while directory.exists():
+                suffix += 1
+                directory = self.files / f"{stem} ({suffix + 1})"
+            directory.mkdir()
+            db.execute("INSERT INTO paper_bundles VALUES(?,?)", (identifier, directory.name))
+        if directory.resolve().parent != self.files.resolve():
+            raise ValueError("论文目录无效")
+        return directory
+
+    def bundle(self, identifier):
+        doc = self.get(identifier)
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            directory = self._bundle(db, identifier, doc["name"])
+            pdf = directory / "原文.pdf"
+            if not pdf.exists():
+                legacy = self.files / f"{identifier}.pdf"
+                if not legacy.is_file():
+                    raise KeyError(identifier)
+                staging = directory / f".copy-{uuid.uuid4().hex}"
+                try:
+                    shutil.copyfile(legacy, staging)
+                    os.replace(staging, pdf)
+                finally:
+                    staging.unlink(missing_ok=True)
+        return directory
+
     def file(self, identifier):
-        self.get(identifier)
-        path = self.files / f'{identifier}.pdf'
-        if path.resolve().parent != self.files.resolve() or not path.is_file():
+        doc = self.get(identifier)
+        with self.db() as db:
+            row = db.execute("SELECT directory FROM paper_bundles WHERE document_id=?", (identifier,)).fetchone()
+        path = self.files / row[0] / "原文.pdf" if row else self.files / f"{doc['id']}.pdf"
+        if not path.resolve().is_relative_to(self.files.resolve()) or not path.is_file():
             raise KeyError(identifier)
         return path
 

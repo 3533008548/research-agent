@@ -189,3 +189,62 @@ async def translate(identifier: str, body: TranslateBody, store: Store, request:
         raise HTTPException(502, '翻译未完成，请检查模型设置或稍后重试') from None
     finally:
         cancel.set()
+
+
+@router.get('/documents/{identifier}/translation')
+def paper_translation(identifier: str, store: Store, request: Request, page: int = 1):
+    if not 1 <= page <= store.get(identifier)['pages']:
+        raise HTTPException(422, '页码超出论文范围')
+    return request.app.state.paper_translations.status(identifier, page)
+
+
+@router.post('/documents/{identifier}/translation', status_code=202)
+def start_translation(identifier: str, store: Store, request: Request):
+    store.get(identifier)
+    agent = request.app.state.agent
+    if not getattr(agent.cfg, 'deepseek_key', '') or agent.cfg.deepseek_key == 'desktop-unconfigured':
+        raise HTTPException(409, '请先在设置中配置模型 API Key')
+    request.app.state.paper_translations.start(identifier)
+    return {'accepted': True}
+
+
+@router.delete('/documents/{identifier}/translation')
+def pause_translation(identifier: str, store: Store, request: Request):
+    store.get(identifier)
+    request.app.state.paper_translations.pause(identifier)
+    return {'accepted': True}
+
+
+def translated_file(identifier, store):
+    store.get(identifier)
+    with store.db() as db:
+        row = db.execute("SELECT state FROM translation_jobs WHERE document_id=?", (identifier,)).fetchone()
+    if not row or row[0] != "complete":
+        raise HTTPException(409, "译文尚未生成")
+    directory = store.bundle(identifier)
+    path = directory / "中文译文.pdf"
+    if not path.is_file() or path.resolve().parent != directory.resolve():
+        raise HTTPException(404, "译文文件不存在")
+    return path
+
+
+@router.get('/documents/{identifier}/translation/file')
+def translated_pdf(identifier: str, store: Store):
+    return FileResponse(translated_file(identifier, store), media_type="application/pdf",
+                        filename=store.get(identifier)["name"].removesuffix(".pdf") + ".zh-CN.pdf",
+                        content_disposition_type="inline", headers={"Cache-Control": "private, no-cache"})
+
+
+@router.get('/translation-notices')
+def translation_notices(store: Store):
+    with store.db() as db:
+        return [dict(row) for row in db.execute('''SELECT j.document_id,j.state,j.error,j.updated_at,d.name
+                    FROM translation_jobs j JOIN documents d ON j.document_id=d.id WHERE j.notified=0
+                    AND j.state IN ('complete','failed','unconfigured') AND d.trashed=0 ORDER BY j.updated_at LIMIT 8''')]
+
+
+@router.post('/documents/{identifier}/translation-notice/ack')
+def acknowledge(identifier: str, updated_at: str, store: Store):
+    with store.db() as db:
+        db.execute('UPDATE translation_jobs SET notified=1 WHERE document_id=? AND updated_at=?', (identifier,updated_at))
+    return {"accepted": True}

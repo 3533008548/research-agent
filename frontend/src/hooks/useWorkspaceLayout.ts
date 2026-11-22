@@ -109,11 +109,12 @@ export function useWorkspaceLayout(active = true) {
     };
   }, [finishDrag]);
 
+  const [wideReader, setWideReader] = useState(false);
   const leftVisible = preferences.leftVisible;
   const rightVisible = rightSidebarVisible(preferences.rightVisibility);
   const widths = useMemo(() => resolveWorkspaceWidths({
-    workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible,
-  }), [workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible]);
+    workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible, wideReader,
+  }), [workspaceWidth, viewportWidth, preferences, leftVisible, rightVisible, wideReader]);
   const leftResizable = leftVisible && widths.mode !== "stacked" && widths.leftBounds.max > widths.leftBounds.min;
   const rightResizable = rightVisible && widths.mode !== "stacked" && widths.rightBounds.max > widths.rightBounds.min;
 
@@ -200,9 +201,12 @@ export function useWorkspaceLayout(active = true) {
     finishDrag();
     updatePreferences({ ...preferencesRef.current, rightVisibility: rightVisible ? "hidden" : "shown" });
   };
-  const showRight = useCallback(() => {
+  const showRight = useCallback((reading = false) => {
+    setWideReader(reading);
     finishDrag();
-    updatePreferences({ ...preferencesRef.current, rightVisibility: "shown" });
+    const current = preferencesRef.current;
+    updatePreferences({ ...current, rightVisibility: "shown",
+      ...(reading && current.rightWidth === 310 ? {rightWidth: 510} : {}) });
   }, [finishDrag, updatePreferences]);
   const setChatDocked = useCallback((docked: boolean) => {
     finishDrag();

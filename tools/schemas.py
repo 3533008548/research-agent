@@ -6,6 +6,14 @@
 def _raw_tool_schemas() -> list[dict]:
     """Return the static schemas used to construct the public tool catalog."""
     return [
+        {"type": "function", "function": {
+            "name": "manage_paper_translation",
+            "description": "查看论文翻译进度和失败原因，根据用户要求暂停、继续或重试。仅凭唯一论文标题或文档 ID 操作；缺少标题可列出任务。",
+            "parameters": {"type":"object","properties":{
+                "action":{"type":"string","enum":["status","pause","resume","retry"]},
+                "paper":{"type":"string","description":"论文名或文档 ID；查询全部任务时省略"}
+            },"required":["action"]}
+        }},
         {
             "type": "function", "function": {
                 "name": "list_tool_results",

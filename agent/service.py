@@ -454,13 +454,19 @@ class ResearchAgent:
                         steer_provider=_consume_running_steers,
                         tool_round_budget=MAX_AGENT_TOOL_ROUNDS,
                     )
-                result = app.invoke(
-                    state,
-                    config={
-                        "configurable": {"thread_id": thread_id},
-                        "recursion_limit": graph_step_limit,
-                    },
-                )
+                graph_config = {
+                    "configurable": {"thread_id": thread_id},
+                    "recursion_limit": graph_step_limit,
+                }
+                graph_input = state
+                if run_id:
+                    state["metadata"]["run_id"] = run_id
+                    checkpoint = app.get_state(graph_config)
+                    # Reclaimed jobs can already have a checkpointed input.
+                    # Resume its pending node without appending the user turn again.
+                    if checkpoint.next and checkpoint.values.get("metadata", {}).get("run_id") == run_id:
+                        graph_input = None
+                result = app.invoke(graph_input, config=graph_config)
                 messages = result.get("messages", [])
                 if not messages:
                     answer = "⚠️ Agent 未返回任何消息。"

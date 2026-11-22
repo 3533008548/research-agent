@@ -92,7 +92,7 @@ class PaperReader:
         self.max_pages = max_pages
         self.max_chars = max_chars
 
-    def parse_document(self, pdf_path: str | Path, *, extract_tables: bool = True) -> dict[str, Any]:
+    def parse_document(self, pdf_path: str | Path, *, extract_tables: bool = True, cancel_event=None) -> dict[str, Any]:
         """Parse a PDF into page-scoped text, table and figure elements.
 
         This is deliberately a plain dictionary so it can be persisted as JSON
@@ -122,6 +122,8 @@ class PaperReader:
 
             for index in range(pages_to_read):
                 from papers.ocr import extract_visual_text
+                from infra.cancellation import raise_if_cancelled
+                raise_if_cancelled(cancel_event, "已暂停全文分块")
 
                 page_number = index + 1
                 text_blocks = self._extract_text_blocks(text_pdf[index])

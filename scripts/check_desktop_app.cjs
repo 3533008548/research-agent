@@ -110,14 +110,10 @@ const model = http.createServer((request, response) => {
   await page.locator('.right-workspace .draggable-chat-tab button').click();
   await page.getByRole('button', { name: '上一页', exact: true }).click();
   await page.locator('.textLayer span').filter({ hasText: 'Each annotation' }).waitFor();
-  await page.locator('.textLayer').evaluate(el => {
-    const range = document.createRange(); range.selectNodeContents(el.querySelector('span'));
-    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
-    el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Shift', bubbles: true }));
-  });
-  await page.getByRole('button', { name: '翻译选段', exact: true }).click();
-  await page.locator('.translation-text').filter({ hasText: '每条批注' }).waitFor();
-  assert.equal(requests.at(-1).messages.at(-1).content, 'Each annotation links a passage to its page.');
+  await page.getByRole('button', { name: '查看译文', exact: true }).click();
+  await page.getByText('已译 2 / 2 段', {exact: true}).waitFor();
+  await page.locator('.translated-sheet [data-segment]').first().waitFor();
+  assert.ok(requests.some(request => request.messages.at(-1).content === 'Each annotation links a passage to its page.'));
   const preview = await desktop.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG().toString('base64'));
   if (preview) fs.writeFileSync(path.join(root, '.visual_check/desktop-client.png'), Buffer.from(preview, 'base64'));
   await page.locator('.right-workspace .draggable-chat-tab button').click();

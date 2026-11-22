@@ -17,7 +17,7 @@ export const CENTER_MIN_WIDTH = 480;
 export const COMPACT_CENTER_MIN_WIDTH = 320;
 export const SIDEBAR_LIMITS = {
   left: { min: 190, max: 420, initial: 240 },
-  right: { min: 245, max: 800, initial: 310 },
+  right: { min: 245, max: 1600, initial: 310 },
 } as const;
 
 export function defaultLayoutPreferences(): WorkspaceLayoutPreferences {
@@ -86,12 +86,14 @@ export function resolveWorkspaceWidths({
   preferences,
   leftVisible,
   rightVisible,
+  wideReader = false,
 }: {
   workspaceWidth: number;
   viewportWidth: number;
   preferences: WorkspaceLayoutPreferences;
   leftVisible: boolean;
   rightVisible: boolean;
+  wideReader?: boolean;
 }): ResolvedWorkspaceWidths {
   const width = Number.isFinite(workspaceWidth) ? Math.max(0, workspaceWidth) : 0;
   const mode = workspaceLayoutMode(Math.min(viewportWidth, width));
@@ -103,7 +105,7 @@ export function resolveWorkspaceWidths({
   const rightMin = rightInRow ? SIDEBAR_LIMITS.right.min : 0;
   // Keep both rails beside chat in restored desktop windows. Only compact
   // widths relax the reading width; saved preferences remain untouched.
-  const centerMin = Math.max(COMPACT_CENTER_MIN_WIDTH, Math.min(CENTER_MIN_WIDTH, width - leftMin - rightMin));
+  const centerMin = Math.max(COMPACT_CENTER_MIN_WIDTH, Math.min(wideReader ? 360 : CENTER_MIN_WIDTH, width - leftMin - rightMin));
   const budget = Math.max(0, width - centerMin);
 
   if (leftWidth + rightWidth > budget) {

@@ -324,6 +324,19 @@ else {
           version: app.getVersion(),
         };
       });
+      ipcMain.handle("desktop:open-translation", async (event, id) => {
+        validSender(event);
+        if (typeof id !== "string" || !/^doc_[0-9a-f]{64}$/.test(id)) throw Error("论文标识无效");
+        const response = await fetch(origin + "/api/v1/desktop/library/" + id + "/translation-path",
+          { headers: {"X-API-Key": token} });
+        if (!response.ok) throw Error("译文文件不可用");
+        const file = fs.realpathSync((await response.json()).path);
+        const library = fs.realpathSync(path.join(dataDirectory(), "primary", "papers", "library"));
+        if (path.dirname(path.dirname(file)) !== library || path.basename(file) !== "中文译文.pdf")
+          throw Error("译文文件位置无效");
+        const error = await shell.openPath(file);
+        if (error) throw Error(error);
+      });
       ipcMain.on("desktop:renderer-error", (event, message) => {
         try {
           validSender(event);

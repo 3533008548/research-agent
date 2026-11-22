@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import time
+import asyncio
+import threading
+from contextlib import asynccontextmanager
 import mimetypes
 from pathlib import Path
 
@@ -18,6 +21,7 @@ from papers.relations import PaperRelationStore
 from agent.daily.scheduler import Scheduler
 from api.workspace_uploads import WorkspaceUploadStore
 from papers.library import LibraryStore
+from papers.translations import PaperTranslations
 from api.library_routes import router as library_router
 
 
@@ -45,7 +49,22 @@ def create_app(
     require_api_key: bool = False,
 ) -> FastAPI:
     """Create an ASGI app around an already configured shared agent instance."""
-    app = FastAPI(title=title, version="v1")
+    @asynccontextmanager
+    async def lifespan(app):
+        stop = threading.Event()
+        translations = app.state.paper_translations
+        thread = None
+        if translations:
+            thread = threading.Thread(target=translations.serve, args=(agent, stop), daemon=True, name="paper-translation")
+            thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            if thread:
+                await asyncio.to_thread(thread.join, 5)
+
+    app = FastAPI(title=title, version="v1", lifespan=lifespan)
     app.state.agent = agent
     app.state.api_started_at = time.monotonic()
     app.state.chat_run_manager = chat_run_manager or ChatRunManager(agent)
@@ -63,6 +82,7 @@ def create_app(
     paths = getattr(cfg, "runtime_paths", None)
     app.state.workspace_paths = paths
     app.state.library_store = LibraryStore(paths) if paths else None
+    app.state.paper_translations = PaperTranslations(app.state.library_store) if paths else None
     app.state.workspace_uploads = WorkspaceUploadStore(paths) if paths else None
     app.state.paper_relation_store = PaperRelationStore(paths) if paths else None
     app.state.workspace_scheduler = (

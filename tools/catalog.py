@@ -35,6 +35,7 @@ class ToolDefinition:
 
 
 _PRESENTATION = {
+    "manage_paper_translation": ("论文翻译管理", 4000),
     "list_tool_results": ("工具结果目录", 12_000),
     "read_tool_result": ("工具结果续读", 10_000),
     "search_tool_result": ("工具结果搜索", 8_000),

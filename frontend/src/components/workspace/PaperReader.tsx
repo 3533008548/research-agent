@@ -1,3 +1,5 @@
+import { TranslatedPage } from "./TranslatedPage";
+import { usePaperTranslation } from "./usePaperTranslation";
 import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -32,8 +34,10 @@ type Props = {
   apiKey: string;
   document: LibraryDocument;
   active: boolean;
+  openTranslationRequest: number;
   toolsHost: HTMLElement | null;
-  onShowTools: () => void;
+  toolsVisible: boolean;
+  onShowTools: (translation?: boolean) => void;
   onReference: (reference: PaperReference) => void;
   location: PaperLocation | null;
   onProgress: (id: string, progress: LibraryDocument["progress"]) => void;
@@ -43,6 +47,8 @@ export function PaperReader({
   document: doc,
   active,
   toolsHost,
+  openTranslationRequest,
+  toolsVisible,
   onShowTools,
   onReference,
   location,
@@ -59,17 +65,23 @@ export function PaperReader({
     [scanned, setScanned] = useState(false);
   const [pan, setPan] = useState(false),
     [space, setSpace] = useState(false),
-    [anchor, setAnchor] = useState<NoteAnchor | null>(null),
-    [side, setSide] = useState<"notes" | "translation">("notes");
+    [anchor, setAnchor] = useState<NoteAnchor | null>(null);
   const [areaMode, setAreaMode] = useState(false);
   const [areaBox, setAreaBox] = useState<NoteAnchor["rects"][number] | null>(null);
   const areaStart = useRef<{ x: number; y: number; page: number; pointer: number } | null>(null);
   const pendingLocation = useRef<PaperLocation | null>(null);
   const renderedPage = useRef<number | null>(null);
-  const [translation, setTranslation] = useState(""),
-    [translationOk, setTranslationOk] = useState(false),
-    [translating, setTranslating] = useState(false),
-    [translatedAnchor, setTranslatedAnchor] = useState<NoteAnchor | null>(null);
+  const [bilingual, setBilingual] = useState(false);
+  useEffect(() => {
+    if (openTranslationRequest) setBilingual(true);
+  }, [openTranslationRequest]);
+  const [textView, setTextView] = useState(false);
+  const showingTranslation = bilingual && toolsVisible;
+  const [hoveredId, setHoveredId] = useState("");
+  const translation = usePaperTranslation(apiKey, doc.id, page, active);
+  const progress = translation.data;
+  const running = progress?.state === "running" || progress?.state === "queued";
+  const hovered = translation.segments.find(s => s.id === hoveredId);
   const [notes, setNotes] = useState<PaperNote[]>([]),
     [draft, setDraft] = useState<Draft | null>(null),
     [saveStatus, setSaveStatus] = useState(""),
@@ -82,7 +94,6 @@ export function PaperReader({
   const draftRef = useRef<Draft | null>(null),
     dirty = useRef(false),
     saving = useRef<Promise<boolean> | null>(null),
-    translateAbort = useRef<AbortController | null>(null),
     drag = useRef<{ x: number; y: number; left: number; top: number } | null>(
       null,
     );
@@ -177,13 +188,13 @@ export function PaperReader({
     }
   }
   async function newNote(value: NoteAnchor | null = null, content = "") {
+    setBilingual(false);
     onShowTools();
     if (!(await flush())) return;
     setEditor(
       { id: crypto.randomUUID(), content, anchor: value, revision: 0 },
       Boolean(value || content),
     );
-    setSide("notes");
     setSaveStatus(value || content ? "待保存" : "新笔记");
   }
 
@@ -235,7 +246,6 @@ export function PaperReader({
     return () => {
       alive = false;
       void flush();
-      translateAbort.current?.abort();
     };
   }, [apiKey, doc.id]);
   useEffect(() => {
@@ -255,7 +265,6 @@ export function PaperReader({
   }, []);
   useEffect(() => {
     if (!active) {
-      translateAbort.current?.abort();
       void flush();
       return;
     }
@@ -466,7 +475,6 @@ export function PaperReader({
         width: Math.min(1, r.width / box.width),
         height: Math.min(1, r.height / box.height),
       }));
-    translateAbort.current?.abort();
     if (text.length > 12000 || rects.length > 300) {
       setError("选段过长，请缩小选择范围。");
       return;
@@ -490,38 +498,6 @@ export function PaperReader({
       x: Math.min(start.x, end.x), y: Math.min(start.y, end.y),
       width: Math.abs(end.x - start.x), height: Math.abs(end.y - start.y),
     };
-  }
-  async function translate() {
-    if (!anchor?.quote) return;
-    onShowTools();
-    const selected = anchor;
-    translateAbort.current?.abort();
-    const abort = new AbortController();
-    translateAbort.current = abort;
-    setSide("translation");
-    setTranslating(true);
-    setTranslationOk(false);
-    setTranslation("");
-    setTranslatedAnchor(selected);
-    try {
-      const result = await libraryRequest<{ text: string }>(
-        apiKey,
-        `/documents/${doc.id}/translate`,
-        {
-          method: "POST",
-          body: JSON.stringify({ text: selected.quote, page: selected.page }),
-          signal: abort.signal,
-        },
-      );
-      if (!abort.signal.aborted) {
-        setTranslation(result.text);
-        setTranslationOk(true);
-      }
-    } catch (e) {
-      if (!abort.signal.aborted) setTranslation(userFacingError(e));
-    } finally {
-      if (translateAbort.current === abort) setTranslating(false);
-    }
   }
   async function search() {
     if (!pdf || !find.trim()) return;
@@ -645,9 +621,10 @@ export function PaperReader({
       )}
       {scanned && (
         <p className="notice">
-          此页未检测到文本层，可阅读和记整页笔记；划选翻译需要可识别的文字。
+          此页未检测到文本层，可框选区域引用或添加笔记。
         </p>
       )}
+      <div className="bilingual-reader">
       <div
         ref={viewport}
         onScroll={e => setScrollTop(e.currentTarget.scrollTop)}
@@ -684,6 +661,17 @@ export function PaperReader({
         <div
           ref={sheet}
           className="pdf-sheet"
+          onPointerLeave={() => setHoveredId("")}
+          onPointerMove={e => {
+            if (!showingTranslation || rendering || e.buttons) return;
+            const frame = e.currentTarget.getBoundingClientRect();
+            const x = (e.clientX - frame.left) / frame.width;
+            const y = (e.clientY - frame.top) / frame.height;
+            const match = translation.segments.find(({bounds: [l,t,r,b]}) => l <= x && x <= r && t <= y && y <= b);
+            setHoveredId(match?.id || "");
+            if (match && match.id !== hoveredId)
+              document.getElementById(doc.id + match.id)?.scrollIntoView({block: "nearest"});
+          }}
           style={
             {
               width: size.width * effectiveScale,
@@ -715,6 +703,10 @@ export function PaperReader({
               reference(value);
             }} />}
           <div className="highlight-layer">
+            {showingTranslation && hovered && <span className="translation-highlight" style={{
+              left: hovered.bounds[0]*100+"%", top: hovered.bounds[1]*100+"%",
+              width: (hovered.bounds[2]-hovered.bounds[0])*100+"%", height: (hovered.bounds[3]-hovered.bounds[1])*100+"%",
+            }} />}
             {(areaBox ? [areaBox] : anchor?.page===page ? anchor.rects : []).map((r,i)=>
               <span key={"picked-"+i} className="paper-reference-highlight" style={{left:r.x*100+"%",top:r.y*100+"%",width:r.width*100+"%",height:r.height*100+"%"}} />)}
             {notes
@@ -735,6 +727,54 @@ export function PaperReader({
           </div>
         </div>
       </div>
+      </div>
+      {active && toolsHost && bilingual && createPortal(<aside className="paper-translation" aria-label="论文译文">
+        <header><strong>第 {page} 页译文</strong></header>
+        <p role="status">{progress?.state === "queued" ? "等待翻译" : running && !progress?.total ? "正在解析论文…" :
+          progress?.total ? `已译 ${progress.done} / ${progress.total} 段` : ""}</p>
+        {running && !!progress?.remaining_seconds && <small>预计剩余约 {Math.ceil(progress.remaining_seconds / 60)} 分钟</small>}
+        {progress && progress.total > 0 && running && <progress aria-label="整篇翻译进度" max={progress.total} value={progress.done}/>}
+        {!!progress?.incomplete_pages?.length && <p className="notice">第 {progress.incomplete_pages.join("、")} 页有未识别的内容，请对照原页。</p>}
+        {(translation.error || progress?.error) && <p role="alert">{translation.error || progress?.error}</p>}
+        {progress && progress.state !== "complete" && <button disabled={translation.busy} onClick={() => void translation.update(running ? "DELETE" : "POST")}>
+          {running ? "暂停翻译" : progress.state === "idle" ? "翻译论文" : "继续翻译"}
+        </button>}
+        {progress?.total && progress.page === page && !translation.segments.length ? <p>此页未提取到可翻译的段落。</p> : null}
+        {progress?.state === "complete" && <button onClick={() => setTextView(v=>!v)}>{textView ? "版式 PDF" : "段落文本"}</button>}
+        {progress?.state === "complete" && !textView ? <TranslatedPage apiKey={apiKey} documentId={doc.id} page={page}
+          segments={translation.segments} hovered={hoveredId} onHover={id => {
+            setHoveredId(id);
+            const segment = translation.segments.find(s => s.id === id);
+            if (!segment || !viewport.current || !sheet.current) return;
+            const v = viewport.current.getBoundingClientRect(), r = sheet.current.getBoundingClientRect();
+            const y = r.top + r.height * segment.bounds[1], x = r.left + r.width * segment.bounds[0];
+            if (y < v.top || y > v.bottom - 20) viewport.current.scrollTop += y-v.top-15;
+            if (x < v.left || x > v.right - 20) viewport.current.scrollLeft += x-v.left-15;
+          }}/> : translation.segments.map(segment => {
+          const [x,y,r,b] = segment.bounds;
+          function locate() {
+            setHoveredId(segment.id);
+            const container = viewport.current, frame = sheet.current;
+            if (!container || !frame) return;
+            const pageBox = frame.getBoundingClientRect(), view = container.getBoundingClientRect();
+            const top = pageBox.top + y*pageBox.height, left = pageBox.left + x*pageBox.width;
+            if (top < view.top || top > view.bottom - 24) container.scrollTop += top - view.top - 12;
+            if (left < view.left || left > view.right - 24) container.scrollLeft += left - view.left - 12;
+          }
+          return <article id={doc.id + segment.id} key={segment.id} tabIndex={0}
+            className={segment.id === hoveredId ? "paired" : ""}
+            onPointerEnter={locate} onPointerLeave={() => setHoveredId("")}
+            onFocus={locate} onBlur={() => setHoveredId("")}>
+            <div className={"translation-text " + segment.kind}>
+              {segment.translation ? <Suspense fallback={segment.translation}><MarkdownContent content={segment.translation}/></Suspense>
+                : <small>待译 · {segment.source}</small>}
+            </div>
+            {segment.translation && <button className="text-button" onClick={() => void newNote({
+              page, quote: segment.source.slice(0, 12000), rects: [{x,y,width:r-x,height:b-y}]
+            }, segment.translation!)}>译文加入笔记</button>}
+          </article>;
+        })}
+      </aside>, toolsHost)}
       <div className="reader-selection">
         <span>
           {rendering
@@ -743,173 +783,120 @@ export function PaperReader({
               ? `第 ${anchor.page} 页 · ${anchor.quote ? "已选 "+anchor.quote.length+" 字" : "已选区域"}`
               : "选中文字或框选图表，可在会话中引用"}
         </span>
-        <button
-          disabled={!anchor?.quote || translating}
-          onClick={() => void translate()}
-        >
-          翻译选段
-        </button>
+        <button disabled={translation.busy} aria-pressed={showingTranslation} onClick={() => {
+          if (!showingTranslation) onShowTools(true);
+          setBilingual(!showingTranslation);
+          setHoveredId("");
+        }}>{showingTranslation ? "收起译文" : "查看译文"}</button>
         <button disabled={!anchor} onClick={() => void newNote(anchor)}>
           添加批注
         </button>
       </div>
       {active &&
-        toolsHost &&
+        toolsHost && !bilingual &&
         createPortal(
           <div className="reader-tools">
-            <div className="settings-tabs">
-              <button
-                aria-pressed={side === "notes"}
-                onClick={() => setSide("notes")}
-              >
-                笔记
-              </button>
-              <button
-                aria-pressed={side === "translation"}
-                onClick={() => setSide("translation")}
-              >
-                翻译
-              </button>
+            <div className="action-row">
+              <h2>论文笔记</h2>
+              <button onClick={() => void newNote()}>新建</button>
             </div>
-            {side === "translation" ? (
+            {draft && (
               <>
-                <h2>选段翻译</h2>
-                {translatedAnchor && (
-                  <blockquote>
-                    第 {translatedAnchor.page} 页<br />
-                    {translatedAnchor.quote}
-                  </blockquote>
+                <p className="panel-hint">
+                  {draft.anchor
+                    ? `第 ${draft.anchor.page} 页批注`
+                    : "整篇笔记"}
+                </p>
+                {draft.anchor && (
+                  <blockquote>{draft.anchor.quote}</blockquote>
                 )}
-                <div className="translation-text">
-                  {translating
-                    ? "正在翻译…"
-                    : translationOk ? (
-                      <Suspense fallback={<p className="markdown-loading">{translation}</p>}>
-                        <MarkdownContent content={translation} />
-                      </Suspense>
-                    ) : translation || "划选论文中的文字后点击翻译。"}
-                </div>
-                {translating ? (
-                  <button onClick={() => translateAbort.current?.abort()}>
-                    取消翻译
-                  </button>
-                ) : (
-                  translationOk && (
-                    <button
-                      onClick={() =>
-                        void newNote(translatedAnchor, translation)
+                <textarea
+                  aria-label="笔记正文"
+                  value={draft.content}
+                  onChange={(e) => {
+                    setEditor({ ...draft, content: e.target.value }, true);
+                    setSaveStatus("待保存");
+                  }}
+                  placeholder="记录你的理解和问题…"
+                />
+                <p className="note-save-status" role="status">
+                  {saveStatus}
+                </p>
+                <button onClick={() => void flush()}>保存笔记</button>
+                {saveStatus.startsWith("保存失败") && (
+                  <button
+                    onClick={() => {
+                      if (draftRef.current) {
+                        setEditor(
+                          {
+                            ...draftRef.current,
+                            id: crypto.randomUUID(),
+                            revision: 0,
+                          },
+                          true,
+                        );
+                        void flush();
                       }
-                    >
-                      译文加入笔记
-                    </button>
-                  )
+                    }}
+                  >
+                    草稿另存为新笔记
+                  </button>
                 )}
               </>
-            ) : (
-              <>
-                <div className="action-row">
-                  <h2>论文笔记</h2>
-                  <button onClick={() => void newNote()}>新建</button>
-                </div>
-                {draft && (
-                  <>
-                    <p className="panel-hint">
-                      {draft.anchor
-                        ? `第 ${draft.anchor.page} 页批注`
-                        : "整篇笔记"}
-                    </p>
-                    {draft.anchor && (
-                      <blockquote>{draft.anchor.quote}</blockquote>
-                    )}
-                    <textarea
-                      aria-label="笔记正文"
-                      value={draft.content}
-                      onChange={(e) => {
-                        setEditor({ ...draft, content: e.target.value }, true);
-                        setSaveStatus("待保存");
-                      }}
-                      placeholder="记录你的理解和问题…"
-                    />
-                    <p className="note-save-status" role="status">
-                      {saveStatus}
-                    </p>
-                    <button onClick={() => void flush()}>保存笔记</button>
-                    {saveStatus.startsWith("保存失败") && (
-                      <button
-                        onClick={() => {
-                          if (draftRef.current) {
-                            setEditor(
-                              {
-                                ...draftRef.current,
-                                id: crypto.randomUUID(),
-                                revision: 0,
-                              },
-                              true,
-                            );
-                            void flush();
+            )}
+            <div className="paper-notes">
+              {notes.map((n) => (
+                <article key={n.id}>
+                  <button
+                    className="note-open"
+                    onClick={() =>
+                      void (async () => {
+                        if (!(await flush())) return;
+                        setEditor(n);
+                        setSaveStatus("已保存");
+                        if (n.anchor) setPage(n.anchor.page);
+                      })()
+                    }
+                  >
+                    <strong>
+                      {n.anchor ? `第 ${n.anchor.page} 页` : "整篇笔记"}
+                    </strong>
+                    <p>{n.content || n.anchor?.quote || "空笔记"}</p>
+                  </button>
+                  <button
+                    className="text-button"
+                    onClick={() =>
+                      void (async () => {
+                        if (!window.confirm("删除这条笔记？")) return;
+                        if (!(await flush())) return;
+                        try {
+                          await libraryRequest(
+                            apiKey,
+                            `/documents/${doc.id}/notes/${n.id}`,
+                            { method: "DELETE" },
+                          );
+                          setNotes((values) =>
+                            values.filter((v) => v.id !== n.id),
+                          );
+                          if (draftRef.current?.id === n.id) {
+                            setEditor(null);
+                            localStorage.removeItem(draftKey);
                           }
-                        }}
-                      >
-                        草稿另存为新笔记
-                      </button>
-                    )}
-                  </>
-                )}
-                <div className="paper-notes">
-                  {notes.map((n) => (
-                    <article key={n.id}>
-                      <button
-                        className="note-open"
-                        onClick={() =>
-                          void (async () => {
-                            if (!(await flush())) return;
-                            setEditor(n);
-                            setSaveStatus("已保存");
-                            if (n.anchor) setPage(n.anchor.page);
-                          })()
+                        } catch (e) {
+                          setSaveStatus(userFacingError(e));
                         }
-                      >
-                        <strong>
-                          {n.anchor ? `第 ${n.anchor.page} 页` : "整篇笔记"}
-                        </strong>
-                        <p>{n.content || n.anchor?.quote || "空笔记"}</p>
-                      </button>
-                      <button
-                        className="text-button"
-                        onClick={() =>
-                          void (async () => {
-                            if (!window.confirm("删除这条笔记？")) return;
-                            if (!(await flush())) return;
-                            try {
-                              await libraryRequest(
-                                apiKey,
-                                `/documents/${doc.id}/notes/${n.id}`,
-                                { method: "DELETE" },
-                              );
-                              setNotes((values) =>
-                                values.filter((v) => v.id !== n.id),
-                              );
-                              if (draftRef.current?.id === n.id) {
-                                setEditor(null);
-                                localStorage.removeItem(draftKey);
-                              }
-                            } catch (e) {
-                              setSaveStatus(userFacingError(e));
-                            }
-                          })()
-                        }
-                      >
-                        删除
-                      </button>
-                    </article>
-                  ))}
-                </div>
-                {!notes.length && !draft && (
-                  <p className="panel-hint">
-                    可以随手记录整篇笔记，也可以选择原文创建批注。
-                  </p>
-                )}
-              </>
+                      })()
+                    }
+                  >
+                    删除
+                  </button>
+                </article>
+              ))}
+            </div>
+            {!notes.length && !draft && (
+              <p className="panel-hint">
+                可以随手记录整篇笔记，也可以选择原文创建批注。
+              </p>
             )}
           </div>,
           toolsHost,

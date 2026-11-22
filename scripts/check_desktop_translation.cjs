@@ -39,17 +39,14 @@ let desktop;
     return (await fetch('/api/v1/library/documents', { method: 'POST', body: data })).status;
   }, Array.from(pdf));
   assert.equal(uploaded, 201);
-  await page.route('**/api/v1/library/documents/*/translate', route => route.fulfill({ json: { text: translation } }));
+  await page.route('**/translation?page=1', route => route.fulfill({ json: {
+    state: 'complete', page: 1, done: 1, total: 1, error: '',
+    segments: [{ id: 'first', kind: 'text', bounds: [.1,.1,.8,.2], source: 'Definition 1.', translation }],
+  }}));
   await page.getByRole('button', { name: '论文库', exact: true }).click();
   await page.getByRole('button', { name: 'formula-translation.pdf', exact: true }).click();
-  await page.locator('.textLayer span').first().waitFor();
-  await page.locator('.reader-selection').getByText('划选文字后可翻译或添加批注', { exact: true }).waitFor();
-  await page.locator('.textLayer').evaluate(el => {
-    const range = document.createRange(); range.selectNodeContents(el);
-    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
-    el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Shift', bubbles: true }));
-  });
-  await page.getByRole('button', { name: '翻译选段', exact: true }).click();
+  await page.getByRole('button', { name: '查看译文', exact: true }).click();
+  await page.getByRole('button', {name:'段落文本',exact:true}).click();
   const result = page.locator('.translation-text');
   await result.locator('.katex-display').first().waitFor();
   await page.evaluate(() => document.fonts.ready);
@@ -66,7 +63,7 @@ let desktop;
   if (preview) fs.writeFileSync(path.join(root, '.visual_check/desktop-translation-math.png'), Buffer.from(preview, 'base64'));
   await page.getByRole('button', { name: '译文加入笔记', exact: true }).click();
   assert.equal(await page.getByRole('textbox', { name: '笔记正文', exact: true }).inputValue(), translation);
-  console.log('Packaged translation passed: local PDF selection, inline/display math, fractions, numbered equations, bundled fonts, contained layout and unchanged note source.');
+  console.log('Packaged translation passed: full-paper translation view, inline/display math, fractions, numbered equations, bundled fonts, contained layout and unchanged note source.');
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (desktop) await desktop.close().catch(() => {});
 });

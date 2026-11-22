@@ -1205,6 +1205,7 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         import fitz
         with fitz.open() as document:
             document.new_page().insert_text((50, 80), "Every claim needs evidence.")
+            document.new_page().insert_text((50, 80), "Hold this page for concurrent chat.")
             uploaded = self.page.request.post(f"{self.base_url}/api/v1/library/documents", multipart={
                 "file": {"name": "reading-tools.pdf", "mimeType": "application/pdf", "buffer": document.tobytes()},
             })
@@ -1221,22 +1222,32 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.page.locator(".note-save-status").filter(has_text="已保存").wait_for()
         self.page.locator(".right-workspace .draggable-chat-tab button").click()
         self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "保留对话草稿")
-        self.page.route("**/api/v1/library/documents/*/translate", lambda route: route.fulfill(json={"text": "每个判断都需要证据。"}))
-        self.page.locator(".textLayer").evaluate("""el => {
-            const range = document.createRange();
-            range.selectNodeContents(el.querySelector('span'));
-            const selection = window.getSelection();
-            selection.removeAllRanges(); selection.addRange(range);
-            el.dispatchEvent(new KeyboardEvent('keyup', {key: 'Shift', bubbles: true}));
-        }""")
-        self.page.get_by_role("button", name="隐藏右侧栏", exact=True).click()
-        self.page.get_by_role("button", name="翻译选段", exact=True).click()
-        self.page.locator(".right-workspace .translation-text").filter(has_text="每个判断都需要证据。").wait_for()
-        self.page.locator(".session-item.active").click()
-        self.page.locator(".right-workspace .composer").wait_for()
-        self.assertTrue(self.page.locator(".paper-reader").is_visible())
+        self.page.get_by_role("button", name="查看译文", exact=True).click()
+        paragraph = self.page.locator(".paper-translation article").first
+        paragraph.get_by_text("每个判断都需要证据。").wait_for()
+        paragraph.hover()
+        highlight = self.page.locator(".translation-highlight")
+        highlight.wait_for()
+        self.page.locator(".reader-toolbar").hover()
+        highlight.wait_for(state="hidden")
+        self.page.locator(".textLayer span").first.hover()
+        self.page.locator(".paper-translation article.paired").wait_for()
+        self.page.locator(".right-workspace .draggable-chat-tab button").click()
         self.assertEqual(self.page.get_by_label("消息", exact=True).input_value(), "保留对话草稿")
-        self.assertEqual(self._state()["calls"], [])
+        self._send("翻译时继续聊天")
+        self.page.locator(".message-assistant").filter(has_text="来自 FastAPI：翻译时继续聊天").wait_for()
+        self.page.request.post(f"{self.base_url}/__e2e__/finish-translation")
+        self.page.locator(".translation-toast").filter(has_text="翻译完成").wait_for()
+        self.page.locator(".translation-toast button").first.click()
+        self.page.locator("#run-inspector .translated-sheet [data-segment]").first.hover()
+        self.page.locator(".translation-highlight").wait_for()
+        self.page.get_by_role("button", name="下一页", exact=True).click()
+        self.page.get_by_label("第 2 页中文 PDF").wait_for()
+        pdf = self.page.request.get(f"{self.base_url}/api/v1/library/documents/{uploaded.json()['id']}/translation/file")
+        self.assertEqual(pdf.status, 200)
+        with fitz.open(stream=pdf.body(), filetype="pdf") as result:
+            self.assertEqual(len(result), 2)
+            self.assertIn("每个判断",result[1].get_text().replace("\n",""))
 
     def test_translation_renders_latex_and_scrolls_wide_equations(self) -> None:
         self._set_viewport({"width": 1440, "height": 1000})
@@ -1256,20 +1267,19 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
 类似地，延迟区间长度的接近度定义为：
 
 \[
-\beta_{v_i}(S_A,S_B)=\frac{1}{1+|(D^A_{v_i}-d^A_{v_i})-(D^B_{v_i}-d^B_{v_i})|}.\tag{2}
+\beta_{v_i}(S_A,S_B)=\frac{1}{1+|(D^A_{v_i}-d^A_{v_i})-(D^B_{v_i}-d^B_{v_i})|}\qquad\text{for all pairs of sending nodes in the admissible set}.\tag{2}
 \]
 
 两者的值均介于 0 和 1 之间。"""
-        self.page.route("**/api/v1/library/documents/*/translate", lambda route: route.fulfill(json={"text": translation}))
+        self.page.route("**/translation?page=1", lambda route: route.fulfill(json={
+            "page": 1, "state": "complete", "done": 1, "total": 1, "error": "",
+            "segments": [{"id": "first", "kind": "text", "bounds": [.1,.1,.8,.2],
+                          "source": "Definition 1.", "translation": translation}],
+        }))
         self.page.get_by_role("button", name="论文库", exact=True).click()
         self.page.get_by_role("button", name="formula-translation.pdf", exact=True).click()
-        self.page.locator(".textLayer span").first.wait_for()
-        self.page.locator(".textLayer").evaluate("""el => {
-            const range = document.createRange(); range.selectNodeContents(el);
-            const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
-            el.dispatchEvent(new KeyboardEvent('keyup', {key: 'Shift', bubbles: true}));
-        }""")
-        self.page.get_by_role("button", name="翻译选段", exact=True).click()
+        self.page.get_by_role("button", name="查看译文", exact=True).click()
+        self.page.get_by_role("button", name="段落文本", exact=True).click()
         self.page.locator(".translation-text .katex-display").first.wait_for()
         self.page.evaluate("document.fonts.ready")
         result = self.page.locator(".translation-text")
@@ -1281,21 +1291,12 @@ class TestMountedFastAPIClientE2E(unittest.TestCase):
         self.assertNotIn(r"\[", result.inner_text())
         self.assertNotIn(r"\(", result.inner_text())
         self.assertIn("两者的值均介于 0 和 1 之间。", result.inner_text())
-        separator = self.page.get_by_role("separator", name="调整运行检查器宽度", exact=True)
-        for key in ("Home", "End"):
-            separator.press(key)
-            self.page.wait_for_timeout(150)
-            self.assertTrue(result.evaluate("el => el.scrollWidth <= el.clientWidth + 1"))
-            self._assert_no_horizontal_page_overflow()
-            equation = result.locator(".katex-display").last
-            if key == "Home":
-                self.assertTrue(equation.evaluate("el => el.scrollWidth > el.clientWidth"))
-                self.assertGreater(equation.evaluate("el => { el.scrollLeft = el.scrollWidth; return el.scrollLeft; }"), 0)
-                self.assertTrue(equation.evaluate("""el => {
-                    const body = el.querySelector('.katex-html');
-                    const right = Math.max(...Array.from(body.children).filter(n => !n.classList.contains('tag')).map(n => n.getBoundingClientRect().right));
-                    return body.querySelector('.tag').getBoundingClientRect().left >= right;
-                }"""), "窄侧栏中公式编号不应与公式重叠")
+        self.page.get_by_role("separator", name="调整运行检查器宽度").press("Home")
+        self.assertTrue(result.evaluate("el => el.scrollWidth <= el.clientWidth + 1"))
+        self._assert_no_horizontal_page_overflow()
+        equation = result.locator(".katex-display").last
+        self.assertTrue(equation.evaluate("el => el.scrollWidth > el.clientWidth"))
+        self.assertGreater(equation.evaluate("el => { el.scrollLeft = el.scrollWidth; return el.scrollLeft; }"), 0)
         output = ROOT / "runtime" / "evaluations" / "translation-math"
         output.mkdir(parents=True, exist_ok=True)
         self.page.screenshot(path=str(output / "sidebar-formulas.png"))

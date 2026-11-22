@@ -1,5 +1,6 @@
 const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("desktop", {
+  openTranslation: (id) => ipcRenderer.invoke("desktop:open-translation", id),
   reportError: (message) => ipcRenderer.send("desktop:renderer-error", String(message).slice(0, 4000)),
   info: () => ipcRenderer.invoke("desktop:info"),
   configure: (value) => ipcRenderer.invoke("desktop:configure", value),

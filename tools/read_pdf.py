@@ -198,17 +198,20 @@ def resolve_paper_title(
     return fallback_title or "未命名论文", "文件名兜底"
 
 
-def _existing_paper_ids(paper_store, paths, title: str, source_file: str) -> list[str]:
+def _existing_paper_ids(paper_store, paths, title: str, source_file: str, processed_pages: int) -> list[str]:
     """Find replacements by title or persisted source file, not only filename text."""
     found: list[str] = []
     for paper in paper_store.list_papers():
         paper_id = str(paper.get("paper_id") or "")
         if not paper_id:
             continue
+        document_map = load_document_map(paths, paper_id)
+        # A limited reading request cannot replace an existing full-paper index.
+        if len((document_map or {}).get("pages") or []) > processed_pages:
+            continue
         if _clean_title(paper.get("title")).casefold() == title.casefold():
             found.append(paper_id)
             continue
-        document_map = load_document_map(paths, paper_id)
         if str((document_map or {}).get("source_file") or "") == source_file:
             found.append(paper_id)
     return list(dict.fromkeys(found))
@@ -276,7 +279,7 @@ def _download_pdf(url: str, destination: Path) -> int:
     raise PDFDownloadError("PDF 下载重定向次数过多")
 
 
-def _resolve_local_pdf(path_text: str, papers_dir: Path) -> Path:
+def _resolve_local_pdf(path_text: str, papers_dir: Path, *, enqueue=True) -> Path:
     """Resolve managed files; the desktop may import an explicit local PDF."""
     path_text = path_text.strip().strip('"\'')
     if path_text.lower().startswith("file:"):
@@ -300,10 +303,13 @@ def _resolve_local_pdf(path_text: str, papers_dir: Path) -> Path:
 
         library = LibraryStore(RuntimePaths.from_root(base.parent.parent))
         with candidate.open("rb") as source:
-            document = library.import_file(candidate.name, source)
+            document = library.import_file(candidate.name, source, enqueue=enqueue)
         if document["trashed"]:
             raise ValueError("该论文在回收站中，请先在论文库恢复")
         return library.file(document["id"])
+    if requested.parent == Path("library") and re.fullmatch(r"doc_[0-9a-f]{64}\.pdf", requested.name):
+        from papers.library import LibraryStore
+        return LibraryStore(RuntimePaths.from_root(base.parent.parent)).file(requested.stem)
     # Display names differ from the content-addressed filenames in the library.
     if not candidate.is_file() and requested.parent == Path("."):
         from papers.library import LibraryStore
@@ -364,7 +370,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
             print(f"      📂 使用缓存: {pdf_path.name}", file=sys.stderr)
     else:
         try:
-            pdf_path = _resolve_local_pdf(raw_input, pdf_dir)
+            pdf_path = _resolve_local_pdf(raw_input, pdf_dir, enqueue=False)
         except (ValueError, OSError, KeyError) as exc:
             return f"❌ {exc}"
 
@@ -377,6 +383,8 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
             fallback_stem = Path(LibraryStore(paths).get(pdf_path.stem)["name"]).stem
         except KeyError:
             pass
+    if pdf_path.name == "原文.pdf" and pdf_path.parent.parent.name == "library":
+        fallback_stem = pdf_path.parent.name
     paper_id = f"paper_{uuid.uuid4().hex[:12]}"
     selected: tuple[PaperReader, dict, dict, dict, str, str, str] | None = None
     failed_attempts: list[str] = []
@@ -416,7 +424,7 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         return f"❌ PDF 未索引：解析/入库前质量检查未通过，尚未写入向量库。已尝试备用解析策略。{detail}"
 
     reader, parsed_document, document_map, quality, parser_label, title, title_source = selected
-    existing_ids = _existing_paper_ids(paper_store, paths, title, source_file) if paper_store else []
+    existing_ids = _existing_paper_ids(paper_store, paths, title, source_file, len(document_map["pages"])) if paper_store else []
     images: list[str] = []
     try:
         from papers.ocr import attach_visual_assets
@@ -527,4 +535,9 @@ def handle_read_pdf(args: dict, paper_store=None, memory_store=None, **_kwargs) 
         except Exception:
             pass
 
+    if snapshot:
+        from papers.library import LibraryStore, now
+        with LibraryStore(paths).db() as db:
+            db.execute("INSERT OR IGNORE INTO translation_jobs(document_id,state,updated_at) VALUES(?,'queued',?)",
+                       (snapshot, now()))
     return result

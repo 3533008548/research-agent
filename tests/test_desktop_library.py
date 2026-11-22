@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import threading
@@ -140,7 +141,7 @@ class LibraryTests(unittest.TestCase):
         self.assertNotIn('❌', result)
         paper_id = store.index_document_map.call_args.kwargs['paper_id']
         saved = load_document_map(self.paths, paper_id)
-        self.assertEqual(saved['source_file'], source_file)
+        self.assertEqual(saved['source_file'], self.store.file(document['id']).relative_to(self.paths.papers_dir).as_posix())
         self.assertEqual(_find_source_pdf(self.paths, paper_id, 'Research paper')[0], self.store.file(document['id']))
         self.assertTrue(saved['quality']['index_round_trip']['accepted'])
 
@@ -162,6 +163,119 @@ class LibraryTests(unittest.TestCase):
             response = client.put(f"/api/v1/library/documents/{doc['id']}/notes/n", headers=headers,
                                   json={'content': 'note', 'anchor': {'page': 3}, 'revision': 0})
             self.assertEqual(response.status_code, 422)
+
+    def test_translation_bounds_follow_displayed_rotation_and_repeated_paragraphs(self):
+        from papers.translations import source_segments
+        with fitz.open() as pdf:
+            page = pdf.new_page(width=300, height=400)
+            page.insert_text((40, 60), "Same paragraph.")
+            page.insert_text((40, 180), "Same paragraph.")
+            page.set_rotation(90)
+            expected = page.search_for("Same paragraph.")
+            boxes = [rect * page.rotation_matrix for rect in expected]
+            data = pdf.tobytes()
+        doc = self.store.import_file("rotated.pdf", io.BytesIO(data))
+        rows, warnings = source_segments(self.store, doc["id"], threading.Event())
+        self.assertEqual(warnings, [])
+        self.assertEqual([row[-1] for row in rows], ["Same paragraph."] * 2)
+        self.assertNotEqual(rows[0][2], rows[1][2])
+        import json
+        for row, box in zip(rows, boxes):
+            for actual, coordinate, dimension in zip(json.loads(row[4]), box, (400, 300) * 2):
+                self.assertAlmostEqual(actual, coordinate / dimension, places=4)
+
+    def test_paper_translation_resumes_only_missing_segments_from_snapshot(self):
+        from papers.artifacts import write_document_map
+        from papers.translations import PaperTranslations
+
+        doc = self.store.import_file("mapped.pdf", io.BytesIO(pdf_bytes()))
+        mapping = {"document_id": doc["id"], "pages": [{"page": 1, "elements": [
+            {"id": "first", "text": "Introduction", "is_heading": True, "kind": "text", "bbox": [10, 20, 200, 40]},
+            {"id": "second", "text": "This paragraph resumes." * 150, "kind": "text", "bbox": [10, 60, 400, 80]},
+        ]}]}
+        write_document_map(self.paths, paper_id="paper_fixture", document_map=mapping)
+        agent = SimpleNamespace(cfg=SimpleNamespace(deepseek_key="fixture", api_url="local",
+            api_read_timeout_seconds=10, api_max_retries=0), model="fixture")
+        jobs = PaperTranslations(self.store)
+        entered, release = threading.Event(), threading.Event()
+        seen = []
+        response = Mock()
+        response.json.return_value = {"choices": [{"message": {"content": "译文"}}]}
+
+        def translate(payload, **kwargs):
+            seen.append(payload["messages"][-1]["content"])
+            if len(seen) == 2:
+                entered.set()
+                release.wait(4)
+                raise RuntimeError("fixture-private")
+            return response
+
+        with patch("papers.translations.LLMClient") as client:
+            client.return_value.post.side_effect = translate
+            worker = threading.Thread(target=jobs.process_next, args=(agent, threading.Event()))
+            worker.start()
+            self.assertTrue(entered.wait(4))
+            jobs.start(doc["id"])
+            snapshot = jobs.status(doc["id"], 1)
+            self.assertEqual((snapshot["state"], snapshot["done"], snapshot["total"]), ("running", 1, 2))
+            self.assertEqual(snapshot["segments"][0]["kind"], "heading")
+            release.set()
+            worker.join(4)
+            self.assertEqual(jobs.status(doc["id"], 1)["state"], "failed")
+            reopened = PaperTranslations(LibraryStore(self.paths))
+            self.assertEqual(reopened.status(doc["id"], 1)["state"], "failed")
+            reopened.start(doc["id"])
+            reopened.process_next(agent, threading.Event())
+            state = reopened.status(doc["id"], 1)
+            self.assertEqual(state["state"], "complete", state)
+            self.assertEqual(seen.count("Introduction"), 1)
+            self.assertEqual(seen[1], seen[2])
+            with fitz.open(self.store.bundle(doc["id"]) / "中文译文.pdf") as pdf:
+                self.assertIn("译文", pdf[0].get_text())
+
+    def test_agent_controls_survive_restart_and_duplicate_import(self):
+        from papers.translations import PaperTranslations
+        from tools.dispatch import execute_tool
+
+        with fitz.open() as pdf:
+            page = pdf.new_page()
+            page.insert_text((50, 70), "The first paragraph.")
+            page.insert_text((50, 120), "The second paragraph.")
+            data = pdf.tobytes()
+        identifier = self.store.import_file("并行阅读.pdf", io.BytesIO(data))["id"]
+        jobs = PaperTranslations(self.store)
+        agent = SimpleNamespace(cfg=SimpleNamespace(deepseek_key="", api_url="local",
+                                api_read_timeout_seconds=8, api_max_retries=0), model="fixture")
+        stop = threading.Event()
+        self.assertTrue(jobs.process_next(agent, stop))
+        self.assertEqual(jobs.status(identifier)["state"], "unconfigured")
+        def command(action):
+            return json.loads(execute_tool("manage_paper_translation", {"action": action, "paper": "并行阅读"}))
+
+        with patch.dict(os.environ, {"APP_DATA_DIR": str(self.paths.root)}):
+            self.assertEqual(command("pause")["state"], "paused")
+            self.store.import_file("duplicate.pdf", io.BytesIO(data))
+            restarted = PaperTranslations(LibraryStore(self.paths))
+            agent.cfg.deepseek_key = "fixture"
+            self.assertFalse(restarted.process_next(agent, stop))
+            self.assertEqual(command("resume")["state"], "queued")
+            def translate(payload, **kwargs):
+                request = json.loads(payload["messages"][-1]["content"])
+                values = {key: "首段" if source.startswith("The first") else "次段"
+                          for key, source in reversed(request.items())}
+                response = Mock()
+                response.json.return_value = {"choices": [{"message": {"content": json.dumps(values)}}]}
+                return response
+            with patch("papers.translations.LLMClient") as client:
+                client.return_value.post.side_effect = translate
+                self.assertTrue(restarted.process_next(agent, stop))
+                self.assertEqual(client.return_value.post.call_count, 1)
+            self.assertEqual(command("status")["state"], "complete")
+            directory = self.store.files / "并行阅读"
+            self.assertEqual((directory / "原文.pdf").read_bytes(), data)
+            with fitz.open(directory / "中文译文.pdf") as translated:
+                text = translated[0].get_text()
+                self.assertLess(text.index("首段"), text.index("次段"))
 
     def test_translation_uses_selected_passage_and_closes_model_response(self):
         doc = self.store.import_file('test.pdf', io.BytesIO(pdf_bytes()))

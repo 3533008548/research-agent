@@ -15,7 +15,7 @@ it("falls back safely for damaged, obsolete and invalid layout preferences", () 
   assert.deepEqual(parseLayoutPreferences(JSON.stringify({
     version: 1, leftWidth: -200, rightWidth: 999999,
     leftVisible: "false", rightVisibility: "sometimes",
-  })), { ...defaultLayoutPreferences(), leftWidth: 190, rightWidth: 800 });
+  })), { ...defaultLayoutPreferences(), leftWidth: 190, rightWidth: 1600 });
   assert.deepEqual(parseLayoutPreferences(JSON.stringify({
     version: 1, leftWidth: 350, rightWidth: 440, leftVisible: false, rightVisibility: "hidden",
   })), { ...defaultLayoutPreferences(), leftWidth: 350, rightWidth: 440, leftVisible: false, rightVisibility: "hidden" });
@@ -57,7 +57,7 @@ it("keeps the center usable for every visibility combination and requested width
           if (leftVisible) assert.ok(resolved.leftWidth >= 190);
           if (rightVisible) assert.ok(resolved.rightWidth >= 245);
           assert.equal(resolved.leftWidth + resolved.centerWidth + resolved.rightWidth, workspaceWidth);
-          assert.ok(resolved.leftWidth <= 420 && resolved.rightWidth <= 800);
+          assert.ok(resolved.leftWidth <= 420 && resolved.rightWidth <= 1600);
           assert.ok(resolved.leftWidth >= resolved.leftBounds.min && resolved.leftWidth <= resolved.leftBounds.max);
           assert.ok(resolved.rightWidth >= resolved.rightBounds.min && resolved.rightWidth <= resolved.rightBounds.max);
           if (!leftVisible) assert.equal(resolved.leftWidth, 0);

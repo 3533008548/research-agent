@@ -110,7 +110,14 @@ def element_citations(paths, document_map, source_ids=None):
         library = LibraryStore(paths)
         snapshot = document_map.get("document_id")
         if not snapshot:
-            snapshot = path.stem if path.parent == library.files else library.register(path, path.name)["id"]
+            if path.parent == library.files:
+                snapshot = path.stem
+            elif path.parent.parent == library.files and path.name == "原文.pdf":
+                with library.db() as db:
+                    snapshot = db.execute("SELECT document_id FROM paper_bundles WHERE directory=?",
+                                          (path.parent.name,)).fetchone()[0]
+            else:
+                snapshot = library.register(path, path.name, enqueue=False)["id"]
         links = {}
         with fitz.open(library.file(snapshot)) as pdf:
             for record in document_map.get("pages", []):
