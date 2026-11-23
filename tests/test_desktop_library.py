@@ -30,6 +30,84 @@ def pdf_bytes(text='Reading with traceable evidence'):
 
 
 class LibraryTests(unittest.TestCase):
+    def test_drawn_underscore_moves_with_identifier_and_spares_fraction_rule(self):
+        from papers.translation_layout import identifier_strokes, restore_identifiers, math_line
+        from papers.translations import _check_identifiers, TranslationFailure
+        from papers.translated_pdf import _place_translations
+
+        with fitz.open() as doc:
+            page = doc.new_page()
+            page.insert_text((70,90), "O Port", fontsize=12)
+            a, b = page.get_text("words")
+            page.draw_line((a[2],91), (b[0],91), width=.5)
+            page.draw_line((68,125), (110,125), width=.6)
+            area = fitz.Rect(a[:4]) | fitz.Rect(b[:4])
+            strokes = identifier_strokes(page, page.get_drawings())
+            self.assertEqual(len(strokes), 1)
+            source = restore_identifiers("O Port", area, strokes)
+            self.assertEqual(source, "O_Port")
+            with self.assertRaises(TranslationFailure):
+                _check_identifiers(source, "端口")
+            value = _check_identifiers(source, "字段 O Port")
+            self.assertEqual(value, "字段 O_Port")
+            clip = fitz.Rect(65,120,116,132)
+            digest = page.get_pixmap(clip=clip).digest
+            bounds = json.dumps([v/d for v,d in zip(area,(page.rect.width,page.rect.height)*2)])
+            _place_translations(page, [dict(source=source,translation=value,bounds=bounds,kind="text")])
+            self.assertIn("O_Port", page.get_text().replace("\n",""))
+            self.assertFalse(any(p["rect"] == strokes[0][0] for p in page.get_drawings()))
+            self.assertEqual(page.get_pixmap(clip=clip).digest, digest)
+        for font,text,expected in [("CMMI10","L",True), ("CMEX10","\ufffd",True), ("CMSY7","•",False)]:
+            self.assertEqual(math_line({"spans":[{"text":text,"font":font,"flags":0}]}),expected)
+
+    def test_translation_recovers_ruled_table_centered_title_list_and_indent(self):
+        from papers.translation_layout import native_lines, ruled_tables, structural_elements
+        from papers.translated_pdf import _place_translations
+
+        with fitz.open() as pdf:
+            page = pdf.new_page(width=400, height=600)
+            def centered(y, value):
+                w = fitz.get_text_length(value, fontsize=20)
+                page.insert_text((200-w/2,y), value, fontsize=20)
+            centered(45, "A centered paper title")
+            centered(68, "on two lines")
+            page.insert_text((178,110), "TABLE I")
+            for y in (120,145,175):
+                page.draw_line((50,y),(350,y))
+            for y in (136,162):
+                page.insert_text((60,y), "Cell A")
+                page.insert_text((230,y), "Cell B")
+            for y in (230,258,286):
+                page.draw_rect((54,y-6,58,y-4), fill=(0,0,0))
+                page.insert_text((65,y), "Independent list entry")
+            page.insert_text((72,350), "A paragraph with a first-line indent.")
+            page.insert_text((60,364), "The paragraph continues.")
+            lines = native_lines(page)
+            paths = page.get_drawings()
+            def element(key, subset):
+                area = fitz.Rect(subset[0]["bbox"])
+                for line in subset[1:]:
+                    area |= fitz.Rect(line["bbox"])
+                return {"id":key, "kind":"text","text":" ".join(l["spans"][0]["text"] for l in subset),"bbox":list(area)}
+            blocks = [element("title1", lines[:1]), element("title2", lines[1:2]),
+                      element("entries", lines[-5:-2]), element("para", lines[-2:])]
+            parts = structural_elements(page, blocks, lines, paths)
+            self.assertEqual([p["id"] for p in parts], ["title1","entries-item0","entries-item1","entries-item2","para"])
+            self.assertIn("on two lines", parts[0]["text"])
+            table, = ruled_tables(lines, paths)
+            self.assertLess(table.y0, 110)
+            self.assertGreater(table.y1, 175)
+            before = page.get_pixmap(clip=table).digest
+            rows = [{**p,"source":p["text"],"translation":"原文标题" if i==0 else "段落翻译用于验证中文换行以后的排版和首行缩进。"*2,
+                     "bounds":json.dumps([n/d for n,d in zip(p["bbox"],(400,600)*2)])} for i,p in enumerate(parts)]
+            _place_translations(page, rows)
+            self.assertEqual(page.get_pixmap(clip=table).digest, before)
+            drawn = native_lines(page)
+            title = next(l["bbox"] for l in drawn if "原文标题" in l["spans"][0]["text"])
+            self.assertAlmostEqual((title[0]+title[2])/2, 200, delta=2)
+            offsets = [l["bbox"][0] for l in drawn if l["bbox"][1]>320]
+            self.assertGreater(offsets[0]-offsets[1], 6)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.paths = RuntimePaths.from_root(self.temp.name)

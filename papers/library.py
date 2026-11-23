@@ -63,7 +63,7 @@ class LibraryStore:
                 CREATE TABLE IF NOT EXISTS discovered(path TEXT PRIMARY KEY, signature TEXT NOT NULL);
             """)
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version < 2:
+            if version < 3:
                 db.execute("BEGIN IMMEDIATE")
                 version = db.execute("PRAGMA user_version").fetchone()[0]
             if version < 1:
@@ -77,6 +77,11 @@ class LibraryStore:
                 db.execute("ALTER TABLE translation_jobs ADD COLUMN layout_ready INTEGER NOT NULL DEFAULT 0")
                 db.execute("UPDATE translation_jobs SET state='idle', error='', notified=1 WHERE state IN ('complete','failed')")
                 db.execute("PRAGMA user_version=2")
+            if version < 3:
+                db.execute("""UPDATE translation_jobs SET layout_ready=0, generation=generation+1,
+                              state=CASE WHEN state IN ('complete','failed') THEN 'idle' ELSE state END,
+                              error=''""")
+                db.execute("PRAGMA user_version=3")
 
     @contextmanager
     def db(self):
