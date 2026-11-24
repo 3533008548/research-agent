@@ -30,6 +30,88 @@ def pdf_bytes(text='Reading with traceable evidence'):
 
 
 class LibraryTests(unittest.TestCase):
+    def test_inline_math_keeps_prose_together_and_survives_pdf_export(self):
+        from papers.translation_layout import INLINE_TOKEN, inline_layout, native_lines
+        from papers.translations import _outside_graphics, _check_identifiers, TranslationFailure
+        from papers.translated_pdf import _place_translations
+
+        with fitz.open() as doc:
+            page = doc.new_page(width=350, height=250)
+            left = 30
+            page.insert_text((left, 50), "We choose the parameter ")
+            start = left + fitz.get_text_length("We choose the parameter ")
+            page.insert_text((start, 50), "a", fontname="symb")
+            page.insert_text((start+9, 50), " for this network.")
+            page.insert_text((left, 65), "The network can recover from failure.")
+            page.insert_text((left, 80), "During normal operation this parameter is fixed.")
+            page.insert_text((left, 95), "After a failure the network switches paths.")
+            page.insert_text((left, 140), "a", fontname="symb")
+            lines = native_lines(page)
+            inline, _, display = inline_layout(lines)
+            self.assertEqual(len(display), 1)
+            box = fitz.Rect(25, 30, 320, 150)
+            segment, = _outside_graphics({"id":"para", "text":"", "kind":"text"}, box, display, lines, inline)
+            _, area, source = segment
+            self.assertIn("recover from failure", source)
+            token, = (m[0] for m in INLINE_TOKEN.finditer(source))
+            for invalid in ["译文", "重复"+token+token]:
+                with self.assertRaises(TranslationFailure):
+                    _check_identifiers(source, invalid)
+            translation = _check_identifiers(source, "网络能够从故障中恢复。\n为网络选择参数"+token+"。\n故障后切换路径。")
+            before = page.get_pixmap(clip=display[0]).digest
+            bounds = json.dumps([v/d for v,d in zip(area, (350,250)*2)])
+            _place_translations(page, [dict(source=source,translation=translation,bounds=bounds,kind="text")])
+            self.assertEqual(before, page.get_pixmap(clip=display[0]).digest)
+            images = [img for img in page.get_image_info() if img["width"] > 1]
+            self.assertEqual(len(images), 1)
+            spans = [s for line in native_lines(page) for s in line["spans"] if "。" in s["text"]]
+            first, middle, last = [s["origin"][1] for s in spans]
+            self.assertAlmostEqual(middle-first, 15, places=2)
+            self.assertAlmostEqual(last-middle, middle-first, places=2)
+            self.assertTrue(fitz.Rect(images[0]["bbox"]).contains(
+                (images[0]["bbox"][0]+.1, middle-.5)))
+            self.assertNotIn("recover", page.get_text())
+            self.assertNotIn("⟦", page.get_text())
+
+    def test_body_line_spacing_is_fixed_across_source_font_sizes(self):
+        from papers.translated_pdf import _place_translations
+        from papers.translation_layout import native_lines
+
+        for size in (8, 10, 12):
+            with self.subTest(size=size), fitz.open() as doc:
+                page = doc.new_page(width=200, height=120)
+                page.insert_text((20, 35), "Original paragraph.", fontsize=size)
+                _place_translations(page, [dict(kind="text", bounds="[0.1,0.1,0.9,0.9]",
+                                                source="Original paragraph.", translation="第一行。\n第二行。\n第三行。")])
+                spans = [line["spans"][0] for line in native_lines(page)]
+                self.assertEqual(len(spans), 3)
+                self.assertAlmostEqual(spans[0]["size"], size, places=2)
+                for previous, current in zip(spans, spans[1:]):
+                    self.assertAlmostEqual(current["origin"][1] - previous["origin"][1], 15, places=2)
+
+    def test_author_membership_uses_separate_spans_and_leaves_names_in_place(self):
+        from papers.translation_layout import membership_translation, native_lines, structural_elements
+        from papers.translated_pdf import _place_translations
+
+        with fitz.open() as doc:
+            page = doc.new_page(width=400,height=200)
+            page.insert_text((20,50), "Wenbin Tian")
+            page.draw_circle((90,47), 3, color=(0,1,0))
+            page.insert_text((96,50), ", Graduate Student Member, IEEE", fontname="tiit")
+            lines = native_lines(page)
+            block = dict(id="author", kind="text", bbox=(18,32,380,56), text=page.get_text())
+            role, = structural_elements(page, [block], lines, page.get_drawings())
+            self.assertEqual(role["kind"], "membership")
+            value = membership_translation(role["text"])
+            self.assertEqual(value, "，IEEE 研究生会员")
+            untouched = fitz.Rect(16,32,94,55)
+            before = page.get_pixmap(clip=untouched).digest
+            bounds = json.dumps([v/d for v,d in zip(role["bbox"], (400,200)*2)])
+            _place_translations(page, [dict(source=role["text"],translation=value,bounds=bounds,kind="membership")])
+            self.assertEqual(before, page.get_pixmap(clip=untouched).digest)
+            self.assertIn("Wenbin Tian", page.get_text())
+            self.assertNotIn("Graduate", page.get_text())
+
     def test_drawn_underscore_moves_with_identifier_and_spares_fraction_rule(self):
         from papers.translation_layout import identifier_strokes, restore_identifiers, math_line
         from papers.translations import _check_identifiers, TranslationFailure
