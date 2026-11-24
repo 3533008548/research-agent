@@ -20,6 +20,7 @@ export function TranslatedPage({apiKey, documentId, page, complete, segments, ho
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [error, setError] = useState("");
   const [ready, setReady] = useState(0);
+  const [regions, setRegions] = useState<Map<string, TranslationSegment["bounds"][]>>(new Map());
   const [width, setWidth] = useState(0);
   const host = useRef<HTMLDivElement>(null), canvas = useRef<HTMLCanvasElement>(null);
 
@@ -52,8 +53,20 @@ export function TranslatedPage({apiKey, documentId, page, complete, segments, ho
       buffer.width = Math.ceil(viewport.width);
       buffer.height = Math.ceil(viewport.height);
       task = p.render({canvas:buffer, viewport});
-      await task.promise;
+      const [, annotations] = await Promise.all([task.promise, p.getAnnotations({intent:"any"})]);
       if (!alive || !canvas.current) return;
+      const next = new Map<string, TranslationSegment["bounds"][]>();
+      for (const ann of annotations) {
+        if (ann.titleObj?.str !== "translation-segment" || !ann.contentsObj?.str) continue;
+        const id = ann.contentsObj.str;
+        const [x,y] = viewport.convertToViewportPoint(ann.rect[0],ann.rect[1]);
+        const [r,b] = viewport.convertToViewportPoint(ann.rect[2],ann.rect[3]);
+        const bounds: TranslationSegment["bounds"] = [Math.min(x,r)/viewport.width,
+          Math.min(y,b)/viewport.height, Math.max(x,r)/viewport.width, Math.max(y,b)/viewport.height];
+        if (!next.has(id)) next.set(id, []);
+        next.get(id)!.push(bounds);
+      }
+      setRegions(next);
       canvas.current.width = buffer.width;
       canvas.current.height = buffer.height;
       canvas.current.getContext("2d")!.drawImage(buffer,0,0);
@@ -87,10 +100,10 @@ export function TranslatedPage({apiKey, documentId, page, complete, segments, ho
     {error && <p role="alert">{error}</p>}
     <div className="translated-sheet" ref={host}>
       <canvas aria-label={`第 ${page} 页中文 PDF`} ref={canvas} style={{visibility:ready===page?"visible":"hidden"}}/>
-      {ready===page && segments.map(({id,bounds:[x,y,r,b]}) =>
-        <div key={id} id={documentId+id} data-segment={id} className={id===hovered?"paired":""}
+      {ready===page && segments.flatMap(({id,bounds}) => (regions.get(id) ?? [bounds]).map(([x,y,r,b],index) =>
+        <div key={id+"-"+index} id={index===0 ? documentId+id : undefined} data-segment={id} className={id===hovered?"paired":""}
           onPointerEnter={()=>onHover(id)} onPointerLeave={()=>onHover("")}
-          style={{left:x*100+"%",top:y*100+"%",width:(r-x)*100+"%",height:(b-y)*100+"%"}}/>)}
+          style={{left:x*100+"%",top:y*100+"%",width:(r-x)*100+"%",height:(b-y)*100+"%"}}/>))}
     </div>
   </>;
 }

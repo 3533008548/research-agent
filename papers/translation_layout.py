@@ -68,16 +68,64 @@ def typography(rect, lines):
     return size, bold, centered, indent if .4*size < indent < 3*size else 0
 
 
+def _attach_drop_caps(elements, lines):
+    elements = list(elements)
+    for i in range(len(elements) - 1):
+        heading, body = elements[i:i+2]
+        title, _, letter = heading["text"].strip().rpartition(" ")
+        if not SECTION_HEADING.fullmatch(title) or not re.fullmatch("[A-Z]", letter):
+            continue
+        body_box = fitz.Rect(body["bbox"])
+        native = lines_in(fitz.Rect(heading["bbox"]), lines)
+        cap = next((fitz.Rect(l["bbox"]) for l in native if line_text(l) == letter
+                    and fitz.Rect(l["bbox"]).intersects(body_box+(-4,0,0,0))), None)
+        heading_line = next((l for l in native if line_text(l) == title), None)
+        if cap is None or heading_line is None or not re.match("[A-Za-z]", body["text"]):
+            continue
+        elements[i] = {**heading, "bbox":heading_line["bbox"], "text":title, "is_heading":True}
+        elements[i+1] = {**body, "bbox":list(body_box | cap), "text":letter+body["text"], "drop_cap":True}
+    return elements
+
+
+def _membership_spans(page, rect, lines):
+    # Some publishers emit one span per word, or combine a role with a name.
+    # Use character bounds so the neighboring names, commas and ORCID stay put.
+    if not any(MEMBER.search(line_text(line)) for line in lines):
+        return []
+    blocks = page.get_text("rawdict", clip=rect+(-.2,-.2,.2,.2),
+                           flags=fitz.TEXTFLAGS_RAWDICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]
+    roles = []
+    for block in blocks:
+        for line in block.get("lines", []):
+            chars = [c for s in line["spans"] for c in s["chars"]]
+            value = "".join(c["c"] for c in chars)
+            for match in MEMBER.finditer(value):
+                selected = chars[match.start():match.end()]
+                box = fitz.Rect(selected[0]["bbox"])
+                for char in selected[1:]:
+                    box |= fitz.Rect(char["bbox"])
+                roles.append({"text":match[0].strip(), "bbox":list(box)})
+    return roles
+
+
 def structural_elements(page, elements, lines, paths):
     marks = [p["rect"] for p in paths if 1 <= p["rect"].width <= 8 and 1 <= p["rect"].height <= 8]
+    orcids = [link["from"] * page.derotation_matrix for link in page.get_links()
+              if re.match(r"https?://orcid\.org/", link.get("uri",""), re.I)] if page.number == 0 else []
     result = []
     previous_title_size = None
-    for element in elements:
+    for element in _attach_drop_caps(elements, lines):
+        if element.get("drop_cap"):
+            result.append(element)
+            previous_title_size = None
+            continue
         box = fitz.Rect(element["bbox"])
         native = lines_in(box, lines)
         if page.number == 0:
-            roles = [s for l in native for s in l["spans"] if MEMBER.fullmatch(s["text"].strip())]
-            if roles:
+            roles = _membership_spans(page, box, native)
+            byline = native and all(any(fitz.Rect(l["bbox"]).intersects(icon)
+                                        for icon in orcids) for l in native)
+            if roles or byline:
                 result.extend({**element, "id":f"{element['id']}-role{i}", "kind":"membership",
                                "text":s["text"], "bbox":s["bbox"]} for i,s in enumerate(roles))
                 previous_title_size = None
@@ -162,7 +210,7 @@ def math_line(line):
                for s in spans)
 
 INLINE_TOKEN = re.compile(r"⟦(\d+\.\d+)\|([^⟧]*)⟧")
-MEMBER = re.compile(r",?\s*(?:(?:Graduate Student|Senior|Student|Life Senior|Life Fellow|Life) )?(?:Member|Fellow), IEEE", re.I)
+MEMBER = re.compile(r"(?:,\s*)?\b(?:(?:Graduate Student|Life Senior|Senior|Student|Life) )?(?:Member|Fellow),\s*IEEE\b", re.I)
 
 
 def membership_translation(source):

@@ -30,6 +30,66 @@ def pdf_bytes(text='Reading with traceable evidence'):
 
 
 class LibraryTests(unittest.TestCase):
+    def test_column_whitespace_and_same_page_continuation_keep_type_size(self):
+        from papers.translated_pdf import _place_translations
+        from papers.translation_layout import native_lines
+
+        for rotation in (0,90,180,270):
+            with self.subTest(rotation=rotation), fitz.open() as doc:
+                page = doc.new_page(width=340, height=300)
+                page.set_cropbox(fitz.Rect(10,10,330,290))
+                page.insert_text((40,60),"Original prose.",fontsize=12)
+                page.draw_rect(fitz.Rect(140,90,165,105),fill=(0,0,0))
+                page.set_rotation(rotation)
+                view = page.rect
+                marker = fitz.Rect(136,86,169,109)*page.rotation_matrix
+                before = page.get_pixmap(clip=marker).digest
+                source = fitz.Rect(30,44,135,66)*page.rotation_matrix
+                bounds = json.dumps([v/d for v,d in zip(source,(view.width,view.height)*2)])
+                _place_translations(page,[dict(id="test",bounds=bounds,kind="text",source="Original prose.",
+                                               translation="\n".join(f"Row {i:02d}." for i in range(36)))])
+                self.assertEqual(doc.page_count,1)
+                self.assertGreater(page.rect.height,view.height)
+                self.assertEqual(page.rect.width,view.width)
+                self.assertEqual(page.get_pixmap(clip=marker).digest,before)
+                spans = [s for l in native_lines(page) for s in l["spans"]]
+                text = "".join(s["text"] for s in spans).replace(" ","")
+                for i in range(36):
+                    self.assertEqual(text.count(f"Row{i:02d}."),1)
+                self.assertTrue(all(abs(s["size"]-12)<.05 for s in spans))
+                targets = [a.rect*page.rotation_matrix for a in page.annots() if a.info["content"]=="test"]
+                self.assertEqual(len(targets),2)
+                self.assertGreater(targets[0].height,source.height)
+                self.assertGreater(targets[1].y0,view.height)
+
+    def test_initial_cap_owned_by_body_and_split_membership_spans(self):
+        from papers.translation_layout import native_lines, structural_elements, line_text
+        with fitz.open() as doc:
+            page = doc.new_page()
+            page.insert_text((60,60),"T. Zhang, ",fontsize=10)
+            page.insert_text((106,60),"Senior ",fontname="tiit",fontsize=10)
+            page.insert_text((136,60),"Member, IEEE,",fontsize=10)
+            page.insert_text((215,60),"J. Lin",fontsize=10)
+            page.insert_text((75,100),"I. INTRODUCTION",fontsize=10)
+            page.insert_text((45,130),"I",fontsize=26)
+            page.insert_text((55,115),"N MANY networks,")
+            page.insert_text((55,130),"recovery matters.")
+            lines = native_lines(page)
+            def bounds(start):
+                return fitz.Rect(next(l["bbox"] for l in lines if line_text(l).startswith(start)))
+            title = bounds("I. INTRODUCTION")
+            cap = fitz.Rect(next(l["bbox"] for l in lines if line_text(l)=="I"))
+            elements = [dict(id="byline",kind="text",text="T. Zhang, Senior Member, IEEE, J. Lin",bbox=(55,45,260,65)),
+                        dict(id="title",kind="text",text="I. INTRODUCTION I",bbox=title|cap,is_heading=True),
+                        dict(id="body",kind="text",text="N MANY networks, recovery matters.",bbox=bounds("N MANY")|bounds("recovery"))]
+            role, heading, body = structural_elements(page,elements,lines,[])
+            self.assertEqual(role["kind"],"membership")
+            self.assertIn("Senior Member, IEEE",role["text"])
+            self.assertLess(role["bbox"][2],215)
+            self.assertEqual(heading["bbox"],list(title) if isinstance(heading["bbox"],list) else tuple(title))
+            self.assertEqual(body["text"],"IN MANY networks, recovery matters.")
+            self.assertTrue(fitz.Rect(body["bbox"]).contains(cap))
+
     def test_inline_math_keeps_prose_together_and_survives_pdf_export(self):
         from papers.translation_layout import INLINE_TOKEN, inline_layout, native_lines
         from papers.translations import _outside_graphics, _check_identifiers, TranslationFailure
@@ -187,7 +247,9 @@ class LibraryTests(unittest.TestCase):
             drawn = native_lines(page)
             title = next(l["bbox"] for l in drawn if "原文标题" in l["spans"][0]["text"])
             self.assertAlmostEqual((title[0]+title[2])/2, 200, delta=2)
-            offsets = [l["bbox"][0] for l in drawn if l["bbox"][1]>320]
+            target = next(a.rect for a in page.annots() if a.info["content"]=="para")
+            offsets = [l["bbox"][0] for l in drawn
+                       if target.contains((fitz.Rect(l["bbox"]).tl+fitz.Rect(l["bbox"]).br)/2)]
             self.assertGreater(offsets[0]-offsets[1], 6)
 
     def setUp(self):
